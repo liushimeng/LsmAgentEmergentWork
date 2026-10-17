@@ -997,10 +997,20 @@ impl BrowserManager {
         // 2026-10-16:new_page 有界化 —— 它排队在 browser handler 事件循环上,
         // 前一 target 导航卡死时(实测 github.com/commits 网络 stall)会无声挂死,
         // 与下方 goto 的 30s 超时同属一级兜底。
+        //
+        // 第 178 轮:建页一律用 **about:blank**,真实 URL 只由下方 goto 加载一次。
+        // 此前把 url 交给 createTarget,而 chromiumoxide 的 create_page 会等到该 URL
+        // **加载完成**才返回 —— 于是首个真实文档发生在隐身/UA/屏幕几何处置**之前**
+        // (真机计数服务器实测:目标 URL 被请求 2 次,req#1 的 UA 原样带 `HeadlessChrome`;
+        // 站点风控 SDK 恰在文档最早期采指纹并上报,第 177 轮「注册早于 goto」对它无效),
+        // 且同一新会话对同一 URL 连续加载两次本身就是异常导航序列。about:blank 无站点
+        // 脚本、无网络请求,是纯粹的空载起点。`about:blank` 非安全上下文 ⇒ 读不到
+        // Client Hints —— 无妨:真机实测无头档 UA 令牌只出现在 **UA 字符串**里
+        // (`Sec-CH-UA` 品牌表恒为正常品牌),而 `navigator.userAgent` 在 about:blank 上可读。
         let page = if new_window {
             use chromiumoxide::cdp::browser_protocol::target::CreateTargetParams;
             let params = CreateTargetParams::builder()
-                .url(url.to_string())
+                .url("about:blank".to_string())
                 .new_window(true)
                 .build()
                 .map_err(chromiumoxide::error::CdpError::msg)?;
@@ -1014,7 +1024,7 @@ impl BrowserManager {
                     ))
                 })??
         } else {
-            tokio::time::timeout(browser_timeout, browser.new_page(url.to_string()))
+            tokio::time::timeout(browser_timeout, browser.new_page("about:blank"))
                 .await
                 .map_err(|_| {
                     chromiumoxide::error::CdpError::msg(format!(
@@ -1044,9 +1054,17 @@ impl BrowserManager {
         // 第 174 轮:无头档 UA 清理必须**先于首次导航** —— 否则第一个文档的网络
         // 请求头仍带 `HeadlessChrome` 令牌(JS 侧改 navigator.userAgent 只骗得过
         // 页面、骗不过服务器)。connect 模式零注入契约不变(用户日常浏览器本无该令牌)。
-        if !inner.connect_mode {
-            super::browser_ns::apply_ua_destealth(&page, inner.stealth).await;
-        }
+        //
+        // 第 178 轮:此刻页面是 about:blank(非安全上下文),`navigator.userAgentData`
+        // 不存在 ⇒ 只能清 UA 字符串(`UaSweep::StringOnly`)。真机实测:
+        // `setUserAgentOverride` 不带 `userAgentMetadata` 时页面侧的
+        // `userAgentData.brands` 会被**清空** —— 「UA 说 Chrome、Client Hints 说空」
+        // 是比原状更显眼的新破绽。故落地后（安全上下文）必须补全,见下方 goto 之后。
+        let ua_sweep = if inner.connect_mode {
+            super::browser_ns::UaSweep::Skipped
+        } else {
+            super::browser_ns::apply_ua_destealth(&page, inner.stealth).await
+        };
         // 第 175 轮:屏幕几何自洽 —— 与 UA 清理同批(都在首次导航前下发),
         // 让首个文档起就满足 `outer <= screen`(真机实测:不补则
         // screen=800x600 < outer=1920,物理不可能,风控一行即可判定)。
@@ -1068,6 +1086,24 @@ impl BrowserManager {
                     browser_timeout.as_secs()
                 ))
             })??;
+
+        // 第 178 轮:UA 去令牌的**落地后补全**。首次导航前那次探测发生在
+        // `about:blank`(非安全上下文,读不到 Client Hints),只清出了 UA 字符串;
+        // 而 `setUserAgentOverride` 不带 `userAgentMetadata` 会把页面侧的
+        // `navigator.userAgentData.brands` 清空(真机实测) —— 那等于用「UA 说 Chrome、
+        // Client Hints 说空」换掉了原来的令牌,得不偿失。现在文档已落在真实安全上下文,
+        // 先撤掉半吊子覆盖让页面重新报出**原生**身份,再探一次即拿到品牌表真值并下发
+        // 完整覆盖。窗口极短(页面脚本早已在 document-start 读到干净的 UA 字符串)。
+        // 有头档此路径不可达(pre-goto 那次本就 `Skipped`,无令牌)。
+        if ua_sweep == super::browser_ns::UaSweep::StringOnly {
+            super::browser_ns::restore_native_ua(&page).await;
+            let done = super::browser_ns::apply_ua_destealth(&page, inner.stealth).await;
+            if done != super::browser_ns::UaSweep::Full {
+                tracing::warn!(
+                    "UA 去令牌落地后补全未生效(Client Hints 品牌表可能为空,与 UA 字符串不自洽): {done:?}"
+                );
+            }
+        }
 
         // UA 覆盖(可选)
         if let Some(ua) = user_agent.filter(|s| !s.is_empty()) {

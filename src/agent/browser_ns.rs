@@ -132,6 +132,7 @@ const PRELUDE_JS: &str = r#"
             __adopt(Navigator.prototype, 'plugins');
             __adopt(Navigator.prototype, 'mimeTypes');
             __adopt(Navigator.prototype, 'languages');
+            __adopt(Navigator.prototype, 'pdfViewerEnabled');
             __adopt(window, 'chrome');
             __adopt(window.Permissions && Permissions.prototype, 'query');
             __adopt(window.WebGLRenderingContext && WebGLRenderingContext.prototype, 'getParameter');
@@ -262,7 +263,14 @@ const FIDELITY_JS: &str = r#"
             const mimeOrder = ctx.mimeOrder;
             const descriptorFor = {
                 getter: (name, fn) => ({ get: reg(fn, 'get ' + name), enumerable: true, configurable: true }),
-                method: (name, fn) => ({ value: reg(fn, name), writable: true, enumerable: true, configurable: true })
+                method: (name, fn) => ({ value: reg(fn, name), writable: true, enumerable: true, configurable: true }),
+                // 第 178 轮(真机差分实测):中间原型必须自带 own `constructor`。
+                // 原生 `PluginArray.prototype` 的自有属性是
+                // `["length","item","namedItem","refresh","constructor"]`,而
+                // `Object.create(PluginArray.prototype)` 只**继承** constructor,
+                // `Object.getOwnPropertyNames(中间原型)` 会少这一项 —— 一行即可看出
+                // 「这不是原生原型」。形态判据见 docs/MCP_Web_Use/32 §七.2。
+                ctor: (proto) => ({ value: proto.constructor, writable: true, enumerable: false, configurable: true })
             };
             // 数组体:实例 own 只有索引 + 具名键;length 与方法全在中间原型上。
             //
@@ -289,6 +297,11 @@ const FIDELITY_JS: &str = r#"
                     Object.defineProperty(proto, 'refresh',
                         descriptorFor.method('refresh', function refresh() {}));
                 }
+                // 符号键的**定义序**决定 `getOwnPropertySymbols` 的返回序。原生
+                // `PluginArray.prototype` 实测为 `[Symbol.toStringTag, Symbol.iterator]`,
+                // 故 toStringTag 必须先定义(真机差分会把顺序差异也照出来)。
+                Object.defineProperty(proto, Symbol.toStringTag,
+                    { value: tag, enumerable: false, configurable: true });
                 Object.defineProperty(proto, Symbol.iterator, {
                     // 第 176 轮:原生 Iterator 的迭代器本身也是 iterable 的
                     // (`iterator[Symbol.iterator]()` 返回自身,ECMAScript 规范要求),
@@ -299,8 +312,9 @@ const FIDELITY_JS: &str = r#"
                     value: reg(function () { return __mkIterator(items); }, '[Symbol.iterator]'),
                     writable: true, enumerable: false, configurable: true
                 });
-                Object.defineProperty(proto, Symbol.toStringTag,
-                    { value: tag, enumerable: false, configurable: true });
+                // 第 178 轮:own `constructor` 收尾挂 —— 字符串键序与原生一致
+                // (`length/item/namedItem/[refresh/]constructor`)。
+                Object.defineProperty(proto, 'constructor', descriptorFor.ctor(RealProto));
                 const o = Object.create(proto);
                 items.forEach((it, i) => {
                     Object.defineProperty(o, String(i),
@@ -323,6 +337,10 @@ const FIDELITY_JS: &str = r#"
                     description: descriptorFor.getter('description', function () { return spec.description; }),
                     enabledPlugin: descriptorFor.getter('enabledPlugin', function () { return plugin; })
                 });
+                // 第 178 轮:own `constructor`(真机差分:原生 `MimeType.prototype` 的
+                // own 键为 `["type","suffixes","description","enabledPlugin","constructor"]`)
+                Object.defineProperty(proto, 'constructor',
+                    descriptorFor.ctor(MimeType.prototype));
                 return Object.create(proto);
             };
             NAMES.forEach((name) => {
@@ -358,6 +376,10 @@ const FIDELITY_JS: &str = r#"
                     Object.defineProperty(plugin, mime.type,
                         { value: mime, enumerable: true, writable: false, configurable: true });
                 });
+                // 第 178 轮:own `constructor`(真机差分:原生 `Plugin.prototype` 的
+                // own 键为 `["name","filename","description","length","item","namedItem","constructor"]`)
+                Object.defineProperty(proto, 'constructor',
+                    descriptorFor.ctor(Plugin.prototype));
                 ctx.plugins.push(plugin);
             });
             const defNav = (key, val) => {
@@ -372,14 +394,26 @@ const FIDELITY_JS: &str = r#"
                 'PluginArray', (p) => p.name, true));
             defNav('mimeTypes', makeArrayLike(mimeOrder, MimeTypeArray.prototype,
                 'MimeTypeArray', (m) => m.type, false));
+            // 第 178 轮:`navigator.pdfViewerEnabled` 必须与回填的 PDF 插件自洽。
+            // 回填分支造出 5 个「PDF Viewer」却让 pdfViewerEnabled 停在该环境的原生值
+            // (无插件环境通常为 false),就是「5 个 PDF 插件 + PDF 查看器不可用」的
+            // 自造矛盾 —— 与第 175 轮「形状错误的回填比不回填更危险」同源。
+            // 仅在页面读到 false 时对齐(真实值 true 原样放行),经 reg() 登记身份。
+            try {
+                if (navigator.pdfViewerEnabled === false) {
+                    defNav('pdfViewerEnabled', true);
+                }
+            } catch (e) {}
         }
     } catch (e) {}
 
     // ③ navigator.languages 空值回填:取页面自报的 navigator.language 及其基语言。
-    //    第 176 轮:去掉 Object.freeze —— 原生 WebIDL sequence<DOMString> 返回的数组
-    //    **不是 frozen**(实测 Object.isFrozen(navigator.languages)===false,数组可写);
-    //    freeze 后严格模式 navigator.languages.push(x) 会抛 TypeError(原生不抛),
-    //    是零成本形态判据。返回普通数组与原生同形。
+    //    第 178 轮**方向修正**(真机实测驱动):`NavigatorLanguage.languages` 的
+    //    WebIDL 类型是 **`FrozenArray<DOMString>`**,原生**就是冻结的** ——
+    //    裸环境(`stealth=off`)四档实测 `Object.isFrozen(navigator.languages) === true`。
+    //    第 176 轮据「sequence 返回非 frozen 数组」把 freeze 去掉了,方向恰好相反:
+    //    那样回填出来的是**异类**(原生冻结、我们可写),严格模式 `push` 不抛反而成了判据。
+    //    故此处恢复 `Object.freeze`,与原生同形。
     try {
         if (!navigator.languages || navigator.languages.length === 0) {
             const lang = navigator.language || 'en-US';
@@ -387,7 +421,7 @@ const FIDELITY_JS: &str = r#"
             const list = base && base !== lang ? [lang, base] : [lang];
             try {
                 Object.defineProperty(Navigator.prototype, 'languages', {
-                    get: reg(function () { return list; }, 'get languages'),
+                    get: reg(function () { return Object.freeze(list); }, 'get languages'),
                     configurable: true, enumerable: true
                 });
             } catch (e) {}
@@ -576,6 +610,43 @@ pub async fn inject_stealth(page: &chromiumoxide::Page, mode: crate::agent::stea
         .await;
 }
 
+/// UA 去自动化令牌的处置结果（第 178 轮）：调用方据此决定是否需要**落地后补全**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UaSweep {
+    /// 页面自报值本就干净（有头档常规情形）—— 零动作。
+    Skipped,
+    /// 只清理了 UA 字符串（拿不到 Client Hints —— 例如探测发生在 `about:blank`，
+    /// 它不是安全上下文，`navigator.userAgentData` 不存在）。
+    ///
+    /// 第 178 轮真机实测：`setUserAgentOverride` **不带** `userAgentMetadata` 时，
+    /// 页面侧的 `navigator.userAgentData.brands` 会被清空 —— 「UA 说 Chrome、
+    /// Client Hints 说空」是比原状更显眼的新破绽。故调用方必须在真实文档落地
+    /// （安全上下文）后走 [`restore_native_ua`] + 二次 [`apply_ua_destealth`] 补全。
+    StringOnly,
+    /// UA 字符串与 Client Hints 品牌表一起清理完毕。
+    Full,
+}
+
+/// 移除 UA 覆盖、恢复浏览器原生身份（第 178 轮）。
+///
+/// 用途：`about:blank` 上只清得出 UA 字符串（非安全上下文读不到 Client Hints），
+/// 而带上 `userAgentMetadata` 的**完整**覆盖需要品牌表真值。落地到真实文档后，
+/// 先撤掉那次「半吊子」覆盖，让页面重新报出**原生** UA 与品牌表，再探一次即可
+/// 拿到完整真值并下发完整覆盖。CDP 约定：`userAgent` 传空串即移除覆盖。
+pub async fn restore_native_ua(page: &chromiumoxide::Page) -> bool {
+    let params =
+        match chromiumoxide::cdp::browser_protocol::emulation::SetUserAgentOverrideParams::builder()
+            .user_agent(String::new())
+            .build()
+    {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), page.execute(params)).await,
+        Ok(Ok(_))
+    )
+}
 /// 无头档 UA 清理（第 174 轮）：`HeadlessChrome/155…` 会出现在 **UA 字符串 + 网络
 /// 请求头 + `Sec-CH-UA` 品牌列表**三处，必须一起改 —— 只改 JS 侧的
 /// `navigator.userAgent` 骗得过页面、骗不过服务器，且"UA 说 Chrome、Client Hints
@@ -583,14 +654,19 @@ pub async fn inject_stealth(page: &chromiumoxide::Page, mode: crate::agent::stea
 /// （唯一能同时改到网络头的通道）。
 ///
 /// 取值全部来自页面自身读数（[`crate::agent::stealth::UA_PROBE_JS`]），只把品牌列表
-/// 里的 `Headless*` 项滤掉 —— **零伪造**。返回 `true` 表示已下发覆盖。
+/// 里的 `Headless*` 项滤掉 —— **零伪造**。
+///
+/// 第 178 轮：返回值从 `bool` 细化为 [`UaSweep`]，因为探测**发生在哪**决定了能拿到
+/// 什么 —— `about:blank`（第 178 轮起的建页起点）不是安全上下文，
+/// `navigator.userAgentData` 不存在 ⇒ 只能清 UA 字符串（`StringOnly`），
+/// 调用方必须在真实文档落地后补全。
 pub async fn apply_ua_destealth(
     page: &chromiumoxide::Page,
     mode: crate::agent::stealth::StealthMode,
-) -> bool {
+) -> UaSweep {
     use crate::agent::stealth;
     if mode == stealth::StealthMode::Off {
-        return false;
+        return UaSweep::Skipped;
     }
     let params = match chromiumoxide::cdp::js_protocol::runtime::EvaluateParams::builder()
         .expression(stealth::UA_PROBE_JS)
@@ -599,27 +675,28 @@ pub async fn apply_ua_destealth(
         .build()
     {
         Ok(p) => p,
-        Err(_) => return false,
+        Err(_) => return UaSweep::Skipped,
     };
     let raw = match tokio::time::timeout(std::time::Duration::from_secs(5), page.evaluate(params)).await
     {
         Ok(Ok(v)) => v,
-        _ => return false,
+        _ => return UaSweep::Skipped,
     };
     let Some(text) = raw.value().and_then(|v| v.as_str()) else {
-        return false;
+        return UaSweep::Skipped;
     };
     let Ok(probe) = serde_json::from_str::<serde_json::Value>(text) else {
-        return false;
+        return UaSweep::Skipped;
     };
     // 无令牌(有头档常规情形)时零动作 —— 这是预期路径,不告警。
     let Some(plan) = stealth::ua_plan(&probe) else {
-        return false;
+        return UaSweep::Skipped;
     };
     let mut builder =
         chromiumoxide::cdp::browser_protocol::emulation::SetUserAgentOverrideParams::builder()
             .user_agent(plan.user_agent.clone());
     // 品牌列表被滤空时只改 UA 字符串，不下发一个比真值更可疑的空品牌表。
+    let mut sweep = UaSweep::StringOnly;
     if plan.has_metadata() {
         use chromiumoxide::cdp::browser_protocol::emulation::{
             UserAgentBrandVersion as Brand, UserAgentMetadata as Meta,
@@ -654,20 +731,21 @@ pub async fn apply_ua_destealth(
             form_factors: None,
         };
         builder = builder.user_agent_metadata(meta);
+        sweep = UaSweep::Full;
     }
     match builder.build() {
         Ok(p) => match page.execute(p).await {
-            Ok(_) => true,
+            Ok(_) => sweep,
             Err(e) => {
                 // 真失败(检测到令牌但覆盖下发不出去)才告警:此时该文档仍带自动化
                 // 令牌,是"该修没修上",必须留痕。fail-open 不阻断导航。
                 tracing::warn!("UA 去自动化令牌覆盖下发失败(本页 UA 仍可能带 Headless 令牌): {e}");
-                false
+                UaSweep::Skipped
             }
         },
         Err(e) => {
             tracing::warn!("UA 去自动化令牌覆盖参数构造失败: {e}");
-            false
+            UaSweep::Skipped
         }
     }
 }
@@ -924,16 +1002,19 @@ mod tests {
         }
     }
 
-    /// 第 176 轮:navigator.languages 回填不得 freeze —— 原生 WebIDL sequence
-    /// 返回非 frozen 数组,freeze 后严格模式 push 抛 TypeError(原生不抛)。
+    /// 第 176 轮引入、**第 178 轮方向修正**:`navigator.languages` 必须**冻结**。
+    /// 真机四档实测(含 `stealth=off` 裸环境)`Object.isFrozen(navigator.languages)
+    /// === true` —— 规范里 `NavigatorLanguage.languages` 的类型是
+    /// `FrozenArray<DOMString>`,冻结是原生形态;第 176 轮按「原生非 frozen」的
+    /// 推断把 freeze 去掉了,造出的才是异类(原生冻结而我们可写)。
     #[test]
-    fn 语言列表回填不得冻结() {
+    fn 语言列表回填必须冻结() {
         use crate::agent::stealth::StealthMode;
         for m in [StealthMode::Fidelity, StealthMode::Hardened] {
             let s = stealth_js_for(m).unwrap();
             assert!(
-                !s.contains("Object.freeze(list)"),
-                "回填不得 freeze(原生 languages 非 frozen,freeze 后严格模式 push 抛错)"
+                s.contains("Object.freeze(list)"),
+                "回填必须冻结(原生 FrozenArray<DOMString>,真机四档实测 isFrozen=true):{s}"
             );
         }
     }
@@ -1092,6 +1173,33 @@ mod tests {
         );
     }
 
+    /// 第 178 轮:回填出「5 个 PDF 插件」却让 `navigator.pdfViewerEnabled` 停在
+    /// 该环境的原生值(无插件环境通常为 false),就是自造矛盾 —— 与第 175 轮
+    /// 「形状错误的回填比不回填更危险」同源。回填分支必须同批对齐,且只在读到
+    /// false 时对齐(真实值 true 原样放行),并经 `reg()` 登记身份。
+    #[test]
+    fn 插件回填同批对齐PDF查看器开关() {
+        use crate::agent::stealth::StealthMode;
+        for m in [StealthMode::Fidelity, StealthMode::Hardened] {
+            let s = stealth_js_for(m).unwrap();
+            assert!(
+                s.contains("navigator.pdfViewerEnabled === false"),
+                "回填分支必须判 pdfViewerEnabled(只在 false 时对齐,真实值放行)"
+            );
+            assert!(
+                s.contains("defNav('pdfViewerEnabled', true)"),
+                "回填分支必须把 pdfViewerEnabled 对齐为 true"
+            );
+            // 跨档升级时的「重新认领」也要覆盖这个入口(否则升档后它退回可读源码)
+            if m == StealthMode::Hardened {
+                assert!(
+                    s.contains("__adopt(Navigator.prototype, 'pdfViewerEnabled')"),
+                    "认领面必须包含 pdfViewerEnabled"
+                );
+            }
+        }
+    }
+
     /// 不得凭空给替身加原生接口没有的属性。`Plugin` 的 WebIDL 接口只有
     /// name/filename/description + 索引取值,**没有 `mimeTypes`**;
     /// 真机 `'mimeTypes' in navigator.plugins[0] === false`。
@@ -1114,6 +1222,11 @@ mod tests {
     /// 注入时序：隐身脚本必须在 `goto` **之前**注册,否则首个文档的页面脚本已在
     /// document-start 读到未处置的 `navigator.webdriver=true` 并把风控信标发出去。
     /// 这条锁在 browser.rs 的 open 路径上(源码顺序断言),纯静态但能防回归。
+    ///
+    /// 第 178 轮扩展:建页必须用 `about:blank`。此前把目标 URL 交给 `createTarget`,
+    /// 而 chromiumoxide 会等它**加载完成**才返回 —— 首个真实文档发生在隐身/UA/屏幕
+    /// 几何处置**之前**(真机计数服务器实测:目标 URL 被请求 2 次,req#1 的 UA 原样带
+    /// `HeadlessChrome`),「注册早于 goto」对它无效。
     #[test]
     fn 隐身脚本注册早于首次导航() {
         let src = include_str!("browser.rs");
@@ -1135,6 +1248,16 @@ mod tests {
         assert!(
             !window.contains("browser_ns::inject_stealth(&page, inner.stealth).await;"),
             "首次导航与下一次导航之间不得重复注册隐身脚本"
+        );
+        // 建页必须是空载起点:两条建页路径都不得再把目标 URL 交给 createTarget
+        assert!(
+            !src.contains(".url(url.to_string())"),
+            "createTarget 不得携带目标 URL(那会让首个真实文档跑在处置之前)"
+        );
+        assert!(
+            src.contains("browser.new_page(\"about:blank\")")
+                && src.contains(".url(\"about:blank\".to_string())"),
+            "两条建页路径(同窗口新 Tab / 独立窗口)都必须以 about:blank 起页"
         );
     }
 }

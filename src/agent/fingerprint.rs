@@ -93,11 +93,29 @@ pub const PROBE_JS: &str = r#"JSON.stringify((() => {
         return { tag, inst, named_item_ok: named };
       } catch (e) { return null; }
     })(),
-    // 第 176 轮:languages 回填形态自证。原生 WebIDL sequence<DOMString>
-    // 返回**非 frozen**数组(Object.isFrozen===false);若为 true 说明我们 freeze 了
-    // (严格模式 push 抛 TypeError,原生不抛)—— 零成本形态判据。
+    // 第 176 轮:languages 回填形态自证。**第 178 轮方向修正(真机实测驱动)**:
+    // `NavigatorLanguage.languages` 的 WebIDL 类型是 `FrozenArray<DOMString>`,
+    // 原生**就是冻结的**(裸环境 `stealth=off` 四档实测 `Object.isFrozen === true`)。
+    // 故告警条件是「读到**非**冻结」—— 那才说明注入把原生形态改坏了。
     languages_frozen: (() => {
       try { return Object.isFrozen(navigator.languages || []); } catch (e) { return null; }
+    })(),
+    // 第 178 轮:PDF 查看器开关与插件表的一致性(2xx 系的回填产物自洽)。
+    pdf_viewer_enabled: (() => {
+      try { return (typeof navigator.pdfViewerEnabled === 'undefined') ? null : navigator.pdfViewerEnabled; }
+      catch (e) { return null; }
+    })(),
+    // 第 178 轮:注入层 window 键面计量。**第 178 轮修了一个死自证** ——
+    // 旧正则 `^__lz[0-9a-f]{8}` 撞不上真实形态 `__lzn` + 8 hex(第 5 字符是 n,
+    // 不是 hex),该 filter 恒为空数组,这一项自诞生起就一直报 0。真机实测:
+    // 有头档 30 个、无头档 1 个、裸环境 0 个。`*_symbols` 为下一步「收敛成
+    // 单一 symbol 命名空间」提供验收基线(原生恒 0)。
+    injected_ns_keys: (() => {
+      try { return Object.getOwnPropertyNames(window).filter((n) => /^__lzn[0-9a-f]{8}/.test(n)).length; }
+      catch (e) { return null; }
+    })(),
+    injected_ns_symbols: (() => {
+      try { return Object.getOwnPropertySymbols(window).length; } catch (e) { return null; }
     })(),
     // 第 176 轮:迭代器自反性自证。原生 Iterator 的迭代器本身 iterable
     // (iterator[Symbol.iterator] 是函数);若为 undefined 说明我们返回的裸对象
@@ -147,18 +165,17 @@ pub const PROBE_JS: &str = r#"JSON.stringify((() => {
         return sites;
       } catch (e) { return null; }
     })(),
-    // ③ 焦点/可见性自洽:文档自报 visible 却拿不到焦点,是「无头/无人值守」的经典组合。
+    // ③ 焦点/可见性自洽:**第 178 轮降级为只观测**。第 177 轮曾把
+    //    「visible 却无焦点」当硬判据(命中即 risk_tier=high),真机四档实测该
+    //    推断不成立:有头档恒 `has_focus=false`(缺省 `LAEW_WEB_FOCUS=keep` 会
+    //    主动把键盘焦点归还给调用前的应用,是**我们自己的设计**),无头档反而
+    //    `has_focus=true` —— 与理论相反;且真实用户窗口被别的窗口遮挡(未最小化)时
+    //    同样是 visible + 无焦点,这是**普通浏览的常态**而非「无人值守」证据。
+    //    字段保留供诊断,不再参与 suspicious / HARD_CODES。
     focus_visibility: (() => {
       try {
         return { visibility: document.visibilityState || '', has_focus: document.hasFocus() === true };
       } catch (e) { return null; }
-    })(),
-    // ⑤ 我们注入的 ns 全局键数量(不可枚举但 getOwnPropertyNames 可见)。
-    //    **只观测不告警**:要彻底消除只能让 window 变成 Proxy(不可能)。如实回报让
-    //    人工/QC 知道有这一层痕迹,而不是假装没有。
-    injected_ns_keys: (() => {
-      try { return Object.getOwnPropertyNames(window).filter((n) => /^__lz[0-9a-f]{8}/.test(n)).length; }
-      catch (e) { return null; }
     })()
   };
 })())"#;
@@ -313,14 +330,31 @@ pub fn classify(fp: &Value) -> Vec<Value> {
         }
     }
     // ===================== 第 176 轮:languages/迭代器形态自证 =====================
-    // 两项都是「我们自己制造的形态破绽」类信号,命中即说明对应根治逻辑失效。
-    if fp.get("languages_frozen").and_then(Value::as_bool) == Some(true) {
+    // 第 178 轮**方向修正**:原生 languages 是 `FrozenArray<DOMString>`(冻结),
+    // 故告警条件是读到**非**冻结 —— 只有注入把它改坏了才会非冻结。
+    // 第 176 轮按相反的推断(「原生非 frozen」)告警,真机四档实测证伪:那条自证
+    // 在**每一台真实浏览器上恒告警**,把干净的 risk_tier=ok 常年抬成 warn。
+    if fp.get("languages_frozen").and_then(Value::as_bool) == Some(false) {
         out.push(json!({
-            "code": "languages_frozen",
-            "advice": "navigator.languages 被 freeze(原生 WebIDL sequence 返回非 frozen 数组);\
-                       严格模式 push 会抛 TypeError(原生不抛),是零成本形态判据;\
-                       处置:确认注入的是最新 browser_ns::FIDELITY_JS(第 176 轮已去 freeze)"
+            "code": "languages_not_frozen",
+            "advice": "navigator.languages **非冻结** —— 原生 `NavigatorLanguage.languages` 的 \
+                       WebIDL 类型是 FrozenArray<DOMString>(真机实测裸环境亦为 true),\
+                       非冻结说明有注入把它改坏了(严格模式 push 不抛本身即判据);\
+                       处置:确认注入的是最新 browser_ns::FIDELITY_JS(回填经 Object.freeze)"
         }));
+    }
+    // 第 178 轮:PDF 查看器开关与插件表必须自洽 —— 插件表非空却报「PDF 查看器不可用」
+    // 是自造矛盾(回填分支现在会一并对齐,故这条命中即说明对齐没生效或环境被改坏)。
+    {
+        let plugins = fp.get("plugins").and_then(Value::as_u64).unwrap_or(0);
+        if plugins > 0 && fp.get("pdf_viewer_enabled").and_then(Value::as_bool) == Some(false) {
+            out.push(json!({
+                "code": "pdf_viewer_plugin_mismatch",
+                "advice": "navigator.plugins 非空(含 PDF 插件)却报 pdfViewerEnabled=false,\
+                           两者矛盾(真实浏览器二者一致);处置:确认注入的是最新 \
+                           browser_ns::FIDELITY_JS(回填分支已同批对齐 pdfViewerEnabled)"
+            }));
+        }
     }
     // iterator_self_iterable 缺测(null = 插件本就空 / 探测失败) = fail-open 不告警;
     // 只有明确读到非 'function'(即 undefined,裸对象没补自反)才告警。
@@ -365,25 +399,17 @@ pub fn classify(fp: &Value) -> Vec<Value> {
             }));
         }
     }
-    // 焦点/可见性自洽:visible 却无焦点 = 经典「无人值守」组合(真机有焦点时二者一致)。
-    if let Some(fv) = fp.get("focus_visibility").filter(|v| !v.is_null()) {
-        let visible = fv.get("visibility").and_then(Value::as_str) == Some("visible");
-        let focused = fv.get("has_focus").and_then(Value::as_bool) == Some(true);
-        if visible && !focused {
-            out.push(json!({
-                "code": "focus_visibility_mismatch",
-                "advice": "文档自报 visibilityState=visible 却 document.hasFocus()=false —— \
-                           真机前台页面二者一致,这是「无头/无人值守」的经典组合判据;\
-                           处置:确认窗口已置前(control bring_to_front)或改用 \
-                           open(reuse_existing=true) 接管用户已登录的真实浏览器"
-            }));
-        }
-    }
+    // 第 178 轮:**焦点/可见性自洽退出告警面**。第 177 轮把它当硬判据,真机四档
+    // 实测推翻(详见 PROBE_JS 内该字段注释):有头档因我们的焦点租约恒无焦点、
+    // 无头档反有焦点,且真实用户窗口被遮挡时同样是 visible+无焦点。字段只回报不判定。
     out
 }
 
 /// 硬判据集合：命中任一即 `risk_tier=high`（建议直接改道 `open(reuse_existing=true)`
 /// 接管用户已登录的真实浏览器，而不是继续在拉起环境上调参）。
+///
+/// 第 178 轮：`focus_visibility_mismatch` 已**移出**该集合（真机四档实测证伪，
+/// 见 `classify` 末尾注释）。
 const HARD_CODES: &[&str] = &[
     "webdriver_true",
     "headless_ua",
@@ -392,7 +418,6 @@ const HARD_CODES: &[&str] = &[
     "screen_geometry_impossible",
     "screen_headless_default",
     "plugin_shape_mismatch",
-    "focus_visibility_mismatch",
 ];
 
 /// 环境风险档（`ok` / `warn` / `high`）——把一长串 `suspicious` 收敛成**一个可执行信号**
@@ -430,17 +455,21 @@ pub fn build(fp: &Value) -> Value {
         "geometry": fp.get("geometry").cloned().unwrap_or(Value::Null),
         "plugin_shape_ok": fp.get("plugin_shape_ok").cloned().unwrap_or(Value::Null),
         "languages_frozen": fp.get("languages_frozen").cloned().unwrap_or(Value::Null),
+        "pdf_viewer_enabled": fp.get("pdf_viewer_enabled").cloned().unwrap_or(Value::Null),
         "iterator_self_iterable": fp.get("iterator_self_iterable").cloned().unwrap_or(Value::Null),
         "automation_globals": fp.get("automation_globals").cloned().unwrap_or(Value::Null),
         "patched_fn_leak": fp.get("patched_fn_leak").cloned().unwrap_or(Value::Null),
         "focus_visibility": fp.get("focus_visibility").cloned().unwrap_or(Value::Null),
         "injected_ns_keys": fp.get("injected_ns_keys").cloned().unwrap_or(Value::Null),
+        "injected_ns_symbols": fp.get("injected_ns_symbols").cloned().unwrap_or(Value::Null),
         "suspicious": susp,
         "note": "risk_tier=high 表示环境在风控眼里已是硬判据级别,继续在本环境调参收益极低,\
                  应直接 open(reuse_existing=true) 接管用户已登录的真实浏览器;\
                  warn=有可升档/可复核项;suspicious 非空不代表一定被拦,但站点风控采这些字段加权很高。\
-                 injected_ns_keys 是我们注入层的 window 键数(不可枚举但 getOwnPropertyNames 可见),\
-                 只观测不告警 —— 彻底消除需让 window 变 Proxy,不可行"
+                 injected_ns_keys 是我们注入层的 window 字符串键数(真机实测:有头档 30 / 无头档 1 / 裸环境 0;\
+                 getOwnPropertyNames 可见,Object.keys 与 for…in 不可见),只观测不告警;\
+                 injected_ns_symbols 是 window 自有符号键数(原生基线 0),收敛方向见 docs/MCP_Web_Use/32 §六。\
+                 focus_visibility 自第 178 轮起只回报不判定(真机复核:真实用户窗口被遮挡时同样是 visible+无焦点)"
     })
 }
 
@@ -648,29 +677,65 @@ mod tests {
     // ===================== 第 176 轮:languages/迭代器形态自证 =====================
 
     #[test]
-    fn 语言列表冻结命中告警() {
+    fn 语言列表非冻结才命中告警() {
         let base = json!({"ok": true, "unmasked": true,
                           "vendor": "Google Inc. (Apple)", "renderer": "ANGLE (Apple)"});
-        // languages_frozen=true → 命中(我们 freeze 了,原生不 freeze)
-        let v = fp(base.clone(), json!({"languages_frozen": true}));
-        assert!(
-            codes(&v).contains(&"languages_frozen".to_string()),
-            "languages_frozen=true 应命中:{:?}",
-            codes(&v)
-        );
-        // 原生态 false → 不告警
-        let ok = fp(base.clone(), json!({"languages_frozen": false}));
+        // 原生形态(冻结)→ 不告警。第 178 轮真机实测:裸环境也是 true,
+        // 故「冻结」是正常态,按第 176 轮的旧逻辑会在每台真机上恒告警。
+        let ok = fp(base.clone(), json!({"languages_frozen": true}));
         assert!(
             !codes(&ok).contains(&"languages_frozen".to_string()),
-            "原生非 frozen 不得告警:{:?}",
+            "原生冻结形态不得告警:{:?}",
             codes(&ok)
+        );
+        assert!(
+            !codes(&ok).contains(&"languages_not_frozen".to_string()),
+            "{:?}",
+            codes(&ok)
+        );
+        // 非冻结 → 命中(注入把 FrozenArray 改坏了)
+        let v = fp(base.clone(), json!({"languages_frozen": false}));
+        assert!(
+            codes(&v).contains(&"languages_not_frozen".to_string()),
+            "非冻结应命中:{:?}",
+            codes(&v)
         );
         // 缺测 fail-open
         let missing = fp(base, json!({}));
         assert!(
-            !codes(&missing).contains(&"languages_frozen".to_string()),
+            !codes(&missing)
+                .iter()
+                .any(|c| c.starts_with("languages")),
             "缺测不得告警:{:?}",
             codes(&missing)
+        );
+    }
+
+    /// 第 178 轮:PDF 查看器开关与插件表自洽 —— 插件非空却报「不可用」是自造矛盾。
+    #[test]
+    fn pdf查看器开关与插件表一致性自证() {
+        let base = json!({"ok": true, "unmasked": true,
+                          "vendor": "Google Inc. (Apple)", "renderer": "ANGLE (Apple)"});
+        // 插件非空 + pdfViewerEnabled=false → 命中
+        let bad = fp(base.clone(), json!({"plugins": 5, "pdf_viewer_enabled": false}));
+        assert!(
+            codes(&bad).contains(&"pdf_viewer_plugin_mismatch".to_string()),
+            "{:?}",
+            codes(&bad)
+        );
+        // 一致(真机常态:plugins=5 + true)→ 不告警
+        let ok = fp(base.clone(), json!({"plugins": 5, "pdf_viewer_enabled": true}));
+        assert!(
+            !codes(&ok).contains(&"pdf_viewer_plugin_mismatch".to_string()),
+            "{:?}",
+            codes(&ok)
+        );
+        // 插件为空(回填未触发)时不做判定,fail-open
+        let empty = fp(base, json!({"plugins": 0, "pdf_viewer_enabled": false}));
+        assert!(
+            !codes(&empty).contains(&"pdf_viewer_plugin_mismatch".to_string()),
+            "{:?}",
+            codes(&empty)
         );
     }
 
@@ -763,29 +828,37 @@ mod tests {
         assert!(!codes(&ok).contains(&"patched_function_source_visible".to_string()));
     }
 
-    /// 焦点/可见性自洽:真机前台页面二者一致,visible 却无焦点是「无人值守」判据。
+    /// 第 178 轮:**焦点/可见性自洽退出告警面**。第 177 轮把它当硬判据
+    /// (命中即 risk_tier=high),真机四档实测证伪:
+    /// - 有头档 `has_focus=false`(缺省 `LAEW_WEB_FOCUS=keep` 主动归还键盘焦点,
+    ///   是我们自己的设计),无头档反而 `has_focus=true`;
+    /// - 真实用户窗口被别的窗口遮挡(未最小化)时同样是 visible + 无焦点。
+    /// 故字段只回报不判定 —— 任何组合都不得产生 suspicious,更不得抬 risk_tier。
     #[test]
-    fn 焦点可见性不自洽命中() {
-        let bad = fp(
-            healthy_base(),
-            json!({"focus_visibility": {"visibility": "visible", "has_focus": false}}),
-        );
-        assert!(codes(&bad).contains(&"focus_visibility_mismatch".to_string()));
-        // 有焦点 / 不可见(后台页,浏览器治理的常态)都不告警
-        for good in [
+    fn 焦点可见性只回报不判定() {
+        let base = json!({"ok": true, "unmasked": true,
+                          "vendor": "Google Inc. (Apple)", "renderer": "ANGLE (Apple)"});
+        for fv in [
+            json!({"visibility": "visible", "has_focus": false}),
             json!({"visibility": "visible", "has_focus": true}),
             json!({"visibility": "hidden", "has_focus": false}),
             json!({"visibility": "hidden", "has_focus": true}),
         ] {
-            let v = fp(healthy_base(), json!({"focus_visibility": good.clone()}));
+            let v = fp(base.clone(), json!({"focus_visibility": fv.clone()}));
             assert!(
-                !codes(&v).contains(&"focus_visibility_mismatch".to_string()),
-                "{good} 不该告警"
+                codes(&v).is_empty(),
+                "{fv} 不得产生任何告警:{:?}",
+                codes(&v)
             );
         }
-        // 缺测 fail-open
-        assert!(!codes(&fp(healthy_base(), json!({})))
-            .contains(&"focus_visibility_mismatch".to_string()));
+        // 硬判据集合里也不得再出现该码
+        assert!(
+            !HARD_CODES.contains(&"focus_visibility_mismatch"),
+            "焦点可见性判据已真机证伪,不得留在 HARD_CODES"
+        );
+        // 字段本身仍要回报(供人工/QC 诊断)
+        let b = build(&fp(base, json!({"focus_visibility": {"visibility": "visible", "has_focus": false}})));
+        assert_eq!(b["focus_visibility"]["has_focus"], json!(false));
     }
 
     /// `risk_tier` 把一长串 suspicious 收敛成**一个可执行信号**:high = 别在拉起
@@ -810,24 +883,50 @@ mod tests {
     }
 
     /// `build()` 必须把新自证项与 `risk_tier` 一并回报,否则探针白采集。
+    /// 第 178 轮:`focus_visibility` 退出判定面后,本条不再靠它抬 `risk_tier`。
     #[test]
     fn 新自证项回报到build() {
         let raw = r#"{"automation_globals":[],"patched_fn_leak":["permissions_query"],
             "focus_visibility":{"visibility":"visible","has_focus":false},
-            "injected_ns_keys":3}"#;
+            "injected_ns_keys":30,"injected_ns_symbols":0,"pdf_viewer_enabled":true}"#;
         let b = build(&parse(raw).unwrap());
         assert_eq!(b["automation_globals"], json!([]));
         assert_eq!(b["patched_fn_leak"], json!(["permissions_query"]));
-        assert_eq!(b["injected_ns_keys"], json!(3));
+        assert_eq!(b["injected_ns_keys"], json!(30));
+        assert_eq!(b["injected_ns_symbols"], json!(0));
+        assert_eq!(b["pdf_viewer_enabled"], json!(true));
         assert_eq!(b["focus_visibility"]["has_focus"], json!(false));
-        // visible+无焦点是硬项 → high
-        assert_eq!(b["risk_tier"], "high");
-        // 注入层 ns 键只观测不告警(消除它需让 window 变 Proxy,不可行)
+        // 只余软项(改写函数源码可见)⇒ warn;不得因 focus_visibility 抬成 high
+        assert_eq!(b["risk_tier"], "warn", "{b}");
+        // 注入层键面计量只观测不告警
         assert!(!b["suspicious"]
             .as_array()
             .unwrap()
             .iter()
             .any(|x| x["code"] == "injected_ns_keys"));
-        assert!(b["note"].as_str().unwrap().contains("injected_ns_keys"));
+        assert!(b["note"].as_str().unwrap().contains("injected_ns_symbols"));
+        assert!(b["note"].as_str().unwrap().contains("focus_visibility"));
+    }
+
+    /// 第 178 轮:注入层 window 键面的计量正则必须撞得上**真实命名空间形态**
+    /// (`inject_ns()` = `__lzn` + 8 hex)。旧正则 `^__lz[0-9a-f]{8}` 恒不匹配
+    /// (第 5 字符是 `n`,不是 hex),导致该自证项自诞生起一直报 0 —— 假阴性比
+    /// 没有这项更糟:它让人以为「几乎没有痕迹」。
+    #[test]
+    fn 命名空间键正则匹配真实形态() {
+        let ns = crate::agent::browser_ns::inject_ns();
+        assert!(ns.starts_with("__lzn"), "命名空间形态变化,请同步修正探针正则:{ns}");
+        // 与 PROBE_JS 内保持一致的正则(用真 regex 引擎,不用手搓匹配)
+        let fixed = regex::Regex::new(r"^__lzn[0-9a-f]{8}").unwrap();
+        assert!(fixed.is_match(ns), "计量正则必须命中真实命名空间:{ns}");
+        // 反例:旧正则(把 `n` 当 hex)必须**不**命中 —— 锁死这次修的是真缺陷
+        let old = regex::Regex::new(r"^__lz[0-9a-f]{8}").unwrap();
+        assert!(
+            !old.is_match(ns),
+            "旧正则应不命中(这正是它恒报 0 的原因):{ns}"
+        );
+        // 探针源码里必须已是修正后的形态(防回归)
+        assert!(PROBE_JS.contains(r"/^__lzn[0-9a-f]{8}/"));
+        assert!(!PROBE_JS.contains(r"/^__lz[0-9a-f]{8}/"));
     }
 }
