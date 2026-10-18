@@ -30,6 +30,10 @@ pub mod browser_status;
 pub mod fingerprint;
 pub mod page_liveness;
 pub mod stealth;
+// 第 184 轮:chromiumoxide 0.9 类型化 CDP 命令补丁层(runForEveryFrame)与
+// OS 显示器拓扑真值(screen.isExtended 回填真值来源)。
+pub mod cdp_ext;
+pub mod display_topology;
 pub mod browser_viewport;
 pub mod browser_window;
 pub mod browser_watchdog;
@@ -89,6 +93,10 @@ mod tests;
 // 匹配任意层级目录,会把 `src/agent/tests/` 静默排除出版本库(详见该文件模块文档)。
 #[cfg(test)]
 mod react_tests;
+// 第 184 轮:反检测体检新增判据用例(crossrealm_tostring_leak / is_extended_mismatch)。
+// fingerprint.rs 已近 1800 行上限,新用例按 react_tests 同款兄弟文件模式放置。
+#[cfg(test)]
+mod fingerprint_tests;
 
 // 运行时辅助项再导出:保持拆分前 `crate::agent::Xxx` 路径对外完全兼容。
 // 第 120 轮:两参薄封装只剩单测在用(生产路径走 `build_runtime_hints_with`),

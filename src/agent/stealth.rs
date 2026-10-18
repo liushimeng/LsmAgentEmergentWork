@@ -135,6 +135,10 @@ pub fn status_json(effective: StealthMode) -> Value {
                  第 183 轮:参数层真值对齐 —— 无头档不再强制 --disable-gpu/--hide-scrollbars,\
                  WebGL 报本机真 GPU(与本机有头 Chrome 逐字节一致,非 WARP 软渲染串),\
                  滚动条宽度跟随宿主 OS 默认;LAEW_WEB_HEADLESS_SOFTRENDER=on 恢复旧软渲染集(排障);\
+                 第 184 轮:子帧 realm 覆盖根治 —— 隐身脚本改经 runForEveryFrame 进入**所有子 frame**\
+                 (此前只进顶层:站点自建同源 iframe 用原生 toString 反查顶层被改写函数\
+                 即读到注入源码,侵入式档被完整击穿),HARDENED_JS 补跨 realm 回家路由;\
+                 FIDELITY_JS ⑥ 按显示器拓扑 OS 真值回填 screen.isExtended(单显示器零动作);\
                  LAEW_WEB_STEALTH=fidelity 可显式降档,=off 可整体关闭,LAEW_WEB_FINGERPRINT=off 只关保真回填与体检",
     })
 }

@@ -334,6 +334,9 @@ const PRELUDE_JS: &str = r#"
             // 一个都没进登记表,跨档升级后 toString 会吐出我们的源码。
             __adoptDeep(window.chrome, 0);
             __adopt(window.Permissions && Permissions.prototype, 'query');
+            // 第 184 轮:FIDELITY_JS ⑥ 的 isExtended 存取器回填(跨档升级认领面收全;
+            // 真原生函数被认领是零可观测差异 —— 其 toString 本就报 [native code])
+            __adopt(window.Screen && Screen.prototype, 'isExtended');
             __adopt(window.WebGLRenderingContext && WebGLRenderingContext.prototype, 'getParameter');
             __adopt(window.WebGL2RenderingContext && WebGL2RenderingContext.prototype, 'getParameter');
             // 回填的 plugins 数组体与其元素/子数组的**中间原型**(方法都挂在那儿)
@@ -721,6 +724,46 @@ const FIDELITY_JS: &str = r#"
                 value: wrappedQuery, configurable: true, writable: true, enumerable: true
             });
         }
+    } catch (e) {}
+
+    // ⑥ 显示器拓扑真值(第 184 轮):`screen.isExtended`(Window Management API 的
+    //    多显示器标记)是显示器派生读数 —— 真机双档基线(38 号文 §二):有头档跟随
+    //    OS 拓扑(本机双显示器读 true),无头档的虚拟屏幕恒 false。无 CDP 原生通道
+    //    (setEmulatedMedia 不覆盖该 API),走 JS 回填:先探测原生属性挂在哪个槽位
+    //    (screen 实例 own / Screen.prototype)与哪种形态(数据属性/存取器),**同位
+    //    同形**回填 —— 布尔值无「形状错误的回填」风险。真值来自 OS
+    //    (display_topology,进程级缓存,Rust 侧替换 %MULTI_DISPLAY% 字面量);
+    //    只在「OS=多显示器 && 页面读到 false」时动作 —— 单显示器机器零动作
+    //    (false 即真值,不伪造拓扑)、有头档原生即真值零动作。真值标记挂 ns 对象
+    //    非枚举键 MD,供体检层对账(fingerprint::screen_is_extended 的 md_marker)。
+    try {
+        if (%MULTI_DISPLAY% === true) {
+            try {
+                if (__nsObj) Object.defineProperty(__nsObj, 'MD', { value: 1, configurable: true, enumerable: false });
+            } catch (e) {}
+            try {
+                if (window.Screen && screen.isExtended === false) {
+                    const own = Object.getOwnPropertyDescriptor(screen, 'isExtended');
+                    const onProto = !own && Object.getOwnPropertyDescriptor(Screen.prototype, 'isExtended');
+                    if (own && typeof own.value === 'boolean') {
+                        // 数据属性形态:镜像 {value, writable, enumerable, configurable}
+                        Object.defineProperty(screen, 'isExtended', {
+                            value: true,
+                            writable: !!own.writable,
+                            enumerable: !!own.enumerable,
+                            configurable: !!own.configurable
+                        });
+                    } else if (own || onProto) {
+                        // 存取器形态(own 在 screen / 在 Screen.prototype):reg() 登记进原生化表
+                        Object.defineProperty(own ? screen : Screen.prototype, 'isExtended', {
+                            get: reg(function isExtended() { return true; }, 'get isExtended'),
+                            set: undefined, enumerable: true, configurable: true
+                        });
+                    }
+                    // 属性原生缺失的浏览器不凭空补 —— 补了才是签名
+                }
+            } catch (e) {}
+        }
     } catch (e) {}"#;
 
 /// 原生化块（**侵入式**，第 174 轮）：`Function.prototype.toString` 对登记表内的函数
@@ -742,6 +785,21 @@ const HARDENED_JS: &str = r#"
         const origToString = Function.prototype.toString;
         const wrappedToString = function toString() {
             try { if (__fd.has(this)) return __fd.get(this); } catch (e) {}
+            // 第 184 轮:跨 realm 反查路由。`runForEveryFrame` 之后每个 frame 都有
+            // 自己的登记表(帧局部闭包 —— 共享表会让攻击者拿到 symbol 后直接
+            // `fd.has(fn)` 探测任意函数是否被改过)。兄弟 realm 的 toString 反查本
+            // realm 函数时本帧必然 miss,原样回退 origToString 即把源码交给对端。
+            // miss 时路由到 `this` 自身原型链上的 toString —— 那是它**本 realm**
+            // 的原生化包装器,持有把它登记进去的那张表;到家后 home === 本包装器
+            // 跳出,终止性由「每一跳都严格走向 this 的家」保证(最多两跳)。
+            // typeof 守卫:非函数 this 的原生行为是 TypeError,路由到
+            // Object.prototype.toString 会返回 "[object …]" 字符串,属行为漂移。
+            try {
+                if (typeof this === 'function') {
+                    const home = Object.getPrototypeOf(this).toString;
+                    if (typeof home === 'function' && home !== wrappedToString) return home.call(this);
+                }
+            } catch (e) {}
             return origToString.call(this);
         };
         try { __fd.set(wrappedToString, 'function toString() { [native code] }'); } catch (e) {}
@@ -814,17 +872,32 @@ pub fn stealth_js_for(mode: crate::agent::stealth::StealthMode) -> Option<String
         out.push_str("\n  }\n");
     }
     out.push_str("})()");
+    // 第 184 轮:OS 显示器拓扑真值字面量(true/false/null)替换进 FIDELITY_JS ⑥;
+    // null = OS 读取失败,fallback 分支整体 no-op(fail-open 不处置)。放在 render_ns
+    // 之前 —— %MULTI_DISPLAY% 不在 render_ns 的改写词表内,先后无影响,但与 %WANT%
+    // 同一处集中替换便于审计。
+    let out = out.replace("%MULTI_DISPLAY%", crate::agent::display_topology::multi_display_literal());
     Some(render_ns(&out))
 }
 
 /// 给页面安装隐身覆写（`Page.addScriptToEvaluateOnNewDocument`：导航/派生新文档
 /// 自动重挂 + 当前文档立即执行）。connect 模式（接管用户浏览器）**不注入** ——
 /// 真实浏览器本无该指纹，且 connect 契约是零注入。
+///
+/// 第 184 轮：改走 `runForEveryFrame: true`（`cdp_ext` 补发的字段，chromiumoxide
+/// 0.9 类型缺失）—— 脚本进入**所有子 frame**。此前只进顶层：站点自建同源 iframe
+/// 拿原生 `Function.prototype.toString` 反查顶层被改写函数即读到我们的源码，
+/// 侵入式档「改过不可反查」被完整击穿（真机实证见 `docs/MCP_Web_Use/38` §三）。
+/// 老 Chrome 拒绝该字段时回退旧参数重发一次（只丢子帧覆盖，不丢顶层注入）。
 pub async fn inject_stealth(page: &chromiumoxide::Page, mode: crate::agent::stealth::StealthMode) {
     use chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams;
     let Some(source) = stealth_js_for(mode) else {
         return;
     };
+    let every = crate::agent::cdp_ext::AddScriptToEvaluateOnNewDocumentEveryFrame::new(source.clone(), true);
+    if page.execute(every).await.is_ok() {
+        return;
+    }
     let _ = page
         .execute(AddScriptToEvaluateOnNewDocumentParams {
             source,
