@@ -303,6 +303,23 @@ fn is_default_webgl(s: &str) -> bool {
     s.contains("webkit") || s.contains("swiftshader") || s.contains("software")
 }
 
+/// 桌面 UA 判定(第 182 轮抽出共用):指针媒体/触摸点判据只适用于桌面形态,
+/// 移动 UA 下 `hover:none`/`pointer:coarse`/多点触摸是**正常读数**,不得误伤。
+/// UA 为空(探针未采到)时返回 false —— fail-open 不猜测。
+fn desktop_ua(fp: &Value) -> bool {
+    let ua = fp
+        .get("platform_ua")
+        .and_then(|p| p.get("ua"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let lower = ua.to_ascii_lowercase();
+    !ua.is_empty()
+        && !lower.contains("android")
+        && !lower.contains("iphone")
+        && !lower.contains("ipad")
+        && !lower.contains("mobile")
+}
+
 /// 解析 [`PROBE_JS`] 返回文本。
 pub fn parse(raw: &str) -> Option<Value> {
     serde_json::from_str::<Value>(raw.trim()).ok()
@@ -359,14 +376,14 @@ pub fn classify(fp: &Value) -> Vec<Value> {
     // ④ 已删除「凭空补 runtime」的旧实现 —— 造一个空 `chrome.runtime` 既违反
     // 「不伪造本机没有的信息」铁律,又可被一行识破(真实扩展上下文的 runtime
     // 必有 id/connect/sendMessage,空 runtime 比没有 runtime 更可疑)。
-    // Notification.permission = 'denied' 但 permissions.query 报告 'prompt'
-    // 是知名检测组合;这里只做单侧提示(不额外发一次 permissions.query)。
-    if fp.get("notification_permission").and_then(Value::as_str) == Some("denied") {
-        out.push(json!({
-            "code": "notification_denied",
-            "advice": "Notification.permission=denied(站点常据此推断自动化/无人值守),人工确认是否被我们的权限预授权影响"
-        }));
-    }
+    //
+    // 第 182 轮:`notification_denied` **退出 suspicious**（降级为 build() 顶层观测字段）。
+    // 真机双档实测：laew 启动参数集自带 `--deny-permission-prompts`（治理原生权限
+    // 气泡），**有头/无头两档** Notification.permission 恒读 `denied` —— 这是我们自己
+    // 启动参数造成的诚实状态，真实用户拒绝通知后读数完全相同，零判别力只剩噪声；
+    // 且 FIDELITY_JS ⑤（第 176 轮精确映射）已保证 permissions.query 与之一致
+    // （denied↔denied），经典「单侧 denied 矛盾组合」并不成立。字段保留在
+    // build() 输出里供人工/QC 对账，但不进 suspicious、不抬 risk_tier。
     // ===================== 第 174 轮:反检测档位自证项 =====================
     // 以下三项只在**明确读到异常值**时告警(缺测量 = fail-open 不告警)。
     if fp.get("ua_headless").and_then(Value::as_bool) == Some(true) {
@@ -611,32 +628,33 @@ pub fn classify(fp: &Value) -> Vec<Value> {
                        (覆写 Navigator.prototype)"
         }));
     }
-    // 指针/悬停媒体查询:桌面 UA 下双 false 是无头典型读数。**只观测**——
-    // 是否属「无头误报」需真机四档基线确认后再决定是否回填(35 §六.1)。
+    // 指针/悬停媒体查询:桌面 UA 下双 false 是无头典型读数。**第 182 轮真机双档
+    // 基线钉死**:有头档四元(hover/any-hover/pointer/any-pointer)恒全 true,无头档
+    // 裸读数恒全 false —— 零假阳性确认;处置已内置为无头档原生 CDP 仿真
+    // (`browser_env_emulation::apply_pointer_env_emulation`,setEmulatedMedia+setTouchEmulationEnabled,
+    // 零注入面),故本条保留为**处置失效自检**:launch 无头档仍命中即说明仿真没下发
+    // (stealth=off 或 CDP 超时 fail-open);connect 模式命中则该用户环境本就如实。
     if let Some(mq) = fp.get("pointer_mq").filter(|v| !v.is_null()) {
         let hover = mq.get("hover").and_then(Value::as_bool);
         let fine = mq.get("fine").and_then(Value::as_bool);
-        let desktop_ua = {
-            let ua = fp
-                .get("platform_ua")
-                .and_then(|p| p.get("ua"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let lower = ua.to_ascii_lowercase();
-            !ua.is_empty()
-                && !lower.contains("android")
-                && !lower.contains("iphone")
-                && !lower.contains("ipad")
-                && !lower.contains("mobile")
-        };
-        if desktop_ua && hover == Some(false) && fine == Some(false) {
+        if desktop_ua(fp) && hover == Some(false) && fine == Some(false) {
             out.push(json!({
                 "code": "pointer_media_headless",
                 "advice": "桌面 UA 下 (hover:hover) 与 (pointer:fine) 双双 false —— 无头环境典型读数\
-                           (真实桌面 Chrome 恒有鼠标指针);本轮只观测不回填,待真机基线确认;\
-                           关键站点优先 headed 可见模式或 open(reuse_existing=true)"
+                           (第 182 轮真机基线:有头档恒全 true);处置已内置(无头档 setEmulatedMedia 仿真),\
+                           仍命中说明仿真未生效(stealth=off / CDP 超时);connect 模式命中则该用户环境本就如实"
             }));
         }
+    }
+    // 第 182 轮:桌面 UA 下 `navigator.maxTouchPoints > 0` 指向无头环境(真机双档:
+    // 有头档 0 / 无头档裸读数 1)。与指针媒体同批处置(setTouchEmulationEnabled(false)
+    // 归零),本条同为处置失效自检;移动 UA 不误伤。
+    if desktop_ua(fp) && fp.get("max_touch_points").and_then(Value::as_u64).unwrap_or(0) > 0 {
+        out.push(json!({
+            "code": "touch_points_headless",
+            "advice": "桌面 UA 却报 maxTouchPoints>0 —— 真机基线有头档恒 0、无头档裸读数 1;\
+                       处置已内置(无头档触摸仿真关闭),仍命中说明仿真未生效"
+        }));
     }
     if let Some(cd) = fp.get("color_depth").filter(|v| !v.is_null()) {
         let c = cd.get("color").and_then(Value::as_u64);
@@ -830,6 +848,9 @@ pub fn build(fp: &Value, mode: crate::agent::stealth::StealthMode) -> Value {
         "screen_orientation": fp.get("screen_orientation").cloned().unwrap_or(Value::Null),
         "hardware_params": fp.get("hardware_params").cloned().unwrap_or(Value::Null),
         "platform_ua": fp.get("platform_ua").cloned().unwrap_or(Value::Null),
+        // 第 182 轮:观测字段(不进 suspicious、不抬 risk_tier,只供人工/QC 对账)
+        "notification_permission": fp.get("notification_permission").cloned().unwrap_or(Value::Null),
+        "max_touch_points": fp.get("max_touch_points").cloned().unwrap_or(Value::Null),
         "suspicious": susp,
         "note": "risk_tier=high 表示环境在风控眼里已是硬判据级别,继续在本环境调参收益极低,\
                  应直接 open(reuse_existing=true) 接管用户已登录的真实浏览器;\
@@ -840,7 +861,11 @@ pub fn build(fp: &Value, mode: crate::agent::stealth::StealthMode) -> Value {
                  focus_visibility 自第 178 轮起只回报不判定(真机复核:真实用户窗口被遮挡时同样是 visible+无焦点)。\
                  第 181 轮:体检面扩到 20 项(见 docs/MCP_Web_Use/35);其中 stack_trace_automation_tokens 与 \
                  automation_doc_leak 是零假阳性硬证据,其余新增项一律只观测不回填。\
-                 mode_design_excluded=true(保真档)时 patched_* 两类属该档设计取舍,标 by_design 且不计入 risk_tier"
+                 第 182 轮:无头档指针媒体四元与触摸点已有原生 CDP 仿真(pointer_media_headless/\
+                 touch_points_headless 是处置失效自检);notification_permission 为纯观测字段 —— \
+                 laew 启动参数(--deny-permission-prompts)下两档恒 denied,与真实用户拒绝通知的读数一致,\
+                 不再计 suspicious。mode_design_excluded=true(保真档)时 patched_* 两类属该档设计取舍,\
+                 标 by_design 且不计入 risk_tier"
     })
 }
 
@@ -917,10 +942,14 @@ mod tests {
             "webdriver_true",
             "no_plugins",
             "no_languages",
-            "notification_denied",
         ] {
             assert!(c.contains(&expect.to_string()), "缺 {expect}:{c:?}");
         }
+        // 第 182 轮:单侧 denied 已退出 suspicious(laew 启动参数下两档恒 denied,零判别力)
+        assert!(
+            !c.contains(&"notification_denied".to_string()),
+            "单侧 denied 不得再进 suspicious:{c:?}"
+        );
     }
 
     #[test]
@@ -1558,6 +1587,7 @@ mod tests {
         for c in [
             "chrome_api_incomplete",
             "pointer_media_headless",
+            "touch_points_headless",
             "color_depth_mismatch",
             "screen_orientation_missing",
             "hw_params_unset",
@@ -1570,6 +1600,63 @@ mod tests {
                 "{c} 真机基线钉死前不得进硬判据集合"
             );
         }
+    }
+
+    // ===================== 第 182 轮:指针/触摸环境仿真自检与降噪 =====================
+
+    /// 桌面 UA + 触摸点 >0 命中(真机基线:有头档 0 / 无头档裸读数 1);移动 UA 不误伤;
+    /// 仿真生效后读 0 → 不命中(自检语义)。
+    #[test]
+    fn 桌面UA下触摸点非零命中() {
+        let base = healthy_webgl();
+        let desktop = json!({"platform_ua": {"platform": "Win32", "ua": "Mozilla/5.0 (Windows NT 10.0) Chrome/155"}});
+        let v = fp(
+            base.clone(),
+            json!({"max_touch_points": 1, "platform_ua": desktop["platform_ua"].clone()}),
+        );
+        assert!(codes(&v).contains(&"touch_points_headless".to_string()));
+        // 仿真生效(归零)→ 不命中
+        let ok = fp(
+            base.clone(),
+            json!({"max_touch_points": 0, "platform_ua": desktop["platform_ua"].clone()}),
+        );
+        assert!(!codes(&ok).contains(&"touch_points_headless".to_string()));
+        // 移动 UA(触摸正常)→ 不误伤
+        let mob = fp(
+            base.clone(),
+            json!({"max_touch_points": 5,
+                   "platform_ua": {"platform": "Linux armv81", "ua": "Mozilla/5.0 (Linux; Android 14) Mobile Safari"}}),
+        );
+        assert!(!codes(&mob).contains(&"touch_points_headless".to_string()));
+        // 桌面 UA 但缺触摸点字段(老探针)→ fail-open 不告警
+        let missing = fp(base, json!({"platform_ua": desktop["platform_ua"].clone()}));
+        assert!(!codes(&missing).contains(&"touch_points_headless".to_string()));
+    }
+
+    /// 第 182 轮:`notification_denied` 退出 suspicious 后,字段仍要回报到 build()
+    /// 顶层(观测可见性不丢),且任何单侧 denied 值都不得抬 risk_tier。
+    #[test]
+    fn 单侧denied只观测不告警且回报build() {
+        let base = healthy_webgl();
+        for perm in ["denied", "default", "granted"] {
+            let v = fp(base.clone(), json!({"notification_permission": perm}));
+            assert!(
+                codes(&v).is_empty(),
+                "单侧 {perm} 不得产生任何告警:{:?}",
+                codes(&v)
+            );
+            let b = build(&v, StealthMode::Hardened);
+            assert_eq!(b["notification_permission"], json!(perm));
+            assert_eq!(b["risk_tier"], "ok", "{perm} 不得抬档:{b}");
+        }
+        // build() 顶层回报触摸点观测值
+        let v = fp(
+            base,
+            json!({"max_touch_points": 0,
+                   "platform_ua": {"platform": "Win32", "ua": "Mozilla/5.0 (Windows NT 10.0) Chrome/155"}}),
+        );
+        let b = build(&v, StealthMode::Hardened);
+        assert_eq!(b["max_touch_points"], json!(0));
     }
 
     /// chrome 自证入口必须覆盖三件套 —— 否则登记漏网在 data.fingerprint 里点不出名。

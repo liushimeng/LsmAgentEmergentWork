@@ -129,6 +129,9 @@ pub fn status_json(effective: StealthMode) -> Value {
                  注入面(第 179 轮):窗口面 API 全部收敛到一个 window[Symbol.for(<ns>)] 命名空间对象,\
                  window 字符串键恒 0(旧实现有头档 30 个),符号键 1;DOM id/class/data-* 换用独立随机 token;\
                  对账数据见 data.fingerprint.injected_ns_keys / injected_ns_symbols / ns_symbol_present;\
+                 第 182 轮:无头档另叠加**原生 CDP 环境仿真**(非 JS 注入)——setEmulatedMedia 四元指针/悬停媒体特性\
+                 + setTouchEmulationEnabled(false) 归零触摸点(真机双档基线:有头档 hover/fine/any-* 全 true、\
+                 maxTouchPoints=0,无头档裸读数全 false/1);有头档恒零动作,connect 零注入不变;\
                  LAEW_WEB_STEALTH=fidelity 可显式降档,=off 可整体关闭,LAEW_WEB_FINGERPRINT=off 只关保真回填与体检",
     })
 }

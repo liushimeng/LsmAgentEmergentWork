@@ -1175,6 +1175,10 @@ impl BrowserManager {
         // 也从一开始就是处置过的环境。connect 模式零注入契约不变。
         if !inner.connect_mode {
             super::browser_ns::inject_stealth(&page, inner.stealth).await;
+            // 第 182 轮:无头档指针/悬停媒体特性 + 触摸点**原生 CDP 仿真**与隐身
+            // 脚本同批下发(首个文档起即处置过的环境;有头档零动作,connect 零注入
+            // 契约不变)。真机实测四元媒体查询与 maxTouchPoints 与有头档逐一对齐。
+            super::browser_env_emulation::apply_pointer_env_emulation(&page, inner.stealth, inner.mode).await;
         }
         tokio::time::timeout(browser_timeout, page.goto(url.to_string()))
             .await
@@ -1540,6 +1544,8 @@ impl BrowserManager {
             super::browser_ns::apply_ua_destealth(&found, inner.stealth).await;
             super::browser_ns::inject_stealth(&found, inner.stealth).await;
             apply_screen_sync_override(&found, inner.screen_sync).await;
+            // 第 182 轮:自愈页同挂指针/触摸环境仿真(与隐身脚本同批,幂等)。
+            super::browser_env_emulation::apply_pointer_env_emulation(&found, inner.stealth, inner.mode).await;
         }
         if inner.highlight && matches!(inner.mode, BrowserMode::Headed) {
             inject_agent_highlight(&found).await;
@@ -1644,12 +1650,13 @@ impl BrowserManager {
     ///
     /// 返回受影响页面数；connect 模式零动作（真实浏览器本无这些痕迹）。
     pub async fn set_stealth(&self, mode: super::stealth::StealthMode) -> usize {
-        let (pages, connect_mode) = {
+        let (pages, connect_mode, browser_mode) = {
             let mut inner = self.inner.lock().await;
             inner.stealth = mode;
             (
                 inner.pages.values().map(|e| e.page.clone()).collect::<Vec<_>>(),
                 inner.connect_mode,
+                inner.mode,
             )
         };
         if connect_mode {
@@ -1658,6 +1665,9 @@ impl BrowserManager {
         for page in &pages {
             super::browser_ns::apply_ua_destealth(page, mode).await;
             super::browser_ns::inject_stealth(page, mode).await;
+            // 第 182 轮:档位切换同步仿真态 —— 升档即时仿真,降到 off 复位仿真
+            // (有头档零动作;connect 上面已早退)。
+            super::browser_env_emulation::apply_pointer_env_emulation(page, mode, browser_mode).await;
         }
         pages.len()
     }
@@ -2831,6 +2841,9 @@ impl BrowserManager {
                 super::browser_ns::apply_ua_destealth(&page, cfg.stealth).await;
                 super::browser_ns::inject_stealth(&page, cfg.stealth).await;
                 apply_screen_sync_override(&page, cfg.screen_sync).await;
+                // 第 182 轮:派生/adopt 新标签页同挂指针/触摸环境仿真(与早期武装
+                // watcher 同语义,两处幂等)。
+                super::browser_env_emulation::apply_pointer_env_emulation(&page, cfg.stealth, cfg.mode).await;
             }
             // 第 100 轮:headed + highlight 时,派生/adopt 的新标签页同样注入蓝框。
             if cfg.highlight && matches!(cfg.mode, BrowserMode::Headed) {

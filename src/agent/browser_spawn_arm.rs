@@ -131,6 +131,10 @@ async fn arm_spawned_target(
     //    不带 screen 字段,不补则派生页整个首生命周期带着 outer>screen 硬判据。
     //    本命令排在 init 链之后(提交门),不会被 init 的无 screen 覆盖回抹。
     super::browser::apply_screen_sync_override(&page, cfg.screen_sync).await;
+    // ②b 指针/悬停媒体特性 + 触摸点仿真(第 182 轮):与 screen_sync 同批下发,
+    // 派生页首个文档起 `matchMedia` 四元与 maxTouchPoints 即与有头档对齐。
+    // 纯 CDP 仿真零注入面;有头档零动作;watcher 只服务于 launch 实例。
+    super::browser_env_emulation::apply_pointer_env_emulation(&page, cfg.stealth, cfg.mode).await;
     // ③ UA 去令牌。无头档走**无探针通道**:覆盖值来自浏览器级 `getVersion` 的
     //    UA 字符串(实例建立时已探好存快照),派生页出生即下发 —— 探针式清理
     //    (`apply_ua_destealth` 的 `Runtime.evaluate`)在首个文档提交前可能阻塞在
