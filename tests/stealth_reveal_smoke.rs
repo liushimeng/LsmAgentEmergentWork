@@ -168,6 +168,72 @@ async fn stealth_first_document_single_load_smoke() {
         .await;
 }
 
+/// **无头档真 GPU 硬件指纹**（第 183 轮，docs/MCP_Web_Use/37 §3.1）。
+///
+/// 修复前：无头档强制 `--disable-gpu` → WebGL 落 WARP 软渲染
+/// （`ANGLE (Microsoft, Microsoft Basic Render Driver …)`），与同机有头 Chrome 的
+/// 真硬件串（如 `ANGLE (Intel, Intel(R) UHD Graphics … D3D11)`）构成硬件指纹差;
+/// 且该串不含旧兜底判定的 webkit/swiftshader/software 任一令牌,原样透传不告警。
+/// 修复后：无头档不再强制软渲染,WebGL 报本机真 GPU —— 与有头**逐字节一致**
+/// （`stealth_baseline_probe compare` 真机全项 PASS）。
+///
+/// **跳过条件（人工判断）**：本机为 VM / RDP 会话 / 显卡驱动被禁等真无 GPU 环境
+/// 时,Chrome 原生回退 WARP/SwiftShader 属真值,本用例会失败 —— 该环境本就建议
+/// `open(reuse_existing=true)` 或有头档,失败即正确指引。
+#[tokio::test]
+#[ignore]
+async fn stealth_headless_gpu_truth_smoke() {
+    let _guard = SMOKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("LAEW_BROWSER_WATCHDOG_EXE", env!("CARGO_BIN_EXE_laew"));
+    let url = spawn_html_server(
+        "<html><head><title>gputruth</title></head><body>g</body></html>",
+    )
+    .await;
+    let out = McpWebUseTool
+        .execute(json!({"action": "open", "url": url, "mode": "hidden", "guard": "locked"}))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    if v["code"] == 3001 {
+        return; // 本机未安装浏览器
+    }
+    assert_eq!(v["code"], 0, "hidden 档 open 应成功: {out}");
+    let page_id = v["data"]["page_id"].as_str().unwrap().to_string();
+
+    let out2 = McpWebUseTool
+        .execute(json!({
+            "action": "control", "page_id": page_id, "control_action": "eval_js",
+            "params": {"expression":
+                "(() => { try { const c = document.createElement('canvas'); \
+                 const g = c.getContext('webgl'); const e = g && g.getExtension('WEBGL_debug_renderer_info'); \
+                 return JSON.stringify({ unmasked: !!e, \
+                 vendor: e ? g.getParameter(e.UNMASKED_VENDOR_WEBGL) : '', \
+                 renderer: e ? g.getParameter(e.UNMASKED_RENDERER_WEBGL) : '' }); } catch (err) { \
+                 return JSON.stringify({ unmasked: false, vendor: '', renderer: '', err: String(err) }); } })()"}
+        }))
+        .await
+        .unwrap();
+    let probe = data_of(&out2)["data"]["result"].as_str().unwrap_or_default().to_string();
+    let p: Value = serde_json::from_str(&probe).unwrap_or(Value::Null);
+    assert_eq!(p["unmasked"], json!(true), "WEBGL_debug_renderer_info 应在场: {probe}");
+    let renderer = p["renderer"].as_str().unwrap_or("").to_ascii_lowercase();
+    for token in ["swiftshader", "basic render driver", "webkit", "software"] {
+        assert!(
+            !renderer.contains(token),
+            "无头档 WebGL 仍报软渲染串(含 {token})—— 第 183 轮起默认不带 --disable-gpu,\
+             仍命中说明真 GPU 初始化失败(VM/RDP/驱动被禁)或误开 LAEW_WEB_HEADLESS_SOFTRENDER=on: {probe}"
+        );
+    }
+    assert!(
+        !renderer.is_empty(),
+        "renderer 不得为空: {probe}"
+    );
+
+    let _ = McpWebUseTool
+        .execute(json!({"action": "close", "page_id": "all"}))
+        .await;
+}
+
 /// **回填替身与同机原生的逐字段差分**（第 178 轮，闭合 31 §九.2）。
 ///
 /// 31 号文遗留：「回填替身的形态只有 Node 垫片背书，没有真机对照」—— 因为本机原生

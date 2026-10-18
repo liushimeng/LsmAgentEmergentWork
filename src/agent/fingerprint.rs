@@ -298,9 +298,19 @@ pub const PROBE_JS: &str = r#"JSON.stringify((() => {
 })())"#;
 
 /// WebGL「自动化兜底串」判定(小写包含)。
+///
+/// 第 183 轮新增 `basic render driver` 令牌:WARP(Windows 高级光栅化平台)读数
+/// `ANGLE (Microsoft, Microsoft Basic Render Driver …)` 不含 webkit/swiftshader/
+/// software 任一旧令牌,旧判定既不回填也不告警地放行 —— 而它是无 GPU/虚拟机/
+/// 被禁用显卡环境的典型读数(实测带 `--disable-gpu` 的无头档即报它,与本机真
+/// Intel UHD 串形成硬件指纹差)。第 183 轮已从参数层根治(无头档不再强制软渲染),
+/// 仍命中即说明真 GPU 初始化失败(VM/RDP/驱动问题)。
 fn is_default_webgl(s: &str) -> bool {
     let s = s.to_ascii_lowercase();
-    s.contains("webkit") || s.contains("swiftshader") || s.contains("software")
+    s.contains("webkit")
+        || s.contains("swiftshader")
+        || s.contains("software")
+        || s.contains("basic render driver")
 }
 
 /// 桌面 UA 判定(第 182 轮抽出共用):指针媒体/触摸点判据只适用于桌面形态,
@@ -341,9 +351,11 @@ pub fn classify(fp: &Value) -> Vec<Value> {
     } else if is_default_webgl(vendor) || is_default_webgl(renderer) {
         out.push(json!({
             "code": "webgl_default_strings",
-            "advice": "WebGL vendor/renderer 是自动化兜底串(WebKit/SwiftShader/software),\
-                       与真实桌面 Chrome 的 Apple/ANGLE/D3D11 串不符,是高风险指纹;\
-                       处置:已在 browser_ns 注入保真回填,若仍命中请开 LAEW_WEB_FINGERPRINT=off 复核是否被覆盖;\
+            "advice": "WebGL vendor/renderer 是软渲染/兜底串(WebKit/SwiftShader/software/WARP),\
+                       与真实桌面 Chrome 的硬件串不符,是高风险指纹;\
+                       处置:第 183 轮起无头档已不强制 --disable-gpu(真 GPU 与本机有头逐字节一致),\
+                       仍命中通常说明真 GPU 初始化失败(VM/RDP/驱动被禁)或误开了\
+                       LAEW_WEB_HEADLESS_SOFTRENDER=on;JS 侧保真回填仍在(browser_ns),\
                        关键任务建议 open(reuse_existing=true) 用真实浏览器指纹"
         }));
     }
@@ -921,6 +933,27 @@ mod tests {
             json!({}),
         );
         assert_eq!(codes(&v), vec!["webgl_default_strings".to_string()]);
+    }
+
+    /// 第 183 轮:WARP 软渲染串(实测 `--disable-gpu` 无头档读数)必须命中兜底串
+    /// 判定 —— 旧 is_default_webgl 的三个令牌一个不含,曾原样放行。
+    #[test]
+    fn webgl_warp软渲染串命中() {
+        let v = fp(
+            json!({"ok": true, "unmasked": true,
+                   "vendor": "Google Inc. (Microsoft)",
+                   "renderer": "ANGLE (Microsoft, Microsoft Basic Render Driver (0x000008C) Direct3D11 vs_5_0 ps_5_0, D3D11)"}),
+            json!({}),
+        );
+        assert_eq!(codes(&v), vec!["webgl_default_strings".to_string()]);
+        // 第 183 轮后的健康读数(真 GPU,与本机有头逐字节一致)不得命中
+        let healthy = fp(
+            json!({"ok": true, "unmasked": true,
+                   "vendor": "Google Inc. (Intel)",
+                   "renderer": "ANGLE (Intel, Intel(R) UHD Graphics (0x00004688) Direct3D11 vs_5_0 ps_5_0, D3D11)"}),
+            json!({}),
+        );
+        assert!(codes(&healthy).is_empty(), "真硬件串不得告警:{:?}", codes(&healthy));
     }
 
     #[test]

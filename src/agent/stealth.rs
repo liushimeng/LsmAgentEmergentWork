@@ -132,6 +132,9 @@ pub fn status_json(effective: StealthMode) -> Value {
                  第 182 轮:无头档另叠加**原生 CDP 环境仿真**(非 JS 注入)——setEmulatedMedia 四元指针/悬停媒体特性\
                  + setTouchEmulationEnabled(false) 归零触摸点(真机双档基线:有头档 hover/fine/any-* 全 true、\
                  maxTouchPoints=0,无头档裸读数全 false/1);有头档恒零动作,connect 零注入不变;\
+                 第 183 轮:参数层真值对齐 —— 无头档不再强制 --disable-gpu/--hide-scrollbars,\
+                 WebGL 报本机真 GPU(与本机有头 Chrome 逐字节一致,非 WARP 软渲染串),\
+                 滚动条宽度跟随宿主 OS 默认;LAEW_WEB_HEADLESS_SOFTRENDER=on 恢复旧软渲染集(排障);\
                  LAEW_WEB_STEALTH=fidelity 可显式降档,=off 可整体关闭,LAEW_WEB_FINGERPRINT=off 只关保真回填与体检",
     })
 }

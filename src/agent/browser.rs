@@ -527,9 +527,37 @@ pub(crate) fn custom_launch_flags(headless: bool, geo_prompt: bool) -> Vec<Strin
         flags.push("deny-permission-prompts");
     }
     if headless {
-        flags.extend(["disable-gpu", "no-sandbox", "disable-dev-shm-usage", "hide-scrollbars"]);
+        // 第 183 轮(真机基线驱动,docs/MCP_Web_Use/37):无头档**不再**强制软渲染 ——
+        // new headless 与有头同一渲染路径,`--disable-gpu` 只会亲手制造 WebGL WARP 指纹
+        // (实测:带它时 UNMASKED_RENDERER = "ANGLE (Microsoft, Microsoft Basic Render
+        // Driver …)",去掉后与本机有头 Chrome **逐字节一致** = 真 Intel UHD 串);
+        // `--hide-scrollbars` 同为老式无头遗产,去掉后滚动条宽度跟随宿主 OS 默认
+        // (Win11 overlay 恒 0 与有头一致,经典滚动条机器上 ~17px 与该机有头一致)。
+        // GPU 初始化失败的机器(VM/RDP/驱动被禁)由 Chrome 原生回退 SwiftShader/WARP,
+        // 与旧参数时代读数相同,不比改前差。杀开关 `LAEW_WEB_HEADLESS_SOFTRENDER=on`
+        // 恢复旧软渲染参数集(排障对照)。
+        flags.push("no-sandbox");
+        flags.push("disable-dev-shm-usage");
+        if headless_softrender_from_env() {
+            flags.extend(["disable-gpu", "hide-scrollbars"]);
+        }
     }
     flags.into_iter().map(str::to_string).collect()
+}
+
+/// 第 183 轮杀开关:`LAEW_WEB_HEADLESS_SOFTRENDER` 置 on/1/true/yes/软渲染 时,
+/// 无头档恢复旧软渲染参数集(`--disable-gpu` + `--hide-scrollbars`)。
+/// 供「真 GPU 初始化导致渲染异常」的机器排障对照;缺省关闭(走真值参数集)。
+/// `browser_reuse::relaunch_args`(auto_relaunch 调试实例)同策略复用。
+pub(crate) fn headless_softrender_from_env() -> bool {
+    matches!(
+        std::env::var("LAEW_WEB_HEADLESS_SOFTRENDER")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "on" | "1" | "true" | "yes" | "软渲染"
+    )
 }
 
 /// 第 175 轮:下发一次**同尺寸的 screen 声明**,让页面读到的 `screen.*` 与
@@ -1197,7 +1225,19 @@ impl BrowserManager {
         // 先撤掉半吊子覆盖让页面重新报出**原生**身份,再探一次即拿到品牌表真值并下发
         // 完整覆盖。窗口极短(页面脚本早已在 document-start 读到干净的 UA 字符串)。
         // 有头档此路径不可达(pre-goto 那次本就 `Skipped`,无令牌)。
-        if ua_sweep == super::browser_ns::UaSweep::StringOnly {
+        //
+        // 第 183 轮:**Skipped 兜底**(docs/MCP_Web_Use/37 §3.4)。首航前探针若在
+        // about:blank 上超时/求值失败,`apply_ua_destealth` 返回 `Skipped` 且此前无人
+        // 再补 —— goto 就带着 `HeadlessChrome` 令牌出去了(36 §五遗留的偶发竞态残留
+        // 通道;第 183 轮启用真 GPU 后冷启动变慢,概率只会上升)。无头档是唯一有令牌
+        // 的档,落地后重探一次并下发完整覆盖,页面侧与后续请求全部干净。有头档本就
+        // 无令牌、connect 模式零注入契约,均零动作。
+        let headless_instance = matches!(inner.mode, BrowserMode::Hidden | BrowserMode::NewHeadless);
+        if ua_sweep == super::browser_ns::UaSweep::StringOnly
+            || (ua_sweep == super::browser_ns::UaSweep::Skipped
+                && headless_instance
+                && !inner.connect_mode)
+        {
             super::browser_ns::restore_native_ua(&page).await;
             let done = super::browser_ns::apply_ua_destealth(&page, inner.stealth).await;
             if done != super::browser_ns::UaSweep::Full {
@@ -3656,9 +3696,56 @@ mod tests {
         // geo_prompt=true 时不加 deny-permission-prompts(保持原生行为档)
         assert!(!custom_launch_flags(false, true).contains(&"deny-permission-prompts".to_string()));
         assert!(custom_launch_flags(false, false).contains(&"deny-permission-prompts".to_string()));
-        // headless 追加 GPU/sandbox 旗标
-        assert!(custom_launch_flags(true, false).contains(&"disable-gpu".to_string()));
+        // headless 追加 sandbox 旗标(disable-gpu 自第 183 轮起默认不再下发,见下个测试)
+        assert!(custom_launch_flags(true, false).contains(&"no-sandbox".to_string()));
+        assert!(!custom_launch_flags(false, false).contains(&"no-sandbox".to_string()));
+    }
+
+    /// env 解析测试并行会改 LAEW_WEB_HEADLESS_SOFTRENDER,读者同样持锁防竞态
+    /// (与 browser_reuse 的同类测试共用 test_support 全局锁,跨模块也串行)。
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::test_support::GLOBAL_ENV_CWD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 第 183 轮:无头档默认**真值参数集**(不带 disable-gpu/hide-scrollbars,
+    /// WebGL 报本机真 GPU 而非 WARP 软渲染串);杀开关恢复旧软渲染集。
+    #[test]
+    fn custom_launch_flags_无头档默认真GPU且杀开关恢复旧集() {
+        let _g = env_lock();
+        std::env::remove_var("LAEW_WEB_HEADLESS_SOFTRENDER");
+        let flags = custom_launch_flags(true, false);
+        assert!(
+            !flags.contains(&"disable-gpu".to_string()),
+            "第 183 轮起无头档默认不强制软渲染(它会制造 WebGL WARP 指纹): {flags:?}"
+        );
+        assert!(
+            !flags.contains(&"hide-scrollbars".to_string()),
+            "第 183 轮起无头档默认不隐藏滚动条(宽度应跟随宿主 OS 默认): {flags:?}"
+        );
+        // 有头档从来就没有这两面旗标
         assert!(!custom_launch_flags(false, false).contains(&"disable-gpu".to_string()));
+        assert!(!custom_launch_flags(false, false).contains(&"hide-scrollbars".to_string()));
+        // 杀开关:恢复旧软渲染参数集(排障对照)
+        for v in ["on", "1", "true", "yes", "软渲染", " ON "] {
+            std::env::set_var("LAEW_WEB_HEADLESS_SOFTRENDER", v);
+            let flags = custom_launch_flags(true, false);
+            assert!(
+                flags.contains(&"disable-gpu".to_string())
+                    && flags.contains(&"hide-scrollbars".to_string()),
+                "杀开关 {v:?} 必须恢复旧软渲染集: {flags:?}"
+            );
+        }
+        // 关闭族值不恢复
+        for v in ["off", "0", "false", "no", ""] {
+            std::env::set_var("LAEW_WEB_HEADLESS_SOFTRENDER", v);
+            assert!(
+                !custom_launch_flags(true, false).contains(&"disable-gpu".to_string()),
+                "关闭族值 {v:?} 不得恢复软渲染集"
+            );
+        }
+        std::env::remove_var("LAEW_WEB_HEADLESS_SOFTRENDER");
     }
 
     #[test]

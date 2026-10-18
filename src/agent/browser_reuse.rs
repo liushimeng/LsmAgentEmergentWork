@@ -391,7 +391,12 @@ pub fn relaunch_args(port: u16, profile_dir: &Path, headless: bool) -> Vec<Strin
     if headless {
         args.push("--headless=new".to_string());
         args.push("--no-sandbox".to_string());
-        args.push("--disable-gpu".to_string());
+        // 第 183 轮(docs/MCP_Web_Use/37):与 launch 路径同策略 —— 默认不再强制
+        // `--disable-gpu`(它会制造 WebGL WARP 软渲染指纹,去掉后与本机有头 Chrome
+        // 逐字节一致);杀开关恢复旧软渲染集。
+        if crate::agent::browser::headless_softrender_from_env() {
+            args.push("--disable-gpu".to_string());
+        }
     }
     args
 }
@@ -684,10 +689,23 @@ mod tests {
 
     #[test]
     fn relaunch_args_headless_appends_flags() {
+        // 第 183 轮:disable-gpu 随杀开关 LAEW_WEB_HEADLESS_SOFTRENDER 门控
+        // (与 launch 路径同策略;与 browser.rs 的 env 测试共用全局锁跨模块串行)。
+        let _g = crate::test_support::GLOBAL_ENV_CWD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("LAEW_WEB_HEADLESS_SOFTRENDER") };
         let args = relaunch_args(9222, Path::new("/tmp/profile"), true);
         assert!(args.contains(&"--headless=new".to_string()));
         assert!(args.contains(&"--no-sandbox".to_string()));
-        assert!(args.contains(&"--disable-gpu".to_string()));
+        assert!(
+            !args.contains(&"--disable-gpu".to_string()),
+            "第 183 轮起默认不带 disable-gpu(WebGL WARP 指纹): {args:?}"
+        );
+        unsafe { std::env::set_var("LAEW_WEB_HEADLESS_SOFTRENDER", "on") };
+        let args = relaunch_args(9222, Path::new("/tmp/profile"), true);
+        assert!(args.contains(&"--disable-gpu".to_string()), "杀开关应恢复旧集: {args:?}");
+        unsafe { std::env::remove_var("LAEW_WEB_HEADLESS_SOFTRENDER") };
     }
 
     #[test]
