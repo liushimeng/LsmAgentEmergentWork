@@ -1066,24 +1066,46 @@ impl BrowserManager {
                     cleanup_registry::register(launch_pid, dir);
                 }
             }
-            // 第 180 轮:浏览器级 UA 探测(有界 2s,fail-open 存 None)—— 派生页
-            // 早期武装的无探针 UA 去令牌通道取值源(`Browser.getVersion` 的 UA
-            // 字符串,无头档带 HeadlessChrome 令牌)。
-            inner.browser_ua = match tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                inner.browser
-                    .as_ref()
-                    .expect("browser initialized")
-                    .user_agent(),
-            )
-            .await
-            {
-                Ok(Ok(ua)) => Some(ua),
-                otherwise => {
-                    tracing::debug!(?otherwise, "浏览器级 UA 探测失败(派生页 UA 走探针式清理)");
-                    None
+            // 第 180 轮:浏览器级 UA 探测(取值源:派生页早期武装的无探针 UA 去令牌
+            // 通道)。第 185 轮(doc 39)实测发现本机 Chrome 155 new headless 的
+            // getVersion 产品名存在**启动期切换**:launch 后立即读恒为
+            // `HeadlessChrome/155.0.0.0`(裸 repro 12/12),安静环境 ~1s 后切换为
+            // 常规 `Chrome/…`(干净),而 Chrome 启停背靠背(测试连跑/慢机)时切换
+            // 可被拖得很久;切换前发出的主文档请求一律带裸令牌(36 §五遗留
+            // 「毫秒级竞态」的真身)。故启动后**轮询 getVersion 直至令牌消失再放行
+            // 后续导航**:切换后 UA 本就干净,去令牌各通道零动作;预算耗尽仍带令牌
+            // 才交给首航剥离覆盖路径兜底(该路径在启停竞争下仍偶发被网络层缺席,
+            // 是已记录残差)。总预算 ~11s(90 次 × 1s 有界 + 100ms 间隔),常态 <1s。
+            inner.browser_ua = None;
+            for attempt in 1..=90 {
+                let got = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    inner.browser
+                        .as_ref()
+                        .expect("browser initialized")
+                        .user_agent(),
+                )
+                .await;
+                let mut masked = false;
+                match got {
+                    Ok(Ok(ua)) => {
+                        masked = !super::stealth::is_headless_ua(&ua);
+                        inner.browser_ua = Some(ua);
+                    }
+                    otherwise => {
+                        tracing::debug!(?attempt, ?otherwise, "浏览器级 UA 探测失败(重试)");
+                    }
                 }
-            };
+                if masked || attempt == 90 {
+                    if !masked {
+                        tracing::warn!(
+                            "UA 启动掩码结算超时(预算内 getVersion 仍带无头令牌),                             交给首航剥离覆盖路径兜底"
+                        );
+                    }
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
             // 第 180 轮:派生页早期武装 watcher(仅 launch 模式 + 开关开启)。
             // 订阅浏览器级 `Target.targetCreated`,页面派生的新标签页出生即下发
             // 隐身/屏幕几何/UA 处置 —— 此前要等 adopt(触发动作收尾)才武装,无头档
@@ -1186,11 +1208,73 @@ impl BrowserManager {
         // `setUserAgentOverride` 不带 `userAgentMetadata` 时页面侧的
         // `userAgentData.brands` 会被**清空** —— 「UA 说 Chrome、Client Hints 说空」
         // 是比原状更显眼的新破绽。故落地后（安全上下文）必须补全,见下方 goto 之后。
+        // 第 185 轮:首航前的 UA 清理改走**无探针优先通道**(`apply_ua_destealth_first_nav`,
+        // docs/MCP_Web_Use/39) —— 用实例建立时 `Browser.getVersion` 缓存的浏览器级 UA
+        // 预剥离令牌并在 goto 前同步 await 完成,确定性先于 req#1 的网络头。旧探针式
+        // 清理的 `Runtime.evaluate` 排在 handler 事件循环上,真 GPU 冷启动变慢后实测
+        // 可拖到超时 → Skipped → goto 带着 HeadlessChrome 令牌出去(36 §五遗留的偶发
+        // 竞态);无缓存(getVersion 也失败)才退回探针式兜底。connect 模式零注入契约不变。
         let ua_sweep = if inner.connect_mode {
             super::browser_ns::UaSweep::Skipped
         } else {
-            super::browser_ns::apply_ua_destealth(&page, inner.stealth).await
+            // 第 185 轮:launch 时的 getVersion 探测只有 2s 单次预算,并行拉起多台
+            // Chrome 的负载下实测可超时留空(现场日志:ua_sweep=Skipped 且 headless=true
+            // → req#1 裸奔)。此处现场补探:不依赖页面上下文,3 次 × 3s 预算,取到即
+            // 回写缓存 —— 首航去令牌的主通道(无探针剥离)必须有浏览器级 UA 可用。
+            if inner.browser_ua.is_none() {
+                let browser = inner.browser.as_ref().expect("browser initialized");
+                for attempt in 1..=3 {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(3),
+                        browser.user_agent(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(ua)) => {
+                            tracing::info!(attempt, "浏览器级 UA 现场补探成功(首航去令牌通道恢复)");
+                            inner.browser_ua = Some(ua);
+                            break;
+                        }
+                        otherwise => {
+                            tracing::warn!(?attempt, ?otherwise, "浏览器级 UA 现场补探失败");
+                        }
+                    }
+                }
+            }
+            super::browser_ns::apply_ua_destealth_first_nav(
+                &page,
+                inner.stealth,
+                inner.browser_ua.as_deref(),
+            )
+            .await
         };
+        // 第 185 轮:**网络侧结算导航**(docs/MCP_Web_Use/39 §3)。真机并行压测实证:
+        // `setUserAgentOverride` 的 ack 只保证浏览器进程已**受理**,网络服务管道内
+        // 落位是异步的 —— ack 后立刻 goto,req#1 偶发仍带 `HeadlessChrome` 令牌,
+        // 而同刻页面侧 `navigator.userAgent` 读数已干净(渲染/网络两条管道独立,
+        // 「页面可见结算闸」观测不到网络侧滞后,故两者并用)。处置:带令牌无头实例
+        // 首航前,先做一次**必定失败的内部结算跳转**(`127.0.0.1:1` 无监听,连接即拒,
+        // <100ms,对目标站点完全不可见)—— 请求构造走同一 NetworkContext 管道,
+        // 按 FIFO 强制其消化覆盖状态;跳转完成 = 覆盖已落位,真实 goto 的 req#1
+        // 确定性干净。有头档无令牌、connect 零注入契约,均零动作。
+        let headless_instance =
+            matches!(inner.mode, BrowserMode::Hidden | BrowserMode::NewHeadless);
+        if ua_sweep != super::browser_ns::UaSweep::Skipped
+            && headless_instance
+            && !inner.connect_mode
+        {
+            let settle = chromiumoxide::cdp::browser_protocol::page::NavigateParams::builder()
+                .url("http://127.0.0.1:1/".to_string())
+                .build();
+            if let Ok(p) = settle {
+                // 拒连/超时就地吞掉 —— 结算跳转的成败无关紧要,只取它的管道冲刷语义。
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    page.execute(p),
+                )
+                .await;
+            }
+        }
         // 第 175 轮:屏幕几何自洽 —— 与 UA 清理同批(都在首次导航前下发),
         // 让首个文档起就满足 `outer <= screen`(真机实测:不补则
         // screen=800x600 < outer=1920,物理不可能,风控一行即可判定)。
@@ -1228,11 +1312,11 @@ impl BrowserManager {
         //
         // 第 183 轮:**Skipped 兜底**(docs/MCP_Web_Use/37 §3.4)。首航前探针若在
         // about:blank 上超时/求值失败,`apply_ua_destealth` 返回 `Skipped` 且此前无人
-        // 再补 —— goto 就带着 `HeadlessChrome` 令牌出去了(36 §五遗留的偶发竞态残留
-        // 通道;第 183 轮启用真 GPU 后冷启动变慢,概率只会上升)。无头档是唯一有令牌
-        // 的档,落地后重探一次并下发完整覆盖,页面侧与后续请求全部干净。有头档本就
-        // 无令牌、connect 模式零注入契约,均零动作。
-        let headless_instance = matches!(inner.mode, BrowserMode::Hidden | BrowserMode::NewHeadless);
+        // 再补 —— goto 就带着 `HeadlessChrome` 令牌出去了。第 185 轮(doc 39)首航前
+        // 主通道已改无探针化(getVersion 缓存 UA 预剥离),本兜底现只覆盖「无缓存 +
+        // 探针也失败」的窄路径;无头档是唯一有令牌的档,落地后重探一次并下发完整
+        // 覆盖,页面侧与后续请求全部干净。有头档本就无令牌、connect 模式零注入契约,
+        // 均零动作。
         if ua_sweep == super::browser_ns::UaSweep::StringOnly
             || (ua_sweep == super::browser_ns::UaSweep::Skipped
                 && headless_instance
@@ -1244,6 +1328,11 @@ impl BrowserManager {
                 tracing::warn!(
                     "UA 去令牌落地后补全未生效(Client Hints 品牌表可能为空,与 UA 字符串不自洽): {done:?}"
                 );
+            }
+            // 第 185 轮:落地后这次覆盖同样过结算闸 —— 渲染进程消费仿真状态滞后于
+            // ack,页面侧读数干净才说明后续页面自发请求(信标/XHR)必带干净 UA。
+            if done != super::browser_ns::UaSweep::Skipped {
+                super::browser_ns::await_ua_override_visible(&page).await;
             }
         }
 

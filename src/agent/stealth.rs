@@ -192,6 +192,24 @@ pub fn strip_headless_tokens(ua: &str) -> String {
     ua.replace("HeadlessChrome", "Chrome").replace("Headless Edge", "Edge")
 }
 
+/// 首航前 UA 去令牌的**无探针**判定（第 185 轮，docs/MCP_Web_Use/39）：
+/// 优先用实例建立时 `Browser.getVersion` 缓存的浏览器级 UA（真值）预剥离令牌 ——
+/// 带令牌时返回剥离后的字符串，调用方据此在首次导航前**确定性**下发 string-only
+/// 覆盖（await 完成才 goto，req#1 请求头不可能读到旧 UA）；干净 / 无缓存返回
+/// `None`，调用方退回探针式 [`browser_ns::apply_ua_destealth`]。
+///
+/// 根治 36 §五遗留的偶发竞态：首航前探针（`Runtime.evaluate` 排在浏览器 handler
+/// 事件循环上，真 GPU 冷启动变慢后实测可拖到超时）返回 `Skipped` → goto 带着
+/// `HeadlessChrome` 令牌出去，落地后兜底再快也追不回已飞出去的请求头。
+pub fn first_nav_ua_strip(browser_ua: Option<&str>) -> Option<String> {
+    let raw = browser_ua?;
+    if !is_headless_ua(raw) {
+        return None;
+    }
+    let cleaned = strip_headless_tokens(raw);
+    (cleaned != raw).then_some(cleaned)
+}
+
 /// UA 清理计划（全部字段来自页面自报值，不伪造）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UaPlan {
@@ -377,6 +395,24 @@ mod tests {
         let plan = ua_plan(&p).expect("UA 仍有令牌,需处置");
         assert!(plan.brands.is_empty());
         assert!(!plan.has_metadata(), "品牌滤空时只改 UA 字符串,不下发空品牌表");
+    }
+
+    #[test]
+    fn 首航无探针剥离三态() {
+        // 带令牌 → 剥离后串（版本号/平台段原样保留，零伪造）
+        let headless = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/155.0.8059.40 Safari/537.36";
+        let cleaned = first_nav_ua_strip(Some(headless)).expect("带令牌必须产出剥离串");
+        assert!(!is_headless_ua(&cleaned));
+        assert!(cleaned.contains("Chrome/155.0.8059.40"), "版本号保留: {cleaned}");
+        assert_eq!(cleaned, strip_headless_tokens(headless));
+        // Headless Edge 令牌同规则
+        let edge = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Headless Edge/155.0.0.0 Safari/537.36";
+        assert!(first_nav_ua_strip(Some(edge)).is_some());
+        // 干净 UA → None（零动作，不发起任何 CDP 调用）
+        let headed = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.8059.40 Safari/537.36";
+        assert!(first_nav_ua_strip(Some(headed)).is_none());
+        // 无缓存 → None（调用方退回探针式兜底）
+        assert!(first_nav_ua_strip(None).is_none());
     }
 
     #[test]

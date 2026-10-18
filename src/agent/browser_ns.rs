@@ -967,6 +967,81 @@ pub async fn restore_native_ua(page: &chromiumoxide::Page) -> bool {
         Ok(Ok(_))
     )
 }
+/// **UA 覆盖结算闸**（第 185 轮，docs/MCP_Web_Use/39 §3）—— 覆盖下发 ack 后，
+/// 轮询页面侧 `navigator.userAgent` 直至不再含自动化令牌（预算耗尽 fail-open 放行）。
+///
+/// 真机并行压测实证：CDP `setUserAgentOverride` 的 ack 只保证**浏览器进程**已处理，
+/// 渲染进程消费仿真状态存在毫秒级滞后 —— ack 后立刻 goto，首请求(req#1)仍偶发带
+/// `HeadlessChrome` 令牌（同页同会话、命令按序，仍复现，故非命令序问题）。渲染侧
+/// 读数干净 ⇒ 同一条仿真状态的浏览器侧网络覆盖必已先行落位（handler 先更新本进程
+/// 状态再通知 renderer），此时放行导航，req#1 确定性干净。纯判定零伪造：只读
+/// `navigator.userAgent`，不改任何值。
+pub(crate) async fn await_ua_override_visible(page: &chromiumoxide::Page) {
+    const ATTEMPTS: usize = 12;
+    for _ in 0..ATTEMPTS {
+        let params = match chromiumoxide::cdp::js_protocol::runtime::EvaluateParams::builder()
+            .expression("navigator.userAgent")
+            .return_by_value(true)
+            .build()
+        {
+            Ok(p) => p,
+            Err(_) => break,
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(1), page.evaluate(params)).await
+        {
+            Ok(Ok(v)) => {
+                let ua = v.value().and_then(|x| x.as_str()).unwrap_or("");
+                if !crate::agent::stealth::is_headless_ua(ua) {
+                    return;
+                }
+            }
+            _ => {}
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    tracing::warn!(
+        "UA 覆盖结算闸超时(预算内页面读数仍带自动化令牌),按已下发放行(req#1 可能带令牌,fail-open)"
+    );
+}
+
+/// 首航前 UA 去令牌（第 185 轮，docs/MCP_Web_Use/39）—— **无探针通道优先**。
+///
+/// 首航前那次清理发生在 goto 之前、必须确定性先于首个网络请求（req#1 的请求头
+/// 骗不过服务器），而探针式 [`apply_ua_destealth`] 的 `Runtime.evaluate` 排在浏览器
+/// handler 事件循环上，真 GPU 冷启动变慢后实测可拖到超时 → `Skipped` → goto 带着
+/// `HeadlessChrome` 令牌出去（36 §五遗留的偶发竞态）。故先用实例建立时
+/// `Browser.getVersion` 缓存的浏览器级 UA（真值）预剥离令牌并**同步 await** 下发
+/// string-only 覆盖；`browser_ua` 无缓存/剥离未生效才退回探针式。
+///
+/// 档位 `Off` 恒零动作；干净 UA（有头档常规）返回 `Skipped` 且**零 CDP 调用**。
+/// 落地后的 Full 补全（品牌表）仍由调用方按 `UaSweep::StringOnly` 走 178 轮链路。
+pub async fn apply_ua_destealth_first_nav(
+    page: &chromiumoxide::Page,
+    mode: crate::agent::stealth::StealthMode,
+    browser_ua: Option<&str>,
+) -> UaSweep {
+    use crate::agent::stealth;
+    if mode == stealth::StealthMode::Off {
+        return UaSweep::Skipped;
+    }
+    if let Some(cleaned) = stealth::first_nav_ua_strip(browser_ua) {
+        if apply_ua_string_override(page, &cleaned).await {
+            // 结算闸:渲染进程消费仿真状态滞后于 ack,等页面侧读数干净再放行
+            // 导航(否则 req#1 偶发带令牌 —— 真机并行压测复现,见函数文档)。
+            await_ua_override_visible(page).await;
+            return UaSweep::StringOnly;
+        }
+        tracing::warn!("首航 UA 无探针覆盖下发失败,退回探针式清理");
+    }
+    let sweep = apply_ua_destealth(page, mode).await;
+    // 探针式路径同样改动了 UA 字符串(StringOnly/Full 都带 user_agent),
+    // 过同一道结算闸再放行导航。
+    if sweep != UaSweep::Skipped {
+        await_ua_override_visible(page).await;
+    }
+    sweep
+}
+
 /// 无头档 UA 清理（第 174 轮）：`HeadlessChrome/155…` 会出现在 **UA 字符串 + 网络
 /// 请求头 + `Sec-CH-UA` 品牌列表**三处，必须一起改 —— 只改 JS 侧的
 /// `navigator.userAgent` 骗得过页面、骗不过服务器，且"UA 说 Chrome、Client Hints
