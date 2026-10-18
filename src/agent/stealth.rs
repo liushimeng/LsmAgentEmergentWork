@@ -175,6 +175,13 @@ pub fn is_headless_ua(ua: &str) -> bool {
     ua.contains("Headless")
 }
 
+/// 去掉 UA 字符串里的自动化令牌(第 180 轮):与 [`UaPlan::user_agent`] 完全同一
+/// 替换规则,供「无页面上下文也能先清字符串」的路径复用(浏览器级 `getVersion`
+/// 拿到的 UA → 派生页出生即下发 string-only 覆盖,品牌表待落地后补全)。
+pub fn strip_headless_tokens(ua: &str) -> String {
+    ua.replace("HeadlessChrome", "Chrome").replace("Headless Edge", "Edge")
+}
+
 /// UA 清理计划（全部字段来自页面自报值，不伪造）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UaPlan {

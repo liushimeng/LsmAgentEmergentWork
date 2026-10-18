@@ -107,6 +107,11 @@ pub struct PageEntry {
 struct BrowserInner {
     browser: Option<Browser>,
     handler: Option<tokio::task::JoinHandle<()>>,
+    /// 派生页早期武装 watcher（第 180 轮，仅 launch 模式启动；与 handler 同点回收）。
+    /// 订阅浏览器级 `Target.targetCreated`,对「页面派生的新标签页」在导航提交时刻
+    /// 下发隐身/屏幕几何/UA 处置(见 `browser_spawn_arm.rs`;提交门约束见
+    /// `docs/MCP_Web_Use/34` §二 —— 命令经 init 链在提交时刻生效)。
+    spawn_arm: Option<tokio::task::JoinHandle<()>>,
     /// 进程外 parent-death watchdog（仅 launch 模式）。
     watchdog: Option<std::process::Child>,
     connect_mode: bool,
@@ -122,6 +127,11 @@ struct BrowserInner {
     /// profile),指纹级打标站点对它的抹除要计入总账;用户日常 Chrome 不记)。
     /// launch 模式恒 None。
     connected_port: Option<u16>,
+    /// 浏览器级 UA 字符串(第 180 轮,实例建立时 `Browser.getVersion` 有界探得):
+    /// 派生页早期武装的无探针 UA 去令牌通道取值源(无头档带 `HeadlessChrome`
+    /// 令牌时,清理后的字符串随 `SpawnArmConfig` 下发,提交后的网络请求与页面
+    /// 读数立即干净;探针式清理会被 provisional 导航阻塞,赶不上提交时刻)。
+    browser_ua: Option<String>,
     pages: HashMap<String, PageEntry>,
     /// launch 模式的一次性 user-data-dir(关闭浏览器时整目录清理)。
     user_data_dir: Option<PathBuf>,
@@ -156,6 +166,33 @@ struct BrowserInner {
     /// (实测首开 outer 1922×1043,高短 37px,违背「默认 1080p」文档承诺);首开时
     /// 主动 setWindowBounds 校正一次,之后保持「用户调整以其为准」(第 158 轮)。
     default_size_applied: bool,
+}
+
+impl BrowserInner {
+    /// 派生页早期武装的实例期望态快照(第 180 轮,`browser_spawn_arm::SpawnArmConfig`)。
+    fn spawn_arm_config(&self) -> super::browser_spawn_arm::SpawnArmConfig {
+        // 无探针 UA 去令牌通道:无头档(screen_sync 有值)+ 档位开启 + 浏览器级
+        // UA 确带令牌时,预计算清理后的字符串 —— 派生页出生即下发,不等探针。
+        let ua_string_sweep = match (self.screen_sync.is_some(), self.browser_ua.as_deref()) {
+            (true, Some(ua))
+                if self.stealth != super::stealth::StealthMode::Off
+                    && super::stealth::is_headless_ua(ua) =>
+            {
+                Some(super::stealth::strip_headless_tokens(ua))
+            }
+            _ => None,
+        };
+        super::browser_spawn_arm::SpawnArmConfig {
+            stealth: self.stealth,
+            screen_sync: self.screen_sync,
+            ua_string_sweep,
+            guard: self.guard.clone(),
+            highlight: self.highlight,
+            mode: self.mode,
+            auto_follow: self.auto_follow,
+            connect_mode: self.connect_mode,
+        }
+    }
 }
 
 /// 浏览器会话管理器(进程内单例)。
@@ -346,7 +383,8 @@ pub const AGENT_HIGHLIGHT_JS: &str = r#"(() => {
 /// 给页面注入 Agent 高亮蓝框(新文档自动重挂 + 当前文档立即执行)。
 /// 第 171 轮:顺带注入屏蔽页面状态栏/进度栏(connect 模式零注入契约不变,由调用方
 /// 的 `guard_visuals_active()` 判据把守 —— 本函数只在 headed 非 connect 调用)。
-async fn inject_agent_highlight(page: &Page) {
+/// 第 180 轮起 `pub(crate)`:派生页早期武装 watcher 的 headed 呈现层对齐复用。
+pub(crate) async fn inject_agent_highlight(page: &Page) {
     use chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams;
     let _ = page
         .execute(AddScriptToEvaluateOnNewDocumentParams {
@@ -499,7 +537,10 @@ pub(crate) fn custom_launch_flags(headless: bool, geo_prompt: bool) -> Vec<Strin
 ///
 /// 复用已有的 device metrics 覆盖通道:同一条命令补 `screen_width`/`screen_height`,
 /// 不新增 CDP 往返。fail-open(覆盖下发失败不阻断导航 —— 只损几何自洽,不损功能)。
-async fn apply_screen_sync_override(page: &chromiumoxide::Page, sync: Option<(u32, u32)>) {
+///
+/// 第 180 轮起 `pub(crate)`:派生页早期武装 watcher(`browser_spawn_arm.rs`)与
+/// adopt/heal 收编路径共用(无头档派生页的 `outer > screen` 硬判据修复不再单点)。
+pub(crate) async fn apply_screen_sync_override(page: &chromiumoxide::Page, sync: Option<(u32, u32)>) {
     let Some((w, h)) = sync else { return };
     if !super::browser_viewport::screen_sync_needed(w, h) {
         return;
@@ -575,9 +616,11 @@ impl BrowserManager {
                     inner: Mutex::new(BrowserInner {
                         browser: None,
                         handler: None,
+                        spawn_arm: None,
                         watchdog: None,
                         connect_mode: false,
                         connected_port: None,
+                        browser_ua: None,
                         screen_sync: None,
                         pages: HashMap::new(),
                         user_data_dir: None,
@@ -736,6 +779,9 @@ impl BrowserManager {
                 }
                 if let Some(handler) = inner.handler.take() {
                     handler.abort();
+                }
+                if let Some(watcher) = inner.spawn_arm.take() {
+                    watcher.abort();
                 }
                 if let Some(child) = inner.watchdog.take() {
                     spawn_watchdog_reaper(child);
@@ -990,6 +1036,54 @@ impl BrowserManager {
             if !connect_mode {
                 if let Some(dir) = launch_dir {
                     cleanup_registry::register(launch_pid, dir);
+                }
+            }
+            // 第 180 轮:浏览器级 UA 探测(有界 2s,fail-open 存 None)—— 派生页
+            // 早期武装的无探针 UA 去令牌通道取值源(`Browser.getVersion` 的 UA
+            // 字符串,无头档带 HeadlessChrome 令牌)。
+            inner.browser_ua = match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                inner.browser
+                    .as_ref()
+                    .expect("browser initialized")
+                    .user_agent(),
+            )
+            .await
+            {
+                Ok(Ok(ua)) => Some(ua),
+                otherwise => {
+                    tracing::debug!(?otherwise, "浏览器级 UA 探测失败(派生页 UA 走探针式清理)");
+                    None
+                }
+            };
+            // 第 180 轮:派生页早期武装 watcher(仅 launch 模式 + 开关开启)。
+            // 订阅浏览器级 `Target.targetCreated`,页面派生的新标签页出生即下发
+            // 隐身/屏幕几何/UA 处置 —— 此前要等 adopt(触发动作收尾)才武装,无头档
+            // 派生页整个首生命周期带着 `outer > screen` 硬判据(screen_sync 从未进
+            // adopt 序列)。watcher 只持有事件流(不持有 Browser 句柄,其非 Clone),
+            // 页面句柄经 `spawn_arm_resolve` 有界解析;与 handler 同点回收。
+            // 杀开关 `LAEW_WEB_SPAWN_ARM=off` 回退旧行为。事件流注册有界 2s,
+            // 失败仅告警(fail-open,回退 adopt 时武装)。
+            if !connect_mode && super::browser_spawn_arm::enabled() {
+                let stream_res = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    inner.browser
+                        .as_ref()
+                        .expect("browser initialized")
+                        .event_listener::<chromiumoxide::cdp::browser_protocol::target::EventTargetCreated>(),
+                )
+                .await;
+                match stream_res {
+                    Ok(Ok(stream)) => {
+                        inner.spawn_arm =
+                            Some(tokio::spawn(super::browser_spawn_arm::watch(stream)));
+                    }
+                    otherwise => {
+                        tracing::warn!(
+                            ?otherwise,
+                            "派生页早期武装:注册 targetCreated 事件流失败(回退 adopt 时武装)"
+                        );
+                    }
                 }
             }
         }
@@ -1305,6 +1399,9 @@ impl BrowserManager {
         if let Some(handler) = inner.handler.take() {
             handler.abort();
         }
+        if let Some(watcher) = inner.spawn_arm.take() {
+            watcher.abort();
+        }
         if let Some(child) = inner.watchdog.take() {
             spawn_watchdog_reaper(child);
         }
@@ -1437,10 +1534,12 @@ impl BrowserManager {
         spawn_event_listeners(&found, events.clone()).await;
         // 第 169 轮:自愈重建句柄的页面重挂隐身覆写(CDP 会话掉线重连后新文档
         // 上下文需要重新挂载;connect 零注入不变)。第 174 轮:UA 清理同挂
-        // (重连后的下一次导航同样要无令牌,否则掉线一次就前功尽弃)。
+        // (重连后的下一次导航同样要无令牌,否则掉线一次就前功尽弃)。第 180 轮:
+        // screen_sync 同挂(无头档重连页的几何自洽防线对齐 adopt/new_page 路径)。
         if !inner.connect_mode {
             super::browser_ns::apply_ua_destealth(&found, inner.stealth).await;
             super::browser_ns::inject_stealth(&found, inner.stealth).await;
+            apply_screen_sync_override(&found, inner.screen_sync).await;
         }
         if inner.highlight && matches!(inner.mode, BrowserMode::Headed) {
             inject_agent_highlight(&found).await;
@@ -1473,6 +1572,63 @@ impl BrowserManager {
     }
 
     // =================== 第 100 轮:窗口可视化 / 人工介入支撑 ===================
+
+    /// 派生页早期武装的句柄解析(第 180 轮):按 target_id 取 `Page` + 配置快照。
+    ///
+    /// **全程有界**(watcher 铁律:不得持锁跨无界 await):
+    /// - 锁等待 ≤1s/次、总预算 3s(`new_page_impl` 持锁可跨 launch+goto 达 30s+,
+    ///   等不到就放弃本页,交 adopt 收编兜底);
+    /// - 锁内 `get_page` ≤2s(attach 完成前返回 NotFound 是**瞬时**失败,静默重试;
+    ///   handler 卡死时 2s 放弃 —— 此时全部 CDP 通道本就同死,不多损什么)。
+    /// 失败一律 `None`(fail-open,页面自身不受影响)。
+    pub(crate) async fn spawn_arm_resolve(
+        &self,
+        tid: &chromiumoxide::cdp::browser_protocol::target::TargetId,
+    ) -> Option<(chromiumoxide::Page, super::browser_spawn_arm::SpawnArmConfig)> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let guard = match tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                self.inner.lock(),
+            )
+            .await
+            {
+                Ok(guard) => guard,
+                Err(_) => {
+                    if std::time::Instant::now() >= deadline {
+                        tracing::debug!("派生页早期武装:3s 未取得管理锁(open 在飞),交由 adopt 收编兜底");
+                        return None;
+                    }
+                    continue;
+                }
+            };
+            let Some(browser) = guard.browser.as_ref() else {
+                return None;
+            };
+            let cfg = guard.spawn_arm_config();
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                browser.get_page(tid.clone()),
+            )
+            .await
+            {
+                Ok(Ok(page)) => return Some((page, cfg)),
+                Ok(Err(_)) => {
+                    // 未 attach 完(NotFound)或 target 已销毁 —— 释放锁后重试到界。
+                    drop(guard);
+                    if std::time::Instant::now() >= deadline {
+                        tracing::debug!("派生页早期武装:3s 内未取得页面句柄(target 可能已关闭)");
+                        return None;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                Err(_) => {
+                    tracing::warn!("派生页早期武装:get_page 超时(浏览器 handler 可能已卡死),放弃本页");
+                    return None;
+                }
+            }
+        }
+    }
 
     /// 当前生效的反检测档位（第 174 轮）。connect 模式（接管用户浏览器）恒
     /// 与实例期望态无关地零注入，但档位回报照旧，供对账。
@@ -2527,29 +2683,41 @@ impl BrowserManager {
     /// 3. 回报 `deduped`/`dropped`,由工具层全量透出(旧实现只回 `spawned.first()` 一个,
     ///    Agent 不知道有堆积)。
     pub async fn adopt_spawned_pages_ex(&self) -> AdoptOutcome {
-        let mut inner = self.inner.lock().await;
+        // 第 180 轮:三段式改排(快照-武装-登记)—— 原「全程持锁」把噪声复查的
+        // 500ms 等待与逐页武装(含可能阻塞在 provisional 导航上的 UA 探测,实测
+        // ~1.4s)全部压在管理锁上,既饿死派生页早期武装 watcher(`spawn_arm_resolve`
+        // 排队等锁),也把并行的其它页面操作串在后面(与 `list_pages` 的
+        // 「快照-探测-清理三段式」同一纪律)。语义保持:分类在锁内快照上完成,
+        // 登记回到锁内并加 target 去重守卫,并行 adopt 不会重复登记同一 target。
         let mut outcome = AdoptOutcome::default();
-        let Some(browser) = inner.browser.as_ref() else {
-            return outcome;
-        };
-        if inner.connect_mode {
-            // 接管模式:浏览器归用户所有,laew 不认领也不关闭任何未知页面。
-            return outcome;
-        }
-        let Ok(pages) = browser.pages().await else {
-            return outcome;
-        };
-        let known: std::collections::HashSet<String> =
-            inner.pages.values().map(|e| e.target_id.clone()).collect();
-        // 注册表内已知页的 URL 身份键(同页去重基准)。fail-open:取不到 URL 跳过。
-        let mut known_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for entry in inner.pages.values() {
-            if let Ok(Some(u)) = entry.page.url().await {
-                if let Some(k) = super::browser_noise::page_url_key(&u) {
-                    known_keys.insert(k);
+        // ---------- 阶段 1(锁内):扫描 + 分类基准 + 期望态快照 ----------
+        let (pages, known, mut known_keys, cfg, pages_len) = {
+            let inner = self.inner.lock().await;
+            let Some(browser) = inner.browser.as_ref() else {
+                return outcome;
+            };
+            if inner.connect_mode {
+                // 接管模式:浏览器归用户所有,laew 不认领也不关闭任何未知页面。
+                return outcome;
+            }
+            let Ok(pages) = browser.pages().await else {
+                return outcome;
+            };
+            let known: std::collections::HashSet<String> =
+                inner.pages.values().map(|e| e.target_id.clone()).collect();
+            // 注册表内已知页的 URL 身份键(同页去重基准)。fail-open:取不到 URL 跳过。
+            let mut known_keys: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for entry in inner.pages.values() {
+                if let Ok(Some(u)) = entry.page.url().await {
+                    if let Some(k) = super::browser_noise::page_url_key(&u) {
+                        known_keys.insert(k);
+                    }
                 }
             }
-        }
+            let cfg = inner.spawn_arm_config();
+            (pages, known, known_keys, cfg, inner.pages.len())
+        };
         let mut candidates: Vec<chromiumoxide::Page> = Vec::new();
         let mut noise: Vec<chromiumoxide::Page> = Vec::new();
         for page in pages {
@@ -2575,6 +2743,7 @@ impl BrowserManager {
             }
             candidates.push(page);
         }
+        // ---------- 阶段 2(锁外):噪声复查 + 逐页武装(全部 CDP) ----------
         // 给刚打开的窗口一次导航时间再复查,避免误杀 `target=_blank` 真页面。
         // 2026-10-12 闲鱼实测修正:原条件 `!candidates.is_empty()` 导致「只有新标签页
         // 一个候选」时不等待 —— 而点击商品链接打开的新 tab 初始正是新标签页,
@@ -2630,9 +2799,10 @@ impl BrowserManager {
         }
         // Tab 总量上限(2026-10-14):只丢弃**本次新候选**的超额部分,不碰既有工作页。
         // `LAEW_WEB_MAX_WINDOWS` 按 windowId 计额(同窗口多 Tab 不占额度),实测 12 个
-        // tab 一个上限都没触发,这里补 tab 维度。
+        // tab 一个上限都没触发,这里补 tab 维度。基准取阶段 1 快照(并行 adopt 的
+        // 登记由阶段 3 的去重守卫兜底,上限为建议性)。
         let max_tabs = max_tabs_from_env();
-        while inner.pages.len() + outcome.adopted.len() + candidates.len() > max_tabs {
+        while pages_len + outcome.adopted.len() + candidates.len() > max_tabs {
             if let Some(extra) = candidates.pop() {
                 let url = extra.url().await.ok().flatten().unwrap_or_default();
                 let _ = extra.close().await;
@@ -2641,6 +2811,7 @@ impl BrowserManager {
                 break;
             }
         }
+        let mut armed: Vec<(chromiumoxide::Page, String, EventBuffer)> = Vec::new();
         for page in candidates {
             let tid: String = page.target_id().clone().into();
             let events = EventBuffer::default();
@@ -2653,36 +2824,50 @@ impl BrowserManager {
             spawn_event_listeners(&page, events.clone()).await;
             // 第 169 轮:派生/adopt 新标签页同样装隐身覆写(connect 零注入不变)。
             // 第 174 轮:UA 清理同挂(无头档派生页同样不能带 HeadlessChrome 令牌)。
-            if !inner.connect_mode {
-                super::browser_ns::apply_ua_destealth(&page, inner.stealth).await;
-                super::browser_ns::inject_stealth(&page, inner.stealth).await;
+            // 第 180 轮:补 screen_sync —— 无头档派生页的 init 链覆盖不带 screen
+            // 字段,不补则 `outer > screen` 物理不可能硬判据常驻(watcher 早期武装
+            // 之外的第二道防线;两处幂等,先到后到零冲突)。
+            if !cfg.connect_mode {
+                super::browser_ns::apply_ua_destealth(&page, cfg.stealth).await;
+                super::browser_ns::inject_stealth(&page, cfg.stealth).await;
+                apply_screen_sync_override(&page, cfg.screen_sync).await;
             }
             // 第 100 轮:headed + highlight 时,派生/adopt 的新标签页同样注入蓝框。
-            if inner.highlight && matches!(inner.mode, BrowserMode::Headed) {
+            if cfg.highlight && matches!(cfg.mode, BrowserMode::Headed) {
                 inject_agent_highlight(&page).await;
             }
             // 第 143 轮:管控同理,派生新标签页按实例期望态注入 + 应用(三档)。
-            if !inner.connect_mode && matches!(inner.mode, BrowserMode::Headed) {
-                let cfg = inner.guard.clone();
-                super::browser_overlay::inject_agent_guard(&page, &cfg).await;
-                let _ = super::browser_overlay::apply_page_guard(&page, &cfg).await;
+            if !cfg.connect_mode && matches!(cfg.mode, BrowserMode::Headed) {
+                super::browser_overlay::inject_agent_guard(&page, &cfg.guard).await;
+                let _ = super::browser_overlay::apply_page_guard(&page, &cfg.guard).await;
             }
             // 第 152 轮:派生页同样按实例期望态挂上跟随器(否则新标签页不跟随)
-            if !inner.connect_mode && inner.auto_follow {
+            if !cfg.connect_mode && cfg.auto_follow {
                 super::browser_follow::install(&page, true).await;
                 let _ = super::browser_follow::set(&page, true).await;
             }
-            let id = new_page_id();
-            inner.pages.insert(
-                id.clone(),
-                PageEntry {
-                    page,
-                    target_id: tid,
-                    created_at: now_compact(),
-                    events,
-                },
-            );
-            outcome.adopted.push(id);
+            armed.push((page, tid, events));
+        }
+        // ---------- 阶段 3(锁内):登记注册表(target 去重守卫) ----------
+        {
+            let mut inner = self.inner.lock().await;
+            for (page, tid, events) in armed {
+                // 并行 adopt/自愈交错守卫:该 target 已被登记则跳过,不产生重复 page_id。
+                if inner.pages.values().any(|e| e.target_id == tid) {
+                    continue;
+                }
+                let id = new_page_id();
+                inner.pages.insert(
+                    id.clone(),
+                    PageEntry {
+                        page,
+                        target_id: tid,
+                        created_at: now_compact(),
+                        events,
+                    },
+                );
+                outcome.adopted.push(id);
+            }
         }
         outcome
     }
@@ -2726,6 +2911,9 @@ impl BrowserManager {
             }
             if let Some(handler) = inner.handler.take() {
                 handler.abort();
+            }
+            if let Some(watcher) = inner.spawn_arm.take() {
+                watcher.abort();
             }
             if let Some(child) = inner.watchdog.take() {
                 spawn_watchdog_reaper(child);
@@ -2826,6 +3014,9 @@ impl BrowserManager {
         }
         if let Some(handler) = inner.handler.take() {
             handler.abort();
+        }
+        if let Some(watcher) = inner.spawn_arm.take() {
+            watcher.abort();
         }
         if let Some(child) = inner.watchdog.take() {
             spawn_watchdog_reaper(child);

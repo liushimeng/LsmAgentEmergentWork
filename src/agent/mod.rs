@@ -24,6 +24,7 @@ pub mod browser_ns;
 pub mod browser_overlay;
 pub mod browser_perm;
 pub mod browser_reuse;
+pub(crate) mod browser_spawn_arm;
 pub mod browser_status;
 pub mod fingerprint;
 pub mod page_liveness;

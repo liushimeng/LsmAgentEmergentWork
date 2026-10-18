@@ -801,6 +801,28 @@ pub enum UaSweep {
     Full,
 }
 
+/// 无探针的 UA 字符串覆盖(第 180 轮):给**尚无可用执行上下文**的派生页在出生
+/// 时刻立即去令牌用 —— `Emulation.setUserAgentOverride` 只传字符串(等价
+/// [`UaSweep::StringOnly`] 语义:页面侧品牌表会被清空,须由落地后补全收口)。
+///
+/// 为什么不探测:派生 target 首个文档提交前 `Runtime.evaluate` 可能阻塞在
+/// provisional 导航上(实测 400ms+),探针式清理赶不上 document-start;而覆盖值
+/// 来自浏览器级 `getVersion` 的 UA 字符串(真值,只滤令牌零伪造)。
+pub async fn apply_ua_string_override(page: &chromiumoxide::Page, user_agent: &str) -> bool {
+    let params =
+        match chromiumoxide::cdp::browser_protocol::emulation::SetUserAgentOverrideParams::builder()
+            .user_agent(user_agent.to_string())
+            .build()
+    {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), page.execute(params)).await,
+        Ok(Ok(_))
+    )
+}
+
 /// 移除 UA 覆盖、恢复浏览器原生身份（第 178 轮）。
 ///
 /// 用途：`about:blank` 上只清得出 UA 字符串（非安全上下文读不到 Client Hints），

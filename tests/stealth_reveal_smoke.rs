@@ -337,6 +337,186 @@ async fn stealth_plugin_backfill_real_machine_diff_smoke() {
         .await;
 }
 
+/// **派生页首文档早期武装**（第 180 轮）。
+///
+/// 33 §六.1 的遗留:页面自己派生的新标签页(`<a target=_blank>` / `window.open` /
+/// `control(new_tab)`)此前要等 adopt(触发动作收尾)才被反检测处置。本用例在
+/// 无头档(hidden)点击 `target=_blank` 派生子页,对子页做「提交后武装」对账。
+///
+/// **判别性断言是落地后的 `sw == 1920x1080`**:chromiumoxide init 链对派生 target
+/// 的 `setDeviceMetricsOverride` 不带 screen 字段,而主分支的 adopt 序列**从不**补
+/// `apply_screen_sync_override` —— 主分支上派生页落地后 `screen` 恒为 `800x600`
+/// 无头默认值(`outer > screen` 物理不可能硬判据),本修复(watcher 提交时刻武装 +
+/// adopt 二道防线)后读到窗口尺寸。
+///
+/// **提交门(实测钉死,docs/MCP_Web_Use/34 §三)**:chromiumoxide 把页面句柄的全部
+/// 命令压在 target init 链之后,而 init 链要等 provisional 导航**提交**才完成
+/// (400ms/1500ms 双延迟实测:命令响应与提交同步)。因此子页 `<head>` 内联脚本
+/// (解析期 = 提交后即刻)读到的 `sw`/`ua` 仍是原生值 —— 这是经 chromiumoxide
+/// 通道的物理下限,断言只覆盖 `parse.wd`(launch 旗标浏览器级生效,恒 false);
+/// `parse.ua`/`parse.sw` 采集留作诊断数据不参与断言。提交后的一切(子资源请求/
+/// XHR/信标/后续文档)全部在处置之下:落地后 `ua` 干净、`sw` 已同步、符号命名空间
+/// 在场。
+///
+/// 子页响应刻意延迟 400ms:真实站点首文档的网络时延常态,给 watcher 与 adopt
+/// 的武装留出与真实世界同量级的窗口。
+#[tokio::test]
+#[ignore]
+async fn stealth_spawned_page_early_armed_smoke() {
+    let _guard = SMOKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("LAEW_BROWSER_WATCHDOG_EXE", env!("CARGO_BIN_EXE_laew"));
+    // 诊断期:打印 watcher/adopt 的时序日志(正式断言不依赖它)。
+    let _ = tracing_subscriber::fmt()
+        .with_target(false)
+        .with_env_filter("lsm_agent=debug")
+        .try_init();
+    // 两路由服务器:`/` 父页(带 target=_blank 锚点),`/child` 延迟 400ms 的子页。
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((mut socket, _)) => {
+                    tokio::spawn(async move {
+                        let mut buf = vec![0_u8; 4096];
+                        let mut read = 0;
+                        loop {
+                            match socket.read(&mut buf[read..]).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    read += n;
+                                    if buf[..read].windows(4).any(|w| w == b"\r\n\r\n")
+                                        || read == buf.len()
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        let head = String::from_utf8_lossy(&buf[..read]).to_string();
+                        let is_child = head.starts_with("GET /child");
+                        if is_child {
+                            // 首文档网络时延建模:给早期武装留出真实站点量级的窗口。
+                            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                        }
+                        let html: &str = if is_child {
+                            // 解析期取样:document-start 处置是否就位,只有这一次机会。
+                            r#"<html><head><script>
+window.__parseProbe = {
+  wd: navigator.webdriver,
+  ua: navigator.userAgent,
+  sw: screen.width + 'x' + screen.height
+};</script><title>child</title></head><body>child</body></html>"#
+                        } else {
+                            r#"<html><head><title>parent</title></head>
+<body><a id="sp" href="/child" target="_blank">go</a></body></html>"#
+                        };
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            html.len(),
+                            html
+                        );
+                        let _ = socket.write_all(resp.as_bytes()).await;
+                    });
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let base = format!("http://{addr}/");
+
+    // ① 无头档开父页(只有无头档才有 UA 令牌与 screen=800x600 默认值可对账)。
+    // 显式 stealth=hardened:单例浏览器的档位是进程级粘滞的(open(stealth=off) 的
+    // 其它用例先跑时,本用例会被继承 Off 而全部断言落空 —— 套件内顺序无关性)。
+    let out = McpWebUseTool
+        .execute(json!({
+            "action": "open", "url": base, "mode": "hidden", "guard": "locked",
+            "stealth": "hardened"
+        }))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    if v["code"] == 3001 {
+        return; // 本机未安装浏览器
+    }
+    assert_eq!(v["code"], 0, "hidden 档 open 应成功: {out}");
+    let parent_id = v["data"]["page_id"].as_str().unwrap().to_string();
+
+    // ② 点击 target=_blank 锚点派生子页(CDP Input 是可信输入,带用户激活,
+    //    不会被弹窗拦截)。响应携带 adopt 回传的 spawned_page_id。
+    let out = McpWebUseTool
+        .execute(json!({
+            "action": "control", "page_id": parent_id, "control_action": "click",
+            "params": {"selector": "#sp"}
+        }))
+        .await
+        .unwrap();
+    let v = data_of(&out);
+    assert_eq!(v["code"], 0, "click 应成功: {out}");
+    let mut child_id = v["data"]["spawned_page_id"].as_str().map(str::to_string);
+    // 兜底:偶尔 click 的 CDP 响应先于 target 创建返回,adopt 巡检扑空 —— `list`
+    // 只见**已收编**页面,恢复手段是再触发一次会巡检的动作(dispatch_event 在
+    // `action_may_spawn_page` 名单内,对 body 派发自定义事件无害),有界 5s。
+    if child_id.is_none() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while child_id.is_none() && std::time::Instant::now() < deadline {
+            let out = McpWebUseTool
+                .execute(json!({
+                    "action": "control", "page_id": parent_id, "control_action": "dispatch_event",
+                    "params": {"selector": "body", "type": "laew-smoke-probe"}
+                }))
+                .await
+                .unwrap();
+            let v = data_of(&out);
+            child_id = v["data"]["spawned_page_id"].as_str().map(str::to_string);
+        }
+    }
+    let child_id = child_id.expect("派生子页应被 adopt 收编回传 page_id");
+
+    // ③ 子页内取「解析期快照 + 当前读数 + 注入面对账」
+    let out = McpWebUseTool
+        .execute(json!({
+            "action": "control", "page_id": child_id, "control_action": "eval_js",
+            "params": {"expression":
+                "JSON.stringify({parse: window.__parseProbe, wd: navigator.webdriver, ua: navigator.userAgent, sw: screen.width + 'x' + screen.height, syms: Object.getOwnPropertySymbols(window).length})"}
+        }))
+        .await
+        .unwrap();
+    let out = data_of(&out);
+    assert_eq!(out["code"], 0, "eval_js 应成功: {out}");
+    let probe = out["data"]["result"].as_str().unwrap_or_default().to_string();
+    let p: Value = serde_json::from_str(&probe).unwrap_or(Value::Null);
+    assert!(!p.is_null(), "取派生页读数失败: {probe}");
+
+    // 解析期(parse)只有 webdriver 参与断言:launch 旗标 `--disable-blink-features=
+    // AutomationControlled` 浏览器级生效,派生页同样覆盖;`sw`/`ua` 受提交门约束
+    // (见用例文档注释),采集留作诊断数据。
+    assert_eq!(
+        p["parse"]["wd"],
+        json!(false),
+        "派生页解析期 webdriver 应已处置(launch 旗标浏览器级生效): {probe}"
+    );
+    // 判别性断言(落地后):screen 必须已同步 —— 主分支上 adopt 从不补 screen_sync,
+    // 派生页落地后恒读 800x600 无头默认值 → outer>screen 物理不可能硬判据。
+    assert_eq!(
+        p["sw"].as_str().unwrap_or(""),
+        "1920x1080",
+        "派生页落地后 screen 必须已同步(主分支为 800x600): {probe}"
+    );
+    assert!(
+        !p["ua"].as_str().unwrap_or("").contains("Headless"),
+        "派生页落地后 UA 不得带 HeadlessChrome 令牌: {probe}"
+    );
+    assert!(
+        p["syms"].as_u64().unwrap_or(0) >= 1,
+        "派生页应有符号命名空间(隐身脚本已注入): {probe}"
+    );
+
+    let _ = McpWebUseTool
+        .execute(json!({"action": "close", "page_id": "all"}))
+        .await;
+}
+
 /// 简版 HTML 服务器（本文件独立于 `web_use_smoke.rs`，故自带夹具）。
 async fn spawn_html_server(html: &'static str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
