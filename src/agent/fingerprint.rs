@@ -188,6 +188,16 @@ pub const PROBE_JS: &str = r#"JSON.stringify((() => {
           const it = navigator.plugins && navigator.plugins[Symbol.iterator] && navigator.plugins[Symbol.iterator]();
           if (it) { add('plugins_iter_next', it.next); add('plugins_iter_self', it[Symbol.iterator]); }
         } catch (e) {}
+        // 第 181 轮:补 chrome 三件套入口 —— 它们挂在**对象值**上,旧的
+        // `__adopt(window,'chrome')` 认领不到,跨档升级后正是这里吐源码。
+        try {
+          const c = window.chrome;
+          if (c) {
+            if (typeof c.csi === 'function') add('chrome_csi', c.csi);
+            if (typeof c.loadTimes === 'function') add('chrome_loadTimes', c.loadTimes);
+            if (c.app && typeof c.app.install === 'function') add('chrome_app_install', c.app.install);
+          }
+        } catch (e) {}
         return sites;
       } catch (e) { return null; }
     })(),
@@ -201,6 +211,87 @@ pub const PROBE_JS: &str = r#"JSON.stringify((() => {
     focus_visibility: (() => {
       try {
         return { visibility: document.visibilityState || '', has_focus: document.hasFocus() === true };
+      } catch (e) { return null; }
+    })(),
+    // ===================== 第 181 轮:体检面补齐(只观测,不回填) =====================
+    // 上面的探针表与 26 §一 表 1–10(我们**已处置**的项)一一对应;这里补的是风控
+    // 还会采、而我们既未处置也看不见的向量。本轮一律**只体检不改读数** ——
+    // 「被拦时如实上报并交还人工」的前提是看得见自己被拦在哪儿。
+    // 一律 fail-open:任何探测抛错返回 null,不告警不猜测。
+    // ① `Error().stack` 里的自动化令牌。真实 Chrome 的 stack 只有页面/V8 帧,
+    //    出现驱动或自动化框架名即硬证据(我们经 CDP 驱动不产生这些帧)。
+    stack_automation_tokens: (() => {
+      try {
+        const s = (new Error()).stack || '';
+        if (!s) return null;
+        const re = /\$cdc_|\$chrome_asyncScriptInfo|__puppeteer|__playwright|__nightmare|__selenium|_phantom|callPhantom|pptr|puppeteer|playwright/i;
+        return re.test(s);
+      } catch (e) { return null; }
+    })(),
+    // ② `document` 上的 chromedriver 系遗留。旧实现只扫 `window` 自有键,
+    //    document 这一侧完全是盲区。
+    document_automation_globals: (() => {
+      try {
+        const re = /^\$cdc_|\$chrome_asyncScriptInfo|__webdriver_|__driver_/i;
+        return Object.getOwnPropertyNames(document).filter((n) => re.test(n));
+      } catch (e) { return null; }
+    })(),
+    // ③ `window.chrome` 形态自证。真机 `Object.keys(chrome)` 恒为 `[app,csi,loadTimes]`,
+    //    在场却缺任一即非真 Chrome 形态(无头/被降级环境)。注意:**不检查
+    //    `chrome.runtime`** —— 175 轮真机实测全新 profile 的真机没有它。
+    chrome_shape: (() => {
+      try {
+        if (!window.chrome) return null;
+        return {
+          app: !!window.chrome.app,
+          csi: typeof window.chrome.csi === 'function',
+          load_times: typeof window.chrome.loadTimes === 'function'
+        };
+      } catch (e) { return null; }
+    })(),
+    // ④ `navigator.webdriver` 的**位置**自证。原生只挂在 `Navigator.prototype` 上,
+    //    实例自有属性恒 undefined;若 `getOwnPropertyDescriptor(navigator,'webdriver')`
+    //    非空,说明 defineProperty 打错了目标(改到实例上)—— 一行即可识破。
+    webdriver_own_property: (() => {
+      try {
+        return Object.getOwnPropertyDescriptor(navigator, 'webdriver') != null;
+      } catch (e) { return null; }
+    })(),
+    // ⑤ 指针/悬停媒体查询。桌面 UA 下 `(hover:hover)` 与 `(pointer:fine)` 双双 false
+    //    是无头环境的典型读数。**本轮只观测不回填** —— 是否属「无头误报」需真机
+    //    四档基线确认(见 35 §六.1)。
+    pointer_mq: (() => {
+      try {
+        const mq = (q) => { try { return !!(window.matchMedia && matchMedia(q).matches); } catch (e) { return null; } };
+        return { hover: mq('(hover:hover)'), fine: mq('(pointer:fine)') };
+      } catch (e) { return null; }
+    })(),
+    // ⑥ colorDepth / pixelDepth 一致性(真实浏览器二者恒等)。
+    color_depth: (() => {
+      try {
+        return { color: screen.colorDepth, pixel: screen.pixelDepth };
+      } catch (e) { return null; }
+    })(),
+    // ⑦ `screen.orientation` 存在性(现代 Chrome 恒有)。
+    screen_orientation: (() => {
+      try {
+        return { present: !!(screen.orientation && screen.orientation.type), type: (screen.orientation && screen.orientation.type) || '' };
+      } catch (e) { return null; }
+    })(),
+    // ⑧ 硬件参数可置信度。`hardwareConcurrency`/`deviceMemory` 为 0 是物理不可能
+    //    (真机恒 ≥1),已采集多年却从未判定 —— 这里补上判定并回报原值。
+    hardware_params: (() => {
+      try {
+        return {
+          hc: navigator.hardwareConcurrency || 0,
+          dm: (typeof navigator.deviceMemory === 'number') ? navigator.deviceMemory : null
+        };
+      } catch (e) { return null; }
+    })(),
+    // ⑨ `navigator.platform` 与 UA 声明的 OS 交叉一致性。
+    platform_ua: (() => {
+      try {
+        return { platform: navigator.platform || '', ua: navigator.userAgent || '' };
       } catch (e) { return null; }
     })()
   };
@@ -459,6 +550,161 @@ pub fn classify(fp: &Value) -> Vec<Value> {
             }));
         }
     }
+    // ===================== 第 181 轮:体检面补齐(只观测的向量) =====================
+    // 定级原则:**只有零假阳性的才进 HARD_CODES**。第 178 轮的教训是把推断当
+    // 硬判据会长年误报(focus_visibility / languages_frozen 都栽过),故新增项里
+    // 只有 stack 令牌与 document 级自动化遗留是「本机绝对不该出现」的硬证据,
+    // 其余一律 warn,等真机基线钉死再决定是否升级。
+    if fp.get("stack_automation_tokens").and_then(Value::as_bool) == Some(true) {
+        out.push(json!({
+            "code": "stack_trace_automation_tokens",
+            "advice": "Error().stack 命中自动化框架/驱动令牌(真实 Chrome 的 stack 只有页面/V8 帧,\
+                       本工具经 CDP 驱动也不产生这些帧)—— 属零假阳性硬证据;\
+                       处置:open(reuse_existing=true) 接管用户已登录的真实浏览器"
+        }));
+    }
+    if let Some(leaked) = fp.get("document_automation_globals").and_then(Value::as_array) {
+        if !leaked.is_empty() {
+            out.push(json!({
+                "code": "automation_doc_leak",
+                "advice": format!(
+                    "document 上存在 chromedriver 系遗留属性: {} —— 本工具经 CDP 驱动不产生这些键,\
+                     属零假阳性硬证据;处置:open(reuse_existing=true) 接管用户已登录的真实浏览器",
+                    leaked.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")
+                )
+            }));
+        }
+    }
+    // chrome 在场却缺三件套:真机 Object.keys(chrome) 恒为 [app,csi,loadTimes]。
+    // 只在**明确在场且缺项**时告警(chrome_shape 为 null = chrome 本就不存在/探测失败,
+    // fail-open 不告警)。
+    if let Some(cs) = fp.get("chrome_shape").filter(|v| !v.is_null()) {
+        let missing: Vec<&str> = vec![
+            (!cs.get("app").and_then(Value::as_bool).unwrap_or(false)).then_some("app"),
+            (!cs.get("csi").and_then(Value::as_bool).unwrap_or(false)).then_some("csi"),
+            (!cs.get("load_times").and_then(Value::as_bool).unwrap_or(false)).then_some("loadTimes"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if !missing.is_empty() {
+            out.push(json!({
+                "code": "chrome_api_incomplete",
+                "advice": format!(
+                    "window.chrome 在场却缺 {} —— 真机 Object.keys(chrome) 恒为 [app,csi,loadTimes],\
+                     缺项即非真 Chrome 形态(无头/被降级环境);处置:确认注入的是最新 \
+                     browser_ns::FIDELITY_JS ④(在场补全 + 缺失创建双分支);\
+                     注:chrome.runtime 不在检查之列(真机全新 profile 本就没有)",
+                    missing.join("/")
+                )
+            }));
+        }
+    }
+    // defineProperty 打错目标:原生 webdriver 只挂在 Navigator.prototype,
+    // 实例自有属性恒 undefined。非空即说明改到实例上,一行即可识破。
+    if fp.get("webdriver_own_property").and_then(Value::as_bool) == Some(true) {
+        out.push(json!({
+            "code": "webdriver_own_property",
+            "advice": "getOwnPropertyDescriptor(navigator,'webdriver') 非空 —— 原生该属性只挂在 \
+                       Navigator.prototype 上,实例自有属性恒 undefined;命中说明覆写打错了目标\
+                       (defineProperty 落到了实例),处置:确认注入的是最新 browser_ns::CORE_JS\
+                       (覆写 Navigator.prototype)"
+        }));
+    }
+    // 指针/悬停媒体查询:桌面 UA 下双 false 是无头典型读数。**只观测**——
+    // 是否属「无头误报」需真机四档基线确认后再决定是否回填(35 §六.1)。
+    if let Some(mq) = fp.get("pointer_mq").filter(|v| !v.is_null()) {
+        let hover = mq.get("hover").and_then(Value::as_bool);
+        let fine = mq.get("fine").and_then(Value::as_bool);
+        let desktop_ua = {
+            let ua = fp
+                .get("platform_ua")
+                .and_then(|p| p.get("ua"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let lower = ua.to_ascii_lowercase();
+            !ua.is_empty()
+                && !lower.contains("android")
+                && !lower.contains("iphone")
+                && !lower.contains("ipad")
+                && !lower.contains("mobile")
+        };
+        if desktop_ua && hover == Some(false) && fine == Some(false) {
+            out.push(json!({
+                "code": "pointer_media_headless",
+                "advice": "桌面 UA 下 (hover:hover) 与 (pointer:fine) 双双 false —— 无头环境典型读数\
+                           (真实桌面 Chrome 恒有鼠标指针);本轮只观测不回填,待真机基线确认;\
+                           关键站点优先 headed 可见模式或 open(reuse_existing=true)"
+            }));
+        }
+    }
+    if let Some(cd) = fp.get("color_depth").filter(|v| !v.is_null()) {
+        let c = cd.get("color").and_then(Value::as_u64);
+        let p = cd.get("pixel").and_then(Value::as_u64);
+        if c.is_some() && p.is_some() && c != p {
+            out.push(json!({
+                "code": "color_depth_mismatch",
+                "advice": format!(
+                    "screen.colorDepth({}) 与 screen.pixelDepth({}) 不一致 —— 真实浏览器二者恒等,\
+                     命中说明视口/设备度量覆盖把其中一个改坏了;本轮只观测",
+                    c.map(|v| v.to_string()).unwrap_or_default(),
+                    p.map(|v| v.to_string()).unwrap_or_default()
+                )
+            }));
+        }
+    }
+    if let Some(so) = fp.get("screen_orientation").filter(|v| !v.is_null()) {
+        if so.get("present").and_then(Value::as_bool) == Some(false) {
+            out.push(json!({
+                "code": "screen_orientation_missing",
+                "advice": "screen.orientation 缺失或无 type —— 现代 Chrome 恒有;\
+                           本轮只观测,待真机基线确认(部分无头档确实不暴露)"
+            }));
+        }
+    }
+    if let Some(hw) = fp.get("hardware_params").filter(|v| !v.is_null()) {
+        let hc = hw.get("hc").and_then(Value::as_u64).unwrap_or(0);
+        let dm = hw.get("dm").and_then(Value::as_u64);
+        if hc == 0 || dm == Some(0) {
+            out.push(json!({
+                "code": "hw_params_unset",
+                "advice": format!(
+                    "hardwareConcurrency={} deviceMemory={} —— 真机恒 ≥1,为 0 是物理不可能;\
+                     命中说明环境被降级/字段被抹;本轮只观测",
+                    hc,
+                    dm.map(|v| v.to_string()).unwrap_or_else(|| "null".into())
+                )
+            }));
+        }
+    }
+    // platform 与 UA 声明的 OS 交叉不一致(如 platform=Linux 而 UA 写 Windows NT)。
+    if let Some(pu) = fp.get("platform_ua").filter(|v| !v.is_null()) {
+        let plat = pu.get("platform").and_then(Value::as_str).unwrap_or("");
+        let ua = pu.get("ua").and_then(Value::as_str).unwrap_or("");
+        let mismatch = (!plat.is_empty() && !ua.is_empty()) && {
+            let plat_l = plat.to_ascii_lowercase();
+            let ua_l = ua.to_ascii_lowercase();
+            // navigator.platform 的合法取值只有 Win32/Win64/MacIntel/MacPPC/Linux …
+            // 用 starts_with 而非 contains:`darwin` 里也含 "win",contains 会误判。
+            let plat_win = plat_l.starts_with("win");
+            let plat_mac = plat_l.starts_with("mac");
+            let plat_linux = plat_l.starts_with("linux") && !plat_l.contains("android");
+            let ua_win = ua_l.contains("windows nt");
+            let ua_mac = ua_l.contains("macintosh") || ua_l.contains("mac os x");
+            let ua_linux = ua_l.contains("linux") && !ua_l.contains("android");
+            (plat_win && !ua_win) || (plat_mac && !ua_mac) || (plat_linux && !ua_linux)
+        };
+        if mismatch {
+            out.push(json!({
+                "code": "platform_ua_mismatch",
+                "advice": format!(
+                    "navigator.platform({plat}) 与 UA 声明的 OS 不一致 —— 真实浏览器二者自洽,\
+                     命中说明 UA/Client Hints 覆盖与 platform 只改了一侧;\
+                     处置:确认 UA 去令牌走 browser_ns::apply_ua_destealth(只滤品牌,不动 platform)"
+                )
+            }));
+        }
+    }
     out
 }
 
@@ -467,6 +713,11 @@ pub fn classify(fp: &Value) -> Vec<Value> {
 ///
 /// 第 178 轮：`focus_visibility_mismatch` 已**移出**该集合（真机四档实测证伪，
 /// 见 `classify` 末尾注释）。
+///
+/// 第 181 轮新增两条 —— 只收「零假阳性」的硬证据（stack 令牌 / document 级
+/// 自动化遗留）；同批新增的 `chrome_api_incomplete` / `pointer_media_headless` 等
+/// 一律先停在 `warn`，等真机基线钉死再决定是否升级（178 轮教训：把推断当硬判据
+/// 会长年误报）。
 const HARD_CODES: &[&str] = &[
     "webdriver_true",
     "headless_ua",
@@ -475,6 +726,16 @@ const HARD_CODES: &[&str] = &[
     "screen_geometry_impossible",
     "screen_headless_default",
     "plugin_shape_mismatch",
+    "stack_trace_automation_tokens",
+    "automation_doc_leak",
+];
+
+/// 「我们自己制造的破绽」类告警 —— 这些只反映**注入形态是否正确**，
+/// 与环境是否像真浏览器无关。在**保真档**下命中属该档语义（它本来就不改函数身份），
+/// 不应计入 `risk_tier`；在**侵入式档**下命中才是登记表漏网的真故障。
+const MODE_DESIGN_CODES: &[&str] = &[
+    "patched_functions_visible",
+    "patched_function_source_visible",
 ];
 
 /// 环境风险档（`ok` / `warn` / `high`）——把一长串 `suspicious` 收敛成**一个可执行信号**
@@ -495,12 +756,51 @@ pub fn risk_tier(susp: &[Value]) -> &'static str {
     }
 }
 
+/// 该告警码是否属于「档位设计取舍」而非环境缺陷（见 [`MODE_DESIGN_CODES`]）。
+pub fn is_mode_design_code(code: &str) -> bool {
+    MODE_DESIGN_CODES.contains(&code)
+}
+
 /// 组装完整 `data.fingerprint` 响应段(健康环境也返回,供人工/QC 对账)。
-pub fn build(fp: &Value) -> Value {
-    let susp = classify(fp);
-    let tier = risk_tier(&susp);
+///
+/// 第 181 轮起接收**当前生效反检测档位**做口径分流（见 35 §2.3）：
+/// - **保真档**：`patched_*` 两类告警是该档语义（本就不改函数身份），标
+///   `by_design: true` 且**不计入 `risk_tier`** —— 否则非侵入式档常年被它们抬成
+///   `warn`，真正值得看的 `webgl_default_strings` / `automation_global_leak` 反被淹没；
+/// - **侵入式档**：同类命中是登记表漏网的真故障，正常计入；
+/// - **关闭档**：全部照常计入（排障对照要看全貌）。
+pub fn build(fp: &Value, mode: crate::agent::stealth::StealthMode) -> Value {
+    use crate::agent::stealth::StealthMode;
+    let mut susp = classify(fp);
+    let exclude_design = mode == StealthMode::Fidelity;
+    if exclude_design {
+        for s in susp.iter_mut() {
+            if s.get("code")
+                .and_then(Value::as_str)
+                .is_some_and(is_mode_design_code)
+            {
+                if let Some(obj) = s.as_object_mut() {
+                    obj.insert("by_design".to_string(), json!(true));
+                }
+            }
+        }
+    }
+    let tier_src: Vec<Value> = if exclude_design {
+        susp.iter()
+            .filter(|s| {
+                !s.get("code")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_mode_design_code)
+            })
+            .cloned()
+            .collect()
+    } else {
+        susp.clone()
+    };
+    let tier = risk_tier(&tier_src);
     json!({
         "risk_tier": tier,
+        "mode_design_excluded": exclude_design,
         "webdriver": fp.get("webdriver").cloned().unwrap_or(Value::Null),
         "webgl": fp.get("webgl").cloned().unwrap_or(Value::Null),
         "plugins": fp.get("plugins").cloned().unwrap_or(Value::Null),
@@ -520,6 +820,16 @@ pub fn build(fp: &Value) -> Value {
         "injected_ns_keys": fp.get("injected_ns_keys").cloned().unwrap_or(Value::Null),
         "injected_ns_symbols": fp.get("injected_ns_symbols").cloned().unwrap_or(Value::Null),
         "ns_symbol_present": fp.get("ns_symbol_present").cloned().unwrap_or(Value::Null),
+        // 第 181 轮:体检面补齐(只观测项,原值回报供人工/QC 对账)
+        "stack_automation_tokens": fp.get("stack_automation_tokens").cloned().unwrap_or(Value::Null),
+        "document_automation_globals": fp.get("document_automation_globals").cloned().unwrap_or(Value::Null),
+        "chrome_shape": fp.get("chrome_shape").cloned().unwrap_or(Value::Null),
+        "webdriver_own_property": fp.get("webdriver_own_property").cloned().unwrap_or(Value::Null),
+        "pointer_mq": fp.get("pointer_mq").cloned().unwrap_or(Value::Null),
+        "color_depth": fp.get("color_depth").cloned().unwrap_or(Value::Null),
+        "screen_orientation": fp.get("screen_orientation").cloned().unwrap_or(Value::Null),
+        "hardware_params": fp.get("hardware_params").cloned().unwrap_or(Value::Null),
+        "platform_ua": fp.get("platform_ua").cloned().unwrap_or(Value::Null),
         "suspicious": susp,
         "note": "risk_tier=high 表示环境在风控眼里已是硬判据级别,继续在本环境调参收益极低,\
                  应直接 open(reuse_existing=true) 接管用户已登录的真实浏览器;\
@@ -527,13 +837,17 @@ pub fn build(fp: &Value) -> Value {
                  第 179 轮起注入层窗口面 API 收敛到一个 symbol 命名空间对象:\
                  injected_ns_keys 应为 0(非零=渲染链路倒退,命中会给出 injected_ns_string_keys),\
                  injected_ns_symbols 应为 1、ns_symbol_present 应为 true(裸环境/stealth=off 时为 0/false)。\
-                 focus_visibility 自第 178 轮起只回报不判定(真机复核:真实用户窗口被遮挡时同样是 visible+无焦点)"
+                 focus_visibility 自第 178 轮起只回报不判定(真机复核:真实用户窗口被遮挡时同样是 visible+无焦点)。\
+                 第 181 轮:体检面扩到 20 项(见 docs/MCP_Web_Use/35);其中 stack_trace_automation_tokens 与 \
+                 automation_doc_leak 是零假阳性硬证据,其余新增项一律只观测不回填。\
+                 mode_design_excluded=true(保真档)时 patched_* 两类属该档设计取舍,标 by_design 且不计入 risk_tier"
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::stealth::StealthMode;
 
     fn fp(webgl: Value, extra: Value) -> Value {
         let mut v = json!({
@@ -725,7 +1039,7 @@ mod tests {
     fn parse_与build() {
         let raw = r#"{"webdriver":false,"webgl":{"ok":true,"unmasked":true,"vendor":"Google Inc. (Apple)","renderer":"ANGLE (Apple)"},"plugins":5,"languages":2,"chrome_runtime":true}"#;
         let v = parse(raw).unwrap();
-        let b = build(&v);
+        let b = build(&v, StealthMode::Hardened);
         assert_eq!(b["webdriver"], json!(false));
         assert!(b["suspicious"].as_array().unwrap().is_empty());
         assert!(b["note"].as_str().unwrap().contains("reuse_existing"));
@@ -828,7 +1142,7 @@ mod tests {
     fn 自证项回报到build() {
         let raw = r#"{"languages_frozen":false,"iterator_self_iterable":"function"}"#;
         let v = parse(raw).unwrap();
-        let b = build(&v);
+        let b = build(&v, StealthMode::Hardened);
         assert_eq!(b["languages_frozen"], json!(false));
         assert_eq!(b["iterator_self_iterable"], json!("function"));
     }
@@ -915,7 +1229,7 @@ mod tests {
             "焦点可见性判据已真机证伪,不得留在 HARD_CODES"
         );
         // 字段本身仍要回报(供人工/QC 诊断)
-        let b = build(&fp(base, json!({"focus_visibility": {"visibility": "visible", "has_focus": false}})));
+        let b = build(&fp(base, json!({"focus_visibility": {"visibility": "visible", "has_focus": false}})), StealthMode::Hardened);
         assert_eq!(b["focus_visibility"]["has_focus"], json!(false));
     }
 
@@ -948,7 +1262,7 @@ mod tests {
             "focus_visibility":{"visibility":"visible","has_focus":false},
             "injected_ns_keys":0,"injected_ns_symbols":1,"ns_symbol_present":true,
             "pdf_viewer_enabled":true}"#;
-        let b = build(&parse(raw).unwrap());
+        let b = build(&parse(raw).unwrap(), StealthMode::Hardened);
         assert_eq!(b["automation_globals"], json!([]));
         assert_eq!(b["patched_fn_leak"], json!(["permissions_query"]));
         assert_eq!(b["injected_ns_keys"], json!(0));
@@ -1032,5 +1346,246 @@ mod tests {
         // 探针源码里必须已是修正后的形态(防回归)
         assert!(PROBE_JS.contains(r"/^__lzn[0-9a-f]{8}/"));
         assert!(!PROBE_JS.contains(r"/^__lz[0-9a-f]{8}/"));
+    }
+
+    // ===================== 第 181 轮:体检面补齐 =====================
+
+    /// 新增探针必须真的在 `PROBE_JS` 里 —— 否则字段恒 null、告警恒不触发,
+    /// 白采集(第 178 轮 `injected_ns_keys` 正则死自证的同类教训)。
+    #[test]
+    fn 新增探针全部在册() {
+        for key in [
+            "stack_automation_tokens",
+            "document_automation_globals",
+            "chrome_shape",
+            "webdriver_own_property",
+            "pointer_mq",
+            "color_depth",
+            "screen_orientation",
+            "hardware_params",
+            "platform_ua",
+        ] {
+            assert!(
+                PROBE_JS.contains(key),
+                "探针字段 {key} 必须出现在 PROBE_JS(否则恒 null 白采集)"
+            );
+        }
+    }
+
+    #[test]
+    fn stack令牌是硬判据() {
+        let v = fp(healthy_webgl(), json!({"stack_automation_tokens": true}));
+        assert!(codes(&v).contains(&"stack_trace_automation_tokens".to_string()));
+        assert_eq!(risk_tier(&classify(&v)), "high", "stack 令牌属零假阳性硬证据");
+        // fail-open:缺测量(null)不得告警
+        let v2 = fp(healthy_webgl(), json!({"stack_automation_tokens": null}));
+        assert!(!codes(&v2).contains(&"stack_trace_automation_tokens".to_string()));
+    }
+
+    #[test]
+    fn document级自动化遗留是硬判据() {
+        let v = fp(
+            healthy_webgl(),
+            json!({"document_automation_globals": ["$cdc_ado9po7621af"]}),
+        );
+        assert!(codes(&v).contains(&"automation_doc_leak".to_string()));
+        assert_eq!(risk_tier(&classify(&v)), "high");
+        // 空数组 = 干净
+        let v2 = fp(healthy_webgl(), json!({"document_automation_globals": []}));
+        assert!(!codes(&v2).contains(&"automation_doc_leak".to_string()));
+    }
+
+    #[test]
+    fn chrome三件套缺失命中但只warn() {
+        // 在场但缺 loadTimes
+        let v = fp(
+            healthy_webgl(),
+            json!({"chrome_shape": {"app": true, "csi": true, "load_times": false}}),
+        );
+        let c = codes(&v);
+        assert!(c.contains(&"chrome_api_incomplete".to_string()), "{c:?}");
+        assert_eq!(risk_tier(&classify(&v)), "warn", "真机基线钉死前一律不上硬判据");
+        // 三件套齐全 = 干净
+        let v2 = fp(
+            healthy_webgl(),
+            json!({"chrome_shape": {"app": true, "csi": true, "load_times": true}}),
+        );
+        assert!(!codes(&v2).contains(&"chrome_api_incomplete".to_string()));
+        // chrome 本就不存在(null) = fail-open 不告警
+        let v3 = fp(healthy_webgl(), json!({"chrome_shape": null}));
+        assert!(!codes(&v3).contains(&"chrome_api_incomplete".to_string()));
+    }
+
+    #[test]
+    fn webdriver落在实例自有属性即命中() {
+        let v = fp(healthy_webgl(), json!({"webdriver_own_property": true}));
+        assert!(codes(&v).contains(&"webdriver_own_property".to_string()));
+        let v2 = fp(healthy_webgl(), json!({"webdriver_own_property": false}));
+        assert!(!codes(&v2).contains(&"webdriver_own_property".to_string()));
+        // 缺测量 fail-open
+        let v3 = fp(healthy_webgl(), json!({}));
+        assert!(!codes(&v3).contains(&"webdriver_own_property".to_string()));
+    }
+
+    #[test]
+    fn 桌面UA下指针媒体双false命中() {
+        let v = fp(
+            healthy_webgl(),
+            json!({
+                "pointer_mq": {"hover": false, "fine": false},
+                "platform_ua": {"platform": "Win32", "ua": "Mozilla/5.0 (Windows NT 10.0) Chrome/155.0.0.0"}
+            }),
+        );
+        assert!(codes(&v).contains(&"pointer_media_headless".to_string()));
+        // 移动 UA 不误伤
+        let v2 = fp(
+            healthy_webgl(),
+            json!({
+                "pointer_mq": {"hover": false, "fine": false},
+                "platform_ua": {"platform": "Linux armv81", "ua": "Mozilla/5.0 (Linux; Android 14) Mobile Safari"}
+            }),
+        );
+        assert!(!codes(&v2).contains(&"pointer_media_headless".to_string()));
+        // 有鼠标 = 干净
+        let v3 = fp(
+            healthy_webgl(),
+            json!({
+                "pointer_mq": {"hover": true, "fine": true},
+                "platform_ua": {"platform": "Win32", "ua": "Mozilla/5.0 (Windows NT 10.0) Chrome/155.0.0.0"}
+            }),
+        );
+        assert!(!codes(&v3).contains(&"pointer_media_headless".to_string()));
+    }
+
+    #[test]
+    fn 颜色深度不一致与方向缺失与硬件参数() {
+        let v = fp(
+            healthy_webgl(),
+            json!({
+                "color_depth": {"color": 24, "pixel": 30},
+                "screen_orientation": {"present": false, "type": ""},
+                "hardware_params": {"hc": 0, "dm": null}
+            }),
+        );
+        let c = codes(&v);
+        assert!(c.contains(&"color_depth_mismatch".to_string()), "{c:?}");
+        assert!(c.contains(&"screen_orientation_missing".to_string()), "{c:?}");
+        assert!(c.contains(&"hw_params_unset".to_string()), "{c:?}");
+        // 一致 / 齐全 = 干净
+        let v2 = fp(
+            healthy_webgl(),
+            json!({
+                "color_depth": {"color": 24, "pixel": 24},
+                "screen_orientation": {"present": true, "type": "landscape-primary"},
+                "hardware_params": {"hc": 16, "dm": 8}
+            }),
+        );
+        let c2 = codes(&v2);
+        assert!(!c2.contains(&"color_depth_mismatch".to_string()), "{c2:?}");
+        assert!(!c2.contains(&"screen_orientation_missing".to_string()), "{c2:?}");
+        assert!(!c2.contains(&"hw_params_unset".to_string()), "{c2:?}");
+    }
+
+    #[test]
+    fn platform与UA交叉不一致命中() {
+        let v = fp(
+            healthy_webgl(),
+            json!({"platform_ua": {"platform": "Linux x86_64", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64) Chrome/155"}}),
+        );
+        assert!(codes(&v).contains(&"platform_ua_mismatch".to_string()));
+        // 自洽 = 干净
+        let v2 = fp(
+            healthy_webgl(),
+            json!({"platform_ua": {"platform": "Win32", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64) Chrome/155"}}),
+        );
+        assert!(!codes(&v2).contains(&"platform_ua_mismatch".to_string()));
+    }
+
+    /// 保真档下「改过可见」是该档设计取舍:标 `by_design` 且**不计入** risk_tier,
+    /// 否则非侵入式档常年被它们抬成 warn,把真正值得看的硬信号淹掉。
+    #[test]
+    fn 保真档下改过可见属设计取舍不抬档() {
+        let v = fp(healthy_webgl(), json!({"patched_fn_leak": ["permissions_query"]}));
+        let hard = build(&v, StealthMode::Hardened);
+        assert_eq!(hard["risk_tier"], "warn", "侵入式档同类命中是登记表漏网,应计入");
+        assert_eq!(hard["mode_design_excluded"], json!(false));
+        assert!(
+            hard["suspicious"][0].get("by_design").is_none(),
+            "侵入式档不该打 by_design 标"
+        );
+
+        let fid = build(&v, StealthMode::Fidelity);
+        assert_eq!(
+            fid["risk_tier"], "ok",
+            "保真档下 patched_* 属设计取舍,不得抬 risk_tier:{fid}"
+        );
+        assert_eq!(fid["mode_design_excluded"], json!(true));
+        assert_eq!(
+            fid["suspicious"][0]["by_design"], json!(true),
+            "仍要回报,但标明属设计取舍:{fid}"
+        );
+
+        // off 档:排障对照要看全貌,照常计入
+        let off = build(&v, StealthMode::Off);
+        assert_eq!(off["risk_tier"], "warn");
+        assert_eq!(off["mode_design_excluded"], json!(false));
+    }
+
+    /// 保真档的口径分流**只**作用于设计取舍类告警,真正的环境硬缺陷照常升 high。
+    #[test]
+    fn 保真档仍会因真缺陷升high() {
+        let v = fp(healthy_webgl(), json!({
+            "patched_fn_leak": ["chrome_csi"],
+            "stack_automation_tokens": true
+        }));
+        let fid = build(&v, StealthMode::Fidelity);
+        assert_eq!(fid["risk_tier"], "high", "stack 令牌不受口径分流影响:{fid}");
+    }
+
+    /// 硬判据集合:只收零假阳性项。第 181 轮新增的两条之外,同批的
+    /// `chrome_api_incomplete` / `pointer_media_headless` 等**不得**进集合
+    /// (178 轮教训:把推断当硬判据会长年误报)。
+    #[test]
+    fn 硬判据集合只收零假阳性() {
+        for c in [
+            "stack_trace_automation_tokens",
+            "automation_doc_leak",
+            "webdriver_true",
+            "headless_ua",
+        ] {
+            assert!(HARD_CODES.contains(&c), "{c} 应在硬判据集合");
+        }
+        for c in [
+            "chrome_api_incomplete",
+            "pointer_media_headless",
+            "color_depth_mismatch",
+            "screen_orientation_missing",
+            "hw_params_unset",
+            "platform_ua_mismatch",
+            "webdriver_own_property",
+            "patched_function_source_visible",
+        ] {
+            assert!(
+                !HARD_CODES.contains(&c),
+                "{c} 真机基线钉死前不得进硬判据集合"
+            );
+        }
+    }
+
+    /// chrome 自证入口必须覆盖三件套 —— 否则登记漏网在 data.fingerprint 里点不出名。
+    #[test]
+    fn chrome自证入口在册() {
+        for key in ["chrome_csi", "chrome_loadTimes", "chrome_app_install"] {
+            assert!(
+                PROBE_JS.contains(key),
+                "patched_fn_leak 自证入口 {key} 必须在册"
+            );
+        }
+    }
+
+    fn healthy_webgl() -> Value {
+        json!({"ok": true, "unmasked": true,
+               "vendor": "Google Inc. (Apple)",
+               "renderer": "ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified)"})
     }
 }

@@ -877,7 +877,10 @@ pub(super) async fn attach_fingerprint(data: &mut Value, page_id: &str) {
         _ => return,
     };
     if let Some(fp) = crate::agent::fingerprint::parse(raw.as_str().unwrap_or_default()) {
-        data["fingerprint"] = crate::agent::fingerprint::build(&fp);
+        // 第 181 轮:体检口径按**当前生效档**分流(35 §2.3)。保真档下「改过可见」
+        // 是该档设计取舍,不该抬 risk_tier;侵入式档同类命中才是登记表漏网。
+        let mode = BrowserManager::global().stealth_mode().await;
+        data["fingerprint"] = crate::agent::fingerprint::build(&fp, mode);
     }
 }
 

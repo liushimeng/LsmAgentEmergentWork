@@ -1140,6 +1140,61 @@ async fn stealth_selfcheck_smoke() {
         "缺省 hardened 档必须把被改写函数的身份原生化:{fid_src}"
     );
 
+    // ⑩b 第 181 轮:嵌套对象里的函数同样必须原生化。chrome 三件套挂在**对象值**上,
+    //     旧的 `__adopt(window,'chrome')` 认领不到它们 —— 这里是本轮核心回归点。
+    let chrome_src = eval(
+        r#"JSON.stringify({
+            csi: (function(){ try { return Function.prototype.toString.call(window.chrome.csi); }
+                              catch(e){ return 'err'; } })(),
+            loadTimes: (function(){ try { return Function.prototype.toString.call(window.chrome.loadTimes); }
+                                    catch(e){ return 'err'; } })(),
+            keys: window.chrome ? Object.keys(window.chrome).sort().join(',') : ''
+        })"#
+            .into(),
+    )
+    .await;
+    let cs: Value = serde_json::from_str(&chrome_src).unwrap_or(Value::Null);
+    assert!(
+        cs["csi"].as_str().unwrap_or("").contains("[native code]"),
+        "chrome.csi 的身份必须原生化(嵌套函数认领回归):{chrome_src}"
+    );
+    assert!(
+        cs["loadTimes"].as_str().unwrap_or("").contains("[native code]"),
+        "chrome.loadTimes 的身份必须原生化(嵌套函数认领回归):{chrome_src}"
+    );
+    // 真机 Object.keys(chrome) 恒为 [app,csi,loadTimes](不含 runtime —— 全新 profile 真机没有)
+    assert_eq!(
+        cs["keys"], json!("app,csi,loadTimes"),
+        "chrome 三件套形态须与真机一致:{chrome_src}"
+    );
+
+    // ⑩c 第 181 轮:webdriver 必须挂在 Navigator.prototype 而非实例自有属性上
+    //     (原生实例自有属性恒 undefined,落错位置一行即可识破)。
+    let wd_own = eval(
+        "String(Object.getOwnPropertyDescriptor(navigator, 'webdriver') != null)".into(),
+    )
+    .await;
+    assert_eq!(
+        wd_own, "false",
+        "navigator 不得有自有 webdriver 属性(应只挂在 Navigator.prototype)"
+    );
+
+    // ⑩d 第 181 轮:本环境不得出现零假阳性硬证据(stack 令牌 / document 级遗留)
+    let hard2: Vec<String> = v["data"]["fingerprint"]["suspicious"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x["code"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    for c in ["stack_trace_automation_tokens", "automation_doc_leak"] {
+        assert!(
+            !hard2.contains(&c.to_string()),
+            "干净环境不得命中零假阳性硬证据 {c}:{hard2:?}"
+        );
+    }
+
     // ⑪ 升侵入式档:被改写函数身份原生化(含 toString 自反闭合)
     let up = McpWebUseTool
         .execute(json!({
@@ -1828,7 +1883,16 @@ async fn stealth_native_shape_baseline_smoke() {
                   plugin_proto: Object.getOwnPropertyNames(Plugin.prototype),\
                   mime_type_array_proto: Object.getOwnPropertyNames(MimeTypeArray.prototype),\
                   plugin_array_proto: Object.getOwnPropertyNames(PluginArray.prototype),\
-                  mime_type_proto: Object.getOwnPropertyNames(MimeType.prototype)\
+                  mime_type_proto: Object.getOwnPropertyNames(MimeType.prototype),\
+                  chrome_keys: window.chrome ? Object.keys(window.chrome).sort() : null,\
+                  webdriver_own: Object.getOwnPropertyDescriptor(navigator, 'webdriver') != null,\
+                  webdriver_on_proto: Object.getOwnPropertyDescriptor(Navigator.prototype, 'webdriver') != null,\
+                  color_eq_pixel: screen.colorDepth === screen.pixelDepth,\
+                  color_depth: screen.colorDepth,\
+                  orientation_present: !!(screen.orientation && screen.orientation.type),\
+                  pointer_mq: { hover: matchMedia('(hover:hover)').matches, fine: matchMedia('(pointer:fine)').matches },\
+                  hw_concurrency: navigator.hardwareConcurrency || 0,\
+                  languages_frozen: Object.isFrozen(navigator.languages || [])\
                 })"}
         }))
         .await
@@ -1857,5 +1921,42 @@ async fn stealth_native_shape_baseline_smoke() {
         shape["plugin_array_proto"],
         serde_json::json!(["length", "item", "namedItem", "refresh", "constructor"]),
         "PluginArray.prototype 有 refresh(基线变化): {shape}"
+    );
+
+    // ===== 第 181 轮:新增形态基线(裸环境读数 = 原生真值) =====
+    // 真机 `Object.keys(chrome)` 恒为 [app,csi,loadTimes] —— 不含 runtime
+    // (全新 profile 的真机没有,补一个空 runtime 即违反「不伪造」铁律)。
+    assert_eq!(
+        shape["chrome_keys"],
+        serde_json::json!(["app", "csi", "loadTimes"]),
+        "chrome 三件套形态基线变化(请重新核实,勿据 mock 编造): {shape}"
+    );
+    // webdriver 只挂在 Navigator.prototype;实例自有属性恒 undefined
+    assert_eq!(
+        shape["webdriver_own"], serde_json::json!(false),
+        "navigator 实例不得有自有 webdriver(基线变化): {shape}"
+    );
+    assert_eq!(
+        shape["webdriver_on_proto"], serde_json::json!(true),
+        "Navigator.prototype 应有 webdriver 存取器(基线变化): {shape}"
+    );
+    // colorDepth 与 pixelDepth 真实浏览器恒等
+    assert_eq!(
+        shape["color_eq_pixel"], serde_json::json!(true),
+        "colorDepth 应等于 pixelDepth(基线变化): {shape}"
+    );
+    assert_eq!(
+        shape["languages_frozen"], serde_json::json!(true),
+        "navigator.languages 原生即冻结(178 轮方向修正的基线): {shape}"
+    );
+    // 以下三条**只记录不判定** —— 无头/有头读数不同,是否属「无头误报」
+    // 待四档实测(35 §六.1),在那之前不得据推断把它们升级成告警。
+    println!(
+        "[基线·只记录] orientation_present={} pointer_mq={:?} hw_concurrency={} color_depth={}",
+        shape["orientation_present"], shape["pointer_mq"], shape["hw_concurrency"], shape["color_depth"]
+    );
+    assert!(
+        shape["hw_concurrency"].as_u64().unwrap_or(0) >= 1,
+        "hardwareConcurrency 真机恒 ≥1(为 0 是物理不可能): {shape}"
     );
 }

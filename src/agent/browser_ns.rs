@@ -262,6 +262,32 @@ const PRELUDE_JS: &str = r#"
             __adopt(proto, Symbol.iterator);
         } catch (e) {}
     };
+    // 第 181 轮:嵌套函数认领(按类收口,不是补点)。`__adopt` 只认领「属性值本身
+    // 是函数 / 属性是 getter」,对**对象值里的自有函数**一个都认领不上 ——
+    // `FIDELITY_JS` ④ 造的 `window.chrome = {app, csi, loadTimes}` 正是这种形态,
+    // 于是 `__adopt(window, 'chrome')` 全数跳过:跨档升级(保真→侵入)后本轮 `__fd`
+    // 是全新表,`chrome.csi.toString()` 会吐出我们的源码。与第 177 轮修的迭代器
+    // 漏登记(`next`/自反方法每次现造、原型上无引用)同类,当时只补了迭代器这一条。
+    // 深度上限 2、只走自有属性名:够到 chrome 三件套与其子对象,又不会爬进
+    // 扩展注入的深层对象图。真机原生函数被认领是零可观测差异(其 toString 本就
+    // 报 [native code],登记表覆盖后返回同一串)。
+    const __adoptDeep = (obj, depth) => {
+        try {
+            if (!obj || typeof obj !== 'object' || (depth | 0) > 2) return;
+            const keys = Object.getOwnPropertyNames(obj);
+            for (let i = 0; i < keys.length; i++) {
+                try {
+                    const d = Object.getOwnPropertyDescriptor(obj, keys[i]);
+                    if (!d) continue;
+                    if (typeof d.get === 'function') reg(d.get, 'get ' + keys[i]);
+                    else if (typeof d.value === 'function') reg(d.value, keys[i]);
+                    else if (d.value && typeof d.value === 'object') {
+                        __adoptDeep(d.value, (depth | 0) + 1);
+                    }
+                } catch (e) {}
+            }
+        } catch (e) {}
+    };
     // 迭代器工厂:保真块与「重装迭代器」共用同一份实现,保证两侧产出的 next /
     // 自反方法永远在**当前这张表**里登记(第 177 轮)。
     const __mkIterator = (items) => {
@@ -303,7 +329,10 @@ const PRELUDE_JS: &str = r#"
             __adopt(Navigator.prototype, 'mimeTypes');
             __adopt(Navigator.prototype, 'languages');
             __adopt(Navigator.prototype, 'pdfViewerEnabled');
-            __adopt(window, 'chrome');
+            // 第 181 轮:chrome 走深度认领。旧的 `__adopt(window,'chrome')` 只看
+            // 「chrome 本身是不是函数」—— 它是对象,于是三件套(csi/loadTimes/app)
+            // 一个都没进登记表,跨档升级后 toString 会吐出我们的源码。
+            __adoptDeep(window.chrome, 0);
             __adopt(window.Permissions && Permissions.prototype, 'query');
             __adopt(window.WebGLRenderingContext && WebGLRenderingContext.prototype, 'getParameter');
             __adopt(window.WebGL2RenderingContext && WebGL2RenderingContext.prototype, 'getParameter');
@@ -598,25 +627,34 @@ const FIDELITY_JS: &str = r#"
         }
     } catch (e) {}
 
-    // ④ window.chrome 缺失兜底。**第 175 轮实测修正**:真机裸环境(全新 profile、
+    // ④ window.chrome 形态还原。**第 175 轮实测修正**:真机裸环境(全新 profile、
     //    无扩展)读到的是 `{app, csi, loadTimes}` —— **没有 `chrome.runtime`**。
     //    它只在加载了扩展的页面暴露。旧实现在缺失时造一个空 `chrome.runtime`,
     //    等于凭空造出「本机没有的身份信息」(违反工程铁律),且更糟的是**可被一行
     //    识破**:真实扩展上下文的 `chrome.runtime` 必有 `id`/`connect`/`sendMessage`,
     //    空 runtime 比没有 runtime 更可疑。故本分支只补真机实测存在的 csi/loadTimes/app。
-    //    注:该分支近乎不可达(真实 Chrome `window.chrome` 恒有),仅作防御保留。
+    //    **第 181 轮**:从「缺失才建」扩到「**在场但三件套不全也补**」—— 真机
+    //    `Object.keys(chrome)` 恒为 `[app,csi,loadTimes]`,缺任一即非真 Chrome 形态
+    //    (无头/被降级环境),与 WebGL UNMASKED 回填同性质:还原被抹掉的**形态**,
+    //    不伪造身份。补的项一律 `reg()` 登记,跨档升级由 `__adoptDeep` 接住。
+    //    在场时**只补缺失项**,绝不整体替换 `window.chrome`(会毁掉扩展注入的
+    //    `chrome.runtime` 等真实扩展上下文)。
     try {
-        if (!window.chrome) {
-            const app = {
+        const ch = window.chrome;
+        const needApp = !ch || !ch.app;
+        const needCsi = !ch || typeof ch.csi !== 'function';
+        const needLoad = !ch || typeof ch.loadTimes !== 'function';
+        if (needApp || needCsi || needLoad) {
+            const mkApp = () => ({
                 isInstalled: false,
                 InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
                 RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' }
-            };
-            const csi = reg(function csi() {
+            });
+            const mkCsi = () => reg(function csi() {
                 const t = (typeof performance !== 'undefined' && performance.timing) || {};
                 return { onloadT: t.domContentLoadedEventEnd || 0, startE: t.navigationStart || 0, pageT: 0, tran: 15 };
             }, 'csi');
-            const loadTimes = reg(function loadTimes() {
+            const mkLoadTimes = () => reg(function loadTimes() {
                 const t = (typeof performance !== 'undefined' && performance.timing) || {};
                 return {
                     commitLoadTime: t.domContentLoadedEventEnd || 0,
@@ -626,10 +664,23 @@ const FIDELITY_JS: &str = r#"
                     requestTime: t.navigationStart || 0
                 };
             }, 'loadTimes');
-            Object.defineProperty(window, 'chrome', {
-                value: { app, csi, loadTimes },
-                configurable: true, enumerable: true, writable: true
-            });
+            const target = (ch && typeof ch === 'object') ? ch : {};
+            const put = (key, val) => {
+                try {
+                    Object.defineProperty(target, key, {
+                        value: val, configurable: true, writable: true, enumerable: true
+                    });
+                } catch (e) { try { target[key] = val; } catch (e2) {} }
+            };
+            if (needApp && !target.app) put('app', mkApp());
+            if (needCsi) put('csi', mkCsi());
+            if (needLoad) put('loadTimes', mkLoadTimes());
+            // 真机没有 chrome 时才整体创建(近乎不可达,防御保留)
+            if (!ch) {
+                Object.defineProperty(window, 'chrome', {
+                    value: target, configurable: true, enumerable: true, writable: true
+                });
+            }
         }
     } catch (e) {}
 
@@ -1522,6 +1573,62 @@ mod tests {
             src.contains("browser.new_page(\"about:blank\")")
                 && src.contains(".url(\"about:blank\".to_string())"),
             "两条建页路径(同窗口新 Tab / 独立窗口)都必须以 about:blank 起页"
+        );
+    }
+    // ===================== 第 181 轮:改过不可反查闭环 =====================
+
+    /// `__adopt` 只认领「属性值是函数 / 属性是 getter」,对**对象值里的自有函数**
+    /// (如 `chrome = {app, csi, loadTimes}`)一个都认领不上 —— 跨档升级后
+    /// `chrome.csi.toString()` 会吐出我们的源码。必须有按类收口的 `__adoptDeep`。
+    #[test]
+    fn 嵌套函数认领存在且被采用() {
+        use crate::agent::stealth::StealthMode;
+        let h = stealth_js_for(StealthMode::Hardened).expect("侵入式档必须注入");
+        assert!(
+            h.contains("__adoptDeep"),
+            "必须有嵌套函数认领(否则 chrome.csi 等对象值函数跨档后吐源码)"
+        );
+        // chrome 必须走深度认领,而不是旧的 `__adopt(window, 'chrome')`
+        assert!(
+            h.contains("__adoptDeep(window.chrome, 0)"),
+            "chrome 必须走深度认领:{h}"
+        );
+        // 深度上限存在(防爬进扩展注入的深层对象图)
+        assert!(h.contains("(depth | 0) > 2"), "深度上限 2 必须在");
+    }
+
+    /// chrome 形态补全:真机 `Object.keys(chrome)` 恒为 `[app,csi,loadTimes]`,
+    /// **在场但缺项**也要补(旧实现只在 `!window.chrome` 时创建,缺项裸奔)。
+    /// 同时必须**不整体替换**已存在的 `window.chrome`(会毁掉扩展注入的 runtime)。
+    #[test]
+    fn chrome形态补全覆盖在场缺项() {
+        use crate::agent::stealth::StealthMode;
+        let f = stealth_js_for(StealthMode::Fidelity).expect("保真档必须注入");
+        assert!(f.contains("needApp"), "必须有在场补全分支");
+        assert!(f.contains("needCsi") && f.contains("needLoad"));
+        // 三件套的工厂必须都带 reg() 登记(否则侵入档原生化不到)
+        assert!(f.contains("reg(function csi()"), "csi 必须登记");
+        assert!(f.contains("reg(function loadTimes()"), "loadTimes 必须登记");
+        // 仍不得凭空补 chrome.runtime(175 轮真机结论:全新 profile 真机没有)。
+        // 判据看**代码**而非注释:补全分支只允许 app/csi/loadTimes 三个键。
+        assert!(
+            !f.contains("put('runtime'"),
+            "补全分支不得写入 runtime 键(真机全新 profile 本就没有)"
+        );
+        // 在场时不得整体替换(保护扩展注入的真实扩展上下文)
+        assert!(
+            f.contains("if (!ch)"),
+            "只有 chrome 整体缺失时才整体创建,在场时只补缺失项"
+        );
+    }
+
+    /// 自证入口必须点名 chrome 三件套 —— 登记漏网要在 `data.fingerprint` 里看得见。
+    #[test]
+    fn chrome自证入口在册() {
+        assert!(
+            crate::agent::fingerprint::PROBE_JS.contains("chrome_csi")
+                && crate::agent::fingerprint::PROBE_JS.contains("chrome_loadTimes"),
+            "patched_fn_leak 必须点名 chrome 三件套入口"
         );
     }
 }
