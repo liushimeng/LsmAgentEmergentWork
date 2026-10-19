@@ -246,6 +246,16 @@ pub struct PaceState {
     /// (`inspect`/`explore`)在 TTL 内据此附 `page_dead{reason:site_wipe,late:true}`。
     /// 按 page_id 而非 host:同一域多页并行时只标记真正被抹的那一页。
     recent_wipe: HashMap<String, (String, Instant)>,
+    /// 每页最近一次**显式请求**的 URL(page_id → URL)。
+    ///
+    /// 2026-10-19:`recent_wipe` 要等后台看护落账(4~10s)才写,而猎聘实测
+    /// 3~6s 就抹 —— 模型在这段窗口里做只读观测动作时拿到的是**无成因**的
+    /// `about_blank` 死页信号,建议却是「重新加载目标地址」,恰是最该避免的动作。
+    /// 本表让死页判据能在**没有**延迟抹除记录时,回落到「该页最近请求的域
+    /// 是否有抹除史」,直接把成因与「别重试」的建议透出。
+    last_request: HashMap<String, String>,
+    /// 是否已从持久化台账回填过(进程内一次;避免每次记账都开库)。
+    hydrated: bool,
 }
 
 /// 「最近延迟抹除」记录的有效期。实测抹除延迟 4~10s,留出模型读到响应后的
@@ -264,6 +274,8 @@ impl Default for PaceState {
             forced_nav: HashMap::new(),
             risk_suppressed_until: HashMap::new(),
             recent_wipe: HashMap::new(),
+            last_request: HashMap::new(),
+            hydrated: false,
         }
     }
 }
@@ -297,6 +309,73 @@ impl WebPace {
         GLOBAL.get_or_init(WebPace::default)
     }
 
+    /// 从持久化台账回填历史抹除账(进程内惰性一次)。
+    ///
+    /// 2026-10-19:抹除账原本只活在进程里,进程一退即归零 —— 猎聘这类自适应打标
+    /// 站点于是让用户**每重跑一次任务就重付一遍 Chrome 风暴**(实测 open→3~6s
+    /// 被抹→连击→冷却→熔断,单次 6 分钟起)。回填后,重跑任务的第一次 `open`
+    /// 即命中 [`Self::wipe_exhausted`],在 `guard_navigation` 处熔断 ——
+    /// **一台 Chrome 都不拉起**。
+    ///
+    /// 只回填**仍在新鲜度窗口内**的记录(`site_risk::is_fresh`,默认 7 天):
+    /// 站点 WAF 会升级也会下线,永不过期的熔断表会把用户永久锁在该域门外。
+    ///
+    /// fail-open:库不可用 / 无历史 / 被杀开关关闭,一律按「无历史」放行,
+    /// 退化回改造前的纯内存行为。
+    pub fn hydrate(&self) {
+        // 先置位再读库:并发首访时后续调用直接返回,且「无历史」也只查一次库。
+        {
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.hydrated {
+                return;
+            }
+            guard.hydrated = true;
+        }
+        let rows = crate::config::site_risk::load_active();
+        if rows.is_empty() {
+            return;
+        }
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut restored = 0usize;
+        for (domain, total, streak) in rows {
+            // 内存已有更高的账(本次进程已经踩过)时以内存为准,不回退。
+            let cur = guard.wipe_total.get(&domain).copied().unwrap_or(0);
+            if total > cur {
+                guard.wipe_total.insert(domain.clone(), total);
+                if streak > 0 {
+                    guard.wipe_streak.insert(domain.clone(), streak);
+                }
+                restored += 1;
+            }
+        }
+        drop(guard);
+        if restored > 0 {
+            tracing::info!(
+                domains = restored,
+                "已从站点反爬声誉台账回填历史抹除账(跨会话记忆生效)"
+            );
+        }
+    }
+
+    /// 记录某页最近一次显式请求的 URL(供死页判据回落到域历史)。
+    pub fn note_page_request(&self, page_id: &str, url: &str) {
+        if page_id.is_empty() || host_of(url).is_none() {
+            return;
+        }
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.last_request.insert(page_id.to_string(), url.to_string());
+    }
+
+    /// 取某页最近一次显式请求的 URL(死页判据用)。
+    pub fn last_request_for(&self, page_id: &str) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last_request
+            .get(page_id)
+            .cloned()
+    }
+
     /// 标记某域进入频控冷却(幂等取更晚截止时刻;成因跟随实际生效的标记)。
     pub fn mark_rate_limited_for(&self, host: &str, secs: Duration) {
         let until = Instant::now() + secs;
@@ -316,6 +395,8 @@ impl WebPace {
     /// 按环境默认冷却时长标记。
     pub fn mark_rate_limited(&self, host: &str) {
         self.mark_rate_limited_for(host, Duration::from_secs(rate_cooldown_secs()));
+        // 2026-10-19:频控命中一并落库(观测用,不参与熔断 —— 频控靠时间自愈)。
+        crate::config::site_risk::record_rate_limit(host);
     }
 
     /// 标记某域进入**风控挑战冷却**(baxia 滑块 punish 实测形态;第 172 轮)。
@@ -391,6 +472,7 @@ impl WebPace {
         requested_url: &str,
         landed_url: &str,
     ) -> Option<WipeOutcome> {
+        self.hydrate();
         if !enabled() {
             return None;
         }
@@ -409,6 +491,7 @@ impl WebPace {
         let streak = guard.wipe_streak.entry(host.clone()).or_insert(0);
         *streak += 1;
         let streak = *streak;
+        let total = *guard.wipe_total.get(&host).unwrap_or(&0);
         let mut triggered = false;
         if streak >= WIPE_STREAK_THRESHOLD {
             let until = Instant::now() + Duration::from_secs(wipe_cooldown_secs());
@@ -417,9 +500,12 @@ impl WebPace {
                 *entry = until;
             }
             // 抹除与频控共用冷却表:后到的标记覆盖成因,信封按最近信号给建议。
-            guard.cooldown_cause.insert(host, CAUSE_SITE_WIPE);
+            guard.cooldown_cause.insert(host.clone(), CAUSE_SITE_WIPE);
             triggered = true;
         }
+        drop(guard);
+        // 2026-10-19:镜像进持久化台账(落库是增强能力,fail-open 不影响本次判定)。
+        crate::config::site_risk::record_wipe(&host, total, streak);
         Some(WipeOutcome {
             streak,
             cooldown_triggered: triggered,
@@ -428,6 +514,7 @@ impl WebPace {
 
     /// 该域跨实例累计抹除次数(总账;无记录返回 0)。
     pub fn wipe_total_for(&self, host: &str) -> u32 {
+        self.hydrate();
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -459,6 +546,12 @@ impl WebPace {
         if guard.cooldown_cause.get(host.as_str()) == Some(&CAUSE_SITE_WIPE) {
             guard.cooldown_until.remove(host.as_str());
             guard.cooldown_cause.remove(host.as_str());
+        }
+        drop(guard);
+        // 2026-10-19:恢复证据同样要落到持久化台账 —— 否则本次进程是「已恢复」,
+        // 下次启动回填又把旧账灌回来,恢复路径永远走不通。
+        if had_streak || had_total {
+            crate::config::site_risk::record_survived(&host);
         }
         had_streak || had_total
     }
@@ -627,6 +720,48 @@ impl WebPace {
 /// / 接管日常浏览器)——建议错位会把 LLM 引向无效等待(猎聘实测硬闯 25+ 次的教训)。
 /// **持久熔断档**(总账 ≥ 阈值且 laew 身份):不再建议「close(all) 换全新
 /// profile」—— 那正是 Chrome 拉起风暴的源头;只剩接管用户日常浏览器或人工。
+/// 整页抹除(`cause=site_wipe`)的 6004 处置文案 —— 按**总账**分流(纯函数)。
+///
+/// 猎聘实测:全新 profile / 复制登录态的调试实例 / 实例内人工手动输入
+/// **三种路径全被抹**,该域是指纹级自适应打标,换 profile 无效。
+/// 旧文案无条件教模型「close(all) 换全新 profile 试 1 次」,总账 ≥2 时
+/// 这条建议已被证伪 —— 照做只会多弹一台 Chrome、多吃一次风控。
+///
+/// - `total == 1`:保留 `close(all)` 换 profile(仍是唯一尚可能有效的路);
+/// - `total >= 2`:明确劝退,改指接管**用户日常 Chrome 本体**(注意
+///   `auto_relaunch` 复制出来的调试实例仍属 CDP 拉起环境,同样会被抹)。
+pub fn site_wipe_advice(host: &str, total: u32, secs: u64) -> (&'static str, String) {
+    if total >= 2 {
+        (
+            "站点整页抹除(反爬,会话/指纹级打标),且**换全新 profile 已被实测无效** \
+(累计抹除 ≥2 次)。不要再 close(all) 重开 —— 只会多弹一台 Chrome、多吃一次风控。\
+正确改道:① open(reuse_existing=true) 接管**用户日常 Chrome 本体**(需人工先用 \
+`--remote-debugging-port=9222` 启动自己的日常 profile,不加 --user-data-dir;\
+注意 auto_relaunch 复制出来的调试实例仍属 CDP 拉起环境,同样会被抹);\
+② request_human 请人工协助;③ 如实向用户报告该站点当前对本环境不可达,不要伪造数据",
+            format!(
+                "站点整页抹除冷却中({host}):剩余 {secs}s;该域已累计被抹 ≥2 次,换全新 profile 无效,\
+不要再 close(all) 重开;改用 open(reuse_existing=true) 接管用户日常 Chrome 本体(人工需先用 \
+--remote-debugging-port 启动自己的日常 profile)或 request_human;\
+确需原会话立即重试可 params.force=true(有次数预算,用尽即拦)",
+            ),
+        )
+    } else {
+        (
+            "站点整页抹除(反爬,会话/指纹级打标)。**先别急着 close(all) 重开** —— \
+每试一次多弹一台 Chrome 窗口,若该域是指纹级打标(对 CDP 拉起环境本身打标)换新 profile 照样被抹。\
+可先试 1 次 close(page_id=\"all\") 回收浏览器换全新 profile(冷却自动解除)后重新 open;\
+若再被抹除即判定指纹级打标,改用 open(reuse_existing=true) 接管本机日常浏览器(真实指纹+登录态),\
+或 request_human 人工协助;已采集数据先落盘",
+            format!(
+                "站点整页抹除冷却中({host}):剩余 {secs}s;建议 close(page_id=\"all\") 回收浏览器换全新 profile 试 1 次(冷却自动解除);\
+若再被抹除则换 open(reuse_existing=true) 接管日常浏览器或 request_human(指纹级打标时换新实例无效);\
+确需原会话立即重试可 params.force=true",
+            ),
+        )
+    }
+}
+
 pub async fn guard_navigation(
     url: &str,
     force: bool,
@@ -665,19 +800,11 @@ pub async fn guard_navigation(
                 .cooldown_cause_for(&host)
                 .unwrap_or(CAUSE_RATE_LIMITED);
             let (cooldown, advice, msg) = match cause {
-                CAUSE_SITE_WIPE => (
-                    wipe_cooldown_secs(),
-                    "站点整页抹除(反爬,会话/指纹级打标)。**先别急着 close(all) 重开** —— \
-每试一次多弹一台 Chrome 窗口,若该域是指纹级打标(对 CDP 拉起环境本身打标)换新 profile 照样被抹。\
-可先试 1 次 close(page_id=\"all\") 回收浏览器换全新 profile(冷却自动解除)后重新 open;\
-若再被抹除即判定指纹级打标,改用 open(reuse_existing=true) 接管本机日常浏览器(真实指纹+登录态),\
-或 request_human 人工协助;已采集数据先落盘",
-                    format!(
-                        "站点整页抹除冷却中({host}):剩余 {secs}s;建议 close(page_id=\"all\") 回收浏览器换全新 profile 试 1 次(冷却自动解除);\
-若再被抹除则换 open(reuse_existing=true) 接管日常浏览器或 request_human(指纹级打标时换新实例无效);\
-确需原会话立即重试可 params.force=true",
-                    ),
-                ),
+                // 2026-10-19:文案按**总账**分流(纯函数,便于单测锁死语义)。
+                CAUSE_SITE_WIPE => {
+                    let (advice, msg) = site_wipe_advice(&host, WebPace::global().wipe_total_for(&host), secs);
+                    (wipe_cooldown_secs(), advice, msg)
+                }
                 // 第 172 轮:人工验证挑战/风控打标(baxia 滑块 punish 实测)——
                 // 冷却期内对该域继续搜索/导航只会加剧风控(实测升级为会话级,
                 // 连首页都被打标);人工完成验证后冷却已自动解除,走不到这里。
@@ -1130,8 +1257,7 @@ mod tests {
     }
 
     #[test]
-    fn 整页抹除_clear_all清冷却与连击_但总账保留() {
-        let p = pace();
+    fn 整页抹除_clear_all清冷却与连击_但总账保留() {        let p = pace();
         p.note_nav_for("liepin.com");
         p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
         p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
@@ -1146,6 +1272,43 @@ mod tests {
         let o = p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
         assert_eq!(o.map(|x| (x.streak, x.cooldown_triggered)), Some((1, false)));
         assert_eq!(p.wipe_total_for("liepin.com"), 3);
+    }
+
+    /// 2026-10-19:6004 文案按总账分流 —— 换全新 profile 已被实测无效时
+    /// (总账 ≥2),不得再教模型 `close(all)` 重开(那只多弹一台 Chrome)。
+    #[test]
+    fn 整页抹除_文案按总账分流劝退close_all重开() {
+        // 总账 1:仍保留 close(all) 换 profile —— 那是唯一尚可能有效的路。
+        let (advice1, msg1) = site_wipe_advice("liepin.com", 1, 90);
+        assert!(
+            advice1.contains("可先试 1 次 close"),
+            "首次抹除应保留 close(all) 这条路;实际:{advice1}"
+        );
+        assert!(msg1.contains("liepin.com"), "短消息应点名成因域");
+
+        // 总账 2:换 profile 已被证伪 → 明确劝退并改指真实浏览器通道。
+        let (advice2, msg2) = site_wipe_advice("liepin.com", 2, 90);
+        assert!(
+            advice2.contains("不要再 close(all) 重开"),
+            "总账 ≥2 应明确劝退 close(all);实际:{advice2}"
+        );
+        assert!(
+            advice2.contains("已被实测无效"),
+            "应说明换 profile 无效的依据;实际:{advice2}"
+        );
+        assert!(
+            advice2.contains("reuse_existing") && advice2.contains("--remote-debugging-port"),
+            "应改指接管用户日常 Chrome 本体并给出启动方式;实际:{advice2}"
+        );
+        assert!(
+            !advice2.contains("可先试 1 次 close"),
+            "劝退后不得同时保留旧建议(模型会挑简单的那条);实际:{advice2}"
+        );
+        assert!(msg2.contains("不要再 close(all)"), "短消息同样须劝退;实际:{msg2}");
+
+        // 分流边界恰好在 2。
+        assert!(site_wipe_advice("x.com", 1, 1).0.contains("可先试 1 次 close"));
+        assert!(site_wipe_advice("x.com", 2, 1).0.contains("不要再 close"));
     }
 
     #[test]
@@ -1197,9 +1360,45 @@ mod tests {
         assert!(p.note_forced_nav("liepin.com").is_none(), "复位后重新计数");
     }
 
+    /// 2026-10-19:跨会话记忆的**核心保证** —— 回填后新进程立刻处于熔断态,
+    /// 于是重跑任务的第一次 `open` 在 `guard_navigation` 处即被拦,
+    /// **一台 Chrome 都不拉起**(根治「每重跑一次就重付一遍 Chrome 风暴」)。
     #[test]
-    fn force预算用尽信封_字段与文案() {
-        let env = force_budget_envelope("liepin.com", 3, FORCE_BUDGET);
+    fn hydrate回填历史抹除账_新进程即刻熔断() {
+        // 直接构造「已攒到阈值的全新实例」(等价于 hydrate 从台账回填后的状态)。
+        let p = pace();
+        for _ in 0..wipe_total_threshold() {
+            p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        }
+        assert!(p.wipe_exhausted("liepin.com"));
+
+        // 恢复证据随新进程一同回填的等价态:台账被清 → 新进程不再熔断。
+        let q = pace();
+        assert!(!q.wipe_exhausted("liepin.com"), "无历史的新进程不得凭空熔断");
+        q.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        assert_eq!(q.wipe_total_for("liepin.com"), 1);
+        // 未达阈值不熔断(阈值语义不因持久化而改变)。
+        assert!(!q.wipe_exhausted("liepin.com"));
+    }
+
+    /// 回填**不得覆盖本次进程已攒到的更高账**(防止旧台账把新证据抹掉)。
+    #[test]
+    fn hydrate回填不覆盖内存更高的账() {
+        let p = pace();
+        // 本次进程已经踩到超过阈值的账。
+        for _ in 0..(wipe_total_threshold() + 2) {
+            p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        }
+        let live = p.wipe_total_for("liepin.com");
+        assert!(live > wipe_total_threshold());
+        // hydrate 在已 hydrated 时是幂等 no-op;这里锁死「重复调用不降级」。
+        p.hydrate();
+        p.hydrate();
+        assert_eq!(p.wipe_total_for("liepin.com"), live, "回填不得回退内存账");
+    }
+
+    #[test]
+    fn force预算用尽信封_字段与文案() {        let env = force_budget_envelope("liepin.com", 3, FORCE_BUDGET);
         let v: serde_json::Value = serde_json::from_str(&env).unwrap();
         assert_eq!(v["code"], CODE_SITE_PACE_COOLDOWN);
         assert_eq!(v["data"]["force_exhausted"], true);

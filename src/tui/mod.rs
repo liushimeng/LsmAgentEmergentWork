@@ -149,6 +149,9 @@ impl TuiSession {
             eprintln!("[laew] 启动时清理审计文件失败(忽略): {e}");
         }
         let db = Db::open(&paths).map_err(anyhow::Error::from)?;
+        // 站点反爬声誉跨会话记忆(2026-10-19):注册进程级台账并回填历史抹除账,
+        // 使重跑任务第一次 open 即熔断、不拉起 Chrome。
+        crate::config::site_risk::init_with(&db);
         let db = Arc::new(Mutex::new(db));
         // 第 152 轮:产物统一落工作目录(不再逃逸到二进制所在目录)
         let plans_dir = crate::artifact_root::artifact_dir("plans");

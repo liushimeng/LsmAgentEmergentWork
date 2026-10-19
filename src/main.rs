@@ -391,6 +391,10 @@ async fn cmd_mcp(c: McpCmd) -> Result<()> {
 fn open_db() -> Result<(Paths, Db)> {
     let paths = Paths::detect().map_err(anyhow::Error::from)?;
     let db = Db::open(&paths).map_err(anyhow::Error::from)?;
+    // 站点反爬声誉跨会话记忆(2026-10-19):注册进程级台账并回填历史抹除账。
+    // 注册放在这里而非门面内部惰性打开 —— 后者会让 `cargo test --lib` 的每个
+    // 记账调用都写用户真实库(单测构造的 WebPace 也会落库)。
+    lsm_agent::config::site_risk::init_with(&db);
     Ok((paths, db))
 }
 

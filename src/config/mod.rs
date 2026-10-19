@@ -13,9 +13,11 @@ pub use crate::database::{
 pub mod agent_memory;
 pub mod agent_message;
 pub mod session_memory;
+pub mod site_risk;
 pub mod subagent_run;
 
 // 重新导出子模块的类型
 pub use agent_memory::{AgentMemoryEntry, AgentMemoryRow};
 pub use session_memory::{EventType, SessionMemoryEntry, SessionMemoryRow};
+pub use site_risk::SiteRiskRow;
 pub use subagent_run::{RunQuery, SubAgentRunEntry, SubAgentRunRow};

@@ -35,14 +35,21 @@ pub(crate) const WEB_TRAVERSAL_PROMPT_SECTION: &str = r##"
     状态)为主,截图仅作辅助(Read 读图片只回存根,视觉判读走
     `control(screenshot, ocr=true)` / `inspect(info=ocr)`)。
 22.3 **整页抹除处置纪律**(页面曾正常加载、随后 URL 变 about:blank /
-    响应带 `page_health.reason=site_wipe` / `site_wipe` / 6004 时):
+    响应带 `page_health.reason=site_wipe` / `page_dead{reason=site_wipe}` /
+    `site_wipe` / 6004 时):
     这是站点对本环境的反爬抹除,**不要反复 `close(page_id="all") + open`**
     —— 每试一次多弹一台 Chrome 窗口,若该域是指纹级打标(对 CDP 拉起的
     浏览器环境本身打标)换新 profile 照样被抹,只会形成拉起→被抹→再拉起的
-    风暴。正确处置:① 同域首次/第二次被抹可试 1 次 close(all) 换全新
-    profile;② 再被抹除即改用 `open(reuse_existing=true)` 接管用户日常
-    Chrome(真实指纹+登录态),或 `request_human` 如实交还现场由人工处理;
+    风暴。正确处置:① 同域首次被抹可试 1 次 close(all) 换全新 profile;
+    ② **累计抹除 ≥2 次即判定「换全新 profile 已被实测无效」,不要再 close(all)
+    重开**,改用 `open(reuse_existing=true)` 接管**用户日常 Chrome 本体**
+    (需人工先用 `--remote-debugging-port=9222` 启动自己的日常 profile、
+    不加 `--user-data-dir`;注意 `auto_relaunch` 复制出来的调试实例仍属
+    CDP 拉起环境,同样会被抹),或 `request_human` 如实交还现场由人工处理;
     ③ 工具层对该域 laew 身份累计抹除达阈值后**持久熔断**(6004,
-    `data.persistent=true`),此时只剩接管日常浏览器或人工两条路,硬闯请
-    先说清理由再用 `force=true`。
+    `data.persistent=true`),且该结论**跨会话记住**(下次任务第一次 open
+    即直接熔断、不再拉起 Chrome),此时只剩接管日常浏览器或人工两条路,
+    硬闯请先说清理由再用 `force=true`;
+    ④ 拿到 `page_dead{reason=site_wipe}` 时**不要重新 open/navigate 重试**
+    —— 那正是该域已知无效的动作;按上面的改道走,或如实报告不可达。
 "##;

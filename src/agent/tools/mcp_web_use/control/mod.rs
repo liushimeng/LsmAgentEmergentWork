@@ -790,6 +790,10 @@ async fn act_navigate(id: &str, p: &Value) -> std::result::Result<Value, String>
     } else {
         None
     };
+    // 2026-10-19:登记本页最近请求(死页判据的域历史来源)。放在 blank 分支**之前**
+    // ——当场就落 blank 的导航同样要登记,否则模型紧接着的只读观测拿不到成因,
+    // 只会收到「重新加载目标地址」这种对抹除域恰是最该避免的建议。
+    crate::agent::browser_pace::WebPace::global().note_page_request(id, url);
     // 2026-10-14 第二轮:延迟抹除复查 —— 结算时页面健康、数秒后才被抹除的形态
     // (猎聘实测)。有抹除史的域等 3.5s 复读落地 URL;当场已落 blank 的不重复复查。
     if !landed.trim().eq_ignore_ascii_case("about:blank") {

@@ -45,6 +45,12 @@ mod page_state;
 mod unlock_zone;
 /// 遍历访问台账(第 146 轮):`pub(crate)` 供编排层(QC 机械足迹)取 seq/footprint。
 pub(crate) mod visit_ledger;
+/// 整页抹除延迟探测与后台看护(2026-10-14 第二/三轮,2026-10-19 扩):
+/// `deferred_wipe_check` 同步复查 + `schedule_wipe_watch` 4s/10s 双档看护。
+mod wipe_watch;
+
+// 拆分自 mod.rs 的再导出:外部调用点(`super::`/`crate::`)路径保持不变。
+use wipe_watch::{deferred_wipe_check, schedule_wipe_watch};
 
 #[cfg(test)]
 mod tests;
@@ -658,134 +664,6 @@ fn merge_wipe_outcome(
     late.or(first)
 }
 
-/// 延迟抹除复查(2026-10-14 第二轮,猎聘实测 `llaew_20261014_140053.log`):
-/// open/navigate 返回时页面健康(标题/URL 正常),但指纹级打标站点会在**数秒后**
-/// (实测 4~10s)才 `location→about:blank`,open 结算时的 page_health 看不到,
-/// LLM 下一轮读到空白页无结构化信号、瞎猜后 close(all)+重开 → Chrome 拉起风暴。
-/// 该域有抹除史(`wipe_total>0`)时,等 [`WIPE_RECHECK_DELAY`] 复读落地 URL:
-/// 已变 about:blank → 记账并返回证据,调用方据此改写响应。无史站点零延迟零开销。
-const WIPE_RECHECK_DELAY: std::time::Duration = std::time::Duration::from_millis(3500);
-
-/// 返回 `Some((landed_url, late_outcome))` = 命中延迟抹除;`None` = 健康或无史。
-/// `count` = 是否计入熔断账本(launch / laew relaunch 实例=true,用户日常 Chrome=false)。
-pub(super) async fn deferred_wipe_check(
-    page: &chromiumoxide::Page,
-    requested_url: &str,
-    count: bool,
-) -> Option<(String, Option<crate::agent::browser_pace::WipeOutcome>)> {
-    let host = crate::agent::browser_pace::host_of(requested_url)?;
-    if crate::agent::browser_pace::WebPace::global().wipe_total_for(&host) == 0 {
-        return None;
-    }
-    tokio::time::sleep(WIPE_RECHECK_DELAY).await;
-    let landed = page.url().await.ok().flatten().unwrap_or_default();
-    if !landed.trim().eq_ignore_ascii_case("about:blank") {
-        return None;
-    }
-    let outcome = if count {
-        crate::agent::browser_pace::WebPace::global()
-            .note_navigation_outcome(requested_url, &landed)
-    } else {
-        None
-    };
-    tracing::warn!(
-        requested_url,
-        "延迟抹除复查命中:open 返回后页面被站点脚本重定向到 about:blank"
-    );
-    Some((landed, outcome))
-}
-
-// =================== 2026-10-14 第三轮:后台抹除看护(wipe watcher) ===================
-//
-// 缺口(猎聘实测 `llaew_20261014_145428.log`):整页抹除实测发生在导航完成后
-// 4~10s,而 deferred_wipe_check 只在有史域做一次 3.5s 同步复查,且「落地非 blank
-// 即清总账」让「先落地成功→数秒后被抹」的序列先清零后无补账 —— 总账轨迹实测
-// 0→1→0→1→2→0,持久熔断(阈值 3)永不触发,close(all)→重开的换 profile 循环
-// 不受限,Chrome 反复拉起(单任务 4 台)。本看护在每次 laew 身份导航落地非 blank
-// 后 spawn 10s 异步任务复读落地 URL,变 blank 即 note_navigation_outcome 补账,
-// 总账/连击/冷却/持久熔断全链路如期生效。
-
-/// 后台抹除看护代际表:page_id → 最新一次被看护导航的代际号。同页后续导航
-/// bump 代际,旧看护任务醒来后发现自己过期即放弃 —— 防止把「新导航的落地页」
-/// 误记为旧请求被抹。
-static WIPE_WATCH_GEN: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, u64>>,
-> = std::sync::OnceLock::new();
-
-/// 看护窗时长:覆盖实测 4~10s 的延迟抹除。
-const WIPE_WATCH_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
-
-fn wipe_watch_bump(page_id: &str) -> u64 {
-    let map = WIPE_WATCH_GEN
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
-    let gen = guard.entry(page_id.to_string()).or_insert(0);
-    *gen += 1;
-    *gen
-}
-
-fn wipe_watch_stale(page_id: &str, gen: u64) -> bool {
-    WIPE_WATCH_GEN
-        .get()
-        .and_then(|m| m.lock().ok())
-        .and_then(|g| g.get(page_id).copied())
-        .map(|cur| cur != gen)
-        .unwrap_or(true)
-}
-
-/// 后台延迟抹除看护:`count=true`(launch 实例 / laew relaunch 调试实例)的导航
-/// 落地非 blank 后调用。用户日常 Chrome 不看护(落地行为归用户,不进熔断账本)。
-pub(super) fn schedule_wipe_watch(
-    page: chromiumoxide::Page,
-    page_id: &str,
-    requested_url: &str,
-    count: bool,
-) {
-    if !count {
-        return;
-    }
-    if crate::agent::browser_pace::host_of(requested_url).is_none() {
-        return;
-    }
-    let gen = wipe_watch_bump(page_id);
-    let pid = page_id.to_string();
-    let url = requested_url.to_string();
-    tokio::spawn(async move {
-        tokio::time::sleep(WIPE_WATCH_DELAY).await;
-        if wipe_watch_stale(&pid, gen) {
-            return; // 同页已有更新的导航接管,旧请求的看护作废
-        }
-        let landed = page.url().await.ok().flatten().unwrap_or_default();
-        if !landed.trim().eq_ignore_ascii_case("about:blank") {
-            // 存活过看护窗 = 真实恢复证据:清该域连击与总账(仅「落地成功」不清 ——
-            // 抹除发生在其后 4~10s,假成功会把补记账清掉,熔断永不触发)。
-            // 回读为空(句柄已死/页已关)不算存活,不清账。
-            if landed.starts_with("http") {
-                let cleared = crate::agent::browser_pace::WebPace::global()
-                    .note_navigation_survived(&url);
-                if cleared {
-                    tracing::info!(
-                        requested_url = %url,
-                        "后台抹除看护:页面存活过看护窗,清该域抹除连击与总账(恢复路径)"
-                    );
-                }
-            }
-            return;
-        }
-        let outcome = crate::agent::browser_pace::WebPace::global()
-            .note_navigation_outcome(&url, &landed);
-        // 第 186 轮:本条导航的响应早已返回给 LLM,追改不了;把「哪一页被抹、
-        // 被抹前请求的是什么」记进 TTL 台账,让模型**下一轮**的只读观测动作
-        // (`inspect`/`explore`)能拿到 `page_dead{reason:site_wipe, late:true}`,
-        // 而不是只看到 `about:blank` + `elements{count:0}` 干猜。
-        crate::agent::browser_pace::WebPace::global().note_late_wipe(&pid, &url);
-        tracing::warn!(
-            requested_url = %url,
-            streak = outcome.as_ref().map(|o| o.streak).unwrap_or(0),
-            "后台抹除看护命中:导航返回后约 10s 页面被站点脚本重定向到 about:blank(已补账:连击/总账/冷却)"
-        );
-    });
-}
 
 // ============================ 第 172 轮:页面存活性 / 登录墙 / 指纹 ============================
 //
@@ -1056,35 +934,72 @@ pub(super) fn site_wipe_ledger_field(requested_url: &str) -> Option<Value> {
 /// 纯函数(判据抽成 [`dead_page_reason`])便于单测锁死形状;取值部分只读台账,
 /// 无 CDP 往返,故可挂在只读动作收尾的零成本位。
 pub(super) fn page_dead_field(page_id: &str, landed_url: &str) -> Option<Value> {
-    dead_page_reason(page_id, landed_url, |pid| {
-        crate::agent::browser_pace::WebPace::global().recent_wipe_for(pid)
-    })
+    dead_page_reason(
+        page_id,
+        landed_url,
+        |pid| crate::agent::browser_pace::WebPace::global().recent_wipe_for(pid),
+        |pid| {
+            // 该页最近一次显式请求的域是否有抹除史(TTL 台账未落账时的成因来源)。
+            let url = crate::agent::browser_pace::WebPace::global().last_request_for(pid)?;
+            let host = crate::agent::browser_pace::host_of(&url)?;
+            let total = crate::agent::browser_pace::WebPace::global().wipe_total_for(&host);
+            (total > 0).then(|| (host, total, url))
+        },
+    )
 }
 
-/// 死页信号判据(纯函数;`recent` 注入便于单测绕开进程级台账)。
+/// 死页信号判据(纯函数;两个注入闭包便于单测绕开进程级台账)。
 ///
-/// `recent` 返回 `(被抹前的请求 URL, 距记账秒数)`。
-pub(super) fn dead_page_reason<F>(page_id: &str, landed_url: &str, recent: F) -> Option<Value>
+/// - `recent`:后台看护 TTL 台账 → `(被抹前的请求 URL, 距记账秒数)`;
+/// - `domain_flag`:该页最近请求域的抹除史 → `(域, 累计抹除次数, 请求 URL)`。
+///
+/// 2026-10-19 新增第三态:猎聘实测抹除发生在导航返回后 **3~6s**,而 TTL 台账要等
+/// 后台看护落账。模型在这段窗口做只读观测时拿到的原是**无成因**的 `about_blank`,
+/// 建议却是「重新加载目标地址」—— 对抹除域恰是最该避免的动作。`domain_flag`
+/// 让成因在台账落账前就能透出。
+pub(super) fn dead_page_reason<F, G>(
+    page_id: &str,
+    landed_url: &str,
+    recent: F,
+    domain_flag: G,
+) -> Option<Value>
 where
     F: Fn(&str) -> Option<(String, u64)>,
+    G: Fn(&str) -> Option<(String, u32, String)>,
 {
     if !landed_url.trim().eq_ignore_ascii_case("about:blank") {
         return None;
     }
-    match recent(page_id) {
-        Some((requested_url, age_secs)) => Some(json!({
+    if let Some((requested_url, age_secs)) = recent(page_id) {
+        return Some(json!({
             "reason": "site_wipe",
             "late": true,
             "requested_url": requested_url,
             "wiped_ago_secs": age_secs,
             "advice": "本页刚被站点侧脚本整页抹除(会话/指纹级反爬),原会话内重试无效。不要在本页做元素操作、不要 close(all) 换 profile 硬闯;按 data.site_wipe_ledger / 6004 的建议改道(接管用户已登录浏览器,或如实报告目标站点当前不可达)",
-        })),
-        None => Some(json!({
-            "reason": "about_blank",
-            "late": false,
-            "advice": "页面当前为空白页(about:blank)。若刚导航过,可能是导航落空或站点重定向到空白页;先用 open/navigate 重新加载目标地址,或在空白页上做元素操作只会全部返回空结果",
-        })),
+        }));
     }
+    if let Some((host, total, requested_url)) = domain_flag(page_id) {
+        return Some(json!({
+            "reason": "site_wipe",
+            "late": false,
+            "evidence": "domain_history",
+            "domain": host,
+            "wipe_total": total,
+            "requested_url": requested_url,
+            "advice": format!(
+                "本页为空白页,而该域({host})在本环境已被站点整页抹除 {total} 次(反爬打标)。\
+**不要重新 open/navigate 重试** —— 那是该域已知无效的动作,只会多烧一轮并加深打标;\
+也不要 close(all) 换 profile(累计 ≥2 次即换新 profile 已实测无效)。\
+改道:open(reuse_existing=true) 接管用户日常 Chrome 本体,或 request_human,或如实报告该站点不可达"
+            ),
+        }));
+    }
+    Some(json!({
+        "reason": "about_blank",
+        "late": false,
+        "advice": "页面当前为空白页(about:blank)。若刚导航过,可能是导航落空或站点重定向到空白页;先用 open/navigate 重新加载目标地址,或在空白页上做元素操作只会全部返回空结果",
+    }))
 }
 
 /// auto_relaunch 成功信封补抹除预警(2026-10-14 第三轮):复制登录态的调试实例
@@ -1724,6 +1639,12 @@ async fn run_open_inner(args: &Value, url: &str) -> Result<String> {
                     } else {
                         None
                     };
+                    // 2026-10-19:登记本页最近请求(死页判据的域历史来源)。
+                    // 放在 blank 分支**之前**:当场落 blank 的导航同样要登记,
+                    // 否则模型紧接着的只读观测拿不到成因,只能收到「重新加载」
+                    // 这种对抹除域反向的建议。
+                    crate::agent::browser_pace::WebPace::global()
+                        .note_page_request(&pid, url);
                     // 2026-10-14 第二轮:延迟抹除复查 —— 结算时页面健康、数秒后
                     // 才被抹除的形态(猎聘实测)。有抹除史的域等 3.5s 复读落地
                     // URL;当场已落 blank 的不重复复查(避免同一次导航双记账)。
@@ -1901,6 +1822,8 @@ async fn run_open_inner(args: &Value, url: &str) -> Result<String> {
             // 让下方 page_health 给出 site_wipe 结构化证据,LLM 不必再瞎猜。
             let mut final_url = final_url;
             let mut title = title;
+            // 2026-10-19:登记本页最近请求(死页判据的域历史来源;见 mod 头注释)。
+            crate::agent::browser_pace::WebPace::global().note_page_request(&page_id, url);
             if !final_url.trim().eq_ignore_ascii_case("about:blank") {
                 if let Some(page) = BrowserManager::global().page(&page_id).await {
                     if let Some((landed, late)) =

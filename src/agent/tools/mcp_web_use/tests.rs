@@ -2940,7 +2940,8 @@ async fn real_browser_viewport_fills_window() {
 /// page_health(reason ∈ {main_doc_error, empty_dom});页面有真实内容 ⇒ 不带该字段。
 /// 目标 URL **不写死在仓库里**(内网/客户站点属敏感信息),由环境变量
 /// `LAEW_REAL_SITE_URL` 提供;未设置时退回公网 example.com(仅验证视口铺满)。
-/// 第 186 轮:死页信号 `data.page_dead` 的三态判定(纯函数 `dead_page_reason`)。
+/// 第 186 轮:死页信号 `data.page_dead` 的三态判定(纯函数 `dead_page_reason`);
+/// 2026-10-19 扩到四态(新增「域历史」兜底,覆盖看护落账前的观察窗口)。
 ///
 /// 猎聘实测缺口:页面被站点抹除后,只读观测动作只拿到 `about:blank` +
 /// `elements{count:0}` + 顶层 `code:0`,零结构化线索,模型只能靠 `ok:false` 猜。
@@ -2948,28 +2949,71 @@ async fn real_browser_viewport_fills_window() {
 fn dead_page_reason_三态判定() {
     // 非空白页:零字段(fail-open,常态不带噪声)
     assert!(
-        super::dead_page_reason("p_1", "https://www.liepin.com/", |_| None).is_none(),
+        super::dead_page_reason("p_1", "https://www.liepin.com/", |_| None, |_| None).is_none(),
         "正常页面不得带 page_dead"
     );
-    assert!(super::dead_page_reason("p_1", "about:blank#x", |_| None).is_none());
+    assert!(
+        super::dead_page_reason("p_1", "about:blank#x", |_| None, |_| None).is_none(),
+        "about:blank#x 是带 fragment 的正常落地,不判死页"
+    );
 
-    // 空白页但无抹除记录:通用死页信号,不给风控方向性误导
-    let plain = super::dead_page_reason("p_1", "about:blank", |_| None).expect("空白页必须有信号");
+    // 空白页但无抹除记录、无域历史:通用死页信号,不给风控方向性误导
+    let plain =
+        super::dead_page_reason("p_1", "about:blank", |_| None, |_| None).expect("空白页必须有信号");
     assert_eq!(plain["reason"], "about_blank");
     assert_eq!(plain["late"], false);
     assert!(plain["advice"].as_str().unwrap_or_default().contains("about:blank"));
 
     // 命中后台看护 TTL 台账:延迟抹除,带成因 URL 与年龄
-    let late = super::dead_page_reason("p_1", "about:blank", |pid| {
-        assert_eq!(pid, "p_1");
-        Some(("https://www.liepin.com/".to_string(), 7))
-    })
+    let late = super::dead_page_reason(
+        "p_1",
+        "about:blank",
+        |pid| {
+            assert_eq!(pid, "p_1");
+            Some(("https://www.liepin.com/".to_string(), 7))
+        },
+        |_| None,
+    )
     .expect("被抹页面必须有信号");
     assert_eq!(late["reason"], "site_wipe");
     assert_eq!(late["late"], true);
     assert_eq!(late["requested_url"], "https://www.liepin.com/");
     assert_eq!(late["wiped_ago_secs"], 7);
     assert!(late["advice"].as_str().unwrap_or_default().contains("换 profile"));
+}
+
+/// 2026-10-19:看护台账落账**之前**的观察窗口(猎聘实测抹除在导航返回后 3~6s,
+/// 而旧实现只在 10s 终检落账)——该窗口内模型拿到的原是「重新加载目标地址」这种
+/// 对抹除域恰是最该避免的建议。本测试锁死「域历史兜底」分支。
+#[test]
+fn dead_page_reason_域历史兜底给出别重试建议() {
+    // 台账未落账(recent=None),但该页最近请求域有抹除史
+    let v = super::dead_page_reason(
+        "p_1",
+        "about:blank",
+        |_| None,
+        |_| Some(("liepin.com".to_string(), 3, "https://www.liepin.com/".to_string())),
+    )
+    .expect("空白页必须有信号");
+    assert_eq!(v["reason"], "site_wipe", "有域历史时不得再给 about_blank 通用建议");
+    assert_eq!(v["late"], false, "域历史不是本页的延迟抹除记录");
+    assert_eq!(v["evidence"], "domain_history");
+    assert_eq!(v["domain"], "liepin.com");
+    assert_eq!(v["wipe_total"], 3);
+    let advice = v["advice"].as_str().unwrap_or_default();
+    assert!(advice.contains("不要重新 open/navigate 重试"), "须明确劝退重试");
+    assert!(advice.contains("liepin.com"), "须点名成因域");
+
+    // 台账有记录时优先用记录(证据更直接),不回落到域历史
+    let both = super::dead_page_reason(
+        "p_1",
+        "about:blank",
+        |_| Some(("https://www.liepin.com/".into(), 3)),
+        |_| Some(("liepin.com".to_string(), 9, "https://www.liepin.com/".into())),
+    )
+    .unwrap();
+    assert_eq!(both["late"], true, "TTL 记录优先");
+    assert!(both.get("evidence").is_none(), "命中记录时不带域历史证据标记");
 }
 
 #[tokio::test]

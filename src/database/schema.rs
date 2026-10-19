@@ -81,6 +81,26 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_subagent_run_type
             ON subagent_run(agent_type, created_at DESC);
 
+        -- ========== 站点反爬声誉台账(2026-10-19,猎聘实测) ==========
+        -- 设计见 tmpPlan/20261019_111003_站点反爬声誉跨会话持久化与抹除早检根治.md。
+        -- 缺口:WebPace 的 wipe_total/wipe_streak 原为进程内 HashMap,进程退出即归零 ——
+        -- 猎聘这类自适应打标站点于是每个新任务都要把「open→3~6s 被抹→连击→冷却→
+        -- 熔断」整段 Chrome 风暴重付一遍(用户实测「反复启动很多次 Chrome」)。
+        -- 本表把「哪条域对本环境整页抹除过/频控过」跨会话记住,使重跑任务的第一次
+        -- open 就能在 guard_navigation 处熔断,**一台 Chrome 都不拉起**。
+        -- 衰减语义:last_wipe_at 超过 LAEW_SITE_RISK_TTL_DAYS(默认 7 天)不再参与熔断,
+        -- 站点修好 WAF 后能自动恢复试探(否则永久熔断表会把用户永远锁在门外)。
+        CREATE TABLE IF NOT EXISTS site_risk (
+            domain       TEXT PRIMARY KEY,
+            wipe_total   INTEGER NOT NULL DEFAULT 0,
+            wipe_streak  INTEGER NOT NULL DEFAULT 0,
+            rate_limit   INTEGER NOT NULL DEFAULT 0,
+            last_wipe_at TEXT,
+            note         TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_site_risk_wipe
+            ON site_risk(wipe_total DESC, last_wipe_at DESC);
+
         -- ========== WorkFlow Agent(第 10 角色)新表 ==========
 
         -- Goal 状态机表
