@@ -97,6 +97,31 @@ impl EventBuffer {
     }
 }
 
+/// about:blank 清扫的「保留最后一页」护栏(纯函数,2026-10-19;便于单测锁死)。
+///
+/// 返回 `true` = 可以关掉这批空白页;`false` = 必须保留(会清空实例内全部页面,
+/// 经 `close_page` 触发整机回收 → 全新 profile + 登录态丢失 + 下次 open 再拉
+/// 一台 Chrome)。空白页零成本(同窗口多 Tab 不占 windowId 额度),留着无代价,
+/// 销毁代价高 —— 假阳性的 `nav_uncommitted` 空白页尤其不能触发这次销毁。
+fn blank_sweep_allowed(closed_candidates: usize, total_pages: usize) -> bool {
+    !(total_pages > 0 && closed_candidates >= total_pages)
+}
+
+/// 从网络环形缓冲(倒序最新在前)算本次导航的整页抹除证据(2026-10-19)。
+///
+/// 供 `new_page_impl` 在**页面注册进注册表之前**使用 —— 那时还没有 `page_id`,
+/// 拿不到注册表里的缓冲,但 `EventBuffer` 是 Arc 共享的,直接借本函数即可。
+/// 判据本身在 [`crate::agent::browser_pace::WipeEvidence::from_network`] 单一真源,
+/// 与 `page_health` / 治理账本共用,永不漂移。取锁失败按「无证据」fail-open。
+fn wipe_evidence_from_buffer(
+    events: &EventBuffer,
+    requested_url: &str,
+) -> Option<crate::agent::browser_pace::WipeEvidence> {
+    let q = events.network.lock().ok()?;
+    let refs: Vec<&Value> = q.iter().rev().map(|ev| &ev.data).collect();
+    crate::agent::browser_pace::WipeEvidence::from_network(refs.into_iter(), requested_url)
+}
+
 pub struct PageEntry {
     pub page: Page,
     pub target_id: String,
@@ -1379,28 +1404,44 @@ impl BrowserManager {
         // 仍 blank 才按原路径返回 page_health 诊断。launch/connect/new_window
         // 各路径统一受益;connect 模式同样做 —— open 语义本就是「此页导航到
         // url」,同 URL 原地刷新一次无害。
-        // 2026-10-14 第三轮:已证实的抹除域(streak≥1/冷却中)跳过自愈 —— 重导航
-        // 只会再吃一次风控请求、多闪一次窗口;自愈是给瞬态 WAF 首击的。
-        let wipe_flagged = crate::agent::browser_pace::host_of(url)
-            .map(|h| crate::agent::browser_pace::WebPace::global().wipe_flagged(&h))
-            .unwrap_or(false);
-        if final_url == "about:blank" && !wipe_flagged {
-            tracing::warn!(
-                url,
-                "open 首航落 about:blank(WAF 首击/导航竞态),原地重导航一次"
-            );
-            let retry = tokio::time::timeout(browser_timeout, page.goto(url.to_string())).await;
-            if let Ok(Ok(_)) = retry {
-                title =
-                    super::browser_cdp::cdp_with_timeout("open.retry.get_title", page.get_title())
-                        .await
-                        .flatten()
-                        .unwrap_or_default();
-                final_url =
-                    super::browser_cdp::cdp_with_timeout("open.retry.url", page.url())
-                        .await
-                        .flatten()
-                        .unwrap_or(final_url);
+        //
+        // 2026-10-19 门槛改判据(根治正反馈棘轮):旧门槛是 `!wipe_flagged`
+        // (该域**是否被记账标记**),域一旦被标记就跳过自愈 → 页面更容易停在
+        // about:blank → 更容易被记抹除 → 计数继续涨,越坏越容易再被判定坏,
+        // 且唯一减压通道(存活看护)要求页面活过看护窗,在空白情形下永远走不到。
+        // 正确判据是**本次落地有没有站点侧内容下发证据**:有证据 = 站点确实把
+        // 内容发下来又抹掉(真抹除),重导航只会再吃一次风控,跳过;无证据 = 导航
+        // 压根没提交(about:blank 起页竞态 / 导航被中止),必须重试一次兜底 ——
+        // 这与该域是否被历史记账无关。
+        if final_url.trim().eq_ignore_ascii_case("about:blank") {
+            let has_site_evidence = wipe_evidence_from_buffer(&events, url).is_some();
+            // 目标 URL 本身就是 about:blank 时无「重试成别的页面」可言,
+            // 直接跳过(否则会对一个空白 URL 触发「WAF 首击」噪声重导航)。
+            let retryable = !has_site_evidence
+                && !url.trim().eq_ignore_ascii_case("about:blank");
+            if retryable {
+                tracing::warn!(
+                    url,
+                    "open 首航落 about:blank 且无站点侧内容下发证据(导航未提交/WAF 首击),原地重导航一次"
+                );
+                let retry = tokio::time::timeout(browser_timeout, page.goto(url.to_string())).await;
+                if let Ok(Ok(_)) = retry {
+                    title =
+                        super::browser_cdp::cdp_with_timeout("open.retry.get_title", page.get_title())
+                            .await
+                            .flatten()
+                            .unwrap_or_default();
+                    final_url =
+                        super::browser_cdp::cdp_with_timeout("open.retry.url", page.url())
+                            .await
+                            .flatten()
+                            .unwrap_or(final_url);
+                }
+            } else if has_site_evidence {
+                tracing::warn!(
+                    url,
+                    "open 首航落 about:blank 但站点侧已有内容下发证据,判为站点整页抹除,跳过自愈重导航(避免多吃一次风控)"
+                );
             }
         }
         let id = new_page_id();
@@ -3071,8 +3112,16 @@ impl BrowserManager {
     /// `page_health` 里透出,无需保留句柄;不清会随每次 open 新开页堆积(实测单任务
     /// 残留 6 个 about:blank 窗口,占 `LAEW_WEB_MAX_WINDOWS` 额度又污染屏幕)。
     /// connect 模式零动作(页面归用户所有);URL 查询失败的页面保守保留(fail-open)。
-    /// 走 [`Self::close_page`] 复用「最后一页关闭 → 回收浏览器」语义:blank 页恰为
-    /// 全部页面时自然触发全新 profile 重启,正是整页抹除的恢复路径。
+    ///
+    /// 2026-10-19 护栏:**不再关掉最后一个页面**。旧实现把 blank 页交给
+    /// [`Self::close_page`] 的「最后一页关闭 → 回收浏览器 → 全新 profile」语义,
+    /// 于是「假阳性的空白页」(见 `nav_uncommitted`:导航未提交也会落 blank)
+    /// 一旦是最后一页就整实例销毁 —— 换全新 profile(**登录态/会话身份全丢**)
+    /// 且下次 `open` 必再拉一台 Chrome。对刚登录过的站点是灾难,对指纹级打标
+    /// 的域更是把「换个身份」当成了「对抗风控」的手段反复执行,正是用户报告的
+    /// 「Agent 反复启动很多次 Chrome」。空白页本身零成本(同窗口多 Tab 不占
+    /// `LAEW_WEB_MAX_WINDOWS` 的 windowId 额度),留着无成本,销毁代价高。
+    /// 被跳过的空白页在返回值里以 `closed < len(candidates)` 体现,并打 WARN 留痕。
     pub async fn close_blank_pages(&self) -> usize {
         // 2026-10-16:锁内只取快照(connect 判定 + Page 克隆),CDP 探测放到锁外
         // 有界执行 —— 撞上卡死 handler 时按「非空白页」保守保留(fail-open),
@@ -3101,10 +3150,23 @@ impl BrowserManager {
         if candidates.is_empty() {
             return 0;
         }
+        // 2026-10-19 护栏:留下至少一个页面 —— 关掉最后一页会经 `close_page` 触发
+        // 整机回收(全新 profile + 登录态丢失 + 下次 open 再拉一台 Chrome)。
+        // 宁留一个零成本的空白页,也不做这次高代价销毁。
+        let total_pages = snapshot.len();
+        if !blank_sweep_allowed(candidates.len(), total_pages) {
+            tracing::warn!(
+                candidates = candidates.len(),
+                total_pages,
+                "about:blank 清扫全部命中但已跳过:保留最后一个页面以免触发浏览器整机回收(会丢登录态并导致反复拉起 Chrome)"
+            );
+            return 0;
+        }
         let closed = candidates.len();
         tracing::info!(
             closed,
-            "MCP_Web_Use 清扫整页抹除遗留的 about:blank 空白页面(死页面,证据已透出)"
+            total_pages,
+            "MCP_Web_Use 清扫 about:blank 空白页面(证据已透出;保留最后一个页面防整机回收)"
         );
         for id in candidates {
             self.close_page(&id).await;
@@ -3849,5 +3911,27 @@ mod tests {
         assert!(prefs.contains("has_seen_welcome_page"));
         let local = std::fs::read_to_string(profile.join("Local State")).unwrap();
         assert!(local.contains("background_mode"));
+    }
+
+    // ===== 2026-10-19:about:blank 清扫的「保留最后一页」护栏 =====
+
+    #[test]
+    fn blank_sweep_keeps_last_page_to_avoid_full_browser_recycle() {
+        // 全部页面都是空白 → 跳过。关掉最后一页会经 close_page 触发整机回收
+        // (全新 profile + 登录态丢失 + 下次 open 再拉一台 Chrome),正是用户报告
+        // 的「Agent 反复启动很多次 Chrome」的一条直接成因。
+        assert!(
+            !blank_sweep_allowed(1, 1),
+            "单个空白页即全部页面,必须保留"
+        );
+        assert!(
+            !blank_sweep_allowed(3, 3),
+            "全部页面皆空白,必须保留"
+        );
+        // 还有一个工作页 → 可以清,不必牵连它。
+        assert!(blank_sweep_allowed(2, 3), "留有工作页时空白页可正常清扫");
+        // 无空白候选 → 无事发生(放行,调用方提前返回)。
+        assert!(blank_sweep_allowed(0, 1));
+        assert!(blank_sweep_allowed(0, 0));
     }
 }

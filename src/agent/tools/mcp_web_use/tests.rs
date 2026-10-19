@@ -505,9 +505,37 @@ async fn control_missing_control_action_returns_1001() {
     assert!(res.contains("缺少 control_action"));
 }
 
+/// 2026-10-19:无页任务级 HITL 的路由判据 —— 整页抹除持久熔断(6004)时
+/// 浏览器一台都没起(`list` 返 `windows=0`),`request_human` 是 advice 里
+/// 「唯一可行」的出路,却因缺 `page_id` 返 1001 而物理不可达,逼得 Agent
+/// 去 `open("about:blank")` 硬造页面(反复弹 Chrome)。此用例锁死「问得到人」。
+#[test]
+fn page_less_hitl_route_allows_request_human_only() {
+    use super::control::is_page_less_hitl;
+    // 无 page_id + request_human → 放行(任务级提问)。
+    assert!(is_page_less_hitl(None, Some("request_human")));
+    // 其余动作缺 page_id 仍拦(它们必须操作具体页面)。
+    for act in [
+        "click",
+        "input_text",
+        "navigate",
+        "screenshot",
+        "set_guard",
+        "request_human_x",
+    ] {
+        assert!(
+            !is_page_less_hitl(None, Some(act)),
+            "{act} 缺 page_id 不得走无页通路"
+        );
+    }
+    // 缺 control_action 也拦(分不清要做什么)。
+    assert!(!is_page_less_hitl(None, None));
+    // 有 page_id 时一律走正常路径(带页提问仍是主路径)。
+    assert!(!is_page_less_hitl(Some("p_abc"), Some("request_human")));
+}
+
 #[tokio::test]
-async fn inspect_missing_page_id_returns_1001() {
-    let res = McpWebUseTool
+async fn inspect_missing_page_id_returns_1001() {    let res = McpWebUseTool
         .execute(json!({"action": "inspect", "info": "console"}))
         .await
         .unwrap();

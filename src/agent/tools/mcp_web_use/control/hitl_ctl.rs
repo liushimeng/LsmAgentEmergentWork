@@ -858,8 +858,12 @@ pub(super) async fn act_request_human(
     id: &str,
     p: &Value,
 ) -> crate::error::Result<String> {
-    // page_id 有效性前置校验(2000 语义与其它动作一致)
-    if crate::agent::browser::BrowserManager::global().page(id).await.is_none() {
+    // 2026-10-19:**无页任务级提问**(`id` 为空)—— 见 `control::run` 的死路说明。
+    // 整页抹除持久熔断(6004)时浏览器一台都没起,「交还人工」是唯一出路却因
+    // 缺 page_id 而不可达,Agent 只能 `open("about:blank")` 硬造页面(反复弹
+    // Chrome)。任务级提问不需要页面:无可解锁/无可置前,只弹窗收应答。
+    // 非空 `id` 仍做有效性前置校验(2000 语义与其它动作一致)。
+    if !id.is_empty() && crate::agent::browser::BrowserManager::global().page(id).await.is_none() {
         return envelope(2000, "page_id 不存在", json!({"page_id": id}));
     }
     let reason = str_arg(p, "reason").unwrap_or("custom");

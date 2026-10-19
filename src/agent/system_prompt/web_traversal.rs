@@ -52,4 +52,16 @@ pub(crate) const WEB_TRAVERSAL_PROMPT_SECTION: &str = r##"
     硬闯请先说清理由再用 `force=true`;
     ④ 拿到 `page_dead{reason=site_wipe}` 时**不要重新 open/navigate 重试**
     —— 那正是该域已知无效的动作;按上面的改道走,或如实报告不可达。
+22.4 **导航未提交 ≠ 站点抹除**(响应带 `page_health.reason=nav_uncommitted` /
+    `site_wipe=false` 时):页面停在 about:blank 且站点侧**零内容下发证据**
+    (主文档无响应、同域子资源 <5)。这是导航本身没提交(慢网关 / 导航被中止),
+    **不是**反爬抹除,工具层也不会把它记进抹除账本。处置:`wait` 复查一次;
+    仍空白就原页 `control(navigate)` 重试一次。**不要**因此 `close(all)`
+    —— 那会丢登录态并再拉一台 Chrome。连续两次 nav_uncommitted 视为该 URL
+    不可达,如实报告并 request_human 确认。
+22.5 **无页也能问人工**(2026-10-19):`control(request_human)` **不需要
+    `page_id`** —— 整页抹除熔断(6004)时一台 Chrome 都没拉起,这正是唯一出路。
+    遇到 6004 / 站点不可达,**直接 request_human 说明情况并请人工在其自己
+    浏览器完成或提供数据**,不要为了凑 `page_id` 去 `open("about:blank")`
+    —— 那是凭空拉起一台 Chrome。
 "##;

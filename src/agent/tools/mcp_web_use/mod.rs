@@ -583,42 +583,42 @@ async fn fit_headed_window(page_id: &str) -> Option<Value> {
 /// 事件恒 `main_doc_status=null`,只能给泛泛的 `empty_dom` 建议「先 wait 复查」,
 /// Agent 空转 25+ 次导航。这里按**请求 URL** 扫缓冲,把「页面曾真实加载后被抹」
 /// 的结构性证据(主文档有响应 / 同域子资源计数)透出来,判定零关键词。
-#[derive(Debug, PartialEq, Eq)]
-pub(super) struct WipeEvidence {
-    /// 请求 URL 主文档的 response 状态(倒序最新一条;None=缓冲里无该条目)
-    pub main_doc_status: Option<i64>,
-    /// 同注册域 response 子资源条数(含主文档)
-    pub subresources: usize,
-}
+///
+/// 2026-10-19:定义迁到 [`crate::agent::browser_pace::WipeEvidence`](单一真源,
+/// 与治理账本 `note_navigation_outcome` 共用判据),此处只做再导出保持
+/// `mcp_web_use::WipeEvidence` 路径不变。
+pub(super) use crate::agent::browser_pace::WipeEvidence;
 
 /// 从网络事件(倒序,最新在前)判定整页抹除证据;不命中返回 `None`(维持既有
 /// `empty_dom` 路径 —— 服务端从未响应不是抹除)。纯函数,可单测。
+///
+/// 2026-10-19:判据下沉到 [`crate::agent::browser_pace::WipeEvidence::from_network`]
+/// 单一真源,本函数只做「倒序事件数组 → 迭代器」的适配,保证 page_health 的
+/// `site_wipe` 判定与治理账本的记账判据**永不漂移**。
 pub(super) fn wipe_evidence_from_events(
     events: &[&Value],
     requested_url: &str,
 ) -> Option<WipeEvidence> {
-    let host = crate::agent::browser_pace::host_of(requested_url)?;
-    let mut main_doc_status = None;
-    let mut subresources = 0usize;
-    for d in events {
-        let Some(url) = d.get("url").and_then(Value::as_str) else {
-            continue;
-        };
-        if crate::agent::browser_pace::host_of(url).as_deref() != Some(host.as_str()) {
-            continue;
-        }
-        if d.get("phase").and_then(Value::as_str) != Some("response") {
-            continue;
-        }
-        subresources += 1;
-        if url == requested_url && main_doc_status.is_none() {
-            main_doc_status = d.get("status").and_then(Value::as_i64);
-        }
-    }
-    (main_doc_status.is_some() || subresources >= 5).then_some(WipeEvidence {
-        main_doc_status,
-        subresources,
-    })
+    WipeEvidence::from_network(events.iter().copied(), requested_url)
+}
+
+/// 按 `page_id` 取该页网络环形缓冲,算本次导航的抹除证据(2026-10-19)。
+///
+/// 记账与 `page_health` 共用同一判据:**没有站点侧内容下发证据就不算抹除**。
+/// 立即态记账点(open 复用 / open 新建 / open 新窗口 / control navigate)统一
+/// 经此函数取证据后喂给 [`crate::agent::browser_pace::WebPace::note_navigation_outcome`],
+/// 消除「about:blank 起页竞态 / 导航被中止 / 文档从未提交」这类 laew 自造空白
+/// 被误记为站点抹除的假阳性。取证据失败(fail-open)按「无证据」处理,即不记账。
+pub(super) async fn page_wipe_evidence(page_id: &str, requested_url: &str) -> Option<WipeEvidence> {
+    BrowserManager::global()
+        .events(page_id)
+        .await
+        .and_then(|buf| {
+            buf.network.lock().ok().and_then(|q| {
+                let events: Vec<&Value> = q.iter().rev().map(|ev| &ev.data).collect();
+                wipe_evidence_from_events(&events, requested_url)
+            })
+        })
 }
 
 /// 整页抹除连击记账 → 响应字段(2026-10-14)。治理状态本体在 `browser_pace`
@@ -1043,15 +1043,7 @@ async fn page_health_field(page_id: &str, final_url: &str, requested_url: &str) 
     if final_url.trim().eq_ignore_ascii_case("about:blank")
         && !requested_url.trim().eq_ignore_ascii_case("about:blank")
     {
-        let wipe = BrowserManager::global()
-            .events(page_id)
-            .await
-            .and_then(|buf| {
-                buf.network.lock().ok().and_then(|q| {
-                    let events: Vec<&Value> = q.iter().rev().map(|ev| &ev.data).collect();
-                    wipe_evidence_from_events(&events, requested_url)
-                })
-            });
+        let wipe = page_wipe_evidence(page_id, requested_url).await;
         if let Some(ev) = wipe {
             return Some(json!({
                 "blank": true,
@@ -1065,6 +1057,23 @@ async fn page_health_field(page_id: &str, final_url: &str, requested_url: &str) 
 同域累计抹除达阈值后工具层对该域 laew 身份持久熔断(6004);人工在场可 request_human 协助登录",
             }));
         }
+        // ⓪-b 导航未提交(2026-10-19):落地空白**且站点侧零内容下发证据** ——
+        //    这不是站点抹除,是导航本身没提交(about:blank 起页竞态 / 导航被中止 /
+        //    CDP 读 URL 失准)。必须与 site_wipe 明确分流:此前无此分支,模型
+        //    收到的要么是泛泛的 empty_dom「先 wait 复查」,要么被误当作站点抹除
+        //    而触发换 profile 反复弹 Chrome —— 后者正是本域的假阳性根源。
+        //    治理账本同步零改动(见 `note_navigation_outcome` 的 evidence 判据)。
+        return Some(json!({
+            "blank": true,
+            "reason": "nav_uncommitted",
+            "requested_url": requested_url,
+            "site_wipe": false,
+            "note": "导航未提交:页面停在 about:blank 且站点侧**没有任何内容下发证据**(主文档无响应、同域子资源 < 5)。这不是反爬整页抹除,不要据此换 profile 或反复导航",
+            "next_action": "先 wait 复查一次(慢网关下主文档可能仍在提交中);\
+若仍为空白,原页 control(navigate) 重试一次即可(工具层已自动原地重导航过一次);\
+连续两次 nav_uncommitted 视为该 URL/网络路径不可达,如实报告并 request_human 确认,\
+不要 close(page_id=\"all\") —— 回收浏览器会丢失登录态并再拉一台 Chrome",
+        }));
     }
     // ① 主文档状态:扫 Network 环形缓冲里 url 命中 final_url 的 response 条目
     //    (倒序取最后一条,天然覆盖「同 URL 多次重定向/reload」)。
@@ -1634,8 +1643,9 @@ async fn run_open_inner(args: &Value, url: &str) -> Result<String> {
                     let count_wipes = !connect_mode
                         || BrowserManager::global().connect_is_laew_relaunch().await;
                     let mut wipe_outcome = if count_wipes {
+                        let ev = page_wipe_evidence(&pid, url).await;
                         crate::agent::browser_pace::WebPace::global()
-                            .note_navigation_outcome(url, &final_url)
+                            .note_navigation_outcome(url, &final_url, ev)
                     } else {
                         None
                     };
@@ -1812,8 +1822,9 @@ async fn run_open_inner(args: &Value, url: &str) -> Result<String> {
             let count_wipes = !connected_now
                 || BrowserManager::global().connect_is_laew_relaunch().await;
             let mut wipe_outcome = if count_wipes {
+                let ev = page_wipe_evidence(&page_id, url).await;
                 crate::agent::browser_pace::WebPace::global()
-                    .note_navigation_outcome(url, &final_url)
+                    .note_navigation_outcome(url, &final_url, ev)
             } else {
                 None
             };
@@ -2090,8 +2101,10 @@ async fn run_open_new_window(args: &Value, url: &str) -> Result<String> {
             // 第 172 轮:new_window 路径同样补自刷新台账 + 登录墙 + 指纹。
             enrich_after_navigation(&page_id, &mut data, &final_url, true).await;
             // 2026-10-14:整页抹除记账(本路径已拒绝 connect 模式,恒记)。
+            // 2026-10-19:记账须有站点侧内容下发证据,否则空白落地按导航未提交处理。
+            let ev = page_wipe_evidence(&page_id, url).await;
             let wipe_outcome = crate::agent::browser_pace::WebPace::global()
-                .note_navigation_outcome(url, &final_url);
+                .note_navigation_outcome(url, &final_url, ev);
             if let Some(v) = site_wipe_field(wipe_outcome) {
                 data["site_wipe"] = v;
             }
@@ -2694,7 +2707,7 @@ impl Tool for McpWebUseTool {
                 "user_agent": { "type": "string", "description": "open 可选:覆盖 User-Agent" },
                 "wait_until": { "type": "string", "enum": ["load", "domcontentloaded", "networkidle"], "description": "open 可选:打开后额外等待(networkidle 额外等 1.5s)" },
                 "block_resources": { "type": "array", "items": { "type": "string" }, "description": "open 可选:拦截资源类型(image/stylesheet/font/media/script),当前仅记录提示" },
-                "page_id": { "type": "string", "description": "close/control/inspect 必填:open/list 返回或 spawned_page_id 回传的页面句柄;close 时可为 \"all\" 一键关闭全部页面并回收浏览器,或 \"background\" 批量关闭全部后台标签页(至少保留一个前台页,探测不到前台页时拒绝执行),或 \"others\" 关闭除 keep 外全部页面(keep 必填且必须是存活 page_id,防一锅端)" },
+                "page_id": { "type": "string", "description": "close/control/inspect 必填:open/list 返回或 spawned_page_id 回传的页面句柄;close 时可为 \"all\" 一键关闭全部页面并回收浏览器,或 \"background\" 批量关闭全部后台标签页(至少保留一个前台页,探测不到前台页时拒绝执行),或 \"others\" 关闭除 keep 外全部页面(keep 必填且必须是存活 page_id,防一锅端)。唯一例外:control_action=request_human 时**可省略** —— 站点不可达/整页抹除熔断时一台浏览器都没起,这正是唯一出路,不必为凑 page_id 去 open 一个空白页" },
                 "keep": { "type": "string", "description": "close 可选(仅 page_id=\"others\" 时必填):要保留的存活 page_id,其余全部关闭" },
                 "control_action": {
                     "type": "string",

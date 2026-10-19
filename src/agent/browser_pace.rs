@@ -296,6 +296,74 @@ pub struct WipeOutcome {
     pub cooldown_triggered: bool,
 }
 
+/// 判定「站点整页抹除」所需的**站点侧内容下发证据**(2026-10-19)。
+///
+/// 本结构体是「什么算整页抹除」的**单一真源**:既喂给
+/// [`WebPace::note_navigation_outcome`] 决定是否记账,也喂给 `page_health`
+/// 决定 `reason=site_wipe` 还是 `reason=nav_uncommitted`,两处不再各写一套
+/// 判据(此前记账只认「落地 about:blank」而 page_health 还额外要求网络证据,
+/// 同一概念两套定义 → 账本被自伤空白灌水 → 过早 6004 熔断)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WipeEvidence {
+    /// 主文档 HTTP 状态码(请求 URL 精确匹配的那条 response 事件;无则 `None`)
+    pub main_doc_status: Option<i64>,
+    /// 同注册域 response 子资源条数(含主文档)
+    pub subresources: usize,
+}
+
+impl WipeEvidence {
+    /// 从网络事件(倒序,最新在前)判定整页抹除证据;不命中返回 `None`。
+    ///
+    /// 判据:主文档确有响应**或**同域子资源响应数 ≥ [`WIPE_EVIDENCE_SUBRESOURCE_MIN`]
+    /// —— 即「站点确实把内容发下来了」。DNS 失败 / 导航被中止 / 文档从未提交
+    /// 时一条 response 都没有,证据为 `None`,**不得**记为抹除。
+    pub fn from_network<'a>(
+        events: impl Iterator<Item = &'a serde_json::Value>,
+        requested_url: &str,
+    ) -> Option<Self> {
+        let host = host_of(requested_url)?;
+        let mut main_doc_status = None;
+        let mut subresources = 0usize;
+        for d in events {
+            let Some(url) = d.get("url").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if host_of(url).as_deref() != Some(host.as_str()) {
+                continue;
+            }
+            if d.get("phase").and_then(serde_json::Value::as_str) != Some("response") {
+                continue;
+            }
+            subresources += 1;
+            if url == requested_url && main_doc_status.is_none() {
+                main_doc_status = d.get("status").and_then(serde_json::Value::as_i64);
+            }
+        }
+        (main_doc_status.is_some() || subresources >= WIPE_EVIDENCE_SUBRESOURCE_MIN).then_some(
+            WipeEvidence {
+                main_doc_status,
+                subresources,
+            },
+        )
+    }
+
+    /// 「先成功落地、数秒后变空白」形态的证据(后台看护专用)。
+    ///
+    /// 这条路径比 [`Self::from_network`] 的证据**更强**:本次导航已经成功提交过
+    /// (落地非空白才会调度看护),随后在 4s/10s 复读观测到 `about:blank` ——
+    /// 「成功 → 空白」的转变本身就是站点侧行为的证据,不依赖网络缓冲回查
+    /// (缓冲可能已轮转,`main_doc_status` 未必还在)。
+    pub fn late_transition() -> Self {
+        WipeEvidence {
+            main_doc_status: None,
+            subresources: 0,
+        }
+    }
+}
+
+/// 抹除证据的同域子资源条数下限(与 `page_health` 旧判据同值,收敛为常量单一真源)。
+pub const WIPE_EVIDENCE_SUBRESOURCE_MIN: usize = 5;
+
 /// 全局单例句柄。
 #[derive(Default)]
 pub struct WebPace {
@@ -457,7 +525,8 @@ impl WebPace {
 
     /// 显式导航落地记账(整页抹除连击;2026-10-14 猎聘实测形态,见模块头 3.)。
     ///
-    /// - 落地 `about:blank` → 该域连击 +1、**总账 +1**(`wipe_total` 跨实例累计,
+    /// - 落地 `about:blank` **且有站点侧证据**(`evidence.is_some()`)→ 该域连击 +1、
+    ///   **总账 +1**(`wipe_total` 跨实例累计,
     ///   达 [`wipe_total_threshold`] 后对 laew 身份持久熔断);连击 ≥
     ///   [`WIPE_STREAK_THRESHOLD`] 触发 `cause=site_wipe` 冷却(幂等取更晚;
     ///   未过阈值不拦截,靠 page_health 证据引导);
@@ -465,12 +534,18 @@ impl WebPace {
     ///   4~10s,落地成功只是假恢复;清账只认 [`Self::note_navigation_survived`]
     ///   的「存活过看护窗」证据);
     /// - 请求 URL 不可解析 host / 落地为空 → 不记账。
+    /// - **`evidence` 为 `None` → 不记账**(2026-10-19):站点侧没有任何内容下发证据
+    ///   时,空白落地是 laew 自造的(about:blank 起页竞态 / 导航被中止 / 文档从未
+    ///   提交 / CDP 读 URL 失准),站点一行脚本都没跑过,记为抹除是**假阳性**。
+    ///   假阳性会灌水 `wipe_total` → 过早触发 6004 持久熔断 → 用户被 TTL 锁在
+    ///   门外,而真实成因(导航竞态)从未被识别,排障无从下手。
     ///
     /// 返回 `Some` 仅当本次落地被计为抹除连击(调用方据此在响应里附 `site_wipe` 段)。
     pub fn note_navigation_outcome(
         &self,
         requested_url: &str,
         landed_url: &str,
+        evidence: Option<WipeEvidence>,
     ) -> Option<WipeOutcome> {
         self.hydrate();
         if !enabled() {
@@ -484,6 +559,11 @@ impl WebPace {
             // 清掉,总账永远归零、持久熔断(阈值 3)永不触发(实测轨迹
             // 0→1→0→1→2→0)。清账改由 [`Self::note_navigation_survived`] 执行 ——
             // 页面**存活过看护窗**才是真恢复证据。
+            return None;
+        }
+        if evidence.is_none() {
+            // 无站点侧内容下发证据 → 空白是自造的,归 `nav_uncommitted`(由调用方
+            // 在 page_health 里分流),治理账本零改动。
             return None;
         }
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -879,7 +959,8 @@ fn persistent_wipe_envelope(host: &str, total: u32, threshold: u32) -> Option<St
         "站点整页抹除持久熔断({host}):已对 laew 拉起环境累计抹除 {total} 次(≥{threshold}),\
 判定为指纹级打标 —— close(all) 换全新 profile/auto_relaunch 调试实例/强制导航均被实测无效,\
 每试一次多弹一台 Chrome 并再吃一次风控。环境打标通常含 IP 维度,当日重试无意义。\
-唯一可行:request_human 交还人工(人工在自己浏览器完成任务或提供数据);已采集数据先落盘,如实失败收口"
+唯一可行:request_human 交还人工(**无需 page_id**,当前无浏览器也能直接提问);\
+人工在自己浏览器完成任务或提供数据;已采集数据先落盘,如实失败收口"
     );
     let data = json!({
         "host": host,
@@ -890,10 +971,15 @@ fn persistent_wipe_envelope(host: &str, total: u32, threshold: u32) -> Option<St
         "advice": "该域已对 laew 拉起的浏览器环境(全新 profile 与调试实例均在内)做指纹级打标,\
 继续 open/navigate/close(all)/force 重试只会反复弹 Chrome 并再次被抹除(实测均无效)。处置:\
 ① 立即停止对该域的一切导航尝试,不要再让用户执行任何调试端口命令(同端口同 profile,结局相同);\
-② request_human 交还人工处理(人工在自己的浏览器完成任务,或提供已采集数据);\
+② request_human 交还人工处理(人工在自己的浏览器完成任务,或提供已采集数据;\
+该动作**不需要 page_id** —— 当前一台 Chrome 都没起也能直接提问,不必 open 造页面);\
 ③ 已采集数据先落盘,如实向用户报告失败与环境判定;环境打标通常含 IP 维度,建议当日不再重试本域",
         "force_hint": "持久熔断下 force 逃生口有预算(缺省 2 次),用尽后同样返回 6004 —— \
 强制导航不改变站点侧打标,只多弹 Chrome 多吃风控",
+        "manual_release": "人工解除熔断(**不需要改代码**):换 IP 或站点 WAF 已修复时,\
+设环境变量 LAEW_SITE_RISK_PERSIST=off 跑一次即可绕过历史账(本次运行不落库不读库);\
+或直接清账:sqlite3 <程序目录>/LsmAgentEmergentWork.db \"delete from site_risk where domain='<host>';\"\
+(记录默认保留 LAEW_SITE_RISK_TTL_DAYS=7 天,超期自动失效)",
     });
     serde_json::to_string(&json!({
         "code": CODE_SITE_PACE_COOLDOWN,
@@ -1112,7 +1198,7 @@ mod tests {
     fn 整页抹除_落地about_blank累计连击() {
         let p = pace();
         // 第一次落 about:blank:连击 1,未过阈值不触发冷却
-        let o1 = p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        let o1 = p.note_navigation_outcome("https://www.liepin.com/", "about:blank", Some(WipeEvidence::late_transition()));
         assert_eq!(
             o1,
             Some(WipeOutcome {
@@ -1122,7 +1208,7 @@ mod tests {
         );
         assert_eq!(p.cooldown_remaining_for("liepin.com"), None);
         // 第二次:连击 2 = 阈值,触发 site_wipe 冷却
-        let o2 = p.note_navigation_outcome("https://www.liepin.com/zhaopin/", "about:blank");
+        let o2 = p.note_navigation_outcome("https://www.liepin.com/zhaopin/", "about:blank", Some(WipeEvidence::late_transition()));
         assert_eq!(
             o2,
             Some(WipeOutcome {
@@ -1137,11 +1223,11 @@ mod tests {
     #[test]
     fn 整页抹除_落地非blank不清账_存活过看护窗才清零() {
         let p = pace();
-        p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        p.note_navigation_outcome("https://www.liepin.com/", "about:blank", Some(WipeEvidence::late_transition()));
         // 2026-10-14 第三轮:落地非 blank 不清账(抹除发生在其后 4~10s,落地成功
         // 只是假恢复 —— 清掉会让后台补记账归零、熔断永不触发)。
         assert_eq!(
-            p.note_navigation_outcome("https://www.liepin.com/", "https://www.liepin.com/"),
+            p.note_navigation_outcome("https://www.liepin.com/", "https://www.liepin.com/", Some(WipeEvidence::late_transition())),
             None
         );
         assert_eq!(p.wipe_streak_for("liepin.com"), 1, "落地成功不清连击");
@@ -1150,7 +1236,7 @@ mod tests {
         assert_eq!(p.wipe_streak_for("liepin.com"), 0);
         assert_eq!(p.wipe_total_for("liepin.com"), 0);
         // 再次单次 blank 仍是连击 1,不触发
-        let o = p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        let o = p.note_navigation_outcome("https://www.liepin.com/", "about:blank", Some(WipeEvidence::late_transition()));
         assert_eq!(o.map(|x| (x.streak, x.cooldown_triggered)), Some((1, false)));
         assert_eq!(p.cooldown_remaining_for("liepin.com"), None);
     }
@@ -1158,8 +1244,8 @@ mod tests {
     #[test]
     fn 整页抹除_子域共享注册域连击() {
         let p = pace();
-        p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
-        let o = p.note_navigation_outcome("https://api-c.liepin.com/x", "about:blank");
+        p.note_navigation_outcome("https://www.liepin.com/", "about:blank", Some(WipeEvidence::late_transition()));
+        let o = p.note_navigation_outcome("https://api-c.liepin.com/x", "about:blank", Some(WipeEvidence::late_transition()));
         assert!(o.is_some_and(|x| x.cooldown_triggered));
         assert_eq!(p.cooldown_cause_for("liepin.com"), Some(CAUSE_SITE_WIPE));
     }
@@ -1167,8 +1253,8 @@ mod tests {
     #[test]
     fn 整页抹除_不可解析host不记账() {
         let p = pace();
-        assert_eq!(p.note_navigation_outcome("about:blank", "about:blank"), None);
-        assert_eq!(p.note_navigation_outcome("not a url", "about:blank"), None);
+        assert_eq!(p.note_navigation_outcome("about:blank", "about:blank", Some(WipeEvidence::late_transition())), None);
+        assert_eq!(p.note_navigation_outcome("not a url", "about:blank", Some(WipeEvidence::late_transition())), None);
     }
 
     // ==================== 2026-10-14 第三轮:后台补记账 + 局势可见性 ====================
@@ -1177,9 +1263,9 @@ mod tests {
     fn wipe_flagged_连击或冷却成立为真_存活恢复后为假() {
         let p = pace();
         assert!(!p.wipe_flagged("liepin.com"), "无任何抹除记录不应判定为抹除域");
-        p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        p.note_navigation_outcome("https://www.liepin.com/", "about:blank", Some(WipeEvidence::late_transition()));
         assert!(p.wipe_flagged("liepin.com"), "连击 1 即已证实抹除(跳过重导航自愈)");
-        p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        p.note_navigation_outcome("https://www.liepin.com/", "about:blank", Some(WipeEvidence::late_transition()));
         assert!(p.wipe_flagged("liepin.com"), "冷却中同样为真");
         // 存活过看护窗 = 真实恢复:连击清零后(冷却未到)不再判定为抹除域,
         // 瞬态首击自愈照常。
@@ -1192,7 +1278,7 @@ mod tests {
         let _g = env_lock(); // env 解析测试并行会改阈值变量,读者同样持锁防竞态
         let p = pace();
         assert!(p.wipe_ledger_snapshot("liepin.com").is_none());
-        p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        p.note_navigation_outcome("https://www.liepin.com/", "about:blank", Some(WipeEvidence::late_transition()));
         let snap = p.wipe_ledger_snapshot("liepin.com").expect("有抹除史应有快照");
         assert_eq!(snap["total"], 1);
         assert_eq!(snap["streak"], 1);
@@ -1210,8 +1296,8 @@ mod tests {
         let p = pace();
         for _ in 0..3 {
             // 每次导航:open 结算落地非 blank(不清账)→ 10s 后看护判定被抹(+1)
-            p.note_navigation_outcome("https://www.liepin.com/", "https://www.liepin.com/");
-            p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+            p.note_navigation_outcome("https://www.liepin.com/", "https://www.liepin.com/", Some(WipeEvidence::late_transition()));
+            p.note_navigation_outcome("https://www.liepin.com/", "about:blank", Some(WipeEvidence::late_transition()));
         }
         assert_eq!(p.wipe_total_for("liepin.com"), 3, "补记账后总账应单调累积");
         assert!(p.wipe_exhausted("liepin.com"), "累计达阈值即熔断");
@@ -1245,8 +1331,8 @@ mod tests {
     #[test]
     fn 整页抹除_冷却期导航决策为拦截() {
         let p = pace();
-        p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
-        p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        p.note_navigation_outcome("https://www.liepin.com/", "about:blank", Some(WipeEvidence::late_transition()));
+        p.note_navigation_outcome("https://www.liepin.com/", "about:blank", Some(WipeEvidence::late_transition()));
         // 冷却 90s > 自动等待 45s → Block
         match p.decide("liepin.com") {
             PaceDecision::Block { .. } => {}
@@ -1259,8 +1345,8 @@ mod tests {
     #[test]
     fn 整页抹除_clear_all清冷却与连击_但总账保留() {        let p = pace();
         p.note_nav_for("liepin.com");
-        p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
-        p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        p.note_navigation_outcome("https://www.liepin.com/", "about:blank", Some(WipeEvidence::late_transition()));
+        p.note_navigation_outcome("https://www.liepin.com/", "about:blank", Some(WipeEvidence::late_transition()));
         assert!(p.cooldown_remaining_for("liepin.com").is_some());
         assert_eq!(p.wipe_total_for("liepin.com"), 2);
         // close(all) 回收浏览器:冷却/连击清零(新身份的当次 blank 不再直接熔断),
@@ -1269,7 +1355,7 @@ mod tests {
         assert_eq!(p.cooldown_remaining_for("liepin.com"), None);
         assert_eq!(p.cooldown_cause_for("liepin.com"), None);
         assert_eq!(p.wipe_total_for("liepin.com"), 2, "总账不被 clear_all 清除");
-        let o = p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        let o = p.note_navigation_outcome("https://www.liepin.com/", "about:blank", Some(WipeEvidence::late_transition()));
         assert_eq!(o.map(|x| (x.streak, x.cooldown_triggered)), Some((1, false)));
         assert_eq!(p.wipe_total_for("liepin.com"), 3);
     }
@@ -1316,7 +1402,7 @@ mod tests {
         let _g = env_lock(); // 阈值变量读者持锁防与 env 解析测试并行竞态(基线既有偶发)
         let p = pace();
         for _ in 0..wipe_total_threshold() {
-            p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+            p.note_navigation_outcome("https://www.liepin.com/", "about:blank", Some(WipeEvidence::late_transition()));
         }
         assert!(p.wipe_exhausted("liepin.com"));
         // 持久熔断信封:laew 身份被拦(6004,cause=site_wipe,persistent=true)
@@ -1341,7 +1427,7 @@ mod tests {
         let p = pace();
         // 攒到持久熔断(缺省阈值 3 次抹除)。
         for _ in 0..wipe_total_threshold() {
-            p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+            p.note_navigation_outcome("https://www.liepin.com/", "about:blank", Some(WipeEvidence::late_transition()));
         }
         assert!(p.wipe_exhausted("liepin.com"));
         assert!(p.note_forced_nav("liepin.com").is_none(), "第 1 次 force 预算内放行");
@@ -1368,14 +1454,14 @@ mod tests {
         // 直接构造「已攒到阈值的全新实例」(等价于 hydrate 从台账回填后的状态)。
         let p = pace();
         for _ in 0..wipe_total_threshold() {
-            p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+            p.note_navigation_outcome("https://www.liepin.com/", "about:blank", Some(WipeEvidence::late_transition()));
         }
         assert!(p.wipe_exhausted("liepin.com"));
 
         // 恢复证据随新进程一同回填的等价态:台账被清 → 新进程不再熔断。
         let q = pace();
         assert!(!q.wipe_exhausted("liepin.com"), "无历史的新进程不得凭空熔断");
-        q.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        q.note_navigation_outcome("https://www.liepin.com/", "about:blank", Some(WipeEvidence::late_transition()));
         assert_eq!(q.wipe_total_for("liepin.com"), 1);
         // 未达阈值不熔断(阈值语义不因持久化而改变)。
         assert!(!q.wipe_exhausted("liepin.com"));
@@ -1387,7 +1473,7 @@ mod tests {
         let p = pace();
         // 本次进程已经踩到超过阈值的账。
         for _ in 0..(wipe_total_threshold() + 2) {
-            p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+            p.note_navigation_outcome("https://www.liepin.com/", "about:blank", Some(WipeEvidence::late_transition()));
         }
         let live = p.wipe_total_for("liepin.com");
         assert!(live > wipe_total_threshold());
@@ -1418,12 +1504,12 @@ mod tests {
         let _g = env_lock(); // 同 账本快照 注:阈值变量读者持锁防并行竞态
         let p = pace();
         for _ in 0..wipe_total_threshold() {
-            p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+            p.note_navigation_outcome("https://www.liepin.com/", "about:blank", Some(WipeEvidence::late_transition()));
         }
         assert!(p.wipe_exhausted("liepin.com"));
         // 仅「落地成功」不算恢复(抹除发生在其后 4~10s):
         assert_eq!(
-            p.note_navigation_outcome("https://www.liepin.com/", "https://www.liepin.com/"),
+            p.note_navigation_outcome("https://www.liepin.com/", "https://www.liepin.com/", Some(WipeEvidence::late_transition())),
             None
         );
         assert!(p.wipe_exhausted("liepin.com"), "落地成功不解除熔断");
@@ -1439,10 +1525,10 @@ mod tests {
     fn 整页抹除_总账跨不同浏览器实例累计() {
         let p = pace();
         // 实例 1 被抹 2 次 → close(all) → 实例 2 再被抹:总账连续累计
-        p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
-        p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        p.note_navigation_outcome("https://www.liepin.com/", "about:blank", Some(WipeEvidence::late_transition()));
+        p.note_navigation_outcome("https://www.liepin.com/", "about:blank", Some(WipeEvidence::late_transition()));
         p.clear_all();
-        p.note_navigation_outcome("https://www.liepin.com/zhaopin/", "about:blank");
+        p.note_navigation_outcome("https://www.liepin.com/zhaopin/", "about:blank", Some(WipeEvidence::late_transition()));
         assert_eq!(p.wipe_total_for("liepin.com"), 3);
         assert!(p.wipe_exhausted("liepin.com"));
         // 其它域的总账互不影响
@@ -1473,8 +1559,8 @@ mod tests {
     #[test]
     fn 冷却成因_频控标记覆盖抹除成因() {
         let p = pace();
-        p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
-        p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        p.note_navigation_outcome("https://www.liepin.com/", "about:blank", Some(WipeEvidence::late_transition()));
+        p.note_navigation_outcome("https://www.liepin.com/", "about:blank", Some(WipeEvidence::late_transition()));
         assert_eq!(p.cooldown_cause_for("liepin.com"), Some(CAUSE_SITE_WIPE));
         // 频控横幅标记时长更长(240s > 90s)→ 成因随实际生效的标记切换
         p.mark_rate_limited_for("liepin.com", Duration::from_secs(240));
@@ -1626,8 +1712,110 @@ mod tests {
             "回收后旧 page_id 的抹除记录必须清除"
         );
         // 注意:跨实例总账 wipe_total 不随 clear_all 清(熔断语义),此处不该受影响
-        p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        p.note_navigation_outcome("https://www.liepin.com/", "about:blank", Some(WipeEvidence::late_transition()));
         p.clear_all();
         assert_eq!(p.wipe_total_for("liepin.com"), 1, "熔断总账不受 clear_all 影响");
+    }
+
+    // ==================== 2026-10-19:抹除记账须有站点侧证据 ====================
+
+    /// 核心不变量:**落地 about:blank 但站点侧零内容下发证据 → 零记账**。
+    ///
+    /// 2026-10-19 猎聘实测根治项。旧实现只认「落地 about:blank」,于是 about:blank
+    /// 起页竞态 / 导航被中止 / 文档从未提交 / CDP 读 URL 失准产生的**自造空白**
+    /// 全被记为站点整页抹除 → `wipe_total` 灌水 → 过早 6004 持久熔断 → 用户被
+    /// TTL 锁在门外,而真实成因从未被识别。
+    #[test]
+    fn 抹除记账_无站点侧证据一律不计账() {
+        let p = pace();
+        let url = "https://www.liepin.com/";
+        // 无证据(导航未提交 / 自造空白)→ 不计账,账本完全不动。
+        assert!(
+            p.note_navigation_outcome(url, "about:blank", None).is_none(),
+            "无站点侧证据的空白落地不得计为抹除"
+        );
+        assert_eq!(p.wipe_total_for("liepin.com"), 0, "总账必须保持 0");
+        // 有证据(站点确实下发了内容又抹掉)→ 照记。
+        assert!(
+            p.note_navigation_outcome(url, "about:blank", Some(WipeEvidence::late_transition()))
+                .is_some(),
+            "有站点侧证据的空白落地必须计为抹除"
+        );
+        assert_eq!(p.wipe_total_for("liepin.com"), 1);
+    }
+
+    /// 连击阈值与冷却**同样**只由有证据的落地驱动 —— 否则冷却是假阳性产物。
+    #[test]
+    fn 抹除冷却_无证据的连续空白不触发() {
+        let p = pace();
+        let url = "https://www.liepin.com/";
+        for _ in 0..5 {
+            p.note_navigation_outcome(url, "about:blank", None);
+        }
+        assert_eq!(p.wipe_total_for("liepin.com"), 0, "5 次自造空白后总账仍须为 0");
+        // 真抹除连击仍如期触发冷却(阈值 2)。
+        p.note_navigation_outcome(url, "about:blank", Some(WipeEvidence::late_transition()));
+        p.note_navigation_outcome(url, "about:blank", Some(WipeEvidence::late_transition()));
+        assert!(
+            matches!(
+                p.decide("liepin.com"),
+                crate::agent::browser_pace::PaceDecision::Block { .. }
+            ),
+            "2 次有证据抹除必须触发 site_wipe 冷却"
+        );
+    }
+
+    /// `WipeEvidence::from_network` 判据(与 page_health 共用的单一真源)。
+    #[test]
+    fn 抹除证据_主文档有响应或同域子资源达标() {
+        use serde_json::json;
+        let url = "https://www.liepin.com/";
+        let ev = |u: &str, phase: &str, status: i64| json!({"url": u, "phase": phase, "status": status});
+
+        // 站点从未响应(DNS 失败 / 导航被中止 / 文档从未提交)→ 无证据。
+        let none: Vec<serde_json::Value> = vec![ev(url, "request", 0)];
+        assert!(WipeEvidence::from_network(none.iter(), url).is_none());
+
+        // 主文档有响应 → 有证据。
+        let main: Vec<serde_json::Value> = vec![ev(url, "response", 200)];
+        let e = WipeEvidence::from_network(main.iter(), url).expect("主文档 200 应有证据");
+        assert_eq!(e.main_doc_status, Some(200));
+        assert_eq!(e.subresources, 1);
+
+        // 主文档无精确匹配但同域子资源 ≥ 阈值 → 有证据。
+        let subs: Vec<serde_json::Value> = (0..WIPE_EVIDENCE_SUBRESOURCE_MIN)
+            .map(|i| ev(&format!("https://www.liepin.com/a{i}.js"), "response", 200))
+            .collect();
+        let e = WipeEvidence::from_network(subs.iter(), url).expect("同域子资源达标应有证据");
+        assert_eq!(e.main_doc_status, None);
+        assert_eq!(e.subresources, WIPE_EVIDENCE_SUBRESOURCE_MIN);
+
+        // 跨域子资源不计数(反爬站点常把静态资源挂 CDN)。
+        let cdn: Vec<serde_json::Value> = (0..20)
+            .map(|i| ev(&format!("https://cdn.example.com/a{i}.js"), "response", 200))
+            .collect();
+        assert!(
+            WipeEvidence::from_network(cdn.iter(), url).is_none(),
+            "跨域子资源不得构成抹除证据"
+        );
+
+        // 落非空白一律不记账(与证据无关)。
+        let p = pace();
+        assert!(p
+            .note_navigation_outcome(url, "https://www.liepin.com/jobs", Some(WipeEvidence::late_transition()))
+            .is_none());
+        assert_eq!(p.wipe_total_for("liepin.com"), 0);
+    }
+
+    /// 「先成功落地 → 4s/10s 后变空白」的后台看护路径:证据是转变本身,
+    /// 不依赖网络缓冲回查,必须照记(否则真阳性全灭,熔断永不触发)。
+    #[test]
+    fn 抹除记账_后台看护的延迟形态照记() {
+        let p = pace();
+        let url = "https://www.liepin.com/";
+        let ev = WipeEvidence::late_transition();
+        assert_eq!(ev.main_doc_status, None, "延迟形态不回查缓冲,状态码为空");
+        assert!(p.note_navigation_outcome(url, "about:blank", Some(ev)).is_some());
+        assert_eq!(p.wipe_total_for("liepin.com"), 1);
     }
 }

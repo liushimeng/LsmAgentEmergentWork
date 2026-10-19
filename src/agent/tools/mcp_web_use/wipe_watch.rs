@@ -37,8 +37,11 @@ pub(super) async fn deferred_wipe_check(
         return None;
     }
     let outcome = if count {
-        crate::agent::browser_pace::WebPace::global()
-            .note_navigation_outcome(requested_url, &landed)
+        crate::agent::browser_pace::WebPace::global().note_navigation_outcome(
+            requested_url,
+            &landed,
+            Some(crate::agent::browser_pace::WipeEvidence::late_transition()),
+        )
     } else {
         None
     };
@@ -101,8 +104,13 @@ async fn read_landed(page: &chromiumoxide::Page) -> Option<String> {
 /// 记一次延迟抹除:补账(连击/总账/冷却)+ 写 TTL 台账 + 告警。
 fn account_late_wipe(page_id: &str, requested_url: &str, at: &'static str) {
     let landed = "about:blank";
-    let outcome =
-        crate::agent::browser_pace::WebPace::global().note_navigation_outcome(requested_url, landed);
+    // 本路径的证据是「本次导航已成功落地 → 随后观测到空白」的转变本身
+    // (见 `WipeEvidence::late_transition`),比立即态路径的证据更强,无需回查缓冲。
+    let outcome = crate::agent::browser_pace::WebPace::global().note_navigation_outcome(
+        requested_url,
+        landed,
+        Some(crate::agent::browser_pace::WipeEvidence::late_transition()),
+    );
     // 第 186 轮:本条导航的响应早已返回给 LLM,追改不了;把「哪一页被抹、
     // 被抹前请求的是什么」记进 TTL 台账,让模型**下一轮**的只读观测动作
     // (`inspect`/`explore`)能拿到 `page_dead{reason=site_wipe,late:true}`,

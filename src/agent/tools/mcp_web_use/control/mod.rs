@@ -263,11 +263,40 @@ pub(super) fn lift_top_level_control_aliases(args: &Value, params: &mut Value) {
     }
 }
 
+/// 无页任务级人工介入的**路由判据**(纯函数,2026-10-19;便于单测锁死死路)。
+///
+/// 只放行 `request_human` —— 它是唯一「不操作具体页面也能成立」的动作。
+/// 其余动作(`click`/`input_text`/`screenshot`…)缺 `page_id` 仍返回 1001,
+/// 语义不变。见 [`run`] 内注释:6004 熔断时零浏览器,`request_human` 是唯一出路,
+/// 不得因缺 `page_id` 而不可达(否则 Agent 只能 `open("about:blank")` 硬造页面,
+/// 反复弹 Chrome)。
+pub(super) fn is_page_less_hitl(id: Option<&str>, action: Option<&str>) -> bool {
+    id.is_none() && action == Some("request_human")
+}
+
 pub(super) async fn run(args: Value) -> crate::error::Result<String> {
-    let Some(id) = str_arg(&args, "page_id") else {
+    let action_opt = str_arg(&args, "control_action");
+    let id_opt = str_arg(&args, "page_id");
+    // 2026-10-19:**无页任务级人工介入** —— `request_human` 不再强制 `page_id`。
+    //
+    // 背景(2026-10-19 猎聘实测):整页抹除持久熔断(6004)的 advice 把
+    // `request_human` 写成「唯一可行」的出路,但旧实现缺 `page_id` 一律 1001
+    // —— 而熔断场景恰恰是**一台 Chrome 都没拉起**(`list` 返 `windows=0`)的时刻,
+    // 于是「唯一出路」物理上不可达。Agent 只能 `open("about:blank")` 硬造一个
+    // page_id 绕路,这正是用户报告的「Agent 反复启动很多次 Chrome」的直接触发器。
+    //
+    // 语义依据:`page_id` 只在需要**解锁/代操作某个具体页面**时才有意义;0 页时的
+    // 任务级提问(「请人在自己浏览器采集并提供数据」)完全成立。`request_human_core`
+    // 对无页句柄本就零动作降级(挑战层探测/解锁/置前全部按「无页面」跳过)。
+    if is_page_less_hitl(id_opt.as_deref(), action_opt.as_deref()) {
+        let mut params = args.get("params").cloned().unwrap_or_else(|| json!({}));
+        lift_top_level_control_aliases(&args, &mut params);
+        return act_request_human("", &params).await;
+    }
+    let Some(id) = id_opt else {
         return envelope(1001, "缺少 page_id", json!({}));
     };
-    let Some(action) = str_arg(&args, "control_action") else {
+    let Some(action) = action_opt else {
         return envelope(1001, "缺少 control_action", json!({}));
     };
     let mut params = args.get("params").cloned().unwrap_or_else(|| json!({}));
@@ -786,7 +815,11 @@ async fn act_navigate(id: &str, p: &Value) -> std::result::Result<Value, String>
     let count_wipes = !BrowserManager::global().is_connect_mode().await
         || BrowserManager::global().connect_is_laew_relaunch().await;
     let mut wipe_outcome = if count_wipes {
-        crate::agent::browser_pace::WebPace::global().note_navigation_outcome(url, &landed)
+        // 2026-10-19:记账须有站点侧内容下发证据(与 page_health 同判据);
+        // 无证据的空白落地是导航未提交,不得计入熔断账本。
+        let ev = super::page_wipe_evidence(id, url).await;
+        crate::agent::browser_pace::WebPace::global()
+            .note_navigation_outcome(url, &landed, ev)
     } else {
         None
     };
