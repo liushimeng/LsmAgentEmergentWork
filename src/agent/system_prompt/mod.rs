@@ -1298,6 +1298,9 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
     options=["已完成登录,继续","登录遇到问题","取消任务"]);③ 人工应答后
     control(set_guard, mode="locked") 收口回防交叉基线;④ inspect 验证登录态 →
     继续任务。guard_note 会显示在页面左下角状态条,是给人工的 UI 引导。
+    **人工点「取消任务」的含义**:一律返 code=4002,编排层立即短路
+    整个任务 —— 收到 4002 就停止,不要重试 request_human、不要换通道(换新
+    profile / reuse_existing / 改站点)再闯,如实报告已完成的部分与取消原因后结束。
 21. 焦点纪律:置前类动作(open 启动浏览器、request_human、bring_to_front、
     6003 focus=true)会占用用户的键盘焦点 —— 系统已在动作收口后自动归还给用户
     原先的应用(LAEW_WEB_FOCUS=keep 缺省),但人工正在其它窗口打字时被短暂抢焦

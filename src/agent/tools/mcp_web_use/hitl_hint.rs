@@ -23,6 +23,44 @@ pub(super) fn is_option_pick_answer(answer: &str) -> bool {
     }
 }
 
+/// 应答是否表达「取消整个任务」语义(第 186 轮,纯函数)。
+///
+/// 背景:弹窗把「取消任务」作为**一等选项**呈现(`hitl_ctl` 缺省选项第 2 项、
+/// auto-HITL 的 `HITL_CHALLENGE_OPTIONS`、系统提示词教 LLM 显式传
+/// `options=[…,"取消任务"]`),但旧实现一律按 `Answered` 返 `code=0`,且
+/// `hitl_answer_hint` 对选项应答回「请 inspect 验证页面状态后**继续流程**」——
+/// 人工用产品提供的标准方式喊停,运行时却把它当「继续」。猎聘实测人工点
+/// 「3. 取消任务」后任务继续空转下游单元并回流 Yolo。
+///
+/// 判据收紧防误伤:
+/// - 选项应答(`N. <正文>`)取正文,命中**任务级**取消词才判真;
+/// - 自由文本要求**整串**落在精确集内(≤20 字符),`取消关注`/`取消屏蔽`
+///   这类子串相似但语义完全不同的短句不命中(前者是页面操作,后者是管控按钮)。
+pub(super) fn is_cancel_answer(answer: &str) -> bool {
+    let t = answer.trim();
+    if t.is_empty() {
+        return false;
+    }
+    // 选项应答:取「`. `」之后的正文再判,`3. 取消任务` 与 `取消任务` 同义。
+    let body = match t.find(". ") {
+        Some(i) if i > 0 && t[..i].chars().all(|c| c.is_ascii_digit()) => t[i + 2..].trim(),
+        _ => t,
+    };
+    const TASK_CANCEL_PHRASES: [&str; 5] = [
+        "取消任务",
+        "放弃任务",
+        "终止任务",
+        "停止任务",
+        "不再继续",
+    ];
+    if TASK_CANCEL_PHRASES.iter().any(|p| body.contains(p)) {
+        return true;
+    }
+    // 自由文本:整串精确命中短词集(`取消`/`放弃`/`终止`/`停止`/`不做了`/`cancel`)。
+    const EXACT: [&str; 6] = ["取消", "放弃", "终止", "停止", "不做了", "cancel"];
+    body.chars().count() <= 20 && EXACT.iter().any(|p| body.eq_ignore_ascii_case(p))
+}
+
 /// 自由文本是否「像验证码/动态码」(第 155 轮):短(≤16 字符)、无 CJK、
 /// 仅字母/数字/空格/连字符/下划线/点(容忍 `993 041` 这类分段码)。
 /// 人工写了整句指示(含中文、或更长、或带逗号句号问号)时不该被当码填进页面
@@ -47,6 +85,14 @@ pub(super) fn looks_like_code_text(answer: &str) -> bool {
 /// - 选项应答(「N. 选项」形态)→ inspect 验证页面状态后继续;
 /// - 其它 reason 自由文本 → 按 human_response 内容继续。
 pub(super) fn hitl_answer_hint(reason: &str, answer: &str) -> String {
+    // 第 186 轮:取消语义**必须在选项分流之前**判定 —— 否则「取消任务」会落进
+    // 「选项应答 → 请 inspect 验证后继续流程」分支,变成对人工喊停的方向相反
+    // 的催促。`hitl_ctl` 正常路径已把它拦在 code=4002 之前,这里是纵深防御:
+    // 任何新接入点绕过那道闸时,提示语也不会反过来劝 Agent 继续。
+    if is_cancel_answer(answer) {
+        return "人工明确取消了本次任务。立即停止:不要重试 request_human、不要换通道(换 profile / reuse_existing / 改站点)再闯;如实报告已完成的部分与取消原因后结束任务。"
+            .to_string();
+    }
     if is_option_pick_answer(answer) {
         "人工点选了选项(如「确认我已完成人工操作,交棒」)。请 inspect 验证页面当前状态后继续流程,不要重复 request_human;登录/人工操作完成后核实状态用 inspect,不要 reload —— 风控敏感站点(京东/天猫系)登录后 reload 会触发风控复核弹「当前页面异常」风控墙".to_string()
     } else if matches!(reason, "captcha" | "sms" | "two_factor") {

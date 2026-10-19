@@ -242,6 +242,15 @@ impl Agent {
                     return Err(AgentError::Cancelled);
                 }
             }
+            // 第 186 轮:人工取消旗标并联 —— 人工在 HITL 弹窗点「取消任务」后,
+            // 正在跑的 SubAgent 必须**立刻**停,不能把剩余迭代的 LLM 调用烧完
+            // (猎聘实测:取消后仍跑完 wf-2 单元 88.7s 才被 QC 拦下)。这里同样
+            // 回填 cancelled tool_result,保住 Anthropic 的 tool_use/tool_result
+            // 配对不破。热路径是 `OnceLock` 取址 + `RwLock` 读,无 await。
+            if crate::agent::human_cancel::is_set() {
+                backfill_cancelled_tool_results(session.context_mut());
+                return Err(AgentError::Cancelled);
+            }
             debug!(iteration = iter, "agent step");
             // 2026-09-22 Yolo ReAct 延迟强制 —— 每轮决策 forced_tool:
             // 探索轮(非最后一轮)留空(model 可自由 ReAct),末轮注入 emit(收口保底)。

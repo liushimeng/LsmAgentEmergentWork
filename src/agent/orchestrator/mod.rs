@@ -299,6 +299,10 @@ impl MultiAgentOrchestrator {
         progress: Option<ProgressTx>,
     ) -> Result<OrchestrationOutcome> {
         let _gate_guard = self.cancel_gate.guard(cancel.clone());
+        // 第 186 轮:任务入口复位人工取消旗标(上一任务的取消不得污染下一任务)。
+        // 复位点选在这里而不是 `handle_inner`:本函数是所有调用方(TUI / `-p` /
+        // `-f`)的统一入口,漏调一处就会让取消态跨任务残留。
+        crate::agent::human_cancel::reset();
         // docs/MCP_Web_Use/25:标签页生命周期治理 —— 任务开始时快照基线,收口时
         // 关闭本任务新开的后台标签页(前台页保留;fail-open,见 page_activity)。
         crate::agent::tools::mcp_web_use::begin_task_tab_ledger().await;

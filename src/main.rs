@@ -708,7 +708,14 @@ async fn run_one_shot(
             lsm_agent::shutdown::terminal_restore_sync();
             lsm_agent::agent::browser::BrowserManager::global().shutdown().await;
             lsm_agent::agent::human_assist::HumanAssistHub::global().cancel_pending();
-            eprintln!("[laew] 任务已取消(用户中断)");
+            // 第 186 轮:区分两种取消来源 —— Ctrl-C(用户中断)与 HITL 弹窗里人工
+            // 点「取消任务」。后者是**有人明确喊停**,报「用户中断」会把责任与
+            // 现场指向错误方向(实测猎聘:人工点取消后任务继续空转,复盘时极易
+            // 误判为用户自己按了 Ctrl-C)。原因串已在工具层记全。
+            match lsm_agent::agent::human_cancel::reason() {
+                Some(reason) => eprintln!("[laew] 任务已取消(人工在介入弹窗中取消:{reason})"),
+                None => eprintln!("[laew] 任务已取消(用户中断)"),
+            }
             std::process::exit(130);
         }
         Err(e) => {

@@ -2200,6 +2200,47 @@ fn hitl_hint_classifies_multi_answer_as_option_pick() {
     assert!(!hitl_hint::is_option_pick_answer("z7z2"));
 }
 
+/// 第 186 轮:「取消任务」选项应答必须被识别为**任务级取消**
+/// (猎聘实测:人工点「3. 取消任务」后旧实现返 code=0 并催 Agent「继续流程」,
+/// 任务继续空转下游单元)。同时锁死误伤边界 —— 「取消关注」「取消屏蔽」是
+/// 页面操作/管控按钮语义,不得被判成取消任务。
+#[test]
+fn hitl_hint_detects_task_cancel_answers() {
+    // 选项应答(产品默认选项第 2 项 / auto-HITL / 系统提示词推荐写法)
+    assert!(hitl_hint::is_cancel_answer("2. 取消任务"));
+    assert!(hitl_hint::is_cancel_answer("3. 取消任务"));
+    assert!(hitl_hint::is_cancel_answer("  1. 放弃任务  "));
+    assert!(hitl_hint::is_cancel_answer("终止任务"));
+    // 多选编码里含取消项同样成立
+    assert!(hitl_hint::is_cancel_answer("1. 我已完成人工操作,继续；3. 取消任务"));
+    // 自由文本短词
+    assert!(hitl_hint::is_cancel_answer("取消"));
+    assert!(hitl_hint::is_cancel_answer("CANCEL"));
+
+    // —— 误伤边界 ——
+    assert!(!hitl_hint::is_cancel_answer(""));
+    assert!(!hitl_hint::is_cancel_answer("1. 确认我已完成人工操作,交棒"));
+    assert!(!hitl_hint::is_cancel_answer("2. 我已登录完成"));
+    assert!(!hitl_hint::is_cancel_answer("取消关注这个公司的职位"));
+    assert!(!hitl_hint::is_cancel_answer("点右上角取消屏蔽按钮"));
+    assert!(!hitl_hint::is_cancel_answer("z7z2"));
+    // 长句含「不再继续」以外的语义不应误判
+    assert!(!hitl_hint::is_cancel_answer("不要取消屏蔽,我想人工点一下滑块"));
+}
+
+/// 第 186 轮:「取消任务」应答的 `next_hint` 不得再是「inspect 验证后继续流程」
+/// —— 那是方向相反的最坏提示(人工喊停反而被催着继续)。
+#[test]
+fn hitl_hint_cancel_answer_hint_points_at_stop() {
+    // 命中取消的应答由 hitl_ctl 直接返 4002 分支,不走本函数的 code=0 分支;
+    // 这里锁的是:即便有人日后把取消误送进 hitl_answer_hint,提示语也不能是「继续」。
+    let h = hitl_hint::hitl_answer_hint("login", "2. 取消任务");
+    assert!(
+        !h.contains("继续流程"),
+        "取消应答的提示语不得催 Agent 继续流程:{h}"
+    );
+}
+
 /// sequence 上下文标记:批内步骤执行时 auto-HITL 守卫应判定「在批内」,
 /// 批外(单步动作)为 false;task_local 未进入 scope 时 fail-open 为 false。
 #[tokio::test]

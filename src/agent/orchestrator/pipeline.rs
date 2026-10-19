@@ -828,12 +828,22 @@ impl MultiAgentOrchestrator {
     // ========== 简单档 ==========
 
     /// 取消检查:命中即返回 `Err(Cancelled)`(由调用方短路,不回流)。
+    ///
+    /// 第 186 轮:并联**人工取消旗标**(`human_cancel`)—— Ctrl-C 之外的第二条
+    /// 取消通道。人工在 HITL 弹窗点「取消任务」时工具层置旗,编排层在此统一
+    /// 短路:既有 `QualityFailure.cancelled` 语义(不可重试、不回流 Yolo)复用
+    /// 现成通路,无需新终态分支。
     pub(super) fn check_cancelled(cancel: &CancelToken) -> Result<()> {
         if cancel.is_cancelled() {
-            Err(AgentError::Cancelled)
-        } else {
-            Ok(())
+            return Err(AgentError::Cancelled);
         }
+        if let Some(reason) = crate::agent::human_cancel::reason() {
+            tracing::warn!(reason = %reason, "人工取消任务,编排短路");
+        }
+        if crate::agent::human_cancel::is_set() {
+            return Err(AgentError::Cancelled);
+        }
+        Ok(())
     }
 
     /// 取 session 最后一条 user 消息文本作为「用户原始 prompt」。

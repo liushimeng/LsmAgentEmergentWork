@@ -691,6 +691,36 @@ async fn request_human_core(id: &str, spec: &HitlSpec) -> HitlReport {
         }
     };
     match outcome {
+        // 第 186 轮:人工在弹窗点「取消任务」选项 —— 应答文本表达取消语义时按
+        // `Cancelled` 收口,而不是伪装成一次普通 `Answered`。此前该路径恒返
+        // `code=0` + 「请 inspect 验证页面状态后继续流程」的 next_hint,人工喊停
+        // 反而被催着继续(猎聘实测:取消后任务继续空转下游单元并回流 Yolo)。
+        // 这里同时置位进程级旗标,由编排层短路整个任务(见 `human_cancel.rs`)。
+        HumanAssistOutcome::Answered { text: answer, via }
+            if crate::agent::tools::mcp_web_use::hitl_hint::is_cancel_answer(&answer) =>
+        {
+            crate::agent::human_cancel::set(&format!(
+                "{reason}:人工应答「{answer}」"
+            ));
+            HitlReport {
+                code: 4002,
+                message: "人工已取消任务".to_string(),
+                status: HitlStatus::Cancelled,
+                data: json!({
+                    "reason": reason,
+                    "kind_label": label,
+                    "assist_channel": via.as_str(),
+                    "human_response": answer,
+                    // 显式对账:本信封是「选项取消」而非「关窗取消」,
+                    // 人工的原始应答原样保留供审计。
+                    "human_cancelled": true,
+                    "cancel_via": "option",
+                    "hitl_repeat_count": hitl_repeat_count,
+                    "hint": "人工明确取消了本次任务。**立即停止**:不要重试 request_human、不要换其它通道(换 profile / reuse_existing / 改站点)再闯。如实向用户报告已完成的部分与被取消的原因,并结束任务。",
+                    "next_hint": "人工已取消任务,立即停止后续动作,如实报告并结束",
+                }),
+            }
+        }
         HumanAssistOutcome::Answered { text: answer, via } => HitlReport {
             code: 0,
             message: "人工已响应".to_string(),
