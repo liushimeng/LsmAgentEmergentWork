@@ -45,7 +45,7 @@ fn detect_multi_display() -> Option<bool> {
     {
         // CoreGraphics C API 直接 FFI(macos_legacy 同款手法,零新 crate):
         // CGGetActiveDisplayList(0, null, &count) 只取计数不取句柄。
-        #[repr(C)]
+        // 注:`#[repr(C)]` 不能加在 type alias 上(E0517),只需 `allow(non_camel_case_types)`。
         #[allow(non_camel_case_types)]
         type CGDirectDisplayID = u32;
         extern "C" {
