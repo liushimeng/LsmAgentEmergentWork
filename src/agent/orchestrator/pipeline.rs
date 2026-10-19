@@ -1039,14 +1039,27 @@ impl MultiAgentOrchestrator {
             return None;
         }
         let threshold = pace::wipe_total_threshold();
+        let reload_threshold = pace::WebPace::reload_loop_threshold();
+        // 第 188 轮:两类反爬死路(整页抹除 / 原地自刷新循环)都纳入预检 ——
+        // 命中即不进 Plan/QC/Main-Work 重管线,直接如实回执,避免为一个已知不可用
+        // 的域把整条编排(数分钟 LLM + 一台 Chrome)再烧一遍。
+        //
+        // 抹除账优先展示:两者同时命中时,抹除是更硬的判据(页面确实已不可用),
+        // 刷新循环只是「页面在动但人工也用不了」。
         let mut blocked: Vec<(String, u32)> = Vec::new();
+        let mut blocked_reload: Vec<(String, u32)> = Vec::new();
         for host in &anchor.hosts {
             let total = pace::WebPace::global().wipe_total_for(host);
             if total >= threshold {
                 blocked.push((host.clone(), total));
+                continue;
+            }
+            let loops = pace::WebPace::global().reload_loops_for(host);
+            if loops >= reload_threshold {
+                blocked_reload.push((host.clone(), loops));
             }
         }
-        if blocked.len() != anchor.hosts.len() {
+        if blocked.len() + blocked_reload.len() != anchor.hosts.len() {
             return None;
         }
         // 「任务确实要去这个站」的防误伤判据(见 `web_task_targets_site` 注释)。
@@ -1056,14 +1069,50 @@ impl MultiAgentOrchestrator {
         let ledger = blocked
             .iter()
             .map(|(h, t)| format!("- `{h}`:累计整页抹除 {t} 次(阈值 {threshold})"))
+            .chain(
+                blocked_reload
+                    .iter()
+                    .map(|(h, n)| format!("- `{h}`:累计页面自刷新循环 {n} 次(阈值 {reload_threshold})")),
+            )
             .collect::<Vec<_>>()
             .join("\n");
         let domains = blocked
             .iter()
+            .chain(blocked_reload.iter())
             .map(|(h, _)| format!("`{h}`"))
             .collect::<Vec<_>>()
             .join("、");
-        let first = blocked.first().map(|(h, _)| h.as_str()).unwrap_or("该站点");
+        let first = blocked
+            .first()
+            .or_else(|| blocked_reload.first())
+            .map(|(h, _)| h.as_str())
+            .unwrap_or("该站点");
+        // 第 188 轮:纯刷新循环命中(无整页抹除)时走独立文案。原文案通篇讲
+        // 「指纹级打标 / 整页抹除」,用在刷新循环上会误导用户去换 IP ——
+        // 而刷新循环的真正出路是**接管用户自己的真实浏览器**(真实浏览器里
+        // 页面不会每几秒重建一次),换 IP 未必奏效。
+        if blocked.is_empty() {
+            return Some(format!(
+                "⚠️ 本任务指定的目标站点已对当前自动化环境**持续重载页面**(站点反爬),本次未进入执行层。\n\n\
+                站点反爬台账:\n{ledger}\n\n\
+                含义:该站点检测到自动化浏览器后,会**每隔几秒把页面整个重建一次**(页面并非打不开,\
+                而是一直在刷新)。实测后果:Agent 点不准任何元素,**人工也输不进去** ——\
+                人工输入的每个字符都会随文档销毁而丢失,`request_human` 在这种页面上是物理死路。\
+                该记录**跨会话累计**,所以每重开一次任务都会重付同一段「刷新 → 空等」循环。\n\n\
+                处置出路(按推荐顺序):\n\
+                1. **接管本机已登录的真实浏览器**:`open(url, reuse_existing=true)` —— \
+                connect 模式零注入、使用真实浏览器指纹,真人在自己的浏览器里不会被刷新打断。\
+                这是唯一既能完成登录/核验又能继续采集的通道;\n\
+                2. **人工提供数据**:在人工介入弹窗里说明,或直接提供已采集的内容;\n\
+                3. **人工解除熔断**(不需要改代码):设环境变量 `LAEW_SITE_RISK_PERSIST=off` 跑一次\
+                即可绕过历史账(注意:这会重新暴露于该站的反爬,可能再次进入重载循环);\
+                或直接清账:`sqlite3 <程序目录>/LsmAgentEmergentWork.db \
+                \"delete from site_risk where domain='{first}';\"`\
+                (记录默认保留 `LAEW_SITE_RISK_TTL_DAYS=7` 天,超期自动失效)。\n\n\
+                本次任务未产生任何浏览器操作(Chrome 拉起数 0),也未产生任何导航请求。\
+                若本任务其实不需要访问 {domains}(例如只是处理本地文件),请去掉站点名后重新描述任务。"
+            ));
+        }
         Some(format!(
             "⚠️ 本任务指定的目标站点已对当前自动化环境**持久熔断**(站点反爬),本次未进入执行层。\n\n\
             站点熔断台账:\n{ledger}\n\n\

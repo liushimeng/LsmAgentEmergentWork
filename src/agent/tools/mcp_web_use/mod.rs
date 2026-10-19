@@ -202,6 +202,25 @@ pub(super) fn eval_timeout_from_env() -> u64 {
     eval_timeout_from(std::env::var("LAEW_WEB_EVAL_TIMEOUT_MS").ok())
 }
 
+/// 第 188 轮:导航**成功后**收尾装配段的总预算(毫秒,缺省 20s)。
+///
+/// 背景见 `open` 内第 188 轮注释:反爬「重载/整页抹除」风暴中这段会整体堵塞,
+/// 实测把两次 `open` 各拖满 300s。取 20s 是因为正常站点的整段装配是**毫秒级**
+/// (每项 CDP 往返各几 ms),20s 已是数千倍余量,命中即意味着确实被堵住了。
+pub(super) const SETTLE_BUDGET_MS_DEFAULT: u64 = 20_000;
+
+/// 结算预算取值解析(纯函数,可单测):正整数生效,缺省/0/非法回退默认。
+pub(super) fn settle_budget_from(raw: Option<String>) -> u64 {
+    raw.and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(SETTLE_BUDGET_MS_DEFAULT)
+}
+
+/// 环境变量覆盖(0/非法回退默认)。
+pub(super) fn settle_budget_ms_from_env() -> u64 {
+    settle_budget_from(std::env::var("LAEW_WEB_SETTLE_TIMEOUT_MS").ok())
+}
+
 // ===================== 多窗口并行:窗口数上限 =====================
 
 /// 单浏览器进程允许同时存在的 Agent 窗口数上限(默认)。
@@ -707,7 +726,61 @@ pub(super) async fn sample_liveness(page_id: &str, agent_initiated: bool) {
     };
     if let Some((origin, url)) = page_liveness::parse_probe(raw.as_str().unwrap_or_default()) {
         page_liveness::observe(page_id, origin, &url, agent_initiated);
+        // 第 188 轮:自刷新不稳定 → 按注册域入账(跨会话记忆)。
+        // 只在**站点自发**重载(`agent_initiated=false`)时入账:Agent 自己的导航
+        // 造成的文档替换不算反爬,否则一次正常的连续导航就会被记成刷页面。
+        note_reload_loop_once(page_id, &url, agent_initiated).await;
     }
+}
+
+/// 第 188 轮:自刷新循环按域去重入账。
+///
+/// 「不稳定」是**状态**而非事件:页面只要还在持续重载,后续每次采样都会再次报
+/// `unstable`,直接每次 +1 会在几秒内把一个域顶到阈值(甚至一行响应里就 +3)。
+/// 故以 `(page_id, 域)` 为去重键:**从「已不稳定」首次跃迁为不稳定的那一次**才计账,
+/// 之后同一页同一域持续不稳定不再重复计 —— 计数语义变成「独立遭遇次数」,
+/// 与 `wipe_total` 的语义对齐。
+///
+/// 仅 laew 自起的浏览器入账(connect 接管用户日常 Chrome 不计):用户在真实浏览器里
+/// 页面重载是正常浏览行为,拿它给站点打标会污染用户的真实使用。
+async fn note_reload_loop_once(page_id: &str, url: &str, agent_initiated: bool) {
+    if agent_initiated {
+        return;
+    }
+    let Some(report) = crate::agent::page_liveness::report(page_id) else {
+        return;
+    };
+    if !report["unstable"].as_bool().unwrap_or(false) {
+        return;
+    }
+    // 域级去重键:同一域换了 page_id 也只记一次连续遭遇(否则一次任务里连开
+    // 三个标签页就把计数顶满,而那本质是**同一次**反爬遭遇)。
+    let Some(host) = crate::agent::browser_pace::host_of(url) else {
+        return;
+    };
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let key = format!("{page_id}|{host}");
+    {
+        let mut g = seen.lock().unwrap_or_else(|e| e.into_inner());
+        if !g.insert(key) {
+            return;
+        }
+    }
+    if !is_laew_owned_page().await {
+        // 接管用户浏览器:不入账,但要把去重键放回去,否则之后误切回 laew 实例时
+        // 会被这条陈旧去重记录静默吞掉首次计账。
+        let mut g = seen.lock().unwrap_or_else(|e| e.into_inner());
+        g.remove(&format!("{page_id}|{host}"));
+        return;
+    }
+    crate::agent::browser_pace::WebPace::global().note_reload_loop(&host);
+}
+
+/// 该页是否属于 laew 自起的浏览器(非 connect 接管的用户浏览器)。
+async fn is_laew_owned_page() -> bool {
+    !BrowserManager::global().is_connect_mode().await
 }
 
 /// 取该页当前的登录墙/会话 DOM 形态(轻量判断式,只回固定几项标记,不取整页 HTML)。
@@ -805,16 +878,19 @@ pub(super) async fn enrich_after_navigation(
     attach_stealth_mode(data).await;
 }
 
-/// 只读动作收尾的信号装配:自刷新台账(非主动)+ 登录墙复查(不采指纹)。
+/// 只读动作收尾的信号装配:自刷新台账(非主动)+ 当前隐身档(不采指纹)。
+///
+/// 第 188 轮复活并接线:此前本函数**零调用方**(死代码),导致 `inspect`/`screenshot`/
+/// `ocr`/`explore` 等只读动作从不采样自刷新台账 —— 而模型排查「页面一直在刷新」时
+/// 恰恰只看这些只读动作,信号在它唯一会去看的出口上完全失明(实测 2026-10-19 BOSS
+/// 直聘一整轮 `page_liveness` 采样数为 0)。
+///
+/// 刻意**不**在这里复探登录墙:只读动作的返回体本身就是页面当前状态,重探一遍
+/// `login_dom_probe` 纯属多一次无谓 CDP 往返,且在页面被反爬卡住时会给 inspect
+/// 白加延迟。登录墙判定仍只发生在导航收尾(`enrich_after_navigation`)。
 pub(super) async fn enrich_after_read(page_id: &str, data: &mut Value) {
     sample_liveness(page_id, false).await;
     page_liveness::attach(data, page_id);
-    if let Ok(Some(page)) = BrowserManager::global().ensure_page_alive(page_id).await {
-        let dom = login_dom_probe(&page).await;
-        if let Ok(Some(url)) = page.url().await {
-            login_wall::attach(data, &url, dom.as_deref());
-        }
-    }
     attach_stealth_mode(data).await;
 }
 
@@ -1885,58 +1961,90 @@ async fn run_open_inner(args: &Value, url: &str) -> Result<String> {
             if let Some(hint) = mode_hint {
                 data["mode_hint"] = json!(hint);
             }
-            // 第 139 轮:有头模式窗口收边(必须先于视口自适应 —— setWindowBounds
-            // 会清除 device metrics 覆盖,晚一步会把刚扩好的视口抹掉)。
-            if effective_mode.is_headed() {
-                if let Some(v) = fit_headed_window(&page_id).await {
-                    data["headed_window"] = v;
-                }
-            }
-            // 第 125 轮:视口自适应(默认开)——内容宽/高超出视口时自动扩展到
-            // 2K 上限,根治「视口太窄页面显示不全、元素不可见不可点」。
-            if auto_expand_enabled(args) {
-                match fit_viewport(&page_id).await {
-                    Some(v) => data["viewport"] = v,
-                    None => {
-                        data["viewport"] =
-                            json!({"expanded": false, "note": "视口测量失败(不影响页面操作);需要时手动 control(set_viewport)"})
+            // 第 188 轮(实测 2026-10-19 BOSS 直聘 zhipin.com):导航**已经成功**之后的
+            // 这段收尾装配,在反爬「重载/整页抹除」风暴中会整体堵塞 —— 页面处在站点脚本
+            // 控制下时 CDP handler 排队,而 `login_dom_probe` 的 `page.url()` 与
+            // `auto_geo_permission` 的 `Browser.setPermission` 均无独立超时兜底。
+            // 实测两次 `open` 各挂满 300s(共 10 分钟静默),而抹除结论在 +3.4s 就已算出,
+            // 白白被拖到 `LAEW_TOOL_TIMEOUT_SECS` 全局兜底,回给模型的反而是零信息量的
+            // 「工具执行超时」而不是本该拿到的 6004 抹除结论,于是上层继续重试继续烧。
+            //
+            // 这里给整段结算套一个总预算:命中即**保留已装配字段**(`data` 在块内就地
+            // 改写,超时前的部分结果天然留存)并补 `settle_truncated` 说明缺了什么,
+            // 然后正常返回。刻意不指定「是哪一步慢」—— 无论哪一步堵住,都保证及时
+            // 交出结论,故对所有站点通用,而非只对 BOSS 直聘。
+            let settle_budget_ms = settle_budget_ms_from_env();
+            let settle_started = std::time::Instant::now();
+            let settled = tokio::time::timeout(
+                std::time::Duration::from_millis(settle_budget_ms),
+                async {
+                    // 第 139 轮:有头模式窗口收边(必须先于视口自适应 —— setWindowBounds
+                    // 会清除 device metrics 覆盖,晚一步会把刚扩好的视口抹掉)。
+                    if effective_mode.is_headed() {
+                        if let Some(v) = fit_headed_window(&page_id).await {
+                            data["headed_window"] = v;
+                        }
                     }
-                }
-            }
-            // 第 161 轮:主文档健康诊断 —— 空白页(主文档 4xx/5xx 或空 DOM)当场
-            // 透出证据与处置,Agent 不必再盲试 reload 才发现不可达。
-            if let Some(v) = page_health_field(&page_id, &final_url, url).await {
-                data["page_health"] = v;
-            }
-            // 第 172 轮:自刷新台账 + 登录墙 + 环境指纹(首航即可见被反爬的迹象)。
-            enrich_after_navigation(&page_id, &mut data, &final_url, true).await;
-            if let Some(v) = site_wipe_field(wipe_outcome) {
-                data["site_wipe"] = v;
-            }
-            // 2026-10-14 第三轮:域有抹除史时附账本快照(落地成功也要看到局势)。
-            if let Some(v) = site_wipe_ledger_field(url) {
-                data["site_wipe_ledger"] = v;
-            }
-            if closed_blanks > 0 {
-                data["closed_blank_pages"] = json!(closed_blanks);
-            }
-            // 第 162 轮:地理位置原生权限弹窗自动处置 —— 导航完成后对页面 origin
-            // CDP 预授权,弹窗永不出现(connected_now 覆盖首次接管场景,不干预
-            // 用户浏览器的权限设置)。
-            if !connected_now {
-                if let Some(v) = BrowserManager::global().auto_geo_permission(&page_id).await {
-                    data["permissions"] = v;
-                }
-            }
-            // 第 146 轮:访问台账记账(新建页面导航成功后;重复访问警示随响应附带)
-            visit_ledger::record_visit(
-                &page_id,
-                &final_url,
-                &title,
-                visit_ledger::VisitSource::Open,
-            );
-            if let Some(note) = visit_ledger::visit_note(&final_url) {
-                data["visit_note"] = note;
+                    // 第 125 轮:视口自适应(默认开)——内容宽/高超出视口时自动扩展到
+                    // 2K 上限,根治「视口太窄页面显示不全、元素不可见不可点」。
+                    if auto_expand_enabled(args) {
+                        match fit_viewport(&page_id).await {
+                            Some(v) => data["viewport"] = v,
+                            None => {
+                                data["viewport"] = json!({"expanded": false, "note": "视口测量失败(不影响页面操作);需要时手动 control(set_viewport)"})
+                            }
+                        }
+                    }
+                    // 第 161 轮:主文档健康诊断 —— 空白页(主文档 4xx/5xx 或空 DOM)当场
+                    // 透出证据与处置,Agent 不必再盲试 reload 才发现不可达。
+                    if let Some(v) = page_health_field(&page_id, &final_url, url).await {
+                        data["page_health"] = v;
+                    }
+                    // 第 172 轮:自刷新台账 + 登录墙 + 环境指纹(首航即可见被反爬的迹象)。
+                    enrich_after_navigation(&page_id, &mut data, &final_url, true).await;
+                    if let Some(v) = site_wipe_field(wipe_outcome) {
+                        data["site_wipe"] = v;
+                    }
+                    // 2026-10-14 第三轮:域有抹除史时附账本快照(落地成功也要看到局势)。
+                    if let Some(v) = site_wipe_ledger_field(url) {
+                        data["site_wipe_ledger"] = v;
+                    }
+                    if closed_blanks > 0 {
+                        data["closed_blank_pages"] = json!(closed_blanks);
+                    }
+                    // 第 162 轮:地理位置原生权限弹窗自动处置 —— 导航完成后对页面 origin
+                    // CDP 预授权,弹窗永不出现(connected_now 覆盖首次接管场景,不干预
+                    // 用户浏览器的权限设置)。
+                    if !connected_now {
+                        if let Some(v) = BrowserManager::global().auto_geo_permission(&page_id).await
+                        {
+                            data["permissions"] = v;
+                        }
+                    }
+                    // 第 146 轮:访问台账记账(新建页面导航成功后;重复访问警示随响应附带)
+                    visit_ledger::record_visit(
+                        &page_id,
+                        &final_url,
+                        &title,
+                        visit_ledger::VisitSource::Open,
+                    );
+                    if let Some(note) = visit_ledger::visit_note(&final_url) {
+                        data["visit_note"] = note;
+                    }
+                },
+            )
+            .await;
+            if settled.is_err() {
+                // fail-open:导航本身已经成功,这里只是**附加信号**装配超时,
+                // 绝不影响动作成功语义,也绝不吞掉此前已装配的任何字段。
+                data["settle_truncated"] = json!({
+                    "budget_ms": settle_budget_ms,
+                    "elapsed_ms": settle_started.elapsed().as_millis() as u64,
+                    "note": "页面已在预算内完成导航,但收尾信号装配(视口/健康诊断/自刷新/登录墙/指纹/\
+地理权限/访问台账)超时被截断 —— 通常意味着页面处于反爬重载或整页抹除中,CDP 调用排队。\
+已装配字段仍有效;处置:勿原地反复重试 open(每次都会再吃一次风控),按 data.page_health / \
+data.site_wipe / data.site_wipe_ledger 的结论改道",
+                });
             }
             envelope(0, "ok", data)
         }

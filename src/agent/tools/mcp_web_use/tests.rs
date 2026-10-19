@@ -3485,4 +3485,20 @@ mod js_dump {
             "不得再落成 window 字符串键"
         );
     }
+
+    // ==================== 第 188 轮:导航结算预算 ====================
+
+    /// 结算预算解析:正整数生效,缺省/0/非法/负数一律回退缺省。
+    ///
+    /// 缺省取 20s:正常站点整段装配是毫秒级,20s 已是数千倍余量 ——
+    /// 命中预算即意味着确实被反爬卡住,而不是「页面有点慢」。
+    #[test]
+    fn 结算预算解析_正整数生效其余回退默认() {
+        assert_eq!(super::settle_budget_from(None), super::SETTLE_BUDGET_MS_DEFAULT);
+        assert_eq!(super::settle_budget_from(Some("5000".into())), 5000);
+        assert_eq!(super::settle_budget_from(Some("0".into())), super::SETTLE_BUDGET_MS_DEFAULT);
+        assert_eq!(super::settle_budget_from(Some("".into())), super::SETTLE_BUDGET_MS_DEFAULT);
+        assert_eq!(super::settle_budget_from(Some("abc".into())), super::SETTLE_BUDGET_MS_DEFAULT);
+        assert_eq!(super::settle_budget_from(Some("-3".into())), super::SETTLE_BUDGET_MS_DEFAULT);
+    }
 }

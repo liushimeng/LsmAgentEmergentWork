@@ -147,7 +147,15 @@ pub fn site_risk_status_line() -> Option<String> {
     }
     let domains = blocked
         .iter()
-        .map(|(d, t)| format!("{d}(抹除 {t} 次)"))
+        .map(|(d, t, cause)| {
+            // 第 188 轮:按成因分别标注,否则「刷新循环」域会被读成「整页抹除」域,
+            // 引导用户去换 IP(而刷新循环的出路是接管真实浏览器,换 IP 未必奏效)。
+            if *cause == crate::agent::browser_pace::CAUSE_RELOAD_LOOP {
+                format!("{d}(页面持续重载 {t} 次)")
+            } else {
+                format!("{d}(抹除 {t} 次)")
+            }
+        })
         .collect::<Vec<_>>()
         .join("、");
     Some(format!("{domains} · 详情与解除 /risk"))

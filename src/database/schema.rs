@@ -96,7 +96,15 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             wipe_streak  INTEGER NOT NULL DEFAULT 0,
             rate_limit   INTEGER NOT NULL DEFAULT 0,
             last_wipe_at TEXT,
-            note         TEXT NOT NULL DEFAULT ''
+            note         TEXT NOT NULL DEFAULT '',
+            -- 第 188 轮:页面**原地自刷新循环**累计次数(与整页抹除并列的第二类反爬)。
+            -- 二者形态不同、处置不同,但同样必须跨会话记住:否则每开一个新会话都要把
+            -- 「反复刷新→人工输不进去→HITL 空转→再刷新」整段重付一遍,用户永远解不开。
+            -- last_reload_at **独立于** last_wipe_at:两类信号的新鲜度时钟各自推进,
+            -- 共用一列会让刷新循环事件把早已过期的抹除熔断续命(反之亦然不可发生,
+            -- 因为本列只写不清)。共用 last_wipe_at 会污染既有熔断语义,故不共用。
+            reload_loops  INTEGER NOT NULL DEFAULT 0,
+            last_reload_at TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_site_risk_wipe
             ON site_risk(wipe_total DESC, last_wipe_at DESC);
@@ -262,8 +270,31 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
 pub fn migrate(conn: &Connection) -> Result<()> {
     migrate_providers_context_max_size(conn)?;
     migrate_providers_allow_private_endpoint(conn)?;
+    migrate_site_risk_reload_loops(conn)?;
     rebuild_role_check(conn, "session_memory")?;
     rebuild_role_check(conn, "agent_memory")?;
+    Ok(())
+}
+
+/// site_risk 表补 reload_loops 列(默认 0,存量记录保持原行为)。
+///
+/// 第 188 轮:站点「原地自刷新循环」此前只活在 page_liveness 的进程内 HashMap,
+/// 进程一退出即归零,与整页抹除(wipe_total 跨会话记忆)形成鲜明不对称 ——
+/// 用户每重开一次会话就把整段「刷新→人工输不进去」重付一遍。存量库自动补列。
+fn migrate_site_risk_reload_loops(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(site_risk)")?;
+    let cols: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (name, ddl) in [
+        ("reload_loops", "INTEGER NOT NULL DEFAULT 0"),
+        ("last_reload_at", "TEXT"),
+    ] {
+        if cols.iter().any(|c| c == name) {
+            continue;
+        }
+        conn.execute(&format!("ALTER TABLE site_risk ADD COLUMN {name} {ddl}"), [])?;
+    }
     Ok(())
 }
 

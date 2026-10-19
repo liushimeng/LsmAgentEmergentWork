@@ -750,6 +750,10 @@ pub(super) async fn run(args: Value) -> crate::error::Result<String> {
             if let Some(note) = background_note {
                 data["page_background"] = note;
             }
+            // 第 188 轮:只读动作收尾补「自刷新台账 + 隐身档」—— 让「页面一直在刷新」
+            // 这一信号在模型**唯一会去看的出口**(inspect/explore/screenshot/ocr)可见。
+            // 此前该装配是零调用方死代码,实测 BOSS 直聘一整轮采样数为 0。
+            super::enrich_after_read(id, &mut data).await;
             envelope(0, "ok", data)
         }
         Err(e) => envelope(2002, &e, json!({})),

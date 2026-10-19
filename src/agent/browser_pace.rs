@@ -66,6 +66,13 @@ pub const WIPE_STREAK_THRESHOLD: u32 = 2;
 /// 第 3 次仍被抹除即可判定为指纹级打标(换新实例无意义,只会反复弹 Chrome)。
 pub const WIPE_TOTAL_THRESHOLD_DEFAULT: u32 = 3;
 
+/// 第 188 轮:原地自刷新循环熔断阈值(默认 3,`LAEW_WEB_RELOAD_LOOP_THRESHOLD` 覆盖)。
+///
+/// 与 [`WIPE_TOTAL_THRESHOLD_DEFAULT`] 取同值以保持两类反爬熔断的一致手感。
+/// 语义差异:抹除意味着**页面已不可用**,刷新循环意味着**页面在动但人工也用不了** ——
+/// 两者对 Agent 都是死路,故一并熔断,只在信封 `cause` 上分流。
+pub const RELOAD_LOOP_THRESHOLD_DEFAULT: u32 = 3;
+
 /// 整页抹除总账阈值(env 覆盖;`0`/非法值回退默认)。
 pub fn wipe_total_threshold() -> u32 {
     std::env::var("LAEW_WEB_WIPE_TOTAL_THRESHOLD")
@@ -103,7 +110,7 @@ pub fn preflight_enabled() -> bool {
 ///
 /// 供 TUI 横幅行 / `/risk` 面板展示与人工解除(见
 /// [`WebPace::blocked_domains_snapshot`])。
-pub fn blocked_domains() -> Vec<(String, u32)> {
+pub fn blocked_domains() -> Vec<(String, u32, &'static str)> {
     WebPace::global().blocked_domains_snapshot()
 }
 
@@ -135,6 +142,8 @@ pub fn risk_cooldown_secs() -> u64 {
 /// 冷却成因(信封 `data.cause` 与文案分流;频控靠等,抹除靠换身份)。
 pub const CAUSE_RATE_LIMITED: &str = "rate_limited";
 pub const CAUSE_SITE_WIPE: &str = "site_wipe";
+/// 第 188 轮:原地自刷新循环(与整页抹除并列的第二类反爬死路)。
+pub const CAUSE_RELOAD_LOOP: &str = "reload_loop";
 /// 第 172 轮:人工验证挑战/风控打标(baxia 滑块 punish 实测形态)。与会话级打标
 /// 的 site_wipe 同属「换策略」族:等待收益低,目的是停止重试加剧风控。
 pub const CAUSE_RISK_CHALLENGE: &str = "risk_challenge";
@@ -250,6 +259,18 @@ pub struct PaceState {
     /// 根治「close(all) 清连击 → 换全新 profile 再被抹」的 Chrome 拉起风暴
     /// (猎聘对 CDP 拉起环境做指纹级打标,换新实例无效,2026-10-14 实测)。
     wipe_total: HashMap<String, u32>,
+    /// 第 188 轮:每注册域**原地自刷新循环**累计次数(与 `wipe_total` 并列的第二类
+    /// 反爬账,语义独立、时钟独立、熔断独立)。
+    ///
+    /// 背景(实测 2026-10-19 BOSS 直聘):站点对自动化环境做「原地反复重载」时,
+    /// 页面**不会**变成 about:blank,`wipe_total` 永远记不上;而页面每隔几秒重建一次
+    /// 意味着**人工也输不进去** —— `request_human` 成了物理死路。整条自刷新治理
+    /// 链路此前只活在 `page_liveness` 的进程内 HashMap,进程一退即归零,用户每重开
+    /// 一次会话就把「反复刷新 → 人工空等 → 再刷新」整段重付一遍。
+    ///
+    /// 达 [`Self::RELOAD_LOOP_THRESHOLD`] 后由 `guard_navigation` 返 6004
+    /// (`cause="reload_loop"`),与抹除熔断共用信封形状,不新造 6xxx 码族。
+    reload_loops: HashMap<String, u32>,
     /// 每注册域**持久熔断下**的 force 强制导航计数(第 174 轮;`clear_all` 不清,
     /// 与 `wipe_total` 同语义,仅恢复证据清零)。超过 [`FORCE_BUDGET`] 后
     /// `force=true` 逃生口同样返 6004 —— 强制导航不改变站点侧指纹级打标,
@@ -295,6 +316,7 @@ impl Default for PaceState {
             cooldown_cause: HashMap::new(),
             wipe_streak: HashMap::new(),
             wipe_total: HashMap::new(),
+            reload_loops: HashMap::new(),
             forced_nav: HashMap::new(),
             risk_suppressed_until: HashMap::new(),
             recent_wipe: HashMap::new(),
@@ -424,7 +446,11 @@ impl WebPace {
             guard.hydrated = true;
         }
         let rows = crate::config::site_risk::load_active();
-        if rows.is_empty() {
+        // 第 188 轮:刷新循环账**独立回填**。注意上面 `load_active` 的空判早返回对
+        // 刷新循环不成立 —— 抹除账为空而刷新循环账非空是常态(原地重载的站点页面
+        // 不会落 about:blank,抹除账天然为零),故两条查询各自独立判空。
+        let reload_rows = crate::config::site_risk::load_active_reload_loops();
+        if rows.is_empty() && reload_rows.is_empty() {
             return;
         }
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -445,6 +471,23 @@ impl WebPace {
             tracing::info!(
                 domains = restored,
                 "已从站点反爬声誉台账回填历史抹除账(跨会话记忆生效)"
+            );
+        }
+        // 第 188 轮:刷新循环账回填(与抹除账分开一句,便于排障时一眼看出是哪类记忆生效)。
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut restored_reload = 0usize;
+        for (domain, total) in reload_rows {
+            let cur = guard.reload_loops.get(&domain).copied().unwrap_or(0);
+            if total > cur {
+                guard.reload_loops.insert(domain, total);
+                restored_reload += 1;
+            }
+        }
+        drop(guard);
+        if restored_reload > 0 {
+            tracing::info!(
+                domains = restored_reload,
+                "已从站点反爬声誉台账回填历史刷新循环账(跨会话记忆生效)"
             );
         }
     }
@@ -665,6 +708,64 @@ impl WebPace {
         self.wipe_total_for(host) >= wipe_total_threshold()
     }
 
+    /// 第 188 轮:记一次「原地自刷新循环」命中并落台账(跨会话记忆)。
+    ///
+    /// 只由**已判定自刷新不稳定**(`page_liveness` 报 `unstable`)的路径调用 ——
+    /// 判据本身已在 `page_liveness` 侧偏保守(30s/90s 双窗、严格排除 Agent 主动
+    /// 导航),此处不再叠加更严的门槛,避免「两次不同形态的保守判据相乘」把正常
+    /// 站点的长 SPA 也误伤。按工程既有原则(误触发把任务拦死 > 漏触发只退回旧行为),
+    /// 熔断阈值取 3(与 [`wipe_total_threshold`] 一致)并保留 `params.force` 逃生口。
+    ///
+    /// 幂等:同一页在同一次「不稳定」期间可能反复命中,故按域**去重后**才加一 ——
+    /// 由调用方保证每次判定为新的不稳定事件(见 `note_reload_loop_once` 的去重键)。
+    pub fn note_reload_loop(&self, host: &str) -> u32 {
+        if !enabled() {
+            return 0;
+        }
+        self.hydrate();
+        let total = {
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let e = guard.reload_loops.entry(host.to_string()).or_insert(0);
+            *e += 1;
+            *e
+        };
+        crate::config::site_risk::record_reload_loop(host, total);
+        tracing::warn!(
+            host,
+            reload_loops = total,
+            threshold = Self::reload_loop_threshold(),
+            "页面自刷新循环命中(该域累计,跨会话记忆);\
+             人工在持续重载的页面上无法输入,request_human 属物理死路"
+        );
+        total
+    }
+
+    /// 该域累计自刷新循环次数(启动期已回填历史)。
+    pub fn reload_loops_for(&self, host: &str) -> u32 {
+        self.hydrate();
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reload_loops
+            .get(host)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// 该域自刷新循环是否已达熔断阈值。
+    pub fn reload_loop_exhausted(&self, host: &str) -> bool {
+        self.reload_loops_for(host) >= Self::reload_loop_threshold()
+    }
+
+    /// 自刷新循环熔断阈值(缺省 3,可配;`0`/非法回退缺省)。
+    pub fn reload_loop_threshold() -> u32 {
+        std::env::var("LAEW_WEB_RELOAD_LOOP_THRESHOLD")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(RELOAD_LOOP_THRESHOLD_DEFAULT)
+    }
+
     /// 持久熔断下登记一次 force 强制导航并判定预算(第 174 轮)。
     ///
     /// 返回 `Some(used)` = 本次是第 `used` 次且**已超预算**(应拦截);
@@ -735,16 +836,28 @@ impl WebPace {
     /// 2026-10-19:熔断状态此前只能从 6004 信封里**间接**看到,没有主动查询入口 ——
     /// 用户被 TTL(默认 7 天)锁在门外时「完全不知道为什么」(第 186 轮教训:
     /// 治理层喊狼来了比没有治理更糟)。横幅一行 + `/risk` 面板把状态变成可查可操作。
-    pub fn blocked_domains_snapshot(&self) -> Vec<(String, u32)> {
+    pub fn blocked_domains_snapshot(&self) -> Vec<(String, u32, &'static str)> {
         self.hydrate();
         let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let threshold = wipe_total_threshold();
-        let mut out: Vec<(String, u32)> = guard
+        let reload_threshold = Self::reload_loop_threshold();
+        let mut out: Vec<(String, u32, &'static str)> = guard
             .wipe_total
             .iter()
             .filter(|(_, total)| **total >= threshold)
-            .map(|(domain, total)| (domain.clone(), *total))
+            .map(|(domain, total)| (domain.clone(), *total, CAUSE_SITE_WIPE))
             .collect();
+        // 第 188 轮:刷新循环熔断域一并列出。抹除优先(同域两类都达阈值时只列抹除,
+        // 它是更硬的判据),故这里跳过已被上一段收录的域。
+        out.extend(
+            guard
+                .reload_loops
+                .iter()
+                .filter(|(domain, total)| {
+                    **total >= reload_threshold && !guard.wipe_total.contains_key(*domain)
+                })
+                .map(|(domain, total)| (domain.clone(), *total, CAUSE_RELOAD_LOOP)),
+        );
         out.sort_by(|a, b| b.1.cmp(&a.1));
         out
     }
@@ -760,9 +873,12 @@ impl WebPace {
     /// 返回是否确有账目被清(供调用方回报)。
     pub fn release_domain(&self, host: &str) -> bool {
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        // 第 188 轮:刷新循环账一并解除 —— `/risk release` 的语义是「解除该域的
+        // 反爬熔断」,只清抹除账却把刷新循环账留着,用户会看到「明明已解除却仍被拦」。
         let had = guard.wipe_total.remove(host).is_some()
             || guard.wipe_streak.remove(host).is_some()
-            || guard.forced_nav.remove(host).is_some();
+            || guard.forced_nav.remove(host).is_some()
+            || guard.reload_loops.remove(host).is_some();
         // 只解抹除成因的冷却(频控靠时间自愈,与本次解除无关)。
         if guard.cooldown_cause.get(host) == Some(&CAUSE_SITE_WIPE) {
             guard.cooldown_until.remove(host);
@@ -947,6 +1063,20 @@ pub async fn guard_navigation(
         )
         .map(Ok);
     }
+    // 第 188 轮:自刷新循环熔断 —— 与抹除并列的第二类死路。与抹除判据的关键差异:
+    // **页面不是不可用,而是每隔几秒被站点重建一次**,于是 Agent 点不准、人工也输不进
+    // (实测 request_human 成了物理死路,人工反复重试 3 次全废)。继续在该域导航
+    // 只会再多付一次「开页→被重载→空等」的循环,故跨会话累计达阈值即熔断。
+    //
+    // 同样只在 laew 身份下熔断:用户日常 Chrome 里页面重载是**正常浏览行为**
+    // (SPA 路由切换也会换 timeOrigin),绝不能据此拦用户自己的浏览器。
+    if laew_identity && WebPace::global().reload_loop_exhausted(&host) {
+        return Some(Ok(reload_loop_envelope(
+            &host,
+            WebPace::global().reload_loops_for(&host),
+            WebPace::reload_loop_threshold(),
+        )));
+    }
     match WebPace::global().decide(&host) {
         PaceDecision::Block { remaining } => {
             let secs = remaining.as_secs().max(1);
@@ -1061,6 +1191,50 @@ fn persistent_wipe_envelope(host: &str, total: u32, threshold: u32) -> Option<St
         "data": data,
     }))
     .ok()
+}
+
+/// 第 188 轮:自刷新循环熔断信封(纯函数,便于单测)。
+///
+/// 复用 6004 信封形状(`cause` 分流),**不新造 6xxx 码族** —— 上层对 6004 的
+/// 「该域当前不可达/不可用,别硬闯」处置逻辑可直接复用。
+fn reload_loop_envelope(host: &str, total: u32, threshold: u32) -> String {
+    let msg = format!(
+        "站点页面自刷新循环熔断({host}):已连续 {total} 次(≥{threshold})在 laew 拉起的浏览器里\
+检测到站点把页面**反复重建**(近 90s 窗口内 ≥3 次 / 近 30s 内 ≥2 次),\
+且这是**跨会话**累计 —— 该域对本环境持续做「原地重载」反爬。\
+注意与整页抹除的区别:页面**并非不可用**,而是每隔几秒被重建一次,\
+因此 Agent 点不准、**人工也输不进去**(人工输入会随文档销毁而丢失),\
+在此反复 request_human 是物理死路。\
+处置:① 不要再对该域 open/navigate/reload —— 只会再多付一次「开页→被重载→空等」;\
+② 改用 open(reuse_existing=true) 接管用户本机已登录的**真实浏览器**\
+(connect 模式零注入、真实指纹,真人在自己的浏览器里不会被刷新打断);\
+③ 若确实无路,request_human 交还人工(**无需 page_id**)如实说明,不要伪造结果"
+    );
+    let data = json!({
+        "host": host,
+        "cause": CAUSE_RELOAD_LOOP,
+        "persistent": true,
+        "reload_loops": total,
+        "reload_loop_threshold": threshold,
+        "advice": "该域对 laew 拉起的浏览器环境持续做「原地反复重载」反爬(跨会话累计)。\
+人工在持续重载的页面上无法输入 —— request_human 是物理死路,请勿再试。处置:\
+① 改用 open(reuse_existing=true) 接管本机已登录的真实浏览器(connect 模式零注入、真实指纹),\
+这是唯一既能登录又能继续操作的通道;\
+② 不要反复 reload —— 刷新只会再吃一次站点风控并延长封锁;\
+③ 已采集数据先落盘,如实向用户报告该域当前不可自动采集",
+        "force_hint": "force 逃生口不改变站点侧重载策略,只多开一次页多等一轮;\
+确需试探时用一次并观察是否仍为 about:blank/短命文档",
+        "manual_release": "人工解除(**不需要改代码**):换 IP 或站点 WAF 已修复时,\
+设环境变量 LAEW_SITE_RISK_PERSIST=off 跑一次即可绕过历史账;\
+或直接清账:sqlite3 <程序目录>/LsmAgentEmergentWork.db \"delete from site_risk where domain='<host>';\"\
+(记录默认保留 LAEW_SITE_RISK_TTL_DAYS=7 天,超期自动失效)",
+    });
+    serde_json::to_string(&json!({
+        "code": CODE_SITE_PACE_COOLDOWN,
+        "message": msg,
+        "data": data,
+    }))
+    .unwrap_or_default()
 }
 
 /// force 预算用尽信封(纯函数,便于单测)。
@@ -1922,5 +2096,119 @@ mod tests {
         assert_eq!(ev.main_doc_status, None, "延迟形态不回查缓冲,状态码为空");
         assert!(p.note_navigation_outcome(url, "about:blank", Some(ev)).is_some());
         assert_eq!(p.wipe_total_for("liepin.com"), 1);
+    }
+
+    // ==================== 第 188 轮:自刷新循环账 ====================
+
+    #[test]
+    fn 刷新循环记账_逐次累加且达阈值熔断() {
+        let p = pace();
+        let th = WebPace::reload_loop_threshold();
+        assert!(!p.reload_loop_exhausted("zhipin.com"), "起始不应熔断");
+        for i in 1..=th {
+            assert_eq!(p.note_reload_loop("zhipin.com"), i);
+        }
+        assert!(p.reload_loop_exhausted("zhipin.com"));
+    }
+
+    /// 关键防误伤:两类账**互不串扰**。刷新循环不得写抹除账(否则用户会被
+    /// 误读成「该域已整页抹除」而去换 IP,而刷新循环的出路是接管真实浏览器);
+    /// 反之抹除也不得写刷新循环账。
+    #[test]
+    fn 刷新循环与抹除两账互不串扰() {
+        let p = pace();
+        p.note_reload_loop("zhipin.com");
+        assert_eq!(p.wipe_total_for("zhipin.com"), 0, "刷新循环不得记抹除");
+        assert!(!p.wipe_exhausted("zhipin.com"));
+
+        let q = pace();
+        q.note_navigation_outcome(
+            "https://www.liepin.com/",
+            "about:blank",
+            Some(WipeEvidence::late_transition()),
+        );
+        assert_eq!(q.reload_loops_for("liepin.com"), 0, "抹除不得记刷新循环");
+    }
+
+    /// 快照按成因分流:抹除域与刷新循环域都要能被 `/risk` 面板看到并释放。
+    #[test]
+    fn 熔断快照_含刷新循环域并标成因() {
+        let p = pace();
+        let th = WebPace::reload_loop_threshold();
+        for _ in 0..th {
+            p.note_reload_loop("zhipin.com");
+        }
+        let snap = p.blocked_domains_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].0, "zhipin.com");
+        assert_eq!(snap[0].1, th);
+        assert_eq!(snap[0].2, CAUSE_RELOAD_LOOP);
+    }
+
+    /// 同域两类同时达阈值时只列抹除(它是更硬的判据),不重复占行。
+    #[test]
+    fn 熔断快照_同域两类达阈值只列抹除() {
+        let p = pace();
+        for _ in 0..wipe_total_threshold() {
+            p.note_navigation_outcome(
+                "https://www.zhipin.com/",
+                "about:blank",
+                Some(WipeEvidence::late_transition()),
+            );
+        }
+        for _ in 0..WebPace::reload_loop_threshold() {
+            p.note_reload_loop("zhipin.com");
+        }
+        let snap = p.blocked_domains_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].2, CAUSE_SITE_WIPE);
+    }
+
+    /// 人工解除必须同时清两类账 —— 否则用户「明明已解除却仍被拦」。
+    #[test]
+    fn 人工解除_同时清两类账() {
+        let p = pace();
+        p.note_reload_loop("zhipin.com");
+        assert!(p.release_domain("zhipin.com"));
+        assert_eq!(p.reload_loops_for("zhipin.com"), 0);
+        assert!(!p.reload_loop_exhausted("zhipin.com"));
+    }
+
+    /// 信封复用 6004 形状并带 `cause=reload_loop`,文案必须**劝退 request_human**
+    /// (在持续重载的页面上它是物理死路),并明确指出接管真实浏览器这条出路。
+    #[test]
+    fn 刷新循环信封_复用6004形状且劝退HITL() {
+        let s = reload_loop_envelope("zhipin.com", 3, 3);
+        let v: serde_json::Value = serde_json::from_str(&s).expect("信封须为合法 JSON");
+        assert_eq!(v["code"], CODE_SITE_PACE_COOLDOWN);
+        assert_eq!(v["data"]["cause"], CAUSE_RELOAD_LOOP);
+        assert_eq!(v["data"]["persistent"], true);
+        let msg = v["message"].as_str().unwrap();
+        assert!(msg.contains("人工也输不进去"), "须点破人工同样不可用: {msg}");
+        assert!(msg.contains("物理死路"), "须劝退 request_human: {msg}");
+        assert!(msg.contains("reuse_existing"), "须给出接管真实浏览器的出路: {msg}");
+    }
+
+    /// 熔断判据按**注册域**归一,且未记账的域一律不熔断(防误伤)。
+    #[test]
+    fn 刷新循环熔断_按注册域归一且未记账域不熔断() {
+        let p = pace();
+        let th = WebPace::reload_loop_threshold();
+        for _ in 0..th {
+            p.note_reload_loop("zhipin.com");
+        }
+        // 换子域仍应命中同一账。
+        assert!(p.reload_loop_exhausted(
+            &host_of("https://www.zhipin.com/web/geek/job").unwrap()
+        ));
+        // 无关域零记账,不得被牵连。
+        assert!(!p.reload_loop_exhausted("liepin.com"));
+        assert_eq!(p.reload_loops_for("liepin.com"), 0);
+    }
+
+    /// 环境变量阈值解析:0/非法回退默认。
+    #[test]
+    fn 刷新循环阈值_环境变量非法回退默认() {
+        assert_eq!(WebPace::reload_loop_threshold(), RELOAD_LOOP_THRESHOLD_DEFAULT);
     }
 }

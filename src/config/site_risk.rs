@@ -76,10 +76,15 @@ pub struct SiteRiskRow {
 /// `last_wipe_at` 为空(只记过频控)或解析失败一律判过期 —— 宁可放行试探,
 /// 也不因一条坏数据把域永久锁死。
 pub fn is_fresh(row: &SiteRiskRow, now: &str) -> bool {
-    let (Some(at), Some(n)) = (
-        row.last_wipe_at.as_deref().and_then(parse_utc),
-        parse_utc(now),
-    ) else {
+    fresh_at(row.last_wipe_at.as_deref(), now)
+}
+
+/// 通用新鲜度判定(第 188 轮):给定最近一次不利事件时刻,判是否仍在窗口内。
+///
+/// 抹除账与刷新循环账各有各的时钟列,新鲜度规则完全相同,故抽成共用函数 ——
+/// 宁可放行试探,也不因一条坏数据/过期数据把域永久锁死。
+pub fn fresh_at(last: Option<&str>, now: &str) -> bool {
+    let (Some(at), Some(n)) = (last.and_then(parse_utc), parse_utc(now)) else {
         return false;
     };
     n.saturating_sub(at) <= (risk_ttl_days() as i64) * 86_400
@@ -227,6 +232,55 @@ impl Db {
         Ok(())
     }
 
+    /// 第 188 轮:记录一次「原地自刷新循环」命中。
+    ///
+    /// 与抹除账**完全独立**:独立计数 `reload_loops`、独立时钟 `last_reload_at`,
+    /// 绝不写 `wipe_total`/`wipe_streak`/`last_wipe_at` —— 故本条既不会延长也不会
+    /// 缩短既有抹除熔断的寿命,两类信号可以各自独立衰减。
+    ///
+    /// 与 [`Self::record_site_wipe`] 同约定:**不在 DAO 里自行加一**
+    /// (total 由调用方的内存台账给出,避免两侧各自记账对不上)。
+    pub fn record_site_reload_loop(&self, domain: &str, total: u32) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            "INSERT INTO site_risk(domain, wipe_total, wipe_streak, rate_limit, last_wipe_at, note,
+                                   reload_loops, last_reload_at)
+             VALUES (?1,0,0,0,NULL,'',?2,?3)
+             ON CONFLICT(domain) DO UPDATE SET
+                reload_loops   = excluded.reload_loops,
+                last_reload_at = excluded.last_reload_at",
+            params![domain, total as i64, now_str()],
+        )?;
+        Ok(())
+    }
+
+    /// 取全部**仍在新鲜度窗口内且刷新循环账非零**的记录(启动期回填用)。
+    ///
+    /// 与 [`Self::load_active_site_risk`] 分开查:抹除账与刷新循环账新鲜度时钟
+    /// 各自独立,合成一次查询会把两类域混进同一个结果集,导致回填时张冠李戴。
+    pub fn load_active_reload_loops(&self) -> Result<Vec<(String, u32)>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let now = now_str();
+        let mut stmt = conn.prepare(
+            "SELECT domain, reload_loops, last_reload_at
+             FROM site_risk WHERE reload_loops > 0",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? as u32,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter(|(_, _, at)| fresh_at(at.as_deref(), &now))
+            .map(|(d, n, _)| (d, n))
+            .collect())
+    }
+
     /// 记一次频控横幅命中(观测用;不参与熔断,不写 `last_wipe_at`)。
     pub fn record_site_rate_limit(&self, domain: &str) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
@@ -246,7 +300,7 @@ impl Db {
     pub fn clear_site_risk(&self, domain: &str) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         conn.execute(
-            "UPDATE site_risk SET wipe_total = 0, wipe_streak = 0
+            "UPDATE site_risk SET wipe_total = 0, wipe_streak = 0, reload_loops = 0
              WHERE domain = ?1",
             params![domain],
         )?;
@@ -302,6 +356,33 @@ pub fn record_wipe(domain: &str, total: u32, streak: u32) {
     if let Some(db) = store() {
         if let Err(e) = db.record_site_wipe(domain, total, streak) {
             tracing::warn!(domain, error = %e, "站点声誉落库失败(fail-open,不影响本次运行)");
+        }
+    }
+}
+
+/// 第 188 轮:记录一次「原地自刷新循环」命中;fail-open。
+///
+/// 与 [`record_wipe`] 一样不在 DAO 内自增,total 由 `WebPace` 内存台账给出。
+pub fn record_reload_loop(domain: &str, total: u32) {
+    if let Some(db) = store() {
+        if let Err(e) = db.record_site_reload_loop(domain, total) {
+            tracing::warn!(domain, error = %e, "刷新循环声誉落库失败(fail-open,不影响本次运行)");
+        }
+    }
+}
+
+/// 第 188 轮:启动期回填刷新循环账,返回 `(domain, reload_loops)` 列表。
+///
+/// 与 [`load_active`] 同样保持单向依赖:DAO 不反向依赖 agent 层,由 `WebPace` 灌内存。
+pub fn load_active_reload_loops() -> Vec<(String, u32)> {
+    let Some(db) = store() else {
+        return Vec::new();
+    };
+    match db.load_active_reload_loops() {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, "刷新循环声誉回填失败(fail-open)");
+            Vec::new()
         }
     }
 }
