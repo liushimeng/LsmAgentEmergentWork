@@ -483,6 +483,52 @@
     /// 同因熔断是模型自行拒绝任务时**唯一**的止动器:拒绝式 Plan 输出同样解析不出
     /// WorkFlow,归一化后逐字相同,第 2 次即熔断收口(不再由编排器代替模型做价值判断)。
     /// 本组测试锁死该性质,防止误删。
+    /// 第 186 轮:人工在 HITL 弹窗点「取消任务」后,编排层的取消闸必须立刻
+    /// 短路 —— 猎聘实测里人工明确喊停,任务却继续跑完 wf-2(88.7s)并回流
+    /// Yolo。本用例锁死「旗标置位 ⇒ `check_cancelled` 返 `Cancelled`」,
+    /// 并确认未置位时不误伤(Ctrl-C 之外的第二条通道不能影响正常任务)。
+    ///
+    /// 进程级单例,必须串行化:与 `human_cancel::tests` 用不同的锁即可,
+    /// 但同文件内仍与其它用例并行,故只操作「先复位再置位」的完整序列。
+    #[test]
+    fn 人工取消旗标使编排取消闸立即短路() {
+        let token = CancelToken::new();
+        crate::agent::human_cancel::reset();
+        assert!(
+            MultiAgentOrchestrator::check_cancelled(&token).is_ok(),
+            "未取消时闸门必须放行"
+        );
+
+        crate::agent::human_cancel::set("login:人工应答「2. 取消任务」");
+        let err = MultiAgentOrchestrator::check_cancelled(&token)
+            .expect_err("人工取消后闸门必须短路");
+        assert!(
+            matches!(err, crate::error::AgentError::Cancelled),
+            "应归一为 Cancelled(走既有 QualityFailure.cancelled 通路),实测 {err:?}"
+        );
+
+        crate::agent::human_cancel::reset();
+        assert!(
+            MultiAgentOrchestrator::check_cancelled(&token).is_ok(),
+            "复位后必须恢复放行(否则会污染后续任务)"
+        );
+    }
+
+    /// 第 186 轮:`from_agent_error` 把 `Cancelled` 映射成
+    /// `retryable=false + cancelled=true` —— 这是「不回流 Yolo、直接短路」的
+    /// 关键对账,人工取消才不会被重试环再跑一轮。
+    #[test]
+    fn 人工取消映射为不可重试的取消失败() {
+        let f = QualityFailure::from_agent_error(
+            AgentRole::SubAgent,
+            "SubAgent 执行失败(wf=wf-1)",
+            &crate::error::AgentError::Cancelled,
+        );
+        assert!(f.cancelled, "Cancelled 必须映射为 cancelled 失败");
+        assert!(!f.retryable, "取消失败不得进入重试");
+        assert_eq!(f.suggestion, "任务已取消");
+    }
+
     #[test]
     fn same_cause_breaker_trips_on_second_identical_reason() {
         let mut b = SameCauseBreaker::new();
