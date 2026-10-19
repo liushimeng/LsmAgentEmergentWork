@@ -219,11 +219,12 @@ pub fn parse_plan_markdown(content: &str) -> Result<WorkFlowPlan> {
                 workflows.push(w);
             }
             // 提取 id 与 name(形如 "1: 名称" / "1：名称" / "1 名称";第 165 轮兼容全角冒号)
+            // 第 187 轮:支持字母数字混合 ID(wf-1b / wf-2a 等),Plan Agent 常见子 workflow 形态
             let after_id = rest
-                .trim_start_matches(|c: char| c.is_ascii_digit() || c == ':' || c == '：' || c == ' ')
+                .trim_start_matches(|c: char| c.is_ascii_alphanumeric() || c == ':' || c == '：' || c == ' ')
                 .to_string();
-            // 提取纯数字 id
-            let id_num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            // 提取字母数字 id(兼容 wf-1b 等)
+            let id_num: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
             let id = if id_num.is_empty() {
                 format!("wf-{}", workflows.len() + 1)
             } else {
@@ -259,7 +260,7 @@ pub fn parse_plan_markdown(content: &str) -> Result<WorkFlowPlan> {
             let id_num: String = id_cell
                 .trim_start_matches("wf-")
                 .chars()
-                .take_while(|c| c.is_ascii_digit())
+                .take_while(|c| c.is_ascii_alphanumeric())
                 .collect();
             if !id_num.is_empty() && cells.len() >= 3 {
                 if let Some(w) = current.take() {
@@ -313,7 +314,7 @@ pub fn parse_plan_markdown(content: &str) -> Result<WorkFlowPlan> {
             let id_num: String = inner
                 .trim_start_matches("wf-")
                 .chars()
-                .take_while(|c| c.is_ascii_digit())
+                .take_while(|c| c.is_ascii_alphanumeric())
                 .collect();
             if !id_num.is_empty() {
                 // 拆出「wf-N 名称」与粗体闭合后的描述(描述兜底为首步骤)

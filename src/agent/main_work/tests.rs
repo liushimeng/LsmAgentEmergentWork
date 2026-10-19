@@ -1395,3 +1395,34 @@ fn infer_depends_on_no_false_edge_without_produce_verb() {
     infer_depends_on(&mut plan);
     assert!(plan.workflows[1].depends_on.is_empty());
 }
+
+#[test]
+fn parse_plan_markdown_supports_alphanumeric_id_wf1b() {
+    // 第 187 轮:Plan Agent 生成 wf-1b 子 workflow,旧解析器只取数字导致 wf-1b → wf-1 重复被去重
+    let md = r#"## 二、WorkFlow 拆解
+
+### WorkFlow 1:站点可达性与阻断定级
+- 步骤:
+  - [ ] 用 MCP_Web_Use 探测站点可达性
+- 依赖:无
+- 验收标准:明确阻断定级
+
+### WorkFlow 1b:熔断兜底
+- 步骤:
+  - [ ] 交还人工处理
+- 依赖:wf-1
+- 验收标准:拿到人工处置结论
+
+### WorkFlow 2:完成登录
+- 步骤:
+  - [ ] 在页面完成登录
+- 依赖:wf-1b
+- 验收标准:登录成功
+"#;
+    let plan = parse_plan_markdown(md).expect("解析失败");
+    assert_eq!(plan.workflows.len(), 3, "应解析出 3 个 workflow(wf-1, wf-1b, wf-2)");
+    assert_eq!(plan.workflows[0].id, "wf-1");
+    assert_eq!(plan.workflows[1].id, "wf-1b");
+    assert_eq!(plan.workflows[2].id, "wf-2");
+    assert_eq!(plan.workflows[2].depends_on, vec!["wf-1b".to_string()]);
+}
