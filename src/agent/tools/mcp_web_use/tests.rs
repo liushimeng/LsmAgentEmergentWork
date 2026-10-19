@@ -2940,6 +2940,38 @@ async fn real_browser_viewport_fills_window() {
 /// page_health(reason ∈ {main_doc_error, empty_dom});页面有真实内容 ⇒ 不带该字段。
 /// 目标 URL **不写死在仓库里**(内网/客户站点属敏感信息),由环境变量
 /// `LAEW_REAL_SITE_URL` 提供;未设置时退回公网 example.com(仅验证视口铺满)。
+/// 第 186 轮:死页信号 `data.page_dead` 的三态判定(纯函数 `dead_page_reason`)。
+///
+/// 猎聘实测缺口:页面被站点抹除后,只读观测动作只拿到 `about:blank` +
+/// `elements{count:0}` + 顶层 `code:0`,零结构化线索,模型只能靠 `ok:false` 猜。
+#[test]
+fn dead_page_reason_三态判定() {
+    // 非空白页:零字段(fail-open,常态不带噪声)
+    assert!(
+        super::dead_page_reason("p_1", "https://www.liepin.com/", |_| None).is_none(),
+        "正常页面不得带 page_dead"
+    );
+    assert!(super::dead_page_reason("p_1", "about:blank#x", |_| None).is_none());
+
+    // 空白页但无抹除记录:通用死页信号,不给风控方向性误导
+    let plain = super::dead_page_reason("p_1", "about:blank", |_| None).expect("空白页必须有信号");
+    assert_eq!(plain["reason"], "about_blank");
+    assert_eq!(plain["late"], false);
+    assert!(plain["advice"].as_str().unwrap_or_default().contains("about:blank"));
+
+    // 命中后台看护 TTL 台账:延迟抹除,带成因 URL 与年龄
+    let late = super::dead_page_reason("p_1", "about:blank", |pid| {
+        assert_eq!(pid, "p_1");
+        Some(("https://www.liepin.com/".to_string(), 7))
+    })
+    .expect("被抹页面必须有信号");
+    assert_eq!(late["reason"], "site_wipe");
+    assert_eq!(late["late"], true);
+    assert_eq!(late["requested_url"], "https://www.liepin.com/");
+    assert_eq!(late["wiped_ago_secs"], 7);
+    assert!(late["advice"].as_str().unwrap_or_default().contains("换 profile"));
+}
+
 #[tokio::test]
 #[ignore = "需要网络 + 本机真实 Chrome(headed 会弹窗口);本地手动跑"]
 async fn real_browser_site_viewport_and_page_health() {

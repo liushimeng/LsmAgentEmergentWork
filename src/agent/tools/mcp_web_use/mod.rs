@@ -774,6 +774,11 @@ pub(super) fn schedule_wipe_watch(
         }
         let outcome = crate::agent::browser_pace::WebPace::global()
             .note_navigation_outcome(&url, &landed);
+        // 第 186 轮:本条导航的响应早已返回给 LLM,追改不了;把「哪一页被抹、
+        // 被抹前请求的是什么」记进 TTL 台账,让模型**下一轮**的只读观测动作
+        // (`inspect`/`explore`)能拿到 `page_dead{reason:site_wipe, late:true}`,
+        // 而不是只看到 `about:blank` + `elements{count:0}` 干猜。
+        crate::agent::browser_pace::WebPace::global().note_late_wipe(&pid, &url);
         tracing::warn!(
             requested_url = %url,
             streak = outcome.as_ref().map(|o| o.streak).unwrap_or(0),
@@ -1031,6 +1036,55 @@ pub(super) fn nav_failure_diagnose(msg: &str) -> Value {
 pub(super) fn site_wipe_ledger_field(requested_url: &str) -> Option<Value> {
     let host = crate::agent::browser_pace::host_of(requested_url)?;
     crate::agent::browser_pace::WebPace::global().wipe_ledger_snapshot(&host)
+}
+
+/// 第 186 轮:只读观测面的**死页信号** `data.page_dead`(fail-open,不命中不带字段)。
+///
+/// 缺口(猎聘实测 `Dir01/laew_stdout.log` 09:42:44):`open` 返回时页面健康
+/// (`final_url=liepin.com`、`risk_tier=ok`),5s 后被站点脚本整页抹除;
+/// 模型紧接着的 `explore(elements/blockers/page_meta)` 拿到的是
+/// `page_meta.url=about:blank` + `elements{count:0, ok:false}`,而顶层仍是
+/// `code=0 / message:"ok"` —— **零结构化线索**,模型只能靠 `ok:false` 猜页面
+/// 死了,白烧两轮才等到 `navigate` 的 `page_health{site_wipe}`。
+///
+/// 两个子形态:
+/// - `reason=site_wipe` + `late:true`:命中后台看护 TTL 台账 —— 页面是被站点
+///   **抹掉**的(有明确成因与改道建议);
+/// - `reason=about_blank`:页面当前就是空白页但无抹除记录 —— 可能是导航落空 /
+///   句柄指向初始空白页,提示重新加载或换通道,不给风控方向性误导。
+///
+/// 纯函数(判据抽成 [`dead_page_reason`])便于单测锁死形状;取值部分只读台账,
+/// 无 CDP 往返,故可挂在只读动作收尾的零成本位。
+pub(super) fn page_dead_field(page_id: &str, landed_url: &str) -> Option<Value> {
+    dead_page_reason(page_id, landed_url, |pid| {
+        crate::agent::browser_pace::WebPace::global().recent_wipe_for(pid)
+    })
+}
+
+/// 死页信号判据(纯函数;`recent` 注入便于单测绕开进程级台账)。
+///
+/// `recent` 返回 `(被抹前的请求 URL, 距记账秒数)`。
+pub(super) fn dead_page_reason<F>(page_id: &str, landed_url: &str, recent: F) -> Option<Value>
+where
+    F: Fn(&str) -> Option<(String, u64)>,
+{
+    if !landed_url.trim().eq_ignore_ascii_case("about:blank") {
+        return None;
+    }
+    match recent(page_id) {
+        Some((requested_url, age_secs)) => Some(json!({
+            "reason": "site_wipe",
+            "late": true,
+            "requested_url": requested_url,
+            "wiped_ago_secs": age_secs,
+            "advice": "本页刚被站点侧脚本整页抹除(会话/指纹级反爬),原会话内重试无效。不要在本页做元素操作、不要 close(all) 换 profile 硬闯;按 data.site_wipe_ledger / 6004 的建议改道(接管用户已登录浏览器,或如实报告目标站点当前不可达)",
+        })),
+        None => Some(json!({
+            "reason": "about_blank",
+            "late": false,
+            "advice": "页面当前为空白页(about:blank)。若刚导航过,可能是导航落空或站点重定向到空白页;先用 open/navigate 重新加载目标地址,或在空白页上做元素操作只会全部返回空结果",
+        })),
+    }
 }
 
 /// auto_relaunch 成功信封补抹除预警(2026-10-14 第三轮):复制登录态的调试实例
@@ -2659,6 +2713,7 @@ const MCP_WEB_USE_DESCRIPTION: &str = r#"通过 CDP 驱动 Chromium 系浏览器
 【extract 详解(抓文章列表/新闻流/商品列表优先用它,不要手写 eval_js 猜字段)】params:item_selector*(列表项根节点 CSS 选择器,不知填什么先 probe=true)、fields(字段投影,形如 {"title":{"selector":"h3 a","required":true},"time":{"selector":"time","attr":"datetime"},"summary":{"selector":".descript","max_chars":300}},省略则只回通用 text+__url)、url_from(取链接的选择器,默认 "a",结果落在 __url)、limit(默认 200 上限 1000)、scan_cap(内部扫描上限,默认 1000)、filter{keywords[],match_all,fields[],time_field,since,until,sort("time:desc"),limit_after_filter}。**数值过滤/排序(通用,不限价格)**:filter.numeric{field?,min?,max?} —— 从字段文本抽取第一个数值(如 "¥10,999" / "32G" / "1.2万")按闭区间过滤;解析不出数字的条目**保留**(fail-open),响应 unparsed_numeric_fields 告知条数,防「字段格式异常→数据静默清空」;sort 对能解析成数值的字段**按数值比较**(根治字典序下 "999">"1299" 的反序,价格/销量/评分排序可直接用),字段未指定 field 时取第一条命名字段。返回 {items,total,returned,scanned,truncated,dropped_required,matched_before_filter,unparsed_time_fields,unparsed_numeric_fields,time_range,field_names,hostname,hint}。**时间字段支持中文相对时间**("3小时前"/"昨天")、ISO、"YYYY-MM-DD HH:mm" 与 Unix 秒;since/until 是闭区间。probe=true 时不抽数据,只返回 {repeated_classes,likely_item_classes,common_selectors} 供你选 item_selector,免去盲试选择器。过滤在页面内完成,返回值天然精简,不会撑爆上下文。
 【page_state 详解】params:keys?(候选全局变量名,默认 __NEXT_DATA__/__NUXT__/__INITIAL_STATE__/__APOLLO_STATE__/__PRELOADED_STATE__/__remixContext/initialState/__INITIAL_DATA__)、probe_window?(默认 true,扫出 window 上所有 __ 前缀键名+一层结构,让你不必先猜名字)、max_bytes?(默认 20000)、max_depth?(默认 8)、max_array_items?(默认 200)。返回 {found,globals,window_globals,jsonld,dropped_paths,truncated,hostname,hint}。**被裁掉的内容会列进 dropped_paths** —— 别误以为数据就这么多;按 globals 的结构选定路径后,用 eval_js 取精确子集(如 JSON.stringify(window.__NEXT_DATA__.props.pageProps.list.slice(0,20)))。
 - sequence(steps*, stop_on_error?): 连续执行模式。steps 最多 24 个,每项结构与单步调用相同(open/list/close/control/inspect),**action 可省略**(第 147 轮:含 control_action 默认 control、含 info 默认 inspect),禁止嵌套 sequence;**step 可省略 page_id**(第 157 轮:自动继承顶层 page_id,顶层也没有时继承上一步/派生页),批内显式 page_id 仍优先;字符串参数里仍可用 "$page_id"/"${page_id}" 占位,点击派生新页可用 "$spawned_page_id"/"${spawned_page_id}",默认自动跟随 spawned_page_id,单步可 follow_spawned=false 保持原页。响应逐步返回 code/message/data(成功步 message 截 300 字符、失败步截 2000),并给出最终 page_id。**第 150 轮步级防护**:任一步数据带 blocker_alert(验证弹窗命中)立即中断整批并顶层透出 blocker_alert/human_assist/next_action —— 收到后必须停止继续输入,立即 request_human 让人工完成验证、交棒后再续跑剩余步骤;单步超 150s 按步骤错误处理(request_human 步豁免);等待 AI 站点回复请用 control(wait),不要把多轮提问无超时地堆进同一批。
+【死页信号 data.page_dead】inspect / explore 在目标页当前为空白页(about:blank)时附带(成功信封才有,正常页面零噪声):`reason=site_wipe` + `late:true` = 该页刚被**站点侧脚本整页抹除**(有 requested_url 与 wiped_ago_secs,原会话内重试无效,按改道建议换通道);`reason=about_blank` = 页面当前空白但无抹除记录(导航落空/句柄指向初始空白页,先重新 open/navigate)。看到 elements/dom 返回空**不要只凭 `count:0` 猜页面死了** —— 先看 page_dead,再决定是重新加载还是改道。
 - explore(page_id?, queries*, summary_hint?)(第 118 轮):批量观察。一次调用合并多个 inspect 维度(elements/dom/screenshot/blockers 等),queries 数组最多 8 项,每项为单步 inspect 入参(如 {"info":"elements"} / {"info":"dom","params":{"selector":"form"}} / {"info":"screenshot"} / {"info":"blockers"});返回 {results:[{info,code,message,data},...], summary_hint, ok_count, err_count}。**进入新页面先用 1 次 explore 收集完整状态**(对比单步 inspect 节省 3-5 次 LLM round-trip);新页面也可直接传 url(省略 page_id,explore 自动打开后再观察,响应附 auto_opened);blockers 命中会附带 next_action hint 指引走 request_human。
 - batch(page_id*, steps*, stop_on_error?)(第 118 轮):批量混合执行,与 sequence 同语义但推荐用于「inspect + control 混合的稳定流程」(登录/表单类:inspect 验证 → input × N → click → wait → inspect 验证)。一次调用最多 24 步,允许任意 control + inspect 顺序;step 可省略 page_id(第 157 轮自动继承)。**对比 sequence 推荐用于批量执行场景**。
 
@@ -2807,6 +2862,40 @@ impl Tool for McpWebUseTool {
     }
 }
 
+/// 只读观测动作收尾挂死页信号(第 186 轮,见 [`page_dead_field`])。
+///
+/// 挂这里而非各自实现内:`inspect` 与 `explore` 共 20+ 个观察维度,逐个补
+/// 会漏且难维护;两者都要求显式 `page_id`,故在分发层统一按 `page_id` 回读
+/// 落地 URL 判定。代价是每次只读动作多一次 `page.url()` CDP 往返(亚毫秒级,
+/// 与该动作本身的 observe 相比可忽略),非空白页直接原样返回。
+async fn annotate_dead_page(args: &Value, res: String) -> String {
+    let Some(id) = str_arg(args, "page_id").filter(|s| !s.starts_with('$')) else {
+        return res;
+    };
+    let Some(page) = BrowserManager::global().page(id).await else {
+        return res;
+    };
+    let landed = match page.url().await {
+        Ok(Some(u)) => u,
+        _ => return res,
+    };
+    let Some(field) = page_dead_field(id, &landed) else {
+        return res;
+    };
+    let mut v: Value = match serde_json::from_str(&res) {
+        Ok(v) => v,
+        Err(_) => return res,
+    };
+    // 只在成功信封上挂:失败信封(code≠0)本身已带原因,叠加会噪声。
+    if v.get("code").and_then(Value::as_i64) != Some(0) {
+        return res;
+    }
+    if let Some(obj) = v.get_mut("data").and_then(Value::as_object_mut) {
+        obj.insert("page_dead".to_string(), field);
+    }
+    serde_json::to_string(&v).unwrap_or(res)
+}
+
 /// 八种 action 的分发(第 171 轮自 `execute` 抽出,便于在分发前后统一挂
 /// 屏蔽页面进度栏推送)。
 async fn dispatch_web_action(action: &str, args: Value) -> Result<String> {
@@ -2821,20 +2910,24 @@ async fn dispatch_web_action(action: &str, args: Value) -> Result<String> {
             // 且 queries 为非空数组时机械转交 explore,语义完全等价(explore 即批量
             // inspect)。分流放这里而非 inspect::run 入口,避免 explore→inspect
             // async 递归(E0733 requires boxing)。
-            if str_arg(&args, "info").is_none()
+            let out = if str_arg(&args, "info").is_none()
                 && args
                     .get("queries")
                     .and_then(Value::as_array)
                     .map(|a| !a.is_empty())
                     .unwrap_or(false)
             {
-                control::run_explore(args).await
+                control::run_explore(args.clone()).await
             } else {
-                inspect::run(args).await
-            }
+                inspect::run(args.clone()).await
+            };
+            Ok(annotate_dead_page(&args, out?).await)
         }
         "sequence" => run_sequence(args).await,
-        "explore" => control::run_explore(args).await,
+        "explore" => {
+            let out = control::run_explore(args.clone()).await;
+            Ok(annotate_dead_page(&args, out?).await)
+        }
         "batch" => control::run_batch(args).await,
         other => envelope(1001, "未知 action", json!({"action": other})),
     }

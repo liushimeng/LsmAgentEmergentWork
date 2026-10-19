@@ -237,7 +237,21 @@ pub struct PaceState {
     /// 复验探针互相打架,冷却永无解除窗口(实测 `remaining_secs` 三次恒 299)。
     /// 抑制窗内同域一律不再打标;挑战是**状态**不是**事件**,复验观测不该续命。
     risk_suppressed_until: HashMap<String, Instant>,
+    /// 每页最近一次**延迟抹除**记录(page_id → (被抹时的请求 URL, 记账时刻))。
+    ///
+    /// 第 186 轮:后台看护命中时导航响应早已返回给 LLM,追改不了;模型下一轮
+    /// 只看到 `about:blank` + `elements{count:0}`,零结构化线索,只能瞎猜
+    /// (猎聘实测白烧 2 轮才等到 `page_health{site_wipe}`)。本表把这段
+    /// 「响应已返回、抹除后发生」的盲区补上 —— 只读观测动作
+    /// (`inspect`/`explore`)在 TTL 内据此附 `page_dead{reason:site_wipe,late:true}`。
+    /// 按 page_id 而非 host:同一域多页并行时只标记真正被抹的那一页。
+    recent_wipe: HashMap<String, (String, Instant)>,
 }
+
+/// 「最近延迟抹除」记录的有效期。实测抹除延迟 4~10s,留出模型读到响应后的
+/// 反应窗口(1~2 轮 LLM 往返,30~60s),取 90s。过期后不再提示,避免陈旧信号
+/// 误导 —— 页面此时若仍是 about:blank,另有 `about_blank` 通用死页信号兜底。
+pub const RECENT_WIPE_TTL: std::time::Duration = std::time::Duration::from_secs(90);
 
 impl Default for PaceState {
     fn default() -> Self {
@@ -249,6 +263,7 @@ impl Default for PaceState {
             wipe_total: HashMap::new(),
             forced_nav: HashMap::new(),
             risk_suppressed_until: HashMap::new(),
+            recent_wipe: HashMap::new(),
         }
     }
 }
@@ -517,6 +532,30 @@ impl WebPace {
         }))
     }
 
+    /// 记一次**延迟抹除**(第 186 轮):后台看护命中时调用,把「哪一页、
+    /// 被抹前请求的是什么 URL」记进 TTL 台账,供后续只读观测动作透出
+    /// `page_dead{reason:site_wipe, late:true}`。同时顺手清掉该页的陈旧记录。
+    pub fn note_late_wipe(&self, page_id: &str, requested_url: &str) {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.recent_wipe.insert(
+            page_id.to_string(),
+            (requested_url.to_string(), Instant::now()),
+        );
+    }
+
+    /// 取该页 TTL 内的最近延迟抹除记录 → `(请求 URL, 记账至今秒数)`。
+    /// 过期记录惰性清理(读时顺手删),不额外起后台清扫任务。
+    pub fn recent_wipe_for(&self, page_id: &str) -> Option<(String, u64)> {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let (url, at) = guard.recent_wipe.get(page_id)?.clone();
+        let age = at.elapsed();
+        if age > RECENT_WIPE_TTL {
+            guard.recent_wipe.remove(page_id);
+            return None;
+        }
+        Some((url, age.as_secs()))
+    }
+
     /// 冷却成因(`rate_limited` / `site_wipe`);无有效冷却返回 `None`。
     pub fn cooldown_cause_for(&self, host: &str) -> Option<&'static str> {
         let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -545,6 +584,10 @@ impl WebPace {
         guard.cooldown_cause.clear();
         guard.wipe_streak.clear();
         guard.risk_suppressed_until.clear();
+        // 第 186 轮:回收浏览器后旧 page_id 全部失效,「最近抹除」台账按
+        // page_id 索引,留着只会让新页误挂旧页的抹除信号 → 一并清空。
+        // (注意:`wipe_total` 跨实例总账**不清**,那是熔断账,语义不同。)
+        guard.recent_wipe.clear();
     }
 
     /// 频控剩余冷却;`None` = 无冷却。
@@ -1358,5 +1401,34 @@ mod tests {
         unsafe { std::env::set_var("LAEW_WEB_RISK_COOLDOWN_SECS", "bad") };
         assert_eq!(risk_cooldown_secs(), 300, "非法回退默认");
         unsafe { std::env::remove_var("LAEW_WEB_RISK_COOLDOWN_SECS") };
+    }
+
+    /// 第 186 轮:「最近延迟抹除」按 page_id 记账、TTL 内可读、跨页隔离、
+    /// 回收浏览器时清空(旧 page_id 失效,留着会让新页误挂旧信号)。
+    #[test]
+    fn 最近抹除台账_按页隔离且随回收清空() {
+        let p = pace();
+        assert!(p.recent_wipe_for("p_a").is_none(), "未记账时零记录");
+
+        p.note_late_wipe("p_a", "https://www.liepin.com/");
+        let (url, age) = p.recent_wipe_for("p_a").expect("记账后 TTL 内可读");
+        assert_eq!(url, "https://www.liepin.com/");
+        assert!(age < 5, "刚记账的年龄应极小,实测 {age}");
+        // 跨页隔离:同域另一页未被抹,不误挂
+        assert!(
+            p.recent_wipe_for("p_b").is_none(),
+            "未被抹的同域页不得带上抹除信号"
+        );
+
+        // 回收浏览器 → 旧 page_id 全部失效,台账一并清空
+        p.clear_all();
+        assert!(
+            p.recent_wipe_for("p_a").is_none(),
+            "回收后旧 page_id 的抹除记录必须清除"
+        );
+        // 注意:跨实例总账 wipe_total 不随 clear_all 清(熔断语义),此处不该受影响
+        p.note_navigation_outcome("https://www.liepin.com/", "about:blank");
+        p.clear_all();
+        assert_eq!(p.wipe_total_for("liepin.com"), 1, "熔断总账不受 clear_all 影响");
     }
 }
