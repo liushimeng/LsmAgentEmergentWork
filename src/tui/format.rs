@@ -1336,6 +1336,7 @@ const HELP_COMMANDS: &[(&str, &str)] = &[
     ("/agents (subag)", "动态子 Agent 名册(含自定义类型)+运行记录"),
     ("/agents history", "子 Agent 运行记录(N=条数,all=跨会话)"),
     ("/workspace [rf]", "查看工作区快照(git/工程/最近改动)"),
+    ("/risk [release <域>]", "查看站点反爬熔断状态并人工解除"),
     ("/commands", "列出自定义斜杠命令"),
     ("/provider", "管理大模型接入记录(默认进入 list 屏)"),
     ("/provider list", "列出所有接入记录"),

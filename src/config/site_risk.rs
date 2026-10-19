@@ -324,6 +324,19 @@ pub fn record_survived(domain: &str) {
     }
 }
 
+/// **人工解除**某域的持久熔断(2026-10-19):清该域抹除账;fail-open。
+///
+/// 与 [`record_survived`] 的差别只在语义:那条由「页面存活过看护窗」自动触发,
+/// 本条由用户显式操作(`/risk release <domain>`)触发 —— 换 IP / 站点 WAF 修复后,
+/// 不必手敲 sqlite3 即可恢复。无库(测试/未初始化)则 no-op。
+pub fn clear_domain(domain: &str) {
+    if let Some(db) = store() {
+        if let Err(e) = db.clear_site_risk(domain) {
+            tracing::warn!(domain, error = %e, "人工解除熔断落库失败(fail-open)");
+        }
+    }
+}
+
 /// 启动期回填:把仍在新鲜度窗口内的抹除账读回内存台账。
 ///
 /// 返回 `(domain, wipe_total, wipe_streak)` 三元组列表,由调用方灌进

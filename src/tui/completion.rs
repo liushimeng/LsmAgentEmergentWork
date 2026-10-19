@@ -156,6 +156,13 @@ impl CompletionEngine {
                 "查看工作区快照(git / 工程类型 / 最近改动)",
                 "/workspace [refresh]",
             ),
+            // 第 187 轮:站点反爬熔断状态 + 人工解除
+            SlashCommand::builtin(
+                "risk",
+                &["risks"],
+                "查看站点反爬熔断状态并人工解除(/risk release <domain>)",
+                "/risk [release <domain>]",
+            ),
         ];
         Self {
             builtin,

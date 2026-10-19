@@ -297,6 +297,9 @@ impl TuiSession {
                 .agent_log
                 .as_ref()
                 .map(|log| banner::log_file_line(&self.paths, log)),
+            // 第 187 轮:站点熔断状态行(有熔断域才出现)—— 让用户不必翻 6004 信封
+            // 就知道「为什么任务没动」,并给出 /risk 这个主动查询/解除入口。
+            site_risk: banner::site_risk_status_line(),
         };
         for line in banner::render(&data, 0, textfit::term_width_for_render()) {
             println!("{line}");

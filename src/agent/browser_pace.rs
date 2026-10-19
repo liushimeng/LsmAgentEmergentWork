@@ -83,6 +83,30 @@ pub fn enabled() -> bool {
     )
 }
 
+/// 站点可达性**预检门**开关(默认开;`LAEW_SITE_RISK_PREFLIGHT=off/0/false/no` 关闭)。
+///
+/// 2026-10-19:编排器入口预检「任务锚点域是否已对当前环境**持久熔断**」,命中则
+/// 不进 Plan/QC/Main-Work 重管线(实测该场景仍要白烧 ~4 分钟 / 3~4 次 LLM 调用
+/// 才得出同一句「站点不可达」,期间模型还可能去试 `close(all)`/`force` 等已被
+/// 证伪的路径)。判据与 [`guard_navigation`] 的持久熔断**同源**(`wipe_total ≥ 阈值`),
+/// 不新增概念;杀开关供排障对照(关闭后回退到「让 Plan 自己探测」的现状)。
+///
+/// 见 `tmpPlan/20261019_154609_猎聘整页抹除反爬机制源码分析与站点可达性预检根治.md`。
+pub fn preflight_enabled() -> bool {
+    !matches!(
+        std::env::var("LAEW_SITE_RISK_PREFLIGHT").ok().as_deref(),
+        Some("off") | Some("0") | Some("false") | Some("no")
+    )
+}
+
+/// 列出当前已持久熔断的站点(总账 ≥ 阈值),按总账降序;无则空表。
+///
+/// 供 TUI 横幅行 / `/risk` 面板展示与人工解除(见
+/// [`WebPace::blocked_domains_snapshot`])。
+pub fn blocked_domains() -> Vec<(String, u32)> {
+    WebPace::global().blocked_domains_snapshot()
+}
+
 /// 同域最小导航间隔(毫秒;默认 2500,`0`/非法值回退默认)。
 pub fn min_interval_ms() -> u64 {
     env_ms("LAEW_WEB_PACE_MIN_INTERVAL_MS", 2500)
@@ -703,6 +727,56 @@ impl WebPace {
             "note": "该域曾对本环境整页抹除(站点反爬):本页当前正常不代表安全,数秒后仍可能被抹;\
 多次抹除达阈值后 laew 身份导航将被持久熔断;采集到的数据应尽快落盘",
         }))
+    }
+
+    /// 列出当前已对 laew 环境**持久熔断**的站点(总账 ≥ 阈值),供 TUI 横幅/面板
+    /// 展示与人工解除(按总账降序)。
+    ///
+    /// 2026-10-19:熔断状态此前只能从 6004 信封里**间接**看到,没有主动查询入口 ——
+    /// 用户被 TTL(默认 7 天)锁在门外时「完全不知道为什么」(第 186 轮教训:
+    /// 治理层喊狼来了比没有治理更糟)。横幅一行 + `/risk` 面板把状态变成可查可操作。
+    pub fn blocked_domains_snapshot(&self) -> Vec<(String, u32)> {
+        self.hydrate();
+        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let threshold = wipe_total_threshold();
+        let mut out: Vec<(String, u32)> = guard
+            .wipe_total
+            .iter()
+            .filter(|(_, total)| **total >= threshold)
+            .map(|(domain, total)| (domain.clone(), *total))
+            .collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1));
+        out
+    }
+
+    /// **人工解除**某域的持久熔断(2026-10-19):清内存账 + 持久化台账 + 冷却。
+    ///
+    /// 供 `/risk release <domain>` 使用 —— 用户换 IP / 站点 WAF 修复后,
+    /// 不必手敲 sqlite3 就能恢复(此前只能靠 6004 信封里的 `manual_release`
+    /// 文案照抄命令,门槛高且易抄错)。
+    ///
+    /// **内存与库必须同清**:只清内存的话,下次启动 `hydrate` 会把旧账灌回来,
+    /// 解除操作等于没做(与 [`Self::note_navigation_survived`] 落库同理)。
+    /// 返回是否确有账目被清(供调用方回报)。
+    pub fn release_domain(&self, host: &str) -> bool {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let had = guard.wipe_total.remove(host).is_some()
+            || guard.wipe_streak.remove(host).is_some()
+            || guard.forced_nav.remove(host).is_some();
+        // 只解抹除成因的冷却(频控靠时间自愈,与本次解除无关)。
+        if guard.cooldown_cause.get(host) == Some(&CAUSE_SITE_WIPE) {
+            guard.cooldown_until.remove(host);
+            guard.cooldown_cause.remove(host);
+        }
+        guard
+            .recent_wipe
+            .retain(|_, (url, _)| host_of(url).as_deref() != Some(host));
+        drop(guard);
+        crate::config::site_risk::clear_domain(host);
+        if had {
+            tracing::info!(host, "人工解除站点持久熔断(内存账 + 持久化台账已清)");
+        }
+        had
     }
 
     /// 记一次**延迟抹除**(第 186 轮):后台看护命中时调用,把「哪一页、
@@ -1481,6 +1555,37 @@ mod tests {
         p.hydrate();
         p.hydrate();
         assert_eq!(p.wipe_total_for("liepin.com"), live, "回填不得回退内存账");
+    }
+
+    /// 2026-10-19:熔断状态**可查可解** —— 快照列出全部熔断域(降序),
+    /// `release_domain` 清内存账后快照不再含该域、且该域不再熔断。
+    /// 这条路径供 TUI `/risk` 与横幅行使用:用户被 TTL 锁在门外时,
+    /// 必须能一眼看到「哪个站点被拦」并**当场解除**,而不是只能翻 6004 信封。
+    #[test]
+    fn 熔断域快照列出全部熔断域_人工解除后清零() {
+        let p = pace();
+        // 两个域都攒到阈值(用不同域避免相互覆盖)。
+        for host in ["a-release-test.com", "b-release-test.com"] {
+            for _ in 0..wipe_total_threshold() {
+                p.note_navigation_outcome(
+                    &format!("https://{host}/"),
+                    "about:blank",
+                    Some(WipeEvidence::late_transition()),
+                );
+            }
+        }
+        let snapshot = p.blocked_domains_snapshot();
+        assert_eq!(snapshot.len(), 2, "两个域都应出现在熔断快照里");
+        assert_eq!(snapshot[0].1, wipe_total_threshold());
+
+        // 人工解除其中一个 → 快照只剩另一个,且被解的域不再熔断。
+        assert!(p.release_domain("a-release-test.com"), "确有账目应返回 true");
+        assert!(!p.wipe_exhausted("a-release-test.com"), "解除后不得再熔断");
+        let after = p.blocked_domains_snapshot();
+        assert_eq!(after.len(), 1, "解除后快照只剩未解除的域");
+        assert_eq!(after[0].0, "b-release-test.com");
+        // 解除不存在的域 → 返回 false(幂等,不报错)。
+        assert!(!p.release_domain("never-seen-test.com"));
     }
 
     #[test]
