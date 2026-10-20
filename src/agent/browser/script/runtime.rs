@@ -424,6 +424,7 @@ fn build_meta_json(env: &PageEnv) -> String {
         "scrollX": env.scroll_x,
         "scrollY": env.scroll_y,
         "ua": env.user_agent,
+        "prefersDark": env.prefers_dark,
         "protocol": protocol,
         "host": host,
         "hostname": hostname,

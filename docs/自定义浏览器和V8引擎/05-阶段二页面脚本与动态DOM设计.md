@@ -3,6 +3,7 @@
 > 对应总体路线图 Phase 2(`01-LsmAgentBrowser总体设计与分阶段路线图.md`)。
 > 目标验收:**依赖 JS 渲染的常见站点可读取正文与交互**。
 > 状态:✅ 已实现(本文档即实现记录,边界见文末)。
+> 后续 C 样式能力见 `06-阶段二第二步CSS级联与外链样式加载设计.md`。
 
 ## 一、问题与目标
 
@@ -202,7 +203,8 @@ actions 应用后同样回写 `tab.html` 与布局——**脚本 DOM 修改立�
 
 ## 九、本轮边界(阶段二第二步待办)
 
-1. **CSS 级联/继承/媒体查询完善**(选择器权重、`:nth-child` 全集、rem/em)——下轮专项;
+1. ~~**CSS 级联/继承/媒体查询完善**~~ → 已在阶段二第二步落地(见 `06-阶段二第二步CSS级联与外链样式加载设计.md`);
+   动画/过渡/伪元素与 `@import` 递归仍待后续阶段;
 2. **MutationObserver / IntersectionObserver** —— 未实现;
 3. **Shadow DOM / Web Components** —— 阶段五;
 4. **async/await 深度语义**:`await` 依赖 Boa 微任务队列,本轮经 `run_jobs` 支持已解析 Promise 的续体;

@@ -81,6 +81,10 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 | `LAEW_BROWSER_MODE` | `headed`/`hidden`/`new_headless` | 请求的浏览器模式。阶段一为进程内无头内核,`headed` 回退为 `hidden` 并在 `data.mode_hint` 说明。见 `src/agent/browser/mod.rs` |
 | `LAEW_WEB_SCRIPT` | `off`/`0`/`false`/`no` | 关闭页面脚本执行与 JS 线程(阶段二);`eval_js` 回退阶段一快照桥。见 `src/agent/browser/script/` |
 | `LAEW_WEB_SCRIPT_BUDGET_MS` | 正整数(默认 `10000`) | 单次页面脚本管线(导航/eval_js/事件分发)墙钟预算。见 `src/agent/browser/script/mod.rs::budget_ms` |
+| `LAEW_WEB_STYLES` | `off`/`0`/`false`/`no` | 关闭外链样式表加载(内联 `<style>` 仍生效)。见 `src/agent/browser/resources.rs` |
+| `LAEW_WEB_MAX_STYLESHEETS` | 正整数(默认 `16`) | 单页外链样式表数量上限 |
+| `LAEW_WEB_MAX_CSS_BYTES` | 正整数(默认 `2097152`) | 单个外链样式表字节上限(总量 4MB) |
+| `LAEW_WEB_PREFERS_DARK` | `1`/`true`/`yes`/`on` | `prefers-color-scheme: dark` 求值为真(样式引擎与 `matchMedia` 共用) |
 | `LAEW_WEB_EVIDENCE` | `off`/`0`/`false`/`no` | 关闭网页取证纪律硬闸门。见 `src/agent/safety/web_evidence.rs` |
 | `LAEW_READ_IMAGE_B64` | `1`/`true`/`yes`/`on` | 恢复 Read 工具图片 base64 全文返回（缺省为存根）。见 `src/agent/tools/read.rs` |
 | `LAEW_WEB_EVAL_TIMEOUT_MS` | 正整数(默认 `30000`) | eval_js 执行预算(阶段一做脚本长度上限与结果截断) |
@@ -112,9 +116,10 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 - **死循环守卫(两级)**：`src/agent/loop_guard.rs` 是**工具级**守卫(判定键 = 相邻两轮的 工具+参数+结果,抓「同动作同结果」);`src/agent/dead_loop/` 是**LLM 交互级**守卫(判定键 = 「模型已见信息集合」指纹 + 输出全量指纹,跨轮次做尾部周期扫描 + 低新颖度检测),补齐前者的三条盲区:换序打转 `A→B→A→B`、换工具打转、上下文自锁。两级同轮命中时**工具级优先**(证据更硬、可逐项复算)。止损后的根因归类与换路径裁决由 Quality-Check Agent 承担(`quality/dead_loop.rs::check_dead_loop`)。设计见 `docs/LLM交互死循环指纹检测与质检裁决/01-设计与解决方案.md`。
 - **终端守卫**：`src/tui/term_guard.rs`。终端窗口关闭后 crossterm `event::read` 永久 hang，通过独立看门狗线程轮询 `POLLHUP` + 0 超时挂断探测根治。
 - **LsmAgentBrowser 内核**：`src/agent/browser/` 是进程内自研浏览器——窗口/标签页、HTTP(S) 网络栈、DOM、布局、软件渲染、JS 执行全部在本进程，**不存在外部浏览器进程、调试端口或 CDP 协议**。设计见 `docs/自定义浏览器和V8引擎/`。阶段一 `mode=headed` 回退为无头内核并在 `data.mode_hint` 说明；原生窗口在阶段三实现。
+- **样式引擎（`browser/style/`）**：CSS 解析/级联/继承/单位/媒体查询/自定义属性唯一真源；外链 `<link rel=stylesheet>` 由 `browser/resources.rs` 宿主预取并**原位内联**为 `<style data-lsm-href=...>`（保持级联顺序），布局、渲染、JS `getComputedStyle`、`inspect(stylesheets)` 共用同一份 `ComputedStyle`。
 - **页面模型**：`page_id` 格式 `p_` + 8 位十六进制；窗口/标签页、历史栈、Cookie Jar、localStorage/sessionStorage 全部内存驻留，`close(page_id="all")` 或进程退出即销毁。`open` 支持同 URL/同站复用，`new_tab`/`_blank` 返回 `spawned_page_id`。
 - **JS 引擎**：`JsRuntime` 抽象；阶段一默认 `boa_engine`（纯 Rust，离线可编译），DOM 通过快照桥暴露 `document/window/location/storage`；`rusty_v8` 作为可选目标后端（`v8-backend` 特性），上层接口不变。
-- **页面能力与安全**：网络请求走本进程 `reqwest`（rustls），沿用 `LAEW_TLS_INSECURE` 与 SSRF 私网拦截；任务锚点 6001 继续在显式 URL 动作入口生效；页面脚本执行、原生窗口、资源加载器分别在阶段二/三/四补齐。
+- **页面能力与安全**：网络请求走本进程 `reqwest`（rustls），沿用 `LAEW_TLS_INSECURE` 与 SSRF 私网拦截；任务锚点 6001 继续在显式 URL 动作入口生效；页面脚本执行与 CSS 级联/外链样式已在阶段二落地，原生窗口与图片/字体等资源加载器分别在阶段三/四补齐。
 - **人工介入**：`control(request_human)` 桥接 `human_assist`（桌面原生弹窗 / TUI），返回 0/4001/4002；取消任务同时置位进程级旗标。弹窗实现见 `src/agent/human_ui/`。
 
 ### 多 Agent 架构（8 角色）
@@ -300,7 +305,13 @@ agent/
     inspect.rs     inspect info 实现(elements/dom/text/network/extract 等)
     net.rs         HTTP(S) 网络栈 / 重定向 / Cookie / 字符集 / SSRF / TLS
     document.rs    DOM / 选择器 / 稳定选择器 / 文本抽取 / 表单序列化
-    layout.rs      块级布局 + 简化 CSS 级联
+    style/         CSS 解析 / 级联 / 继承 / 单位 / 媒体查询 / 自定义属性
+      mod.rs        StyleEngine、规则收集、@media、级联主流程
+      selector.rs   选择器 AST / 匹配 / 特异性
+      values.rs     ComputedStyle、长度/颜色/关键字、var() 替换
+      tests.rs      样式引擎单元测试
+    resources.rs   外链样式表收集 / 宿主预取 / 原位内联 / 网络台账
+    layout.rs      块级布局 + 文本换行(消费 ComputedStyle)
     render.rs      fontdue + tiny-skia 软件渲染 + PNG
     js.rs          Boa 引导后端 + DOM 快照桥(阶段一回退路径)
     script/        阶段二页面脚本与动态 DOM(每 Tab 持久 JS 线程)

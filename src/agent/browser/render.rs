@@ -82,6 +82,9 @@ impl FontSet {
         pixmap.fill(Color::WHITE);
 
         for b in &layout.boxes {
+            if !b.visible {
+                continue;
+            }
             if let Some(bg) = b.background {
                 if let Some(rect) = tiny_skia::Rect::from_xywh(
                     b.x as f32,
@@ -97,6 +100,9 @@ impl FontSet {
         }
 
         for line in &layout.lines {
+            if !line.visible {
+                continue;
+            }
             let y = line.y - scroll_y;
             if y + line.size * 2.0 < 0.0 || y > height as f64 {
                 continue;

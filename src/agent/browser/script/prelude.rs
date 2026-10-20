@@ -47,6 +47,7 @@ function __lsmRefresh(nodes, meta) {
   __lsmCookie = String(__lsmMeta.cookies || "");
   navigator.userAgent = String(__lsmMeta.ua || "");
   __lsmSetViewport(Number(__lsmMeta.width) || 1280, Number(__lsmMeta.height) || 720);
+  window.__lsmPrefersDark = !!__lsmMeta.prefersDark;
   window.scrollX = Number(__lsmMeta.scrollX) || 0;
   window.scrollY = Number(__lsmMeta.scrollY) || 0;
   window.pageXOffset = window.scrollX;
@@ -732,6 +733,56 @@ XMLHttpRequest.prototype.getResponseHeader = function (k) {
   return (this._respHeaders && this._respHeaders[String(k).toLowerCase()]) || null;
 };
 
+// ---------- matchMedia(视口/方向/配色子集) ----------
+function __cssLen(v) {
+  v = String(v || "").trim().toLowerCase();
+  var n = parseFloat(v);
+  if (isNaN(n)) return null;
+  if (v.indexOf("rem") >= 0 || v.indexOf("em") >= 0) return n * 16;
+  if (v.indexOf("pt") >= 0) return n * 4 / 3;
+  return n;
+}
+function __mediaTerm(term) {
+  term = String(term || "").trim().toLowerCase();
+  if (!term) return true;
+  if (term.charAt(0) === "(" && term.charAt(term.length - 1) === ")") {
+    var inner = term.slice(1, -1);
+    var colon = inner.indexOf(":");
+    if (colon < 0) return false;
+    var name = inner.slice(0, colon).trim();
+    var value = inner.slice(colon + 1).trim();
+    var w = Number(window.innerWidth) || 1280;
+    var h = Number(window.innerHeight) || 720;
+    if (name === "min-width") { var a = __cssLen(value); return a !== null && w >= a; }
+    if (name === "max-width") { var b = __cssLen(value); return b !== null && w <= b; }
+    if (name === "min-height") { var c = __cssLen(value); return c !== null && h >= c; }
+    if (name === "max-height") { var d = __cssLen(value); return d !== null && h <= d; }
+    if (name === "orientation") return value === "landscape" ? w >= h : (value === "portrait" ? w < h : false);
+    if (name === "prefers-color-scheme") return value === "dark" ? !!window.__lsmPrefersDark : (value === "light" ? !window.__lsmPrefersDark : false);
+    return false;
+  }
+  if (term === "all" || term === "screen") return true;
+  return false;
+}
+function __evalMedia(query) {
+  var parts = String(query || "").split(",");
+  for (var i = 0; i < parts.length; i++) {
+    var raw = parts[i].trim();
+    if (!raw) continue;
+    var neg = false;
+    if (/^not\s+/i.test(raw)) { neg = true; raw = raw.replace(/^not\s+/i, ""); }
+    raw = raw.replace(/^only\s+/i, "");
+    var terms = raw.split(/\s+and\s+/i);
+    var ok = true;
+    for (var j = 0; j < terms.length; j++) {
+      if (!__mediaTerm(terms[j])) { ok = false; break; }
+    }
+    if (neg) ok = !ok;
+    if (ok) return true;
+  }
+  return false;
+}
+
 // ---------- window ----------
 var window = {
   document: document, location: location, navigator: navigator, screen: screen, history: history,
@@ -740,12 +791,43 @@ var window = {
   scrollX: 0, scrollY: 0, pageXOffset: 0, pageYOffset: 0,
   devicePixelRatio: 1, name: "", closed: false, isSecureContext: true,
   getComputedStyle: function (el) {
-    var css = "";
-    try { css = String((el && el.style && el.style.cssText) || ""); } catch (e) {}
-    return { getPropertyValue: function (p) { return __cssGet(css, p); } };
+    var css = {};
+    try {
+      var n = el && el.__lsm_node;
+      if (n && n.css) css = n.css;
+      else {
+        var inline = String((el && el.style && el.style.cssText) || "");
+        var parts = inline.split(";");
+        for (var i = 0; i < parts.length; i++) {
+          var p = parts[i];
+          var c = p.indexOf(":");
+          if (c > 0) css[p.slice(0, c).trim().toLowerCase()] = p.slice(c + 1).trim();
+        }
+      }
+    } catch (e) {}
+    var out = {};
+    for (var k in css) {
+      if (!Object.prototype.hasOwnProperty.call(css, k)) continue;
+      out[k] = css[k];
+      // 兼容 CSSStyleDeclaration 的 camelCase 属性访问。
+      out[k.replace(/-([a-z])/g, function (_, c) { return c.toUpperCase(); })] = css[k];
+    }
+    out.getPropertyValue = function (p) {
+      var key = String(p).toLowerCase();
+      return Object.prototype.hasOwnProperty.call(css, key) ? css[key] : "";
+    };
+    return out;
   },
-  matchMedia: function () {
-    return { matches: false, media: "", addListener: function () {}, removeListener: function () {}, addEventListener: function () {}, removeEventListener: function () {} };
+  matchMedia: function (q) {
+    var query = String(q || "");
+    return {
+      matches: __evalMedia(query),
+      media: query,
+      onchange: null,
+      addListener: function () {}, removeListener: function () {},
+      addEventListener: function () {}, removeEventListener: function () {},
+      dispatchEvent: function () { return false; }
+    };
   },
   addEventListener: function (type, fn) {
     if (typeof fn === "function") __lsmListeners.push({ sel: "@window", type: String(type), fn: fn });
@@ -767,6 +849,8 @@ var window = {
     getEntriesByType: function () { return []; }
   }
 };
+var getComputedStyle = function (el) { return window.getComputedStyle(el); };
+var matchMedia = function (q) { return window.matchMedia(q); };
 window.self = window; window.top = window; window.parent = window; window.frames = window;
 window.window = window;
 try {

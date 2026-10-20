@@ -115,6 +115,22 @@ fn route(path: &str) -> (&'static str, String) {
              </body></html>"
                 .to_string(),
         )
+    } else if path == "/css-page" {
+        (
+            "200 OK",
+            "<!doctype html><html><head><title>样式页</title>\
+             <link rel=\"stylesheet\" href=\"/site.css\"></head><body>\
+             <p id=\"styled\">样式文本</p>\
+             <div id=\"hidden-by-css\">外链样式隐藏</div>\
+             </body></html>"
+                .to_string(),
+        )
+    } else if path == "/site.css" {
+        (
+            "200 OK",
+            "#hidden-by-css{display:none} #styled{color:rgb(1, 2, 3);font-size:30px} body{font-size:20px}"
+                .to_string(),
+        )
     } else if path == "/js-click" {
         (
             "200 OK",
@@ -486,6 +502,94 @@ async fn js交互_click监听阻止默认导航() {
     )
     .await;
     assert_eq!(panel["data"]["visible"], true, "listener 修改 style 后面板应可见:{panel}");
+
+    exec(&tool, json!({"action": "close", "page_id": page_id})).await;
+}
+
+// ============ 阶段二第二步:外链样式与计算样式 ============
+
+#[tokio::test]
+async fn 外链样式加载与计算样式可观测() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebUseTool;
+    let open = exec(
+        &tool,
+        json!({"action": "open", "url": format!("{base}/css-page"), "mode": "hidden", "reuse": false}),
+    )
+    .await;
+    assert_eq!(open["code"], 0, "{open}");
+    let page_id = open["data"]["page_id"].as_str().unwrap().to_string();
+
+    // 样式表清单:外链已内联为 data-lsm-href。
+    let sheets = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": page_id, "info": "stylesheets"}),
+    )
+    .await;
+    assert_eq!(sheets["code"], 0, "{sheets}");
+    assert_eq!(sheets["data"]["count"], 1, "应加载 1 个外链样式表:{sheets}");
+    assert!(sheets["data"]["rules"].as_u64().unwrap_or(0) >= 2, "{sheets}");
+    assert!(
+        sheets["data"]["sheets"][0]["href"]
+            .as_str()
+            .unwrap_or("")
+            .ends_with("/site.css"),
+        "{sheets}"
+    );
+
+    // 外链 CSS 的 display:none 参与计算样式。
+    let hidden = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": page_id, "info": "elements",
+                "params": {"selector": "#hidden-by-css", "include_style": true}}),
+    )
+    .await;
+    assert_eq!(
+        hidden["data"]["computed_style"]["display"], "none",
+        "外链样式应影响计算样式:{hidden}"
+    );
+    assert_eq!(
+        hidden["data"]["visible"], false,
+        "外链样式隐藏的元素可见性应为 false:{hidden}"
+    );
+
+    // 字号/颜色计算值。
+    let styled = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": page_id, "info": "elements",
+                "params": {"selector": "#styled", "include_style": true}}),
+    )
+    .await;
+    assert_eq!(styled["data"]["computed_style"]["font-size"], "30px", "{styled}");
+    assert_eq!(
+        styled["data"]["computed_style"]["color"], "rgb(1, 2, 3)",
+        "{styled}"
+    );
+
+    // JS getComputedStyle 读取同一份计算样式。
+    let computed = exec(
+        &tool,
+        json!({"action": "control", "page_id": page_id, "control_action": "eval_js",
+                "params": {"expression":
+                    "getComputedStyle(document.getElementById('styled')).getPropertyValue('font-size')"}}),
+    )
+    .await;
+    assert_eq!(computed["data"]["result"], "30px", "{computed}");
+
+    // 外链样式请求进入网络台账。
+    let net = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": page_id, "info": "network"}),
+    )
+    .await;
+    let events = net["data"]["events"].as_array().cloned().unwrap_or_default();
+    assert!(
+        events
+            .iter()
+            .any(|e| e["url"].as_str().unwrap_or("").ends_with("/site.css")),
+        "样式表请求应记录在台账:{net}"
+    );
 
     exec(&tool, json!({"action": "close", "page_id": page_id})).await;
 }

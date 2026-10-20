@@ -9,7 +9,12 @@ src/agent/browser/
   inspect.rs      inspect info 观测实现（elements/dom/network/extract 等）
   net.rs          HTTP(S) 网络栈、重定向、Cookie、字符集、请求台账
   document.rs     html5ever/kuchikiki DOM 封装、选择器、稳定选择器、文本抽取、表单
-  layout.rs       块级布局、文本换行、CSS 子集、元素矩形、页面尺寸
+  layout.rs       块级布局、文本换行、元素矩形、页面尺寸(消费计算样式)
+  style/          样式引擎:CSS 解析/级联/继承/单位/媒体查询/自定义属性
+    mod.rs        StyleEngine、规则收集、@media、级联主流程
+    selector.rs   选择器 AST/匹配/特异性(后代/子代/相邻/兄弟)
+    values.rs     ComputedStyle、长度/颜色/关键字、var() 替换
+  resources.rs    外链样式表收集、宿主预取、原位内联、台账
   render.rs       软件光栅化（tiny-skia + fontdue）与 PNG 编码
   js.rs           JsRuntime 抽象、Boa 后端、DOM 快照桥
   storage.rs      Cookie Jar、localStorage、sessionStorage（全内存）
@@ -127,16 +132,19 @@ pub struct FetchResponse {
 - 可见性：阶段一以 `display:none`/`hidden`/`aria-hidden="true"`/`type=hidden` 为不可见判据；
 - 表单：`input/textarea/select/button`；值优先取运行时覆盖表（`form_values`），其次 `value`/`checked`/`selected`。
 
-### 4.2 CSS
+### 4.2 CSS(阶段二第二步起由 `style/` 样式引擎统一提供)
 
-阶段一解析并应用以下子集：
-
-- 来源：`<style>` 内容、`<link rel=stylesheet>` 已内联时不抓取（阶段四）、元素 `style` 属性；
-- 选择器：标签、`.class`、`#id`、`[attr]`、`[attr=value]`、后代/子代、逗号分组；
-- 声明：`display`、`visibility`、`color`、`background-color`、`font-size`、`font-weight`、`font-family`、
-  `line-height`、`margin*`、`padding*`、`border*`、`width/height`、`max-width`、`text-align`、`white-space`；
-- 计算顺序：UA 默认值 → 作者样式（按出现顺序，同权重后者覆盖）→ 内联样式；
-- 阶段一不做完整层叠/继承/媒体查询（阶段二/三补齐），但提供稳定的 `computed_style(node)` 供布局与渲染使用。
+- 来源：UA 默认值 → 作者样式(`<style>` + 宿主内联的外链 `<link rel=stylesheet>`)→ 内联 `style` 属性；
+- 选择器：标签/`*`/`#id`/`.class`/属性(`= ~= ^= $= *= |=`)/后代/子代 `>`/相邻 `+`/兄弟 `~`/常用伪类；
+- 级联键：`(important, origin, specificity(a,b,c), order)`;内联视作 `(1,0,0,0)`；
+- 继承：`color/font-size/font-weight/font-family/line-height/text-align/white-space/visibility` 等；
+- 单位：`px/em/rem/%/pt/pc/in/cm/mm`、字号关键字、`inherit/initial/unset`；
+- 媒体查询：`@media` 与 `<link media>`;类型(`all/screen/print`)、`min/max-width/height`、
+  `orientation`、`prefers-color-scheme`、`and`/逗号/`not`；
+- 自定义属性：`--var` 声明与继承、`var(--x[, fallback])` 替换(深度 ≤ 8)；
+- 元素级硬约束：`hidden`/`aria-hidden=true`/`input[type=hidden]` → `display:none`；
+- 产出 `ComputedStyle` + `to_map()`,供布局、渲染、JS `getComputedStyle` 与 inspect 共用。
+- 完整层叠(动画/过渡/伪元素/`@supports` 精确求值)与 `@import` 递归在后续阶段补齐。
 
 ## 五、布局与渲染
 
@@ -190,6 +198,7 @@ pub struct JsOutcome { pub value: String, pub value_type: String, pub pending: V
   - `navigate(url)`：导航；
   - `click(selector)`：原生点击语义；
   - `set_value(selector, value)`：写入运行时值；
+- 计算样式：快照节点携带 `css` 表，`getComputedStyle(el)` 读取真实计算值；`matchMedia` 按视口/方向/配色偏好求值；
 - 返回值：`undefined`→`"undefined"`；对象/数组 JSON 化；超长（>256KB）落盘并返回 `saved_to`；
 - 超时：`LAEW_WEB_EVAL_TIMEOUT_MS`（默认 30s）；Boa 无中断 API，采用执行前限制脚本长度 + 执行后校验，
   阶段二接入 V8 后可实现真正中断。

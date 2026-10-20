@@ -1,0 +1,908 @@
+//! 计算样式与 CSS 值解析:长度/颜色/关键字/自定义属性替换。
+//!
+//! `ComputedStyle` 是布局、渲染、JS 快照、inspect 共用的纯数据真源。
+//! 百分比长度按视口宽估算(简化,见设计文档"已知边界")。
+
+use std::collections::BTreeMap;
+
+pub type Rgb = [u8; 3];
+
+#[derive(Debug, Clone)]
+pub struct ComputedStyle {
+    pub display: String,
+    pub visibility: String,
+    pub color: Rgb,
+    pub background: Option<Rgb>,
+    pub font_size: f64,
+    pub font_weight: u16,
+    pub font_family: String,
+    pub line_height: f64,
+    pub text_align: String,
+    pub white_space: String,
+    pub margin_top: f64,
+    pub margin_right: f64,
+    pub margin_bottom: f64,
+    pub margin_left: f64,
+    pub padding_top: f64,
+    pub padding_right: f64,
+    pub padding_bottom: f64,
+    pub padding_left: f64,
+    pub width: Option<f64>,
+    pub max_width: Option<f64>,
+    pub height: Option<f64>,
+    pub opacity: f64,
+    /// 未建模属性的计算值文本(如 position/border-radius)。
+    pub extra: BTreeMap<String, String>,
+    /// 自定义属性表(继承用,不进入 `to_map`)。
+    pub custom: BTreeMap<String, String>,
+}
+
+impl Default for ComputedStyle {
+    fn default() -> Self {
+        Self {
+            display: "inline".to_string(),
+            visibility: "visible".to_string(),
+            color: [32, 32, 32],
+            background: None,
+            font_size: 16.0,
+            font_weight: 400,
+            font_family: String::new(),
+            line_height: 16.0 * 1.45,
+            text_align: "left".to_string(),
+            white_space: "normal".to_string(),
+            margin_top: 0.0,
+            margin_right: 0.0,
+            margin_bottom: 0.0,
+            margin_left: 0.0,
+            padding_top: 0.0,
+            padding_right: 0.0,
+            padding_bottom: 0.0,
+            padding_left: 0.0,
+            width: None,
+            max_width: None,
+            height: None,
+            opacity: 1.0,
+            extra: BTreeMap::new(),
+            custom: BTreeMap::new(),
+        }
+    }
+}
+
+impl ComputedStyle {
+    /// 文档根元素的计算样式基线。
+    pub fn root() -> Self {
+        Self {
+            display: "block".to_string(),
+            ..Default::default()
+        }
+    }
+
+    pub fn is_block(&self) -> bool {
+        matches!(
+            self.display.as_str(),
+            "block" | "flex" | "grid" | "table" | "table-row" | "list-item"
+        )
+    }
+
+    pub fn is_hidden(&self) -> bool {
+        self.display == "none"
+    }
+
+    /// 供 `getComputedStyle` / inspect 使用的计算值表(kebab-case)。
+    pub fn to_map(&self) -> BTreeMap<String, String> {
+        let mut out = BTreeMap::new();
+        out.insert("display".into(), self.display.clone());
+        out.insert("visibility".into(), self.visibility.clone());
+        out.insert("color".into(), rgb_text(self.color));
+        out.insert(
+            "background-color".into(),
+            self.background
+                .map(rgb_text)
+                .unwrap_or_else(|| "rgba(0, 0, 0, 0)".into()),
+        );
+        out.insert("font-size".into(), format!("{}px", num(self.font_size)));
+        out.insert("font-weight".into(), self.font_weight.to_string());
+        out.insert(
+            "font-family".into(),
+            if self.font_family.is_empty() {
+                "system-ui".to_string()
+            } else {
+                self.font_family.clone()
+            },
+        );
+        out.insert("line-height".into(), format!("{}px", num(self.line_height)));
+        out.insert("text-align".into(), self.text_align.clone());
+        out.insert("white-space".into(), self.white_space.clone());
+        for (name, v) in [
+            ("margin-top", self.margin_top),
+            ("margin-right", self.margin_right),
+            ("margin-bottom", self.margin_bottom),
+            ("margin-left", self.margin_left),
+            ("padding-top", self.padding_top),
+            ("padding-right", self.padding_right),
+            ("padding-bottom", self.padding_bottom),
+            ("padding-left", self.padding_left),
+        ] {
+            out.insert(name.to_string(), format!("{}px", num(v)));
+        }
+        out.insert("width".into(), length_text(self.width));
+        out.insert("max-width".into(), length_text(self.max_width));
+        out.insert("height".into(), length_text(self.height));
+        out.insert("opacity".into(), num(self.opacity));
+        for (k, v) in &self.extra {
+            out.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        out
+    }
+}
+
+fn num(v: f64) -> String {
+    if (v - v.round()).abs() < 0.01 {
+        format!("{}", v.round() as i64)
+    } else {
+        format!("{:.2}", v)
+    }
+}
+
+fn length_text(v: Option<f64>) -> String {
+    v.map(|v| format!("{}px", num(v)))
+        .unwrap_or_else(|| "auto".into())
+}
+
+fn rgb_text(c: Rgb) -> String {
+    format!("rgb({}, {}, {})", c[0], c[1], c[2])
+}
+
+/// 上下文:百分比/`rem`/视口相关解析。
+#[derive(Debug, Clone, Copy)]
+pub struct ValueCtx {
+    pub viewport_width: f64,
+    pub viewport_height: f64,
+    pub root_font_size: f64,
+}
+
+impl Default for ValueCtx {
+    fn default() -> Self {
+        Self {
+            viewport_width: 1280.0,
+            viewport_height: 720.0,
+            root_font_size: 16.0,
+        }
+    }
+}
+
+const BLOCK_TAGS: &[&str] = &[
+    "html",
+    "body",
+    "div",
+    "p",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "ul",
+    "ol",
+    "li",
+    "dl",
+    "dt",
+    "dd",
+    "form",
+    "table",
+    "thead",
+    "tbody",
+    "tfoot",
+    "tr",
+    "section",
+    "article",
+    "header",
+    "footer",
+    "main",
+    "nav",
+    "aside",
+    "blockquote",
+    "pre",
+    "figure",
+    "figcaption",
+    "fieldset",
+    "address",
+    "hr",
+    "details",
+    "summary",
+    "dialog",
+    "center",
+];
+
+const HIDDEN_TAGS: &[&str] = &[
+    "head", "title", "meta", "link", "style", "script", "noscript", "template", "base",
+];
+
+/// 标签的 UA 默认样式。可继承属性从父级复制,其余属性重置。
+pub fn ua_default(tag: &str, parent: &ComputedStyle) -> ComputedStyle {
+    let tag = tag.to_ascii_lowercase();
+    let mut st = ComputedStyle {
+        display: if HIDDEN_TAGS.contains(&tag.as_str()) {
+            "none".to_string()
+        } else if BLOCK_TAGS.contains(&tag.as_str()) {
+            "block".to_string()
+        } else {
+            "inline".to_string()
+        },
+        // 继承属性
+        visibility: parent.visibility.clone(),
+        color: parent.color,
+        font_size: parent.font_size,
+        font_weight: parent.font_weight,
+        font_family: parent.font_family.clone(),
+        line_height: parent.line_height,
+        text_align: parent.text_align.clone(),
+        white_space: parent.white_space.clone(),
+        ..Default::default()
+    };
+    match tag.as_str() {
+        "h1" => {
+            st.font_size = parent.font_size * 2.0;
+            st.font_weight = 700;
+            st.line_height = st.font_size * 1.2;
+        }
+        "h2" => {
+            st.font_size = parent.font_size * 1.5;
+            st.font_weight = 700;
+            st.line_height = st.font_size * 1.2;
+        }
+        "h3" => {
+            st.font_size = parent.font_size * 1.17;
+            st.font_weight = 700;
+            st.line_height = st.font_size * 1.25;
+        }
+        "h4" => {
+            st.font_size = parent.font_size;
+            st.font_weight = 700;
+            st.line_height = st.font_size * 1.3;
+        }
+        "h5" => {
+            st.font_size = parent.font_size * 0.83;
+            st.font_weight = 700;
+            st.line_height = st.font_size * 1.35;
+        }
+        "h6" => {
+            st.font_size = parent.font_size * 0.67;
+            st.font_weight = 700;
+        }
+        "strong" | "b" | "th" => st.font_weight = 700,
+        "small" => st.font_size = (parent.font_size * 0.85).max(8.0),
+        "code" | "kbd" | "samp" => {
+            st.font_family = "monospace".to_string();
+        }
+        "pre" => {
+            st.font_family = "monospace".to_string();
+            st.white_space = "pre".to_string();
+        }
+        "center" | "caption" => st.text_align = "center".to_string(),
+        _ => {}
+    }
+    let margin = match tag.as_str() {
+        "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "ul" | "ol" | "pre" | "blockquote"
+        | "dl" | "figure" => 8.0,
+        _ => 0.0,
+    };
+    if margin > 0.0 {
+        st.margin_top = margin;
+        st.margin_bottom = margin;
+    }
+    if tag == "li" {
+        st.margin_left = 20.0;
+    }
+    if tag == "body" {
+        st.margin_top = 8.0;
+        st.margin_bottom = 8.0;
+        st.margin_left = 8.0;
+        st.margin_right = 8.0;
+    }
+    st
+}
+
+/// 应用单条声明。`parent` 用于 `inherit`, `root` 用于 `initial`/`revert`。
+pub fn apply_declaration(
+    st: &mut ComputedStyle,
+    key: &str,
+    value: &str,
+    parent: &ComputedStyle,
+    root: &ComputedStyle,
+    ctx: &ValueCtx,
+) {
+    let key = key.trim().to_ascii_lowercase();
+    let value = value.trim();
+    if key.is_empty() || value.is_empty() {
+        return;
+    }
+    if key.starts_with("--") {
+        st.custom.insert(key, value.to_string());
+        return;
+    }
+    if value.eq_ignore_ascii_case("inherit") {
+        apply_inherited(st, &key, parent);
+        return;
+    }
+    if value.eq_ignore_ascii_case("initial") || value.eq_ignore_ascii_case("revert") {
+        apply_initial(st, &key, root);
+        return;
+    }
+    if value.eq_ignore_ascii_case("unset") {
+        if is_inherited_property(&key) {
+            apply_inherited(st, &key, parent);
+        } else {
+            apply_initial(st, &key, root);
+        }
+        return;
+    }
+    match key.as_str() {
+        "display" => st.display = normalize_display(value),
+        "visibility" => {
+            st.visibility = value.to_ascii_lowercase();
+        }
+        "color" => {
+            if let Some(c) = resolve_color(value, st.color) {
+                st.color = c;
+            }
+        }
+        "background-color" => {
+            if value.eq_ignore_ascii_case("transparent") {
+                st.background = None;
+            } else if let Some(c) = resolve_color(value, st.color) {
+                st.background = Some(c);
+            }
+        }
+        "background" => {
+            if value.eq_ignore_ascii_case("none") || value.eq_ignore_ascii_case("transparent") {
+                st.background = None;
+            } else if let Some(Some((rgb, alpha))) = parse_color(value) {
+                st.background = Some(blend_on_white(rgb, alpha));
+            }
+        }
+        "font-size" => {
+            if let Some(v) = parse_font_size(value, parent.font_size, ctx) {
+                st.font_size = v.clamp(6.0, 200.0);
+                st.line_height = st.font_size * 1.45;
+            }
+        }
+        "font-weight" => {
+            if let Some(v) = parse_font_weight(value, st.font_weight) {
+                st.font_weight = v;
+            }
+        }
+        "font-family" => st.font_family = value.trim_matches(|c| c == '"' || c == '\'').to_string(),
+        "line-height" => {
+            if let Some(v) = parse_line_height(value, st.font_size, ctx) {
+                st.line_height = v.clamp(1.0, 500.0);
+            }
+        }
+        "text-align" => {
+            let v = value.to_ascii_lowercase();
+            let v = match v.as_str() {
+                "start" => "left".to_string(),
+                "end" => "right".to_string(),
+                other => other.to_string(),
+            };
+            if matches!(v.as_str(), "left" | "right" | "center" | "justify") {
+                st.text_align = v;
+            }
+        }
+        "white-space" => {
+            let v = value.to_ascii_lowercase();
+            if matches!(
+                v.as_str(),
+                "normal" | "nowrap" | "pre" | "pre-wrap" | "pre-line" | "break-spaces"
+            ) {
+                st.white_space = v;
+            }
+        }
+        "margin" => {
+            let values = parse_box_values(value, st.font_size, ctx);
+            if let Some((t, r, b, l)) = expand_box(&values) {
+                st.margin_top = t;
+                st.margin_right = r;
+                st.margin_bottom = b;
+                st.margin_left = l;
+            }
+        }
+        "margin-top" | "margin-right" | "margin-bottom" | "margin-left" => {
+            if let Some(v) = parse_length(value, st.font_size, ctx) {
+                match key.as_str() {
+                    "margin-top" => st.margin_top = v,
+                    "margin-right" => st.margin_right = v,
+                    "margin-bottom" => st.margin_bottom = v,
+                    _ => st.margin_left = v,
+                }
+            }
+        }
+        "padding" => {
+            let values = parse_box_values(value, st.font_size, ctx);
+            if let Some((t, r, b, l)) = expand_box(&values) {
+                st.padding_top = t;
+                st.padding_right = r;
+                st.padding_bottom = b;
+                st.padding_left = l;
+            }
+        }
+        "padding-top" | "padding-right" | "padding-bottom" | "padding-left" => {
+            if let Some(v) = parse_length(value, st.font_size, ctx) {
+                match key.as_str() {
+                    "padding-top" => st.padding_top = v.max(0.0),
+                    "padding-right" => st.padding_right = v.max(0.0),
+                    "padding-bottom" => st.padding_bottom = v.max(0.0),
+                    _ => st.padding_left = v.max(0.0),
+                }
+            }
+        }
+        "width" => st.width = parse_length(value, st.font_size, ctx).filter(|v| *v > 0.0),
+        "max-width" => {
+            if value.eq_ignore_ascii_case("none") {
+                st.max_width = None;
+            } else {
+                st.max_width = parse_length(value, st.font_size, ctx).filter(|v| *v > 0.0);
+            }
+        }
+        "height" => st.height = parse_length(value, st.font_size, ctx).filter(|v| *v > 0.0),
+        "opacity" => {
+            if let Ok(v) = value.parse::<f64>() {
+                st.opacity = v.clamp(0.0, 1.0);
+            }
+        }
+        "background-image"
+        | "position"
+        | "top"
+        | "left"
+        | "right"
+        | "bottom"
+        | "z-index"
+        | "border-radius"
+        | "border"
+        | "border-color"
+        | "box-shadow"
+        | "overflow"
+        | "overflow-x"
+        | "overflow-y"
+        | "float"
+        | "clear"
+        | "text-decoration"
+        | "cursor"
+        | "letter-spacing"
+        | "word-spacing"
+        | "list-style"
+        | "list-style-type"
+        | "flex"
+        | "flex-direction"
+        | "flex-wrap"
+        | "justify-content"
+        | "align-items"
+        | "gap"
+        | "grid-template-columns"
+        | "grid-template-rows"
+        | "transform"
+        | "transition" => {
+            st.extra.insert(key, value.to_string());
+        }
+        _ => {
+            st.extra.insert(key, value.to_string());
+        }
+    }
+}
+
+fn is_inherited_property(key: &str) -> bool {
+    matches!(
+        key,
+        "color"
+            | "font-size"
+            | "font-weight"
+            | "font-family"
+            | "line-height"
+            | "text-align"
+            | "white-space"
+            | "visibility"
+            | "cursor"
+            | "letter-spacing"
+            | "word-spacing"
+            | "list-style"
+            | "list-style-type"
+    )
+}
+
+fn apply_inherited(st: &mut ComputedStyle, key: &str, parent: &ComputedStyle) {
+    match key {
+        "color" => st.color = parent.color,
+        "font-size" => {
+            st.font_size = parent.font_size;
+            st.line_height = parent.line_height;
+        }
+        "font-weight" => st.font_weight = parent.font_weight,
+        "font-family" => st.font_family = parent.font_family.clone(),
+        "line-height" => st.line_height = parent.line_height,
+        "text-align" => st.text_align = parent.text_align.clone(),
+        "white-space" => st.white_space = parent.white_space.clone(),
+        "visibility" => st.visibility = parent.visibility.clone(),
+        "display" => st.display = parent.display.clone(),
+        other => {
+            if let Some(v) = parent.extra.get(other) {
+                st.extra.insert(other.to_string(), v.clone());
+            }
+        }
+    }
+}
+
+fn apply_initial(st: &mut ComputedStyle, key: &str, root: &ComputedStyle) {
+    match key {
+        "color" => st.color = [0, 0, 0],
+        "font-size" => {
+            st.font_size = 16.0;
+            st.line_height = 16.0 * 1.45;
+        }
+        "font-weight" => st.font_weight = 400,
+        "font-family" => st.font_family.clear(),
+        "line-height" => st.line_height = st.font_size * 1.45,
+        "text-align" => st.text_align = "left".to_string(),
+        "white-space" => st.white_space = "normal".to_string(),
+        "visibility" => st.visibility = "visible".to_string(),
+        "display" => st.display = "inline".to_string(),
+        "margin-top" | "margin-right" | "margin-bottom" | "margin-left" => {
+            let _ = root;
+            match key {
+                "margin-top" => st.margin_top = 0.0,
+                "margin-right" => st.margin_right = 0.0,
+                "margin-bottom" => st.margin_bottom = 0.0,
+                _ => st.margin_left = 0.0,
+            }
+        }
+        "padding-top" | "padding-right" | "padding-bottom" | "padding-left" => match key {
+            "padding-top" => st.padding_top = 0.0,
+            "padding-right" => st.padding_right = 0.0,
+            "padding-bottom" => st.padding_bottom = 0.0,
+            _ => st.padding_left = 0.0,
+        },
+        "width" | "height" | "max-width" => match key {
+            "width" => st.width = None,
+            "height" => st.height = None,
+            _ => st.max_width = None,
+        },
+        "background" | "background-color" => st.background = None,
+        "opacity" => st.opacity = 1.0,
+        _ => {}
+    }
+}
+
+fn normalize_display(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "none" => "none".into(),
+        "block" => "block".into(),
+        "inline" => "inline".into(),
+        "inline-block" => "inline-block".into(),
+        "flex" | "inline-flex" => "flex".into(),
+        "grid" | "inline-grid" => "grid".into(),
+        "table" | "inline-table" => "table".into(),
+        "table-row" => "table-row".into(),
+        "table-cell" => "table-cell".into(),
+        "list-item" => "list-item".into(),
+        "contents" => "contents".into(),
+        other => other.to_string(),
+    }
+}
+
+// ===================== 长度 / 字号 / 行高 =====================
+
+/// 解析长度。`auto`/无法识别返回 `None`。
+pub fn parse_length(value: &str, font_size: f64, ctx: &ValueCtx) -> Option<f64> {
+    let v = value.trim().to_ascii_lowercase();
+    if v.is_empty() || v == "auto" || v == "none" {
+        return None;
+    }
+    if let Some(n) = v.strip_suffix("px") {
+        return n.trim().parse::<f64>().ok();
+    }
+    if let Some(n) = v.strip_suffix("rem") {
+        return n.trim().parse::<f64>().ok().map(|n| n * ctx.root_font_size);
+    }
+    if let Some(n) = v.strip_suffix("em") {
+        return n.trim().parse::<f64>().ok().map(|n| n * font_size);
+    }
+    if let Some(n) = v.strip_suffix('%') {
+        return n
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(|n| n / 100.0 * ctx.viewport_width);
+    }
+    if let Some(n) = v.strip_suffix("pt") {
+        return n.trim().parse::<f64>().ok().map(|n| n * 4.0 / 3.0);
+    }
+    if let Some(n) = v.strip_suffix("pc") {
+        return n.trim().parse::<f64>().ok().map(|n| n * 16.0);
+    }
+    if let Some(n) = v.strip_suffix("in") {
+        return n.trim().parse::<f64>().ok().map(|n| n * 96.0);
+    }
+    if let Some(n) = v.strip_suffix("cm") {
+        return n.trim().parse::<f64>().ok().map(|n| n * 37.795);
+    }
+    if let Some(n) = v.strip_suffix("mm") {
+        return n.trim().parse::<f64>().ok().map(|n| n * 3.7795);
+    }
+    v.parse::<f64>().ok()
+}
+
+fn parse_font_size(value: &str, parent_size: f64, ctx: &ValueCtx) -> Option<f64> {
+    let v = value.trim().to_ascii_lowercase();
+    let keyword = match v.as_str() {
+        "xx-small" => Some(9.0),
+        "x-small" => Some(10.0),
+        "small" => Some(13.0),
+        "medium" => Some(16.0),
+        "large" => Some(18.0),
+        "x-large" => Some(24.0),
+        "xx-large" => Some(32.0),
+        "smaller" => Some(parent_size * 0.85),
+        "larger" => Some(parent_size * 1.2),
+        "inherit" => Some(parent_size),
+        _ => None,
+    };
+    if keyword.is_some() {
+        return keyword;
+    }
+    parse_length(&v, parent_size, ctx)
+}
+
+fn parse_line_height(value: &str, font_size: f64, ctx: &ValueCtx) -> Option<f64> {
+    let v = value.trim().to_ascii_lowercase();
+    if v == "normal" {
+        return Some(font_size * 1.45);
+    }
+    if let Some(n) = v.strip_suffix('%') {
+        return n.trim().parse::<f64>().ok().map(|n| font_size * n / 100.0);
+    }
+    if let Ok(n) = v.parse::<f64>() {
+        // 无单位:相对字号倍数。
+        return Some(font_size * n);
+    }
+    parse_length(&v, font_size, ctx)
+}
+
+fn parse_font_weight(value: &str, current: u16) -> Option<u16> {
+    let v = value.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "normal" => Some(400),
+        "bold" => Some(700),
+        "bolder" => Some((current + 300).min(900)),
+        "lighter" => Some(current.saturating_sub(300).max(100)),
+        _ => v.parse::<u16>().ok().map(|n| n.clamp(100, 900)),
+    }
+}
+
+/// 解析 1~4 个盒模型分量;含 `auto` 的按 0 处理(简化)。
+fn parse_box_values(value: &str, font_size: f64, ctx: &ValueCtx) -> Vec<f64> {
+    value
+        .split_whitespace()
+        .filter_map(|part| {
+            if part.eq_ignore_ascii_case("auto") {
+                Some(0.0)
+            } else {
+                parse_length(part, font_size, ctx)
+            }
+        })
+        .collect()
+}
+
+fn expand_box(values: &[f64]) -> Option<(f64, f64, f64, f64)> {
+    match values.len() {
+        1 => Some((values[0], values[0], values[0], values[0])),
+        2 => Some((values[0], values[1], values[0], values[1])),
+        3 => Some((values[0], values[1], values[2], values[1])),
+        4 => Some((values[0], values[1], values[2], values[3])),
+        _ => None,
+    }
+}
+
+// ===================== 颜色 =====================
+
+/// 解析颜色。外层 `None` 表示无法识别;`Some(None)` 表示 `transparent`。
+pub fn parse_color(value: &str) -> Option<Option<([u8; 3], u8)>> {
+    let v = value.trim().to_ascii_lowercase();
+    if v.is_empty() {
+        return None;
+    }
+    if v == "transparent" {
+        return Some(None);
+    }
+    if let Some(rgb) = named_color(&v) {
+        return Some(Some((rgb, 255)));
+    }
+    if let Some(hex) = v.strip_prefix('#') {
+        return parse_hex_color(hex).map(Some);
+    }
+    if let Some(rest) = v.strip_prefix("rgba(").or_else(|| v.strip_prefix("rgb(")) {
+        let rest = rest.trim_end_matches(')');
+        let parts: Vec<&str> = rest.split(',').map(str::trim).collect();
+        if parts.len() >= 3 {
+            let r = parse_channel(parts[0])?;
+            let g = parse_channel(parts[1])?;
+            let b = parse_channel(parts[2])?;
+            let a = if let Some(raw) = parts.get(3) {
+                let raw = raw.trim();
+                let is_pct = raw.ends_with('%');
+                let n = raw.trim_end_matches('%').parse::<f64>().ok()?;
+                let n = if is_pct { n / 100.0 } else { n };
+                (n.clamp(0.0, 1.0) * 255.0).round() as u8
+            } else {
+                255
+            };
+            return Some(Some(([r, g, b], a)));
+        }
+        return None;
+    }
+    if let Some(rest) = v.strip_prefix("hsla(").or_else(|| v.strip_prefix("hsl(")) {
+        let rest = rest.trim_end_matches(')');
+        let parts: Vec<&str> = rest.split(',').map(str::trim).collect();
+        if parts.len() >= 3 {
+            let h = parts[0].trim_end_matches("deg").parse::<f64>().ok()?;
+            let s = parts[1].trim_end_matches('%').parse::<f64>().ok()? / 100.0;
+            let l = parts[2].trim_end_matches('%').parse::<f64>().ok()? / 100.0;
+            let a = parts
+                .get(3)
+                .and_then(|s| s.parse::<f64>().ok())
+                .map(|a| (a.clamp(0.0, 1.0) * 255.0).round() as u8)
+                .unwrap_or(255);
+            return Some(Some((hsl_to_rgb(h, s, l), a)));
+        }
+    }
+    None
+}
+
+fn resolve_color(value: &str, current: [u8; 3]) -> Option<[u8; 3]> {
+    if value.trim().eq_ignore_ascii_case("currentcolor") {
+        return Some(current);
+    }
+    parse_color(value)
+        .and_then(|c| c)
+        .map(|(rgb, a)| blend_on_white(rgb, a))
+}
+
+fn blend_on_white(c: [u8; 3], alpha: u8) -> [u8; 3] {
+    if alpha == 255 {
+        return c;
+    }
+    let a = alpha as f64 / 255.0;
+    [
+        (c[0] as f64 * a + 255.0 * (1.0 - a)).round() as u8,
+        (c[1] as f64 * a + 255.0 * (1.0 - a)).round() as u8,
+        (c[2] as f64 * a + 255.0 * (1.0 - a)).round() as u8,
+    ]
+}
+
+fn parse_channel(s: &str) -> Option<u8> {
+    let s = s.trim();
+    if let Some(p) = s.strip_suffix('%') {
+        let v = p.trim().parse::<f64>().ok()?;
+        return Some((v / 100.0 * 255.0).round().clamp(0.0, 255.0) as u8);
+    }
+    s.parse::<f64>()
+        .ok()
+        .map(|v| v.round().clamp(0.0, 255.0) as u8)
+}
+
+fn parse_hex_color(hex: &str) -> Option<([u8; 3], u8)> {
+    if !hex.is_ascii() {
+        return None;
+    }
+    let chars: Vec<char> = hex.chars().filter(|c| !c.is_whitespace()).collect();
+    let expand = |c: char| -> Option<u8> { c.to_digit(16).map(|d| (d * 17) as u8) };
+    match chars.len() {
+        3 => Some((
+            [expand(chars[0])?, expand(chars[1])?, expand(chars[2])?],
+            255,
+        )),
+        4 => Some((
+            [expand(chars[0])?, expand(chars[1])?, expand(chars[2])?],
+            expand(chars[3])?,
+        )),
+        6 => Some((
+            [
+                u8::from_str_radix(&hex[0..2], 16).ok()?,
+                u8::from_str_radix(&hex[2..4], 16).ok()?,
+                u8::from_str_radix(&hex[4..6], 16).ok()?,
+            ],
+            255,
+        )),
+        8 => Some((
+            [
+                u8::from_str_radix(&hex[0..2], 16).ok()?,
+                u8::from_str_radix(&hex[2..4], 16).ok()?,
+                u8::from_str_radix(&hex[4..6], 16).ok()?,
+            ],
+            u8::from_str_radix(&hex[6..8], 16).ok()?,
+        )),
+        _ => None,
+    }
+}
+
+fn hsl_to_rgb(h: f64, s: f64, l: f64) -> [u8; 3] {
+    let h = h.rem_euclid(360.0) / 360.0;
+    if s <= 0.0 {
+        let v = (l * 255.0).round().clamp(0.0, 255.0) as u8;
+        return [v, v, v];
+    }
+    let q = if l < 0.5 {
+        l * (1.0 + s)
+    } else {
+        l + s - l * s
+    };
+    let p = 2.0 * l - q;
+    let hue = |mut t: f64| -> f64 {
+        if t < 0.0 {
+            t += 1.0;
+        }
+        if t > 1.0 {
+            t -= 1.0;
+        }
+        if t < 1.0 / 6.0 {
+            p + (q - p) * 6.0 * t
+        } else if t < 0.5 {
+            q
+        } else if t < 2.0 / 3.0 {
+            p + (q - p) * (2.0 / 3.0 - t) * 6.0
+        } else {
+            p
+        }
+    };
+    [
+        (hue(h + 1.0 / 3.0) * 255.0).round().clamp(0.0, 255.0) as u8,
+        (hue(h) * 255.0).round().clamp(0.0, 255.0) as u8,
+        (hue(h - 1.0 / 3.0) * 255.0).round().clamp(0.0, 255.0) as u8,
+    ]
+}
+
+fn named_color(name: &str) -> Option<[u8; 3]> {
+    Some(match name {
+        "black" => [0, 0, 0],
+        "white" => [255, 255, 255],
+        "red" => [255, 0, 0],
+        "green" => [0, 128, 0],
+        "blue" => [0, 0, 255],
+        "yellow" => [255, 255, 0],
+        "orange" => [255, 165, 0],
+        "purple" => [128, 0, 128],
+        "pink" => [255, 192, 203],
+        "brown" => [165, 42, 42],
+        "gray" | "grey" => [128, 128, 128],
+        "lightgray" | "lightgrey" => [211, 211, 211],
+        "darkgray" | "darkgrey" => [169, 169, 169],
+        "silver" => [192, 192, 192],
+        "gold" => [255, 215, 0],
+        "cyan" | "aqua" => [0, 255, 255],
+        "magenta" | "fuchsia" => [255, 0, 255],
+        "lime" => [0, 255, 0],
+        "navy" => [0, 0, 128],
+        "teal" => [0, 128, 128],
+        "olive" => [128, 128, 0],
+        "maroon" => [128, 0, 0],
+        "beige" => [245, 245, 220],
+        "ivory" => [255, 255, 240],
+        "khaki" => [240, 230, 140],
+        "salmon" => [250, 128, 114],
+        "tomato" => [255, 99, 71],
+        "coral" => [255, 127, 80],
+        "crimson" => [220, 20, 60],
+        "indigo" => [75, 0, 130],
+        "violet" => [238, 130, 238],
+        "turquoise" => [64, 224, 208],
+        "skyblue" => [135, 206, 235],
+        "steelblue" => [70, 130, 180],
+        "royalblue" => [65, 105, 225],
+        "dodgerblue" => [30, 144, 255],
+        "forestgreen" => [34, 139, 34],
+        "seagreen" => [46, 139, 87],
+        "darkgreen" => [0, 100, 0],
+        "darkblue" => [0, 0, 139],
+        "darkred" => [139, 0, 0],
+        "transparent" => return None,
+        _ => return None,
+    })
+}

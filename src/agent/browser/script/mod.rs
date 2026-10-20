@@ -29,6 +29,8 @@ pub struct PageEnv {
     pub scroll_x: f64,
     pub scroll_y: f64,
     pub user_agent: String,
+    /// `prefers-color-scheme: dark` 求值结果(matchMedia 用)。
+    pub prefers_dark: bool,
 }
 
 /// 脚本来源:inline 文本或宿主预取的外链内容。
@@ -256,7 +258,7 @@ pub(crate) async fn run_pipeline(
         // 快照后立即销毁 Document(NodeRef 非 Send,不能跨 await 存活)。
         let nodes = {
             let doc = super::document::Document::parse(&out.html, base_url);
-            doc.snapshot_nodes()
+            doc.snapshot_nodes_styled(viewport)
         };
         let reply: Result<JsReply, String> = match tokio::task::spawn_blocking(move || {
             h.request(|tx| JsRequest::RunScripts {
@@ -320,6 +322,14 @@ pub(crate) fn build_env(
         scroll_x: 0.0,
         scroll_y: 0.0,
         user_agent: ua.to_string(),
+        prefers_dark: matches!(
+            std::env::var("LAEW_WEB_PREFERS_DARK")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
     }
 }
 

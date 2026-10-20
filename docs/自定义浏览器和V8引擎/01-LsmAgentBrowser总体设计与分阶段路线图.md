@@ -119,12 +119,18 @@
 > **第一步已实现**(2026-10):页面脚本执行管线(内联/外链)、每 Tab 持久 JS 线程(Boa)、
 > 事件 listener 与 DOMContentLoaded/load、fetch/XHR 真实请求、虚拟时钟定时器、
 > 动态 DOM 回写与布局重算。设计见 `05-阶段二页面脚本与动态DOM设计.md`。
+>
+> **第二步已实现**(2026-10):独立 CSS 级联引擎(特异性/`!important`/继承/单位/媒体查询/`var()`)、
+> 外链样式表预取与原位内联、`getComputedStyle`/`matchMedia`、`inspect(stylesheets)`。
+> 设计见 `06-阶段二第二步CSS级联与外链样式加载设计.md`。
 
 - ✅ 执行页面内联/外链 `<script>`；事件循环（宏任务/微任务）——微任务经 run_jobs 驱动(已 resolve 续体可执行),宏任务为虚拟时钟定时器;
 - ✅ DOM/BOM 绑定:往返同步模型(快照注入 + 动作回传 + 宿主应用到真实 DOM),`document`/`window`/`location`/`history`/定时器/`fetch`/XHR 可用;
 - ✅ 表单事件(input/change/submit)、click 事件、preventDefault;冒泡经父链匹配实现,捕获阶段 ⏳;
 - ✅ 动态节点变化后重建布局;
-- ⏳ CSS 级联与计算样式（选择器权重、继承、媒体查询子集）——第二步专项。
+- ✅ CSS 级联与计算样式(选择器权重、`!important`、继承、单位、媒体查询子集、自定义属性);
+- ✅ 外链样式表 `<link rel=stylesheet>` 宿主预取并原位内联,网络台账可观测;
+- ⏳ 完整 CSS 层叠(动画/过渡/伪元素/`@supports` 精确求值)、`@import` 递归、图片/字体子资源——阶段三/四。
 
 **验收**:依赖 JS 渲染的常见站点可读取正文与交互——**已达成**(`tests/web_use_engine.rs` 6 个端到端用例)。
 

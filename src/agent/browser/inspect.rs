@@ -5,6 +5,7 @@
 use serde_json::{json, Value};
 
 use super::document::{self, Document};
+use super::style::{MediaCtx, StyleEngine};
 use super::{EngineError, EngineResult, LsmBrowserManager};
 
 fn p_str<'a>(params: &'a Value, key: &str) -> Option<&'a str> {
@@ -86,6 +87,36 @@ pub async fn inspect(
             }))
         }
         "elements" => inspect_elements(tab, &doc, params),
+        "stylesheets" => {
+            let engine = style_engine(tab, &doc);
+            let sheets: Vec<Value> = engine
+                .sheets()
+                .iter()
+                .enumerate()
+                .map(|(idx, s)| {
+                    json!({
+                        "index": idx,
+                        "href": s.href,
+                        "media": s.media,
+                        "bytes": s.bytes,
+                        "rules": s.rules,
+                    })
+                })
+                .collect();
+            Ok(json!({
+                "ok": true,
+                "count": sheets.len(),
+                "rules": engine.rule_count(),
+                "sheets": sheets,
+                "media": {
+                    "width": engine.media().viewport_width,
+                    "height": engine.media().viewport_height,
+                    "prefers_dark": engine.media().prefers_dark,
+                    "print": engine.media().print,
+                },
+                "note": "外链样式已由宿主预取并原位内联为 <style data-lsm-href=...>",
+            }))
+        }
         "dom" => inspect_dom(&doc, params),
         "localstorage" | "sessionstorage" => {
             let map = if info == "sessionstorage" {
@@ -217,7 +248,27 @@ fn inspect_elements(
     if p_bool(params, "include_outer_html", false) {
         v["outer_html"] = json!(document::outer_html(node));
     }
+    // 可见性以计算样式为准(外链/内联 CSS 的 display/visibility 都生效)。
+    let engine = style_engine(tab, doc);
+    let computed = engine.computed_chain(node);
+    let visible = computed.display != "none"
+        && computed.visibility != "hidden"
+        && computed.visibility != "collapse"
+        && computed.opacity > 0.0;
+    v["visible"] = json!(visible);
+    if let Some(rect) = v.get_mut("rect").and_then(Value::as_object_mut) {
+        rect.insert("visible".to_string(), json!(visible));
+    }
+    if p_bool(params, "include_style", false) {
+        v["computed_style"] = json!(computed.to_map());
+    }
     Ok(v)
+}
+
+/// 按标签页视口构建样式引擎(与布局使用同一份计算规则)。
+fn style_engine(tab: &super::TabState, doc: &Document) -> StyleEngine {
+    let media = MediaCtx::new(tab.viewport.width as f64, tab.viewport.height as f64);
+    StyleEngine::from_document(doc, media)
 }
 
 fn inspect_dom(doc: &Document, params: &Value) -> EngineResult<Value> {

@@ -670,6 +670,7 @@ mod tests {
             text: text.to_string(),
             visible: true,
             attrs: Default::default(),
+            css: Default::default(),
         }
     }
 

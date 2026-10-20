@@ -12,8 +12,10 @@ pub mod js;
 pub mod layout;
 pub mod net;
 pub mod render;
+pub mod resources;
 pub mod script;
 pub mod storage;
+pub mod style;
 pub mod urlutil;
 
 #[cfg(test)]
@@ -461,10 +463,20 @@ impl LsmBrowserManager {
         let raw_html = resp.text();
         let content_type = resp.content_type();
         let empty_session = HashMap::new();
-        let pipeline = script::run_pipeline(
+        // 外链样式表先预取内联,脚本执行与布局都消费同一份样式。
+        let resources_out = resources::load_stylesheets(
             &mut inner,
             &self.http,
             &raw_html,
+            &resp.final_url,
+            &ua,
+            timeout_ms,
+        )
+        .await;
+        let pipeline = script::run_pipeline(
+            &mut inner,
+            &self.http,
+            &resources_out.html,
             &resp.final_url,
             &ua,
             (viewport.width, viewport.height),
@@ -537,10 +549,15 @@ impl LsmBrowserManager {
                     redirect: resp.redirect_chain.len() > 1,
                     at_ms: now_ms(),
                 }];
+                recs.extend(resources_out.network.clone());
                 recs.extend(pipeline.network.clone());
                 recs
             },
-            console: pipeline.console.clone(),
+            console: {
+                let mut logs = resources_out.console.clone();
+                logs.extend(pipeline.console.clone());
+                logs
+            },
             form_values: pipeline.form_values.clone(),
             focused: None,
             mouse: None,
@@ -676,6 +693,16 @@ impl LsmBrowserManager {
         };
         let raw_html = resp.text();
         let content_type = resp.content_type();
+        // 外链样式表先预取内联(失败降级,不阻断导航)。
+        let resources_out = resources::load_stylesheets(
+            inner,
+            &self.http,
+            &raw_html,
+            &resp.final_url,
+            ua,
+            timeout_ms,
+        )
+        .await;
         // 导航换页:旧 JS 线程全局状态随页面销毁,重建线程。
         if let Some(tab) = inner.tabs.get_mut(page_id) {
             if let Some(old) = tab.js.take() {
@@ -690,7 +717,7 @@ impl LsmBrowserManager {
         let pipeline = script::run_pipeline(
             inner,
             &self.http,
-            &raw_html,
+            &resources_out.html,
             &resp.final_url,
             ua,
             (viewport_w, viewport_h),
@@ -717,7 +744,11 @@ impl LsmBrowserManager {
         tab.form_values = pipeline.form_values.clone();
         tab.focused = None;
         tab.last_active_ms = now_ms();
-        tab.console = pipeline.console;
+        tab.console = resources_out.console.clone();
+        tab.console.extend(pipeline.console);
+        for rec in resources_out.network {
+            record_network(tab, rec);
+        }
         tab.js = pipeline.js;
         for rec in pipeline.network {
             record_network(tab, rec);

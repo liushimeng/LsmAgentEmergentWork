@@ -76,7 +76,7 @@ async fn js_dispatch(
         env.scroll_x = tab.scroll_x;
         env.scroll_y = tab.scroll_y;
         let doc = Document::parse(&tab.html, &tab.url);
-        let nodes = doc.snapshot_nodes();
+        let nodes = doc.snapshot_nodes_styled((tab.viewport.width, tab.viewport.height));
         (handle, env, nodes)
     };
     let sel = selector.to_string();
@@ -250,7 +250,7 @@ async fn js_eval_thread(
         env.scroll_x = tab.scroll_x;
         env.scroll_y = tab.scroll_y;
         let doc = Document::parse(&tab.html, &tab.url);
-        let nodes = doc.snapshot_nodes();
+        let nodes = doc.snapshot_nodes_styled((tab.viewport.width, tab.viewport.height));
         (handle, env, nodes)
     };
     let script_text = script_text.to_string();
@@ -1325,7 +1325,7 @@ async fn act_eval(
             return Err(EngineError::page_not_found(pid));
         };
         let doc = Document::parse(&tab.html, &tab.url);
-        let nodes = doc.snapshot_nodes();
+        let nodes = doc.snapshot_nodes_styled((tab.viewport.width, tab.viewport.height));
         let cookie_header = inner.cookies.header_for(&tab.url).unwrap_or_default();
         let empty = empty_map();
         let meta = JsPageMeta {

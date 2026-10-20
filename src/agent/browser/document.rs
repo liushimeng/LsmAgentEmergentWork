@@ -9,6 +9,7 @@ use kuchikiki::traits::*;
 use kuchikiki::{ElementData, NodeDataRef, NodeRef};
 use serde_json::{json, Value};
 
+use super::style::{ComputedStyle, StyleEngine};
 use super::urlutil;
 
 /// 块级标签:文本抽取时插入换行。
@@ -327,6 +328,17 @@ impl Document {
     ///
     /// 阶段二起改为文档序(先根后子)递归遍历,并记录 `parent` 索引供 JS 侧事件冒泡使用。
     pub fn snapshot_nodes(&self) -> Vec<SnapshotNode> {
+        self.snapshot_nodes_inner(None)
+    }
+
+    /// 带计算样式的快照:每个节点附 `css`(供 JS `getComputedStyle`)。
+    pub fn snapshot_nodes_styled(&self, viewport: (u32, u32)) -> Vec<SnapshotNode> {
+        let media = super::style::MediaCtx::new(viewport.0 as f64, viewport.1 as f64);
+        let engine = StyleEngine::from_document(self, media);
+        self.snapshot_nodes_inner(Some(&engine))
+    }
+
+    fn snapshot_nodes_inner(&self, engine: Option<&StyleEngine>) -> Vec<SnapshotNode> {
         let mut out = Vec::new();
         let start = self
             .root
@@ -334,24 +346,51 @@ impl Document {
             .ok()
             .map(|n| n.as_node().clone())
             .unwrap_or_else(|| self.root.clone());
-        snapshot_walk(&start, usize::MAX, 0, &self.base_url, &mut out);
+        // 根样式:优先应用 `<html>` 的计算样式,保证 `html{font-size:...}` 等继承生效。
+        let root_style = match engine {
+            Some(e) => self
+                .first("html")
+                .ok()
+                .flatten()
+                .map(|n| e.computed(&n, &e.initial_style()))
+                .unwrap_or_else(|| e.initial_style()),
+            None => ComputedStyle::root(),
+        };
+        snapshot_walk(
+            &start,
+            usize::MAX,
+            0,
+            &self.base_url,
+            &mut out,
+            engine,
+            &root_style,
+        );
         out
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn snapshot_walk(
     node: &NodeRef,
     parent: usize,
     depth: usize,
     base_url: &str,
     out: &mut Vec<SnapshotNode>,
+    engine: Option<&StyleEngine>,
+    parent_style: &ComputedStyle,
 ) {
     if depth > 40 || out.len() >= 5000 {
         return;
     }
     let mut child_parent = parent;
+    let mut child_style = parent_style.clone();
     if let Some(el) = node.as_element() {
         let tag = el.name.local.to_string();
+        if engine.is_some() {
+            child_style = engine
+                .map(|e| e.computed(node, parent_style))
+                .unwrap_or_else(|| parent_style.clone());
+        }
         if !SKIP_TEXT_TAGS.contains(&tag.as_str()) {
             let attrs = common_attrs(node);
             let idx = out.len();
@@ -373,11 +412,24 @@ fn snapshot_walk(
                 text: truncate_chars(&collapse_ws(&node.text_contents()), 4000),
                 visible: is_visible(node),
                 attrs,
+                css: if engine.is_some() {
+                    child_style.to_map().into_iter().collect()
+                } else {
+                    HashMap::new()
+                },
             });
         }
     }
     for child in node.children() {
-        snapshot_walk(&child, child_parent, depth + 1, base_url, out);
+        snapshot_walk(
+            &child,
+            child_parent,
+            depth + 1,
+            base_url,
+            out,
+            engine,
+            &child_style,
+        );
     }
 }
 
@@ -398,6 +450,8 @@ pub struct SnapshotNode {
     pub text: String,
     pub visible: bool,
     pub attrs: HashMap<String, String>,
+    /// 计算样式(kebab-case);无样式引擎时为空。
+    pub css: HashMap<String, String>,
 }
 
 impl SnapshotNode {
@@ -417,6 +471,7 @@ impl SnapshotNode {
             "text": self.text,
             "visible": self.visible,
             "attrs": self.attrs,
+            "css": self.css,
         })
     }
 }

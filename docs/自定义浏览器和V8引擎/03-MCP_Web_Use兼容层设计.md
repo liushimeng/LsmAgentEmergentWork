@@ -117,7 +117,8 @@ src/agent/browser/               内核:窗口/标签页 / 网络 / DOM / 布局
 | --- | --- |
 | `console` | `{events:[{level,text,at_ms}], count, collection_healthy, last_event_at}` |
 | `network` | `{events:[{url,method,status,content_type,bytes,elapsed_ms,redirect,at_ms}], count, ...}` |
-| `elements` | `{ok,tag,selector,id,classes,text,value,href,attributes,visible,rect{...},count,index}` |
+| `elements` | `{ok,tag,selector,id,classes,text,value,href,attributes,visible,rect{...},count,index}`；`params.include_style=true` 时附加 `computed_style:{...}` |
+| `stylesheets` | `{ok,count,rules,sheets:[{index,href,media,bytes,rules}],media:{width,height,prefers_dark,print}}` |
 | `dom` | `{ok,selector,node_count,tree}` 或 `{ok,selector,outer_html}` |
 | `localstorage` / `sessionstorage` | `{key: value}`（支持 `prefix`/`contains` 过滤） |
 | `cookies` | `{cookies:[{name,value,domain,path,expires,httpOnly,secure,sameSite}]}` |
@@ -164,7 +165,8 @@ src/agent/browser/               内核:窗口/标签页 / 网络 / DOM / 布局
 
 ## 十、阶段二/三的扩展点
 
-- 页面脚本执行：`Document` → 持久 DOM + 事件循环；`JsRuntime` 换 V8；
+- 页面脚本执行：`Document` → 持久 DOM + 事件循环；`JsRuntime` 换 V8（✅ 第一步/第二步已落地）；
+- 样式与资源：CSS 级联引擎、外链样式预取内联、`getComputedStyle`（✅ 阶段二第二步）；
+  图片/字体等子资源、缓存、下载管理（⏳ 阶段四）；
 - 原生窗口：`BrowserMode::Headed` 不再回退，`guard/highlight` 产生真实视觉效果；
-- 资源加载器：图片/CSS/JS 子资源、缓存、下载管理；
 - 反爬治理如仍有需要，改为**内核原生请求策略**（限速/重试/Cookie 隔离），不恢复 CDP 注入。
