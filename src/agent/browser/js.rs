@@ -653,6 +653,7 @@ mod tests {
     fn node(tag: &str, id: &str, class: &str, text: &str, href: &str) -> SnapshotNode {
         SnapshotNode {
             index: 0,
+            parent: usize::MAX,
             selector: if id.is_empty() {
                 tag.to_string()
             } else {

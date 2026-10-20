@@ -72,6 +72,61 @@ fn route(path: &str) -> (&'static str, String) {
             "<html><head><title>第二页</title></head><body><h2>Next Page</h2></body></html>"
                 .to_string(),
         )
+    } else if path == "/js-inline" {
+        (
+            "200 OK",
+            "<html><head><title>JS内联页</title></head><body><div id=\"app\">加载中</div>\
+             <script>document.getElementById('app').innerHTML = '<h1>内联渲染完成</h1><p>内容由脚本注入</p>';</script>\
+             </body></html>"
+                .to_string(),
+        )
+    } else if path == "/app.js" {
+        (
+            "200 OK",
+            "document.getElementById('app').textContent = '外链脚本已执行';".to_string(),
+        )
+    } else if path == "/js-external" {
+        (
+            "200 OK",
+            "<html><head><title>JS外链页</title><script src=\"/app.js\"></script></head>\
+             <body><div id=\"app\">占位</div></body></html>"
+                .to_string(),
+        )
+    } else if path == "/api/data" {
+        (
+            "200 OK",
+            "{\"items\": [\"甲\", \"乙\", \"丙\"]}".to_string(),
+        )
+    } else if path == "/js-fetch" {
+        (
+            "200 OK",
+            "<html><head><title>JS取数页</title></head><body><ul id=\"list\"></ul>\
+             <script>fetch('/api/data').then(function(r){ return r.json(); }).then(function(d){\
+               document.getElementById('list').innerHTML = d.items.map(function(x){ return '<li>条目' + x + '</li>'; }).join('');\
+             });</script>\
+             </body></html>"
+                .to_string(),
+        )
+    } else if path == "/js-timer" {
+        (
+            "200 OK",
+            "<html><head><title>JS定时页</title></head><body><div id=\"later\">未就绪</div>\
+             <script>setTimeout(function(){ document.getElementById('later').textContent = '延迟渲染完成'; }, 2000);</script>\
+             </body></html>"
+                .to_string(),
+        )
+    } else if path == "/js-click" {
+        (
+            "200 OK",
+            "<html><head><title>JS交互页</title></head><body><div id=\"panel\" style=\"display:none\">面板</div>\
+             <a id=\"btn\" href=\"/next\">切换</a>\
+             <script>document.getElementById('btn').addEventListener('click', function(e){\
+               e.preventDefault();\
+               document.getElementById('panel').style.display = 'block';\
+             });</script>\
+             </body></html>"
+                .to_string(),
+        )
     } else if path.starts_with("/search") {
         let q = path
             .split_once('?')
@@ -104,6 +159,8 @@ async fn exec(tool: &McpWebUseTool, args: Value) -> Value {
 fn allow_loopback() {
     std::env::set_var("LAEW_ALLOW_PRIVATE_ENDPOINT", "1");
     std::env::set_var("LAEW_SITE_RISK_PERSIST", "off");
+    // 测试并行共享全局浏览器单例,放开标签页上限避免竞争。
+    std::env::set_var("LAEW_WEB_MAX_TABS", "32");
 }
 
 #[tokio::test]
@@ -286,4 +343,180 @@ async fn 失效_page_id_返回_2000() {
     )
     .await;
     assert_eq!(v["code"], 2000, "{v}");
+}
+
+// ============ 阶段二:页面脚本与动态 DOM ============
+
+#[tokio::test]
+async fn js渲染_内联脚本正文可读() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebUseTool;
+    let open = exec(
+        &tool,
+        json!({"action": "open", "url": format!("{base}/js-inline"), "mode": "hidden", "reuse": false}),
+    )
+    .await;
+    assert_eq!(open["code"], 0, "{open}");
+    let page_id = open["data"]["page_id"].as_str().unwrap().to_string();
+    let app = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": page_id, "info": "elements",
+                "params": {"selector": "#app"}}),
+    )
+    .await;
+    let text = app["data"]["text"].as_str().unwrap_or("");
+    assert!(text.contains("内联渲染完成"), "脚本注入的正文应可读:{app}");
+    assert!(!text.contains("加载中"), "占位文本应被替换:{app}");
+
+    exec(&tool, json!({"action": "close", "page_id": page_id})).await;
+}
+
+#[tokio::test]
+async fn js渲染_外链脚本执行() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebUseTool;
+    let open = exec(
+        &tool,
+        json!({"action": "open", "url": format!("{base}/js-external"), "mode": "hidden", "reuse": false}),
+    )
+    .await;
+    assert_eq!(open["code"], 0, "{open}");
+    let page_id = open["data"]["page_id"].as_str().unwrap().to_string();
+    let app = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": page_id, "info": "elements",
+                "params": {"selector": "#app"}}),
+    )
+    .await;
+    assert!(
+        app["data"]["text"].as_str().unwrap_or("").contains("外链脚本已执行"),
+        "外链脚本内容应生效:{app}"
+    );
+
+    exec(&tool, json!({"action": "close", "page_id": page_id})).await;
+}
+
+#[tokio::test]
+async fn js渲染_fetch_取数后渲染() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebUseTool;
+    let open = exec(
+        &tool,
+        json!({"action": "open", "url": format!("{base}/js-fetch"), "mode": "hidden", "reuse": false}),
+    )
+    .await;
+    assert_eq!(open["code"], 0, "{open}");
+    let page_id = open["data"]["page_id"].as_str().unwrap().to_string();
+    let list = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": page_id, "info": "elements",
+                "params": {"selector": "#list"}}),
+    )
+    .await;
+    let text = list["data"]["text"].as_str().unwrap_or("");
+    assert!(text.contains("条目甲"), "fetch 数据应渲染进 DOM:{list}");
+    assert!(text.contains("条目丙"), "fetch 数据应渲染进 DOM:{list}");
+
+    exec(&tool, json!({"action": "close", "page_id": page_id})).await;
+}
+
+#[tokio::test]
+async fn js渲染_定时器延迟后可读() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebUseTool;
+    let open = exec(
+        &tool,
+        json!({"action": "open", "url": format!("{base}/js-timer"), "mode": "hidden", "reuse": false}),
+    )
+    .await;
+    assert_eq!(open["code"], 0, "{open}");
+    let page_id = open["data"]["page_id"].as_str().unwrap().to_string();
+    let later = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": page_id, "info": "elements",
+                "params": {"selector": "#later"}}),
+    )
+    .await;
+    assert!(
+        later["data"]["text"].as_str().unwrap_or("").contains("延迟渲染完成"),
+        "虚拟时钟应快进执行定时回调:{later}"
+    );
+
+    exec(&tool, json!({"action": "close", "page_id": page_id})).await;
+}
+
+#[tokio::test]
+async fn js交互_click监听阻止默认导航() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebUseTool;
+    let open = exec(
+        &tool,
+        json!({"action": "open", "url": format!("{base}/js-click"), "mode": "hidden", "reuse": false}),
+    )
+    .await;
+    assert_eq!(open["code"], 0, "{open}");
+    let page_id = open["data"]["page_id"].as_str().unwrap().to_string();
+
+    let clicked = exec(
+        &tool,
+        json!({"action": "control", "page_id": page_id, "control_action": "click",
+                "params": {"selector": "#btn"}}),
+    )
+    .await;
+    assert_eq!(clicked["code"], 0, "{clicked}");
+    assert_eq!(clicked["data"]["default_prevented"], true, "preventDefault 应生效:{clicked}");
+    assert_eq!(clicked["data"]["js_handled"], true, "listener 应命中:{clicked}");
+
+    // 页面未导航:标题仍是 JS交互页,面板已显示。
+    let title = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": page_id, "info": "title"}),
+    )
+    .await;
+    assert_eq!(title["data"]["title"], "JS交互页", "preventDefault 后不应跳转:{title}");
+    let panel = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": page_id, "info": "elements",
+                "params": {"selector": "#panel"}}),
+    )
+    .await;
+    assert_eq!(panel["data"]["visible"], true, "listener 修改 style 后面板应可见:{panel}");
+
+    exec(&tool, json!({"action": "close", "page_id": page_id})).await;
+}
+
+#[tokio::test]
+async fn eval_js_全局跨调用保留() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebUseTool;
+    let open = exec(
+        &tool,
+        json!({"action": "open", "url": format!("{base}/js-inline"), "mode": "hidden", "reuse": false}),
+    )
+    .await;
+    assert_eq!(open["code"], 0, "{open}");
+    let page_id = open["data"]["page_id"].as_str().unwrap().to_string();
+
+    let first = exec(
+        &tool,
+        json!({"action": "control", "page_id": page_id, "control_action": "eval_js",
+                "params": {"expression": "window.__laew_counter = 41; 'set'"}}),
+    )
+    .await;
+    assert_eq!(first["data"]["result"], "set", "{first}");
+    let second = exec(
+        &tool,
+        json!({"action": "control", "page_id": page_id, "control_action": "eval_js",
+                "params": {"expression": "window.__laew_counter + 1"}}),
+    )
+    .await;
+    assert_eq!(second["data"]["result"], "42", "全局变量应跨 eval_js 保留:{second}");
+
+    exec(&tool, json!({"action": "close", "page_id": page_id})).await;
 }

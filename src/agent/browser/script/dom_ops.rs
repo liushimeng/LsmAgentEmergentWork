@@ -1,0 +1,306 @@
+//! 宿主侧动作应用:JS 线程回传的结构性 DOM 修改在此落到真实 kuchikiki 文档。
+//!
+//! 选择器定位用 `Document::select`;fragment 注入用 `parse_html` + `<body>` 包裹
+//! (kuchikiki 的 `parse_fragment` 需要其内部 markup5ever 版本的 `QualName`,
+//! 不引入第二套类型,零新依赖)。
+
+use std::collections::{HashMap, HashSet};
+
+use kuchikiki::NodeRef;
+
+use super::JsAction;
+use crate::agent::browser::document::{self, Document};
+
+const MAX_INLINE_SCRIPTS: usize = 32;
+const MAX_INLINE_BYTES: usize = 256 * 1024;
+const MAX_EXTERNAL_SCRIPTS: usize = 16;
+
+/// 单轮应用结果:DOM 之外的副作用汇总,由调用方合并进 TabState/存储。
+#[derive(Debug, Default, Clone)]
+pub struct ApplySummary {
+    pub applied: usize,
+    pub failed: usize,
+    /// selector → value(set_value/set_checked 合并)。
+    pub form_values: HashMap<String, String>,
+    pub title: Option<String>,
+    /// 原样 Set-Cookie 行。
+    pub cookies: Vec<String>,
+    /// local storage 写入。
+    pub storage_local: Vec<(String, String)>,
+    pub storage_local_remove: Vec<String>,
+    pub storage_local_clear: bool,
+    /// session storage 写入。
+    pub storage_session: Vec<(String, String)>,
+    pub storage_session_remove: Vec<String>,
+    pub storage_session_clear: bool,
+    /// 滚动(set/offset)。
+    pub scroll_to: Option<f64>,
+    pub scroll_by: Option<f64>,
+    pub focus: Option<String>,
+    pub blur: bool,
+    /// 非法动作示例(进 console 日志)。
+    pub errors: Vec<String>,
+}
+
+/// 把 actions 应用到文档。导航类动作(click/navigate/new_tab/submit/back/forward/reload)
+/// 不在此处理,由调用方在锁外执行。
+pub fn apply(doc: &Document, actions: &[JsAction], base_url: &str) -> ApplySummary {
+    let mut summary = ApplySummary::default();
+    for action in actions {
+        match action.kind.as_str() {
+            "set_attr" => {
+                let Some(node) = find(doc, &action.selector) else {
+                    summary.failed += 1;
+                    continue;
+                };
+                set_attr_value(&node, &action.key, &action.value);
+                summary.applied += 1;
+            }
+            "remove_attr" => {
+                let Some(node) = find(doc, &action.selector) else {
+                    summary.failed += 1;
+                    continue;
+                };
+                if let Some(el) = node.as_element() {
+                    el.attributes.borrow_mut().remove(action.key.trim());
+                }
+                summary.applied += 1;
+            }
+            "set_text" => {
+                let Some(node) = find(doc, &action.selector) else {
+                    summary.failed += 1;
+                    continue;
+                };
+                for child in node.children().collect::<Vec<_>>() {
+                    child.detach();
+                }
+                node.append(NodeRef::new_text(&action.value));
+                summary.applied += 1;
+            }
+            "set_html" | "replace_html" => {
+                if action.selector.starts_with("@created:") {
+                    // detached 元素上的 innerHTML 赋值:节点未入树,无处落地,静默忽略。
+                    summary.failed += 1;
+                    continue;
+                }
+                let Some(node) = find(doc, &action.selector) else {
+                    summary.failed += 1;
+                    continue;
+                };
+                if action.kind == "replace_html" {
+                    let Some(parent) = node.parent() else {
+                        summary.failed += 1;
+                        continue;
+                    };
+                    for frag in parse_fragment_nodes(&action.value) {
+                        parent.insert_before(frag);
+                    }
+                    node.detach();
+                } else {
+                    for child in node.children().collect::<Vec<_>>() {
+                        child.detach();
+                    }
+                    for frag in parse_fragment_nodes(&action.value) {
+                        node.append(frag);
+                    }
+                }
+                summary.applied += 1;
+            }
+            "append_html" => {
+                let Some(node) = find(doc, &action.selector) else {
+                    summary.failed += 1;
+                    continue;
+                };
+                for frag in parse_fragment_nodes(&action.value) {
+                    node.append(frag);
+                }
+                summary.applied += 1;
+            }
+            "insert_html" => {
+                let Some(node) = find(doc, &action.selector) else {
+                    summary.failed += 1;
+                    continue;
+                };
+                for frag in parse_fragment_nodes(&action.value) {
+                    node.insert_before(frag);
+                }
+                summary.applied += 1;
+            }
+            "remove_node" => {
+                let Some(node) = find(doc, &action.selector) else {
+                    summary.failed += 1;
+                    continue;
+                };
+                node.detach();
+                summary.applied += 1;
+            }
+            "set_value" => {
+                if let Some(node) = find(doc, &action.selector) {
+                    set_attr_value(&node, "value", &action.value);
+                    summary.applied += 1;
+                }
+                summary
+                    .form_values
+                    .insert(action.selector.clone(), action.value.clone());
+            }
+            "set_checked" => {
+                if let Some(node) = find(doc, &action.selector) {
+                    if action.value == "true" {
+                        set_attr_value(&node, "checked", "");
+                    } else if let Some(el) = node.as_element() {
+                        el.attributes.borrow_mut().remove("checked");
+                    }
+                    summary.applied += 1;
+                }
+                summary
+                    .form_values
+                    .insert(action.selector.clone(), action.value.clone());
+            }
+            "set_title" => summary.title = Some(action.value.clone()),
+            "set_cookie" => summary.cookies.push(action.value.clone()),
+            "storage_local" => summary.storage_local.push((action.key.clone(), action.value.clone())),
+            "storage_local_remove" => summary.storage_local_remove.push(action.key.clone()),
+            "storage_local_clear" => summary.storage_local_clear = true,
+            "storage_session" => summary.storage_session.push((action.key.clone(), action.value.clone())),
+            "storage_session_remove" => summary.storage_session_remove.push(action.key.clone()),
+            "storage_session_clear" => summary.storage_session_clear = true,
+            "scroll" => {
+                if let Ok(v) = action.value.parse::<f64>() {
+                    summary.scroll_to = Some(v.max(0.0));
+                }
+            }
+            "scroll_by" => {
+                if let Ok(v) = action.value.parse::<f64>() {
+                    summary.scroll_by = Some(v);
+                }
+            }
+            "focus" => summary.focus = Some(action.selector.clone()),
+            "blur" => summary.blur = true,
+            _ => {
+                // 导航类(click/navigate/submit/new_tab/back/forward/reload)与未知类型留给调用方。
+            }
+        }
+    }
+    let _ = base_url;
+    summary
+}
+
+/// 应用非 DOM 副作用之外的提醒(fetch 类动作在台账已单独记录)。
+pub fn note_errors(summary: &ApplySummary) -> Vec<String> {
+    summary.errors.clone()
+}
+
+fn find(doc: &Document, selector: &str) -> Option<NodeRef> {
+    if selector.is_empty() {
+        return None;
+    }
+    doc.first(selector).ok().flatten()
+}
+
+fn set_attr_value(node: &NodeRef, key: &str, value: &str) {
+    if let Some(el) = node.as_element() {
+        // html5ever 解析时属性名统一小写,写入侧保持一致。
+        el.attributes
+            .borrow_mut()
+            .insert(key.trim().to_ascii_lowercase(), value.to_string());
+    }
+}
+
+/// 解析 HTML 片段为零散节点(不依赖 kuchikiki 内部 QualName)。
+fn parse_fragment_nodes(html: &str) -> Vec<NodeRef> {
+    use kuchikiki::traits::TendrilSink;
+    let wrapped = format!("<body>{html}</body>");
+    let parsed = kuchikiki::parse_html().one(wrapped);
+    parsed
+        .select_first("body")
+        .map(|b| b.as_node().children().collect::<Vec<_>>())
+        .unwrap_or_default()
+}
+
+/// 脚本收集产物。
+#[derive(Debug, Default)]
+pub struct CollectedScripts {
+    pub inline: Vec<super::ScriptSource>,
+    /// 外链脚本的绝对 URL(宿主侧预取后并入 inline 执行)。
+    pub external_urls: Vec<String>,
+}
+
+/// 收集文档中的 `<script>`:内联文本直接提取,外链 src 返回 URL 清单。
+/// `executed` 为已执行内容指纹集合,跨轮去重(脚本注入的脚本不会重复执行)。
+pub fn collect_scripts(doc: &Document, base_url: &str, executed: &mut HashSet<u64>) -> CollectedScripts {
+    let mut out = CollectedScripts::default();
+    let Ok(scripts) = doc.select("script") else {
+        return out;
+    };
+    for node in scripts {
+        let src = document::attr(&node, "src");
+        let typ = document::attr(&node, "type")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !typ.is_empty()
+            && !typ.contains("javascript")
+            && !typ.contains("ecmascript")
+            && !typ.contains("module")
+        {
+            continue;
+        }
+        if let Some(src) = src {
+            if out.external_urls.len() >= MAX_EXTERNAL_SCRIPTS {
+                continue;
+            }
+            if let Some(abs) = crate::agent::browser::urlutil::resolve(base_url, &src) {
+                if abs.starts_with("http://") || abs.starts_with("https://") {
+                    if !out.external_urls.contains(&abs) {
+                        out.external_urls.push(abs);
+                    }
+                } else if let Some(rest) = abs.strip_prefix("data:") {
+                    // data: URL 直接作为内联内容。
+                    push_inline(&mut out, rest, executed, &abs);
+                }
+            }
+            continue;
+        }
+        let text = node.text_contents();
+        if out.inline.len() >= MAX_INLINE_SCRIPTS || text.len() > MAX_INLINE_BYTES {
+            continue;
+        }
+        push_inline(&mut out, &text, executed, "");
+    }
+    out
+}
+
+fn push_inline(
+    out: &mut CollectedScripts,
+    content: &str,
+    executed: &mut HashSet<u64>,
+    src_url: &str,
+) {
+    let fp = fingerprint(content);
+    if executed.contains(&fp) {
+        return;
+    }
+    executed.insert(fp);
+    // data: URL 简化处理:取逗号后内容,base64 变体按原样跳过。
+    let body = if let Some(rest) = content.strip_prefix("data:") {
+        rest.split_once(',')
+            .map(|(_, payload)| payload.to_string())
+            .unwrap_or_default()
+    } else {
+        content.to_string()
+    };
+    if body.trim().is_empty() {
+        return;
+    }
+    out.inline.push(super::ScriptSource {
+        kind: "inline",
+        content: body,
+        src_url: src_url.to_string(),
+    });
+}
+
+fn fingerprint(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}

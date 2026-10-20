@@ -79,6 +79,8 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 | `LAEW_TARGET_ANCHOR` | `off`/`0`/`false`/`no` | 关闭任务锚点全部四层。详见「领域概念 · 任务锚点」 |
 | `LAEW_TARGET_ANCHOR_BLOCK` | `off`/`0`/`false`/`no` | 仅关闭 L3 工具级阻断，保留 L1/L2/L4（观察模式） |
 | `LAEW_BROWSER_MODE` | `headed`/`hidden`/`new_headless` | 请求的浏览器模式。阶段一为进程内无头内核,`headed` 回退为 `hidden` 并在 `data.mode_hint` 说明。见 `src/agent/browser/mod.rs` |
+| `LAEW_WEB_SCRIPT` | `off`/`0`/`false`/`no` | 关闭页面脚本执行与 JS 线程(阶段二);`eval_js` 回退阶段一快照桥。见 `src/agent/browser/script/` |
+| `LAEW_WEB_SCRIPT_BUDGET_MS` | 正整数(默认 `10000`) | 单次页面脚本管线(导航/eval_js/事件分发)墙钟预算。见 `src/agent/browser/script/mod.rs::budget_ms` |
 | `LAEW_WEB_EVIDENCE` | `off`/`0`/`false`/`no` | 关闭网页取证纪律硬闸门。见 `src/agent/safety/web_evidence.rs` |
 | `LAEW_READ_IMAGE_B64` | `1`/`true`/`yes`/`on` | 恢复 Read 工具图片 base64 全文返回（缺省为存根）。见 `src/agent/tools/read.rs` |
 | `LAEW_WEB_EVAL_TIMEOUT_MS` | 正整数(默认 `30000`) | eval_js 执行预算(阶段一做脚本长度上限与结果截断) |
@@ -300,7 +302,13 @@ agent/
     document.rs    DOM / 选择器 / 稳定选择器 / 文本抽取 / 表单序列化
     layout.rs      块级布局 + 简化 CSS 级联
     render.rs      fontdue + tiny-skia 软件渲染 + PNG
-    js.rs          Boa 引导后端 + DOM 快照桥(JsRuntime 抽象)
+    js.rs          Boa 引导后端 + DOM 快照桥(阶段一回退路径)
+    script/        阶段二页面脚本与动态 DOM(每 Tab 持久 JS 线程)
+      mod.rs       管线(收集→预取→执行→动作应用→回写)+ 消息协议
+      runtime.rs   JS 线程主体(Boa Context/原生 fetch 桥/事件循环/微任务预算)
+      prelude.rs   PRELUDE v2(持久全局 + 事件系统 + 虚拟时钟定时器)
+      dom_ops.rs   动作→kuchikiki DOM 应用 + 脚本收集
+      tests.rs     单元测试
     storage.rs     Cookie Jar / localStorage / sessionStorage
     urlutil.rs     URL 解析 / 字符集解码 / 文件名净化
     tests.rs       内核单元测试

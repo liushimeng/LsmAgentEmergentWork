@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 
 use super::document::{self, Document};
 use super::js::{self, JsPageMeta};
+use super::script;
 use super::{EngineError, EngineResult, LsmBrowserManager};
 use crate::agent::browser::urlutil;
 
@@ -49,6 +50,226 @@ fn timeout_ms(params: &Value, top: &Value, default: u64) -> u64 {
     p_u64(params, "timeout_ms")
         .or_else(|| p_u64(top, "timeout_ms"))
         .unwrap_or(default)
+}
+
+// ============ 阶段二:页面 JS 线程交互 ============
+
+/// 若页面有 JS 线程,把事件分发到页面 listener。无线程/失败返回 None(并清理失效句柄)。
+async fn js_dispatch(
+    mgr: &LsmBrowserManager,
+    pid: &str,
+    selector: &str,
+    event: &str,
+) -> Option<script::JsReply> {
+    let (handle, env, nodes) = {
+        let inner = mgr.inner.lock().await;
+        let tab = inner.tabs.get(pid)?;
+        let handle = tab.js.clone()?;
+        let mut env = script::build_env(
+            &inner,
+            &tab.url,
+            &tab.title,
+            &tab.user_agent,
+            (tab.viewport.width, tab.viewport.height),
+            &tab.session_storage,
+        );
+        env.scroll_x = tab.scroll_x;
+        env.scroll_y = tab.scroll_y;
+        let doc = Document::parse(&tab.html, &tab.url);
+        let nodes = doc.snapshot_nodes();
+        (handle, env, nodes)
+    };
+    let sel = selector.to_string();
+    let evt = event.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        handle.request(|tx| script::JsRequest::Dispatch {
+            selector: sel,
+            event: evt,
+            env,
+            nodes,
+            reply: tx,
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(reply)) => Some(reply),
+        _ => {
+            mgr.clear_js(pid).await;
+            None
+        }
+    }
+}
+
+/// 应用 JS 回复:DOM 动作落到 `tab.html` 并重算布局;存储/Cookie/标题/滚动/台账合并。
+/// 返回导航类待执行动作(click/navigate/submit/new_tab/back/forward/reload)。
+async fn apply_js_reply(
+    mgr: &LsmBrowserManager,
+    pid: &str,
+    reply: &script::JsReply,
+) -> Vec<script::JsAction> {
+    let mut inner = mgr.inner.lock().await;
+    let (tab_url, tab_html) = {
+        let Some(tab) = inner.tabs.get(pid) else {
+            return Vec::new();
+        };
+        (tab.url.clone(), tab.html.clone())
+    };
+    let doc = Document::parse(&tab_html, &tab_url);
+    let summary = script::dom_ops::apply(&doc, &reply.outcome.actions, &tab_url);
+    for line in &summary.cookies {
+        inner
+            .cookies
+            .set_from_headers(&tab_url, &[("set-cookie".to_string(), line.clone())]);
+    }
+    let origin = urlutil::storage_origin(&tab_url);
+    for (k, v) in &summary.storage_local {
+        inner
+            .local_storage
+            .entry(origin.clone())
+            .or_default()
+            .insert(k.clone(), v.clone());
+    }
+    for k in &summary.storage_local_remove {
+        if let Some(m) = inner.local_storage.get_mut(&origin) {
+            m.remove(k);
+        }
+    }
+    if summary.storage_local_clear {
+        if let Some(m) = inner.local_storage.get_mut(&origin) {
+            m.clear();
+        }
+    }
+    let Some(t) = inner.tabs.get_mut(pid) else {
+        return Vec::new();
+    };
+    // session 存储合并
+    for (k, v) in &summary.storage_session {
+        t.session_storage.insert(k.clone(), v.clone());
+    }
+    for k in &summary.storage_session_remove {
+        t.session_storage.remove(k);
+    }
+    if summary.storage_session_clear {
+        t.session_storage.clear();
+    }
+    let final_html = doc.serialize_full();
+    let final_doc = Document::parse(&final_html, &t.url);
+    t.html = final_html.clone();
+    t.layout = super::layout::compute(&final_doc, t.viewport.width as f64, mgr.font());
+    if let Some(title) = &summary.title {
+        t.title = title.clone();
+    }
+    for (k, v) in summary.form_values {
+        t.form_values.insert(k, v);
+    }
+    if let Some(s) = summary.scroll_to {
+        t.scroll_y = s.max(0.0);
+    }
+    if let Some(s) = summary.scroll_by {
+        t.scroll_y = (t.scroll_y + s).max(0.0);
+    }
+    if let Some(f) = summary.focus {
+        t.focused = Some(f);
+    }
+    if summary.blur {
+        t.focused = None;
+    }
+    for log in &reply.outcome.logs {
+        if t.console.len() > 400 {
+            t.console.remove(0);
+        }
+        t.console.push(super::ConsoleRecord {
+            level: log.level.clone(),
+            text: log.text.clone(),
+            at_ms: super::now_ms(),
+        });
+    }
+    for rec in &reply.network {
+        if t.network.len() > 200 {
+            t.network.remove(0);
+        }
+        t.network.push(super::NetworkRecord {
+            url: rec.url.clone(),
+            method: if rec.method.is_empty() {
+                "FETCH".to_string()
+            } else {
+                rec.method.clone()
+            },
+            status: rec.status,
+            content_type: rec.content_type.clone(),
+            bytes: rec.bytes,
+            elapsed_ms: rec.elapsed_ms,
+            redirect: rec.redirect,
+            at_ms: super::now_ms(),
+        });
+    }
+    reply
+        .outcome
+        .actions
+        .iter()
+        .filter(|a| {
+            matches!(
+                a.kind.as_str(),
+                "click" | "navigate" | "new_tab" | "submit" | "back" | "forward" | "reload"
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+/// eval_js 走页面 JS 线程(持久全局)。线程不可用时返回 None,由调用方回退快照桥。
+async fn js_eval_thread(
+    mgr: &LsmBrowserManager,
+    pid: &str,
+    script_text: &str,
+) -> Option<script::JsReply> {
+    if !script::scripts_enabled() {
+        return None;
+    }
+    {
+        // 懒启动:页面无脚本时首次 eval_js 建线程,获得持久会话。
+        let mut inner = mgr.inner.lock().await;
+        if let Some(tab) = inner.tabs.get_mut(pid) {
+            if tab.js.is_none() {
+                tab.js = Some(script::JsHandle::spawn());
+            }
+        }
+    }
+    let (handle, env, nodes) = {
+        let inner = mgr.inner.lock().await;
+        let tab = inner.tabs.get(pid)?;
+        let handle = tab.js.clone()?;
+        let mut env = script::build_env(
+            &inner,
+            &tab.url,
+            &tab.title,
+            &tab.user_agent,
+            (tab.viewport.width, tab.viewport.height),
+            &tab.session_storage,
+        );
+        env.scroll_x = tab.scroll_x;
+        env.scroll_y = tab.scroll_y;
+        let doc = Document::parse(&tab.html, &tab.url);
+        let nodes = doc.snapshot_nodes();
+        (handle, env, nodes)
+    };
+    let script_text = script_text.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        handle.request(|tx| script::JsRequest::Eval {
+            script: script_text,
+            env,
+            nodes,
+            reply: tx,
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(reply)) => Some(reply),
+        _ => {
+            mgr.clear_js(pid).await;
+            None
+        }
+    }
 }
 
 /// 执行一个 control_action。
@@ -425,6 +646,43 @@ async fn click_inner(
         "mode": kind,
         "selector": stable,
     });
+    // 阶段二:页面 listener 分发。preventDefault 或 JS 产生导航动作时优先按 JS 语义执行;
+    // listener 未拦截时继续默认行为(handler 与默认导航并存,贴近真实浏览器)。
+    if !matches!(kind, "right" | "double" | "js") {
+        if let Some(reply) = js_dispatch(mgr, pid, &stable, "click").await {
+            let pending = apply_js_reply(mgr, pid, &reply).await;
+            if reply.handled {
+                out["js_handled"] = json!(true);
+            }
+            if reply.default_prevented {
+                out["default_prevented"] = json!(true);
+                return Ok(out);
+            }
+            if let Some(action) = pending.into_iter().next() {
+                let nav_result: EngineResult<Option<(String, String)>> = match action.kind.as_str() {
+                    "navigate" => mgr.navigate(pid, &action.url, timeout).await.map(|n| Some((n.url, n.title))),
+                    "new_tab" => mgr.new_tab(pid, &action.url, timeout).await.map(|n| Some((n.final_url, n.title))),
+                    "back" | "forward" | "reload" => mgr.history_nav(pid, &action.kind, timeout).await.map(|n| Some((n.url, n.title))),
+                    "click" | "submit" => {
+                        let p = json!({"selector": action.selector});
+                        // Box::pin 打断 async 递归(click 动作 → click_inner → 再分发)。
+                        Box::pin(click_inner(mgr, pid, &p, "js")).await?;
+                        Ok(None)
+                    }
+                    _ => Ok(None),
+                };
+                match nav_result {
+                    Ok(Some((url, title))) => {
+                        out["final_url"] = json!(url);
+                        out["title"] = json!(title);
+                        return Ok(out);
+                    }
+                    Ok(None) => return Ok(out),
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+    }
     match plan {
         Some(NavPlan::NewTab { url }) => {
             let spawned = mgr.new_tab(pid, &url, timeout).await?;
@@ -483,21 +741,32 @@ async fn act_input(mgr: &LsmBrowserManager, pid: &str, params: &Value) -> Engine
     require_page(pid)?;
     let selector = require_selector(params)?;
     let text = params.get("text").and_then(Value::as_str).unwrap_or("");
-    let mut inner = mgr.inner.lock().await;
-    let tab = inner
-        .tabs
-        .get_mut(pid)
-        .ok_or_else(|| EngineError::page_not_found(pid))?;
-    let doc = Document::parse(&tab.html, &tab.url);
-    let nodes = doc.select(selector).map_err(EngineError::action_failed)?;
-    let node = nodes.get(nth(params)).ok_or_else(|| {
-        EngineError::action_failed(format!("输入目标未命中:{selector}"))
-    })?;
-    let stable = Document::stable_selector(node);
-    if !document::is_visible(node) {
-        return Err(EngineError::action_failed("输入目标不可见").with_data(json!({"selector": stable})));
+    let stable = {
+        let mut inner = mgr.inner.lock().await;
+        let tab = inner
+            .tabs
+            .get_mut(pid)
+            .ok_or_else(|| EngineError::page_not_found(pid))?;
+        let doc = Document::parse(&tab.html, &tab.url);
+        let nodes = doc.select(selector).map_err(EngineError::action_failed)?;
+        let node = nodes.get(nth(params)).ok_or_else(|| {
+            EngineError::action_failed(format!("输入目标未命中:{selector}"))
+        })?;
+        let stable = Document::stable_selector(node);
+        if !document::is_visible(node) {
+            return Err(EngineError::action_failed("输入目标不可见").with_data(json!({"selector": stable})));
+        }
+        tab.form_values.insert(stable.clone(), text.to_string());
+        stable
+    };
+    // 阶段二:input + change 事件分发到页面 listener(锁外执行)。
+    let mut js_events = false;
+    for evt in ["input", "change"] {
+        if let Some(reply) = js_dispatch(mgr, pid, &stable, evt).await {
+            apply_js_reply(mgr, pid, &reply).await;
+            js_events = js_events || reply.handled;
+        }
     }
-    tab.form_values.insert(stable.clone(), text.to_string());
     Ok(json!({
         "selector": stable,
         "text": text,
@@ -505,6 +774,7 @@ async fn act_input(mgr: &LsmBrowserManager, pid: &str, params: &Value) -> Engine
         "applied": true,
         "value_after": {"len": text.chars().count(), "matched": true, "head": text.chars().take(40).collect::<String>()},
         "fallbacks": 0,
+        "js_events": js_events,
     }))
 }
 
@@ -527,26 +797,28 @@ async fn act_clear(mgr: &LsmBrowserManager, pid: &str, params: &Value) -> Engine
 async fn act_select_option(mgr: &LsmBrowserManager, pid: &str, params: &Value) -> EngineResult<Value> {
     require_page(pid)?;
     let selector = require_selector(params)?;
-    let mut inner = mgr.inner.lock().await;
-    let tab = inner
-        .tabs
-        .get_mut(pid)
-        .ok_or_else(|| EngineError::page_not_found(pid))?;
-    let doc = Document::parse(&tab.html, &tab.url);
-    let nodes = doc.select(selector).map_err(EngineError::action_failed)?;
-    let node = nodes.get(nth(params)).ok_or_else(|| EngineError::action_failed("select 未命中"))?;
-    let select = if document::tag_name(node) == "select" {
-        node.clone()
-    } else {
-        document::closest_tag(node, "select")
-            .ok_or_else(|| EngineError::action_failed("目标不是 select 且不在 select 内"))?
-    };
-    let select_selector = Document::stable_selector(&select);
-    let options: Vec<_> = select
-        .select("option")
-        .map_err(|_| EngineError::action_failed("非法选择器"))?
-        .into_iter()
-        .collect();
+    // 非 Send 的 DOM 句柄全部收在块内,await 前销毁。
+    let (select_selector, value, idx, label, mode) = {
+        let mut inner = mgr.inner.lock().await;
+        let tab = inner
+            .tabs
+            .get_mut(pid)
+            .ok_or_else(|| EngineError::page_not_found(pid))?;
+        let doc = Document::parse(&tab.html, &tab.url);
+        let nodes = doc.select(selector).map_err(EngineError::action_failed)?;
+        let node = nodes.get(nth(params)).ok_or_else(|| EngineError::action_failed("select 未命中"))?;
+        let select = if document::tag_name(node) == "select" {
+            node.clone()
+        } else {
+            document::closest_tag(node, "select")
+                .ok_or_else(|| EngineError::action_failed("目标不是 select 且不在 select 内"))?
+        };
+        let select_selector = Document::stable_selector(&select);
+        let options: Vec<_> = select
+            .select("option")
+            .map_err(|_| EngineError::action_failed("非法选择器"))?
+            .into_iter()
+            .collect();
     let value_filter = p_str(params, "value").map(str::to_string);
     let values_filter: Vec<String> = params
         .get("values")
@@ -581,14 +853,32 @@ async fn act_select_option(mgr: &LsmBrowserManager, pid: &str, params: &Value) -
         return Err(EngineError::param("select_option 需要 value/values/text/index 之一"));
     }
     let (value, idx, label) = chosen.ok_or_else(|| EngineError::action_failed("没有匹配的 option"))?;
-    tab.form_values.insert(select_selector.clone(), value.clone());
+        tab.form_values.insert(select_selector.clone(), value.clone());
+        let mode = if value_filter.is_some() {
+            "value"
+        } else if text_filter.is_some() {
+            "text"
+        } else if index_filter.is_some() {
+            "index"
+        } else {
+            "value"
+        };
+        (select_selector, value, idx, label, mode)
+    };
+    // 阶段二:change 事件分发到页面 listener。
+    let mut js_events = false;
+    if let Some(reply) = js_dispatch(mgr, pid, &select_selector, "change").await {
+        apply_js_reply(mgr, pid, &reply).await;
+        js_events = reply.handled;
+    }
     Ok(json!({
         "selected": true,
         "selector": select_selector,
         "value": value,
         "text": label,
         "index": idx,
-        "mode": if value_filter.is_some() { "value" } else if text_filter.is_some() { "text" } else if index_filter.is_some() { "index" } else { "value" },
+        "mode": mode,
+        "js_events": js_events,
     }))
 }
 
@@ -646,6 +936,18 @@ async fn act_key_press(
     let timeout = timeout_ms(params, top, 60_000);
     if key.eq_ignore_ascii_case("enter") {
         if let Some((url, method, body)) = resolve_submit(mgr, pid, selector).await? {
+            // 阶段二:submit 事件先分发,preventDefault 可拦截提交(冒泡命中 form listener)。
+            if let Some(dispatch_sel) = selector {
+                if let Some(reply) = js_dispatch(mgr, pid, dispatch_sel, "submit").await {
+                    apply_js_reply(mgr, pid, &reply).await;
+                    if reply.default_prevented {
+                        return Ok(json!({
+                            "key": key, "mode": "keyevent", "submitted": false,
+                            "default_prevented": true,
+                        }));
+                    }
+                }
+            }
             let nav = mgr.submit_form(pid, &url, &method, body, timeout).await?;
             return Ok(json!({
                 "key": key, "mode": "keyevent", "submitted": true,
@@ -674,6 +976,17 @@ async fn act_press_sequence(
     for key in &keys {
         if key.eq_ignore_ascii_case("enter") {
             if let Some((url, method, body)) = resolve_submit(mgr, pid, selector).await? {
+                if let Some(dispatch_sel) = selector {
+                    if let Some(reply) = js_dispatch(mgr, pid, dispatch_sel, "submit").await {
+                        apply_js_reply(mgr, pid, &reply).await;
+                        if reply.default_prevented {
+                            return Ok(json!({
+                                "pressed": true, "keys": keys, "focused": true,
+                                "submitted": false, "default_prevented": true,
+                            }));
+                        }
+                    }
+                }
                 let nav = mgr.submit_form(pid, &url, &method, body, timeout).await?;
                 submitted = true;
                 return Ok(json!({
@@ -827,11 +1140,25 @@ async fn act_dispatch_event(
     }
     if ev == "submit" {
         if let Some((url, method, body)) = resolve_submit(mgr, pid, Some(selector)).await? {
+            if let Some(reply) = js_dispatch(mgr, pid, selector, "submit").await {
+                apply_js_reply(mgr, pid, &reply).await;
+                if reply.default_prevented {
+                    return Ok(json!({"selector": selector, "event": event, "dispatched": true, "default_prevented": true}));
+                }
+            }
             let nav = mgr
                 .submit_form(pid, &url, &method, body, timeout_ms(params, top, 60_000))
                 .await?;
             return Ok(json!({"selector": selector, "event": event, "dispatched": true, "final_url": nav.url}));
         }
+    }
+    // 其余事件类型:优先分发到页面 listener(阶段二),无 listener 时保持记录语义。
+    if let Some(reply) = js_dispatch(mgr, pid, selector, &ev).await {
+        apply_js_reply(mgr, pid, &reply).await;
+        return Ok(json!({
+            "selector": selector, "event": event, "dispatched": true,
+            "js_handled": reply.handled,
+        }));
     }
     Ok(json!({"selector": selector, "event": event, "dispatched": true}))
 }
@@ -984,6 +1311,13 @@ async fn act_eval(
     let await_promise = p_bool(params, "await_promise", false);
     let _ = timeout_ms(params, top, 30_000);
 
+    // 阶段二:优先走页面 JS 线程(持久全局,DOM 修改落回文档);
+    // 线程不可用(LAEW_WEB_SCRIPT=off / 超时)回退阶段一快照桥。
+    if let Some(reply) = js_eval_thread(mgr, pid, &script).await {
+        let pending = apply_js_reply(mgr, pid, &reply).await;
+        return finish_eval(mgr, pid, reply.outcome, pending, await_promise).await;
+    }
+
     let (outcome, pending) = {
         let mut inner = mgr.inner.lock().await;
         let some_tab = inner.tabs.get(pid).cloned();
@@ -1103,6 +1437,17 @@ async fn act_eval(
     };
 
     // 导航/点击动作在锁外执行。
+    finish_eval(mgr, pid, outcome, pending, await_promise).await
+}
+
+/// eval_js 收尾:执行导航类动作并组装响应信封。
+async fn finish_eval(
+    mgr: &LsmBrowserManager,
+    pid: &str,
+    outcome: js::JsOutcome,
+    pending: Vec<js::JsAction>,
+    await_promise: bool,
+) -> EngineResult<Value> {
     let mut applied = 0usize;
     for action in &pending {
         let result: EngineResult<()> = match action.kind.as_str() {
@@ -1138,7 +1483,7 @@ async fn act_eval(
         data["truncate_hint"] = json!("返回值超过 256KB,已截断;可拆分表达式或分页读取");
     }
     if await_promise {
-        data["promise_note"] = json!("阶段一 Boa 不执行异步微任务;await_promise 仅回显参数");
+        data["promise_note"] = json!("阶段二 JS 线程在脚本结束后驱动微任务;已 resolve 的 Promise/await 续体会执行");
     }
     Ok(data)
 }

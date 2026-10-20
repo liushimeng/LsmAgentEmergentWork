@@ -116,13 +116,17 @@
 
 ### Phase 2 — 页面脚本与动态 DOM
 
-- 执行页面内联/外链 `<script>`；事件循环（宏任务/微任务）；
-- DOM/BOM 原生绑定（非快照）：`document`、`window`、`location`、`history`、定时器、`fetch`/XHR；
-- 表单事件、自定义事件、冒泡/捕获；
-- 动态节点变化后重建布局；
-- CSS 级联与计算样式（选择器权重、继承、媒体查询子集）。
+> **第一步已实现**(2026-10):页面脚本执行管线(内联/外链)、每 Tab 持久 JS 线程(Boa)、
+> 事件 listener 与 DOMContentLoaded/load、fetch/XHR 真实请求、虚拟时钟定时器、
+> 动态 DOM 回写与布局重算。设计见 `05-阶段二页面脚本与动态DOM设计.md`。
 
-**验收**：依赖 JS 渲染的常见站点可读取正文与交互。
+- ✅ 执行页面内联/外链 `<script>`；事件循环（宏任务/微任务）——微任务经 run_jobs 驱动(已 resolve 续体可执行),宏任务为虚拟时钟定时器;
+- ✅ DOM/BOM 绑定:往返同步模型(快照注入 + 动作回传 + 宿主应用到真实 DOM),`document`/`window`/`location`/`history`/定时器/`fetch`/XHR 可用;
+- ✅ 表单事件(input/change/submit)、click 事件、preventDefault;冒泡经父链匹配实现,捕获阶段 ⏳;
+- ✅ 动态节点变化后重建布局;
+- ⏳ CSS 级联与计算样式（选择器权重、继承、媒体查询子集）——第二步专项。
+
+**验收**:依赖 JS 渲染的常见站点可读取正文与交互——**已达成**(`tests/web_use_engine.rs` 6 个端到端用例)。
 
 ### Phase 3 — 布局/渲染/窗口
 

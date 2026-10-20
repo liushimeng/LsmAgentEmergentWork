@@ -12,6 +12,7 @@ pub mod js;
 pub mod layout;
 pub mod net;
 pub mod render;
+pub mod script;
 pub mod storage;
 pub mod urlutil;
 
@@ -155,6 +156,8 @@ pub struct TabState {
     pub guard: GuardState,
     pub highlight: bool,
     pub auto_follow: bool,
+    /// 页面 JS 线程句柄(阶段二:持久 Boa Context,导航换页时重建)。
+    pub js: Option<script::JsHandle>,
 }
 
 #[derive(Debug, Clone)]
@@ -299,6 +302,8 @@ impl LsmBrowserManager {
 
     pub async fn shutdown(&self) {
         let mut inner = self.inner.lock().await;
+        let ids: Vec<String> = inner.tabs.keys().cloned().collect();
+        shutdown_js_handles(&inner, &ids);
         inner.tabs.clear();
         inner.windows.clear();
         inner.cookies.clear();
@@ -323,6 +328,14 @@ impl LsmBrowserManager {
 
     pub async fn page_exists(&self, page_id: &str) -> bool {
         self.inner.lock().await.tabs.contains_key(page_id)
+    }
+
+    /// 丢弃失效的 JS 线程句柄(线程超时/退出后由交互层调用)。
+    pub async fn clear_js(&self, page_id: &str) {
+        let mut inner = self.inner.lock().await;
+        if let Some(tab) = inner.tabs.get_mut(page_id) {
+            tab.js = None;
+        }
     }
 
     pub async fn list_pages(&self) -> Vec<PageSummary> {
@@ -424,6 +437,7 @@ impl LsmBrowserManager {
                             error = %err.message,
                             "复用页面导航失败,剔除该页后新建页面"
                         );
+                        shutdown_js_handles(&inner, &[pid.clone()]);
                         inner.tabs.remove(&pid);
                         close_from_windows(&mut inner, &[pid.clone()]);
                         clear_session_if_empty(&mut inner);
@@ -444,10 +458,22 @@ impl LsmBrowserManager {
             ..Default::default()
         };
         let resp = self.fetch_main(&mut inner, &requested, &ua, timeout_ms).await?;
-        let html = resp.text();
+        let raw_html = resp.text();
         let content_type = resp.content_type();
+        let empty_session = HashMap::new();
+        let pipeline = script::run_pipeline(
+            &mut inner,
+            &self.http,
+            &raw_html,
+            &resp.final_url,
+            &ua,
+            (viewport.width, viewport.height),
+            &empty_session,
+        )
+        .await;
+        let html = pipeline.html;
         let doc = document::Document::parse(&html, &resp.final_url);
-        let title = doc.title();
+        let title = pipeline.title.clone().unwrap_or_else(|| doc.title());
         let layout = layout::compute(&doc, viewport.width as f64, &self.font);
         let page_id = format!("p_{:08x}", inner.seq + 1);
         inner.seq += 1;
@@ -500,18 +526,22 @@ impl LsmBrowserManager {
             viewport,
             scroll_x: 0.0,
             scroll_y: 0.0,
-            network: vec![NetworkRecord {
-                url: requested.clone(),
-                method: "GET".to_string(),
-                status: resp.status,
-                content_type: content_type.clone(),
-                bytes: resp.bytes.len(),
-                elapsed_ms: resp.elapsed_ms,
-                redirect: resp.redirect_chain.len() > 1,
-                at_ms: now_ms(),
-            }],
-            console: Vec::new(),
-            form_values: HashMap::new(),
+            network: {
+                let mut recs = vec![NetworkRecord {
+                    url: requested.clone(),
+                    method: "GET".to_string(),
+                    status: resp.status,
+                    content_type: content_type.clone(),
+                    bytes: resp.bytes.len(),
+                    elapsed_ms: resp.elapsed_ms,
+                    redirect: resp.redirect_chain.len() > 1,
+                    at_ms: now_ms(),
+                }];
+                recs.extend(pipeline.network.clone());
+                recs
+            },
+            console: pipeline.console.clone(),
+            form_values: pipeline.form_values.clone(),
             focused: None,
             mouse: None,
             layout,
@@ -526,6 +556,7 @@ impl LsmBrowserManager {
             },
             highlight: false,
             auto_follow: false,
+            js: pipeline.js,
         };
         inner.tabs.insert(page_id.clone(), tab);
         if let Some(w) = inner.windows.iter_mut().find(|w| w.id == window_id) {
@@ -643,15 +674,32 @@ impl LsmBrowserManager {
                         .with_data(json!({"reason": "connection_level", "retryable": true}))
                 })?
         };
-        let html = resp.text();
+        let raw_html = resp.text();
         let content_type = resp.content_type();
-        let doc = document::Document::parse(&html, &resp.final_url);
-        let title = doc.title();
-        let viewport_w = inner
+        // 导航换页:旧 JS 线程全局状态随页面销毁,重建线程。
+        if let Some(tab) = inner.tabs.get_mut(page_id) {
+            if let Some(old) = tab.js.take() {
+                old.shutdown();
+            }
+        }
+        let (viewport_w, viewport_h, session_snapshot) = inner
             .tabs
             .get(page_id)
-            .map(|t| t.viewport.width)
-            .unwrap_or(DEFAULT_VIEWPORT_W);
+            .map(|t| (t.viewport.width, t.viewport.height, t.session_storage.clone()))
+            .unwrap_or((DEFAULT_VIEWPORT_W, DEFAULT_VIEWPORT_H, HashMap::new()));
+        let pipeline = script::run_pipeline(
+            inner,
+            &self.http,
+            &raw_html,
+            &resp.final_url,
+            ua,
+            (viewport_w, viewport_h),
+            &session_snapshot,
+        )
+        .await;
+        let html = pipeline.html;
+        let doc = document::Document::parse(&html, &resp.final_url);
+        let title = pipeline.title.clone().unwrap_or_else(|| doc.title());
         let layout = layout::compute(&doc, viewport_w as f64, &self.font);
         let Some(tab) = inner.tabs.get_mut(page_id) else {
             return Err(EngineError::page_not_found(page_id));
@@ -666,9 +714,14 @@ impl LsmBrowserManager {
         tab.layout = layout;
         tab.scroll_x = 0.0;
         tab.scroll_y = 0.0;
-        tab.form_values.clear();
+        tab.form_values = pipeline.form_values.clone();
         tab.focused = None;
         tab.last_active_ms = now_ms();
+        tab.console = pipeline.console;
+        tab.js = pipeline.js;
+        for rec in pipeline.network {
+            record_network(tab, rec);
+        }
         if push_history {
             tab.history.truncate(tab.history_index + 1);
             tab.history.push(HistoryEntry {
@@ -780,6 +833,7 @@ impl LsmBrowserManager {
         match page_id {
             "all" => {
                 let ids: Vec<String> = inner.tabs.keys().cloned().collect();
+                shutdown_js_handles(&inner, &ids);
                 inner.tabs.clear();
                 inner.windows.clear();
                 inner.cookies.clear();
@@ -796,6 +850,7 @@ impl LsmBrowserManager {
                     .filter(|t| !t.foreground)
                     .map(|t| t.id.clone())
                     .collect();
+                shutdown_js_handles(&inner, &ids);
                 for id in &ids {
                     inner.tabs.remove(id);
                 }
@@ -808,9 +863,11 @@ impl LsmBrowserManager {
             }
             "others" => CloseOutcome::default(),
             id => {
-                let existed = inner.tabs.remove(id).is_some();
+                let existed = inner.tabs.contains_key(id);
                 if existed {
                     let ids = vec![id.to_string()];
+                    shutdown_js_handles(&inner, &ids);
+                    inner.tabs.remove(id);
                     close_from_windows(&mut inner, &ids);
                     clear_session_if_empty(&mut inner);
                     CloseOutcome {
@@ -835,6 +892,7 @@ impl LsmBrowserManager {
             .filter(|id| id.as_str() != keep)
             .cloned()
             .collect();
+        shutdown_js_handles(&inner, &ids);
         for id in &ids {
             inner.tabs.remove(id);
         }
@@ -1238,6 +1296,17 @@ fn close_from_windows(inner: &mut Inner, ids: &[String]) {
         }
     }
     inner.windows.retain(|w| !w.tabs.is_empty());
+}
+
+/// 通知被关闭页面的 JS 线程退出(线程自行收尾,无需等待)。
+fn shutdown_js_handles(inner: &Inner, ids: &[String]) {
+    for id in ids {
+        if let Some(tab) = inner.tabs.get(id) {
+            if let Some(h) = &tab.js {
+                h.shutdown();
+            }
+        }
+    }
 }
 
 fn record_network(tab: &mut TabState, rec: NetworkRecord) {

@@ -91,6 +91,14 @@ impl Document {
         outer_html(&self.root)
     }
 
+    /// 全保真序列化(kuchikiki 内置 serializer,保留全部属性与子树)。
+    ///
+    /// 阶段二动态 DOM 回写专用:脚本注入/修改后的文档必须无损回到 `tab.html`,
+    /// `outer_html` 只重建已知属性集,不满足该要求。
+    pub fn serialize_full(&self) -> String {
+        self.root.to_string()
+    }
+
     pub fn body_html(&self) -> String {
         self.root
             .select_first("body")
@@ -316,52 +324,68 @@ impl Document {
     }
 
     /// 遍历 DOM 生成 JS 桥使用的元素快照。
+    ///
+    /// 阶段二起改为文档序(先根后子)递归遍历,并记录 `parent` 索引供 JS 侧事件冒泡使用。
     pub fn snapshot_nodes(&self) -> Vec<SnapshotNode> {
         let mut out = Vec::new();
-        let mut stack: Vec<(NodeRef, usize)> = self
+        let start = self
             .root
             .select_first("body")
             .ok()
-            .map(|n| vec![(n.as_node().clone(), 0usize)])
-            .unwrap_or_else(|| vec![(self.root.clone(), 0)]);
-        while let Some((node, depth)) = stack.pop() {
-            if depth > 40 || out.len() >= 5000 {
-                continue;
-            }
-            if let Some(el) = node.as_element() {
-                let tag = el.name.local.to_string();
-                if !SKIP_TEXT_TAGS.contains(&tag.as_str()) {
-                    let attrs = common_attrs(&node);
-                    out.push(SnapshotNode {
-                        index: out.len(),
-                        selector: Self::stable_selector(&node),
-                        tag: tag.clone(),
-                        id: attrs.get("id").cloned().unwrap_or_default(),
-                        class: attrs.get("class").cloned().unwrap_or_default(),
-                        name: attrs.get("name").cloned().unwrap_or_default(),
-                        typ: attrs.get("type").cloned().unwrap_or_default(),
-                        value: attrs.get("value").cloned().unwrap_or_default(),
-                        href: attr(&node, "href")
-                            .and_then(|h| urlutil::resolve(&self.base_url, &h))
-                            .unwrap_or_default(),
-                        checked: attr(&node, "checked").is_some(),
-                        text: truncate_chars(&collapse_ws(&node.text_contents()), 4000),
-                        visible: is_visible(&node),
-                        attrs,
-                    });
-                }
-            }
-            for child in node.children() {
-                stack.push((child, depth + 1));
-            }
-        }
+            .map(|n| n.as_node().clone())
+            .unwrap_or_else(|| self.root.clone());
+        snapshot_walk(&start, usize::MAX, 0, &self.base_url, &mut out);
         out
+    }
+}
+
+fn snapshot_walk(
+    node: &NodeRef,
+    parent: usize,
+    depth: usize,
+    base_url: &str,
+    out: &mut Vec<SnapshotNode>,
+) {
+    if depth > 40 || out.len() >= 5000 {
+        return;
+    }
+    let mut child_parent = parent;
+    if let Some(el) = node.as_element() {
+        let tag = el.name.local.to_string();
+        if !SKIP_TEXT_TAGS.contains(&tag.as_str()) {
+            let attrs = common_attrs(node);
+            let idx = out.len();
+            child_parent = idx;
+            out.push(SnapshotNode {
+                index: idx,
+                parent,
+                selector: Document::stable_selector(node),
+                tag: tag.clone(),
+                id: attrs.get("id").cloned().unwrap_or_default(),
+                class: attrs.get("class").cloned().unwrap_or_default(),
+                name: attrs.get("name").cloned().unwrap_or_default(),
+                typ: attrs.get("type").cloned().unwrap_or_default(),
+                value: attrs.get("value").cloned().unwrap_or_default(),
+                href: attr(node, "href")
+                    .and_then(|h| urlutil::resolve(base_url, &h))
+                    .unwrap_or_default(),
+                checked: attr(node, "checked").is_some(),
+                text: truncate_chars(&collapse_ws(&node.text_contents()), 4000),
+                visible: is_visible(node),
+                attrs,
+            });
+        }
+    }
+    for child in node.children() {
+        snapshot_walk(&child, child_parent, depth + 1, base_url, out);
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct SnapshotNode {
     pub index: usize,
+    /// 父元素在快照数组中的索引;`usize::MAX` 表示无父(根)。
+    pub parent: usize,
     pub selector: String,
     pub tag: String,
     pub id: String,
@@ -380,6 +404,7 @@ impl SnapshotNode {
     pub fn to_json(&self) -> Value {
         json!({
             "i": self.index,
+            "parent": self.parent,
             "sel": self.selector,
             "tag": self.tag,
             "id": self.id,
