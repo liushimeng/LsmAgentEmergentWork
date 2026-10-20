@@ -390,30 +390,45 @@ impl LsmBrowserManager {
                     .get(&pid)
                     .map(|t| t.user_agent.clone())
                     .unwrap_or_else(|| user_agent.unwrap_or(DEFAULT_UA).to_string());
-                let nav = self
+                match self
                     .navigate_locked(&mut inner, &pid, &requested, timeout_ms, true, &ua)
-                    .await?;
-                let (window_id, vw, vh) = inner
-                    .tabs
-                    .get(&pid)
-                    .map(|t| (t.window_id.clone(), t.viewport.width, t.viewport.height))
-                    .unwrap_or_default();
-                return Ok(OpenOutcome {
-                    page_id: pid,
-                    title: nav.title,
-                    final_url: nav.url,
-                    request_url: nav.requested_url,
-                    mode: BrowserMode::Hidden.as_str().to_string(),
-                    mode_hint: mode_hint(mode),
-                    reused: true,
-                    status: nav.status,
-                    content_type: nav.content_type,
-                    source_bytes: nav.source_bytes,
-                    redirect_chain: nav.redirect_chain,
-                    window_id,
-                    viewport_width: vw,
-                    viewport_height: vh,
-                });
+                    .await
+                {
+                    Ok(nav) => {
+                        let (window_id, vw, vh) = inner
+                            .tabs
+                            .get(&pid)
+                            .map(|t| (t.window_id.clone(), t.viewport.width, t.viewport.height))
+                            .unwrap_or_default();
+                        return Ok(OpenOutcome {
+                            page_id: pid,
+                            title: nav.title,
+                            final_url: nav.url,
+                            request_url: nav.requested_url,
+                            mode: BrowserMode::Hidden.as_str().to_string(),
+                            mode_hint: mode_hint(mode),
+                            reused: true,
+                            status: nav.status,
+                            content_type: nav.content_type,
+                            source_bytes: nav.source_bytes,
+                            redirect_chain: nav.redirect_chain,
+                            window_id,
+                            viewport_width: vw,
+                            viewport_height: vh,
+                        });
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            page_id = %pid,
+                            url = %requested,
+                            error = %err.message,
+                            "复用页面导航失败,剔除该页后新建页面"
+                        );
+                        inner.tabs.remove(&pid);
+                        close_from_windows(&mut inner, &[pid.clone()]);
+                        clear_session_if_empty(&mut inner);
+                    }
+                }
             }
         }
 
