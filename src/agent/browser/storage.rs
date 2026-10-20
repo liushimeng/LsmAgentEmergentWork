@@ -8,6 +8,48 @@ use std::collections::HashMap;
 
 use super::urlutil;
 
+/// SameSite 属性（阶段四）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SameSite {
+    /// 仅同站请求携带。
+    Strict,
+    /// 同站携带；跨站顶级导航 GET 携带。
+    Lax,
+    /// 所有请求携带（需 Secure）。
+    None,
+}
+
+impl SameSite {
+    /// 从字符串解析（大小写不敏感）。
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "strict" => Some(Self::Strict),
+            "lax" => Some(Self::Lax),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+
+/// 判断请求是否应携带 Cookie（SameSite 检查）。
+///
+/// - `Strict`：仅同站请求携带。
+/// - `Lax`：同站携带；跨站顶级导航 GET 请求携带。
+/// - `None`：所有请求携带（需 Secure）。
+pub fn should_send_cookie(
+    same_site: Option<SameSite>,
+    is_same_site: bool,
+    is_top_level_nav: bool,
+    is_get: bool,
+) -> bool {
+    match same_site {
+        Some(SameSite::Strict) => is_same_site,
+        Some(SameSite::Lax) => is_same_site || (is_top_level_nav && is_get),
+        Some(SameSite::None) => true,
+        None => is_same_site || (is_top_level_nav && is_get), // 默认按 Lax 处理（现代浏览器行为）
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cookie {
     pub name: String,
@@ -78,14 +120,31 @@ impl CookieJar {
         }
     }
 
-    /// 构造请求头 `Cookie: a=b; c=d`。
+    /// 构造请求头 `Cookie: a=b; c=d`（同站请求）。
+    ///
+    /// 同站请求默认发送所有匹配的 Cookie（domain/path/secure）。
+    /// 跨站请求请用 [`Self::header_for_cross_site`]。
     pub fn header_for(&self, url: &str) -> Option<String> {
+        self.header_for_cross_site(url, true, true)
+    }
+
+    /// 构造请求头（支持 SameSite 跨站检查）。
+    ///
+    /// - `is_same_site`：是否同站请求。
+    /// - `is_top_level_nav`：是否顶级导航（影响 Lax 判断）。
+    pub fn header_for_cross_site(
+        &self,
+        url: &str,
+        is_same_site: bool,
+        is_top_level_nav: bool,
+    ) -> Option<String> {
         let host = urlutil::host_of(url)?;
         let path = url::Url::parse(url)
             .ok()
             .map(|u| u.path().to_string())
             .unwrap_or_else(|| "/".to_string());
         let secure = url.starts_with("https://");
+        let is_get = true; // 简化：GET 请求
         let mut parts = Vec::new();
         for c in &self.cookies {
             if !domain_matches(&host, &c.domain, c.host_only) {
@@ -95,6 +154,11 @@ impl CookieJar {
                 continue;
             }
             if c.secure && !secure {
+                continue;
+            }
+            // SameSite 检查（阶段四）
+            let ss = c.same_site.as_deref().and_then(SameSite::from_str);
+            if !should_send_cookie(ss, is_same_site, is_top_level_nav, is_get) {
                 continue;
             }
             parts.push(format!("{}={}", c.name, c.value));
@@ -291,5 +355,74 @@ mod tests {
         jar.set_explicit("x", "1", None, None, "https://a.test/");
         jar.delete("x", None);
         assert!(jar.header_for("https://a.test/").is_none());
+    }
+
+    #[test]
+    fn samesite_strict_同站携带() {
+        assert!(should_send_cookie(
+            Some(SameSite::Strict),
+            true,
+            true,
+            true
+        ));
+        assert!(!should_send_cookie(
+            Some(SameSite::Strict),
+            false,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn samesite_lax_顶级导航get携带() {
+        assert!(should_send_cookie(
+            Some(SameSite::Lax),
+            false,
+            true,
+            true
+        ));
+        assert!(!should_send_cookie(
+            Some(SameSite::Lax),
+            false,
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn samesite_none_所有请求携带() {
+        assert!(should_send_cookie(
+            Some(SameSite::None),
+            false,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn samesite_默认lax行为() {
+        // 无 SameSite 属性：默认 Lax
+        assert!(should_send_cookie(None, false, true, true));
+        assert!(!should_send_cookie(None, false, false, true));
+    }
+
+    #[test]
+    fn samesite_strict_跨站iframe不携带() {
+        assert!(!should_send_cookie(
+            Some(SameSite::Strict),
+            false,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn samesite_lax_跨站post不携带() {
+        assert!(!should_send_cookie(
+            Some(SameSite::Lax),
+            false,
+            false,
+            false
+        ));
     }
 }

@@ -6,6 +6,7 @@
 //! 设计见 `docs/自定义浏览器和V8引擎/`。
 
 pub mod api;
+pub mod cache;
 pub mod document;
 pub mod images;
 pub mod inspect;
@@ -13,8 +14,10 @@ pub mod js;
 pub mod layout;
 pub mod net;
 pub mod render;
+pub mod resource;
 pub mod resources;
 pub mod script;
+pub mod security;
 pub mod storage;
 pub mod style;
 pub mod urlutil;
