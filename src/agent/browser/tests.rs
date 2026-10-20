@@ -258,3 +258,136 @@ fn cors_跨域校验判定() {
         CorsResult::SameOrigin
     ));
 }
+
+// ===================== inspect 诊断能力(第 174 轮) =====================
+
+#[tokio::test]
+async fn 页面文本与健康度可观测() {
+    let mgr = LsmBrowserManager::new();
+    let url = html_doc("<h1>标题文字</h1><p>正文段落</p>");
+    let out = mgr
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .await
+        .unwrap();
+    let text = inspect::inspect(&mgr, &out.page_id, "text", &serde_json::json!({}))
+        .await
+        .unwrap();
+    let body = text["text"].as_str().unwrap_or("");
+    assert!(body.contains("标题文字"), "text={body}");
+    assert!(body.contains("正文段落"), "text={body}");
+    assert_eq!(text["source"], "layout");
+
+    let health = inspect::inspect(&mgr, &out.page_id, "page_health", &serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(health["blank_page"], false);
+    assert!(health["visible_text_chars"].as_u64().unwrap_or(0) > 0, "{health}");
+    mgr.shutdown().await;
+}
+
+#[tokio::test]
+async fn 空白页健康度给出可执行结论() {
+    let mgr = LsmBrowserManager::new();
+    let url = html_doc("");
+    let out = mgr
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .await
+        .unwrap();
+    let health = inspect::inspect(&mgr, &out.page_id, "page_health", &serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(health["blank_page"], true);
+    assert!(health["diagnosis"].as_str().unwrap_or("").len() > 4, "{health}");
+    assert!(health["hint"].as_str().unwrap_or("").len() > 4, "{health}");
+    mgr.shutdown().await;
+}
+
+#[tokio::test]
+async fn 被祖先隐藏的元素不再自报可见() {
+    // 此前 visible 只看元素自身样式:祖先 display:none 时仍报 visible=true
+    // 却给不出矩形,Agent 会把隐藏控件当成可交互目标。
+    let mgr = LsmBrowserManager::new();
+    let url = html_doc("<div style='display:none'><input id='box'></div>");
+    let out = mgr
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .await
+        .unwrap();
+    let v = inspect::inspect(&mgr, &out.page_id, "elements", &serde_json::json!({"selector": "#box"}))
+        .await
+        .unwrap();
+    assert_eq!(v["visible"], false, "{v}");
+    assert_eq!(v["rect"]["laid_out"], false, "{v}");
+    assert_eq!(v["render_blocked_by"], "ancestor_display_none", "{v}");
+    mgr.shutdown().await;
+}
+
+#[tokio::test]
+async fn 行内元素矩形不再恒为零() {
+    let mgr = LsmBrowserManager::new();
+    let url = html_doc("<div><input id='box' style='width:200px;height:30px'></div>");
+    let out = mgr
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .await
+        .unwrap();
+    let v = inspect::inspect(&mgr, &out.page_id, "elements", &serde_json::json!({"selector": "#box"}))
+        .await
+        .unwrap();
+    assert_eq!(v["visible"], true, "{v}");
+    assert_eq!(v["rect"]["laid_out"], true, "{v}");
+    assert_eq!(v["rect"]["width"], 200.0, "{v}");
+    assert_eq!(v["rect"]["height"], 30.0, "{v}");
+    mgr.shutdown().await;
+}
+
+#[tokio::test]
+async fn 截图尊重_output_path_别名() {
+    use serde_json::json;
+    let mgr = LsmBrowserManager::new();
+    let url = html_doc("<p>截图</p>");
+    let out = mgr
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .await
+        .unwrap();
+    let dir = std::env::temp_dir().join(format!("laew_shot_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let target = dir.join("shot.png");
+    let v = api::control(
+        &mgr,
+        Some(&out.page_id),
+        "screenshot",
+        &json!({"output_path": target.to_string_lossy()}),
+        &json!({}),
+    )
+    .await
+    .unwrap();
+    let saved = v["save_path"].as_str().unwrap_or("");
+    assert_eq!(saved, target.to_string_lossy(), "{v}");
+    assert!(target.exists(), "截图应落到指定路径:{saved}");
+    let _ = std::fs::remove_file(&target);
+    let _ = std::fs::remove_dir(&dir);
+    mgr.shutdown().await;
+}
+
+#[tokio::test]
+async fn extract_未声明字段时自动抽取文本() {
+    let mgr = LsmBrowserManager::new();
+    let url = html_doc("<ul><li>甲条目</li><li>乙条目</li></ul>");
+    let out = mgr
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .await
+        .unwrap();
+    let v = inspect::inspect(
+        &mgr,
+        &out.page_id,
+        "extract",
+        &serde_json::json!({"item_selector": "li"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["auto_fields"], true, "{v}");
+    let items = v["items"].as_array().cloned().unwrap_or_default();
+    assert_eq!(items.len(), 2, "{v}");
+    // 此前未声明 fields 时每条 item 都是空对象 {}。
+    assert!(items[0]["text"].as_str().unwrap_or("").contains("甲条目"), "{v}");
+    mgr.shutdown().await;
+}

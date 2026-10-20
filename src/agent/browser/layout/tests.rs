@@ -658,3 +658,81 @@ fn flex_图片条目按固有宽度排布() {
     assert!((b.w - 80.0).abs() < 1.0, "b.w={}", b.w);
     assert!((b.x - (a.x + 100.0)).abs() < 1.0);
 }
+
+// ===================== 行内盒与尺寸(第 174 轮) =====================
+
+#[test]
+fn 行内元素自身建盒_不再恒零尺寸() {
+    // 真实站点的输入框就是这样挂在 div 下:此前行内元素自身永远拿不到盒子,
+    // inspect(elements) 的 rect 恒 0×0,坐标点击被当成"点 (0,0)"。
+    let doc = Document::parse(
+        "<body><div><input id=a></div><div><span><button id=b>搜</button></span></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let a = layout.rect_for("#a").expect("input 应有布局盒");
+    assert!(a.2 > 0.0 && a.3 > 0.0, "input rect={a:?}");
+    let b = layout.rect_for("#b").expect("button 应有布局盒");
+    assert!(b.2 > 0.0 && b.3 > 0.0, "button rect={b:?}");
+}
+
+#[test]
+fn 行内盒尊重显式宽高() {
+    let doc = Document::parse(
+        "<body><div><input id=a style='width:329px;height:38px'></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let a = layout.rect_for("#a").unwrap();
+    assert!((a.2 - 329.0).abs() < 1.0, "w={}", a.2);
+    assert!((a.3 - 38.0).abs() < 1.0, "h={}", a.3);
+}
+
+#[test]
+fn inline_block_作为原子内联盒建盒() {
+    let doc = Document::parse(
+        "<body><div><span id=a style='display:inline-block;width:60px;height:20px'>x</span></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let a = layout.rect_for("#a").expect("inline-block 应有布局盒");
+    assert!((a.2 - 60.0).abs() < 1.0, "w={}", a.2);
+    assert!((a.3 - 20.0).abs() < 1.0, "h={}", a.3);
+}
+
+#[test]
+fn 百分比宽度按父内容宽求解() {
+    // 此前百分比一律按视口宽解析:`width:50%` 在 400px 的容器里也算成 400。
+    let doc = Document::parse(
+        "<body><div style='width:400px'><div id=a style='width:50%'>x</div></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let a = layout.rect_for("#a").unwrap();
+    assert!((a.2 - 200.0).abs() < 1.0, "w={} (应为父内容宽 400 的一半)", a.2);
+}
+
+#[test]
+fn 显式高度参与占位() {
+    let doc = Document::parse(
+        "<body><div id=a style='height:300px'>x</div><p id=b>after</p></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let a = layout.rect_for("#a").unwrap();
+    let b = layout.rect_for("#b").unwrap();
+    assert!((a.3 - 300.0).abs() < 2.0, "h={}", a.3);
+    assert!(b.1 > a.1 + 250.0, "后续块应按声明高度下移: a.y={} b.y={}", a.1, b.1);
+}
+
+#[test]
+fn 无盒元素不与零尺寸元素混淆() {
+    // 被祖先 display:none 剪枝的元素没有布局盒(rect_for=None),
+    // 与"有盒子但宽高为 0"必须能区分(inspect 侧用 laid_out 表达)。
+    let doc = Document::parse(
+        "<body><div style='display:none'><input id=a></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    assert!(layout.rect_for("#a").is_none(), "被剪枝元素不应有布局盒");
+}

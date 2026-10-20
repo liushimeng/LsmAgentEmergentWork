@@ -5,7 +5,8 @@
 //! 重新序列化回 `tab.html`。设计见 `docs/自定义浏览器和V8引擎/05-阶段二页面脚本与动态DOM设计.md`。
 
 pub mod dom_ops;
-mod prelude;
+pub mod env_js;
+pub mod prelude;
 pub mod runtime;
 
 #[cfg(test)]
@@ -173,7 +174,15 @@ pub struct PipelineOut {
     pub form_values: HashMap<String, String>,
 }
 
-const MAX_ROUNDS: usize = 3;
+/// 脚本管线轮次上限。
+///
+/// 每一轮把"上一轮注入的 `<script>`"取回并执行;AMD 装载器会连续注入多个模块
+/// 脚本(每个模块一轮),3 轮远远不够,页面 widget 层会卡在"等模块"状态。
+/// 轮次本身很便宜(`collect_scripts` 按内容指纹去重,已执行过的脚本不再取回),
+/// 配合墙钟预算即可。
+const MAX_ROUNDS: usize = 24;
+/// 整条脚本管线的墙钟预算(毫秒)。
+const PIPELINE_BUDGET_MS: u64 = 20_000;
 const MAX_EXTERNAL_BYTES: usize = 2 * 1024 * 1024;
 const SCRIPT_FETCH_TIMEOUT_MS: u64 = 15_000;
 
@@ -200,11 +209,20 @@ pub(crate) async fn run_pipeline(
     }
     let mut executed = std::collections::HashSet::new();
     let mut handle: Option<JsHandle> = None;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(PIPELINE_BUDGET_MS);
     let title_now = {
         let doc = super::document::Document::parse(raw_html, base_url);
         doc.title()
     };
     for round in 0..MAX_ROUNDS {
+        if std::time::Instant::now() >= deadline {
+            out.console.push(super::ConsoleRecord {
+                level: "warn".to_string(),
+                text: format!("脚本管线达到墙钟预算({PIPELINE_BUDGET_MS}ms),已停止继续取回模块"),
+                at_ms: super::now_ms(),
+            });
+            break;
+        }
         let collected = {
             // Document(NodeRef)非 Send,收集完立即销毁,不跨 await 存活。
             let doc = super::document::Document::parse(&out.html, base_url);

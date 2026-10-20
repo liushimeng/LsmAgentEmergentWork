@@ -225,11 +225,13 @@ mod tests {
             max_age: Some(3600),
             ..Default::default()
         };
-        let exp = p.expires_at_ms().unwrap();
+        // 先取基准时刻再算过期时刻:反过来会把两次调用之间的耗时算进差值,
+        // 让 `exp - now` 恒小于 max_age(原断言是恒失败的,只是偶尔同毫秒侥幸通过)。
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis();
+        let exp = p.expires_at_ms().unwrap();
         assert!(exp > now);
         assert!(exp - now >= 3600 * 1000);
     }

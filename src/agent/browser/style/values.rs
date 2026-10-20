@@ -30,6 +30,14 @@ pub struct ComputedStyle {
     pub width: Option<f64>,
     pub max_width: Option<f64>,
     pub height: Option<f64>,
+    /// `width` 的百分比原值(`50%` → 50.0);布局层按父内容宽二次求解。
+    ///
+    /// 样式层无法得知父盒尺寸,故百分比在此单独留痕,由布局层按真实包含块解析
+    /// (见 `layout/mod.rs` 的百分比宽度分支)。`width` 字段此时仍是按视口宽的
+    /// 粗估值,布局层以本字段优先。
+    pub width_percent: Option<f64>,
+    /// `height` 的百分比原值;父高未知时按 `auto` 处理(见布局层)。
+    pub height_percent: Option<f64>,
     pub opacity: f64,
     /// 定位体系(阶段三):position/inset/z-index,全部非继承。
     pub pos: PositionStyle,
@@ -282,6 +290,8 @@ impl Default for ComputedStyle {
             width: None,
             max_width: None,
             height: None,
+            width_percent: None,
+            height_percent: None,
             opacity: 1.0,
             pos: PositionStyle::default(),
             flex: FlexContainerStyle::default(),
@@ -746,7 +756,10 @@ pub fn apply_declaration(
                 }
             }
         }
-        "width" => st.width = parse_length(value, st.font_size, ctx).filter(|v| *v > 0.0),
+        "width" => {
+            st.width_percent = parse_percent(value);
+            st.width = parse_length(value, st.font_size, ctx).filter(|v| *v > 0.0);
+        }
         "max-width" => {
             if value.eq_ignore_ascii_case("none") {
                 st.max_width = None;
@@ -754,7 +767,16 @@ pub fn apply_declaration(
                 st.max_width = parse_length(value, st.font_size, ctx).filter(|v| *v > 0.0);
             }
         }
-        "height" => st.height = parse_length(value, st.font_size, ctx).filter(|v| *v > 0.0),
+        "height" => {
+            st.height_percent = parse_percent(value);
+            // 百分比高度的粗估值按视口宽算没有意义(视口宽≠高),交给布局层按父高求解;
+            // 父高未知时按 `auto` 处理。
+            st.height = if st.height_percent.is_some() {
+                None
+            } else {
+                parse_length(value, st.font_size, ctx).filter(|v| *v > 0.0)
+            };
+        }
         "opacity" => {
             if let Ok(v) = value.parse::<f64>() {
                 st.opacity = v.clamp(0.0, 1.0);
@@ -1105,6 +1127,16 @@ fn normalize_display(value: &str) -> String {
 }
 
 // ===================== 长度 / 字号 / 行高 =====================
+
+/// 解析百分比原值(`50%` → 50.0);非百分比/无法识别返回 `None`。
+///
+/// 百分比长度的最终值依赖包含块尺寸,样式层无从得知,故单独留痕交布局层求解。
+pub fn parse_percent(value: &str) -> Option<f64> {
+    let v = value.trim();
+    v.strip_suffix('%')
+        .and_then(|n| n.trim().parse::<f64>().ok())
+        .filter(|n| n.is_finite())
+}
 
 /// 解析长度。`auto`/无法识别返回 `None`。
 pub fn parse_length(value: &str, font_size: f64, ctx: &ValueCtx) -> Option<f64> {

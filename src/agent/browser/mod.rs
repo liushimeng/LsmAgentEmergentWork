@@ -1234,14 +1234,30 @@ impl LsmBrowserManager {
         let full_page = params.get("full_page").and_then(Value::as_bool).unwrap_or(false);
         let ocr = params.get("ocr").and_then(Value::as_bool).unwrap_or(false);
         if ocr {
-            let doc = document::Document::parse(&tab.html, &tab.url);
-            let text = doc.text();
+            // OCR 语义 = "截图里能看到的文字":优先取布局产出的文本行;
+            // 布局无文本(内容被 display:none 剪枝或由 JS 生成)时回退到 DOM 文本。
+            let layout_text = tab
+                .layout
+                .lines
+                .iter()
+                .filter(|l| l.visible)
+                .map(|l| l.text.trim())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let (text, source) = if layout_text.trim().is_empty() {
+                let doc = document::Document::parse(&tab.html, &tab.url);
+                (document::collapse_ws(&doc.text()), "dom_text")
+            } else {
+                (layout_text, "lsm_layout_text")
+            };
             let blocks: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
             return Ok(json!({
                 "ocr_text": text,
                 "ocr_block_count": blocks.len(),
-                "ocr_source": "lsm_layout_text",
-                "note": "阶段一 OCR 返回内核可见文本;真实像素 OCR 在阶段五接入",
+                "ocr_source": source,
+                "note": "阶段一 OCR 返回内核可见文本;真实像素 OCR 在阶段五接入。\
+                         ocr_source=dom_text 表示布局层没有可见文本(内容被 display:none 剪枝或由页面脚本生成)",
             }));
         }
         // 阶段四第二步：clip 区域截图（文档坐标；full_page=false 时 y 相对视口）。
@@ -1286,10 +1302,12 @@ impl LsmBrowserManager {
         if png.is_empty() {
             return Err(EngineError::new(3001, "渲染失败(无法编码 PNG)"));
         }
-        let save_path = params
-            .get("save_path")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
+        // 落盘路径:`save_path` 为契约名,`output_path`/`path` 为常见别名
+        // (LLM 常按直觉写别名,静默忽略会让 Agent 找不到自己要的截图)。
+        let save_path = ["save_path", "output_path", "path"]
+            .iter()
+            .find_map(|k| params.get(*k).and_then(Value::as_str))
+            .filter(|s| !s.trim().is_empty())
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
                 let dir = artifact_root::artifact_dir("web_screenshots");

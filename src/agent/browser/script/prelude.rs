@@ -5,7 +5,7 @@
 //! `docs/自定义浏览器和V8引擎/05-阶段二页面脚本与动态DOM设计.md` 第四节。
 
 /// 原生函数由 Rust 注册(`__lsmFetchNative`/`atob`/`btoa`),此处只做 JS 侧装配。
-pub const PRELUDE: &str = r##"
+const PRELUDE_BODY: &str = r##"
 var __lsmNodes = [];
 var __lsmMeta = {};
 var __lsmActions = [];
@@ -20,6 +20,8 @@ var __lsmCookie = "";
 var __lsmWriteBuf = [];
 var __lsmListeners = [];
 var __lsmTimers = [];
+// 动态插入的 <script> 的 load/error 回调(AMD 装载器靠它推进模块解析)。
+var __lsmScriptCbs = {};
 var __lsmTimerSeq = 0;
 var __lsmNow = 0;
 var __lsmTimerRan = 0;
@@ -57,63 +59,6 @@ function __lsmRefresh(nodes, meta) {
   document.readyState = "loading";
 }
 
-function __matchSimple(n, s) {
-  s = String(s || "").trim();
-  if (!s) return false;
-  var tag = (s.match(/^([a-zA-Z0-9*_-]+)/) || [])[1] || "";
-  if (tag && tag !== "*" && tag.toLowerCase() !== String(n.tag || "").toLowerCase()) return false;
-  var ids = s.match(/#([A-Za-z0-9_-]+)/g) || [];
-  for (var i = 0; i < ids.length; i++) {
-    if (String(n.id || "") !== ids[i].slice(1)) return false;
-  }
-  var classes = String(n.class || "").split(/\s+/);
-  var cls = s.match(/\.([A-Za-z0-9_-]+)/g) || [];
-  for (var j = 0; j < cls.length; j++) {
-    if (classes.indexOf(cls[j].slice(1)) < 0) return false;
-  }
-  var attrs = s.match(/\[([^\]]+)\]/g) || [];
-  for (var k = 0; k < attrs.length; k++) {
-    var expr = attrs[k].slice(1, -1);
-    var eq = expr.indexOf("=");
-    if (eq >= 0) {
-      var key = expr.slice(0, eq).trim();
-      var val = expr.slice(eq + 1).trim().replace(/^["']|["']$/g, "");
-      if (String((n.attrs || {})[key]) !== val) return false;
-    } else {
-      if (!Object.prototype.hasOwnProperty.call(n.attrs || {}, expr.trim())) return false;
-    }
-  }
-  return true;
-}
-function __match(n, s) {
-  s = String(s || "").trim();
-  if (!s) return false;
-  var parts = s.split(",");
-  for (var i = 0; i < parts.length; i++) {
-    var sel = parts[i].trim();
-    var tokens = sel.split(/\s+/).filter(function (x) { return x && x !== ">"; });
-    var right = tokens.length ? tokens[tokens.length - 1] : sel;
-    if (__matchSimple(n, right)) return true;
-  }
-  return false;
-}
-function __query(sel) {
-  var out = [];
-  for (var i = 0; i < __lsmNodes.length; i++) {
-    if (__match(__lsmNodes[i], sel)) out.push(__mk(__lsmNodes[i]));
-  }
-  return out;
-}
-function __queryOne(sel) {
-  var all = __query(sel);
-  return all.length ? all[0] : null;
-}
-function __findBySel(sel) {
-  for (var i = 0; i < __lsmNodes.length; i++) {
-    if (__lsmNodes[i].sel === sel || __match(__lsmNodes[i], sel)) return __lsmNodes[i];
-  }
-  return null;
-}
 function __ancestorChain(idx) {
   var chain = [];
   var cur = idx;
@@ -195,6 +140,34 @@ function __mkStyle(getCss, setCss) {
   });
 }
 
+// ---------- 动态脚本的 load 事件 ----------
+// 站点用 `document.createElement("script")` 插脚本后,靠脚本元素的 onload
+// 回调推进后续逻辑(AMD 装载器全部依赖这个信号)。宿主执行完外链脚本后会
+// 调用 `__lsmFireScriptLoad(src_url)` 触发对应回调。
+function __lsmRegisterScriptLoad(el) {
+  if (!el || !el.__attrs) return;
+  var url = String(el.__attrs.src || "");
+  if (!url) return;
+  if (!__lsmScriptCbs[url]) __lsmScriptCbs[url] = [];
+  __lsmScriptCbs[url].push(el);
+}
+function __lsmFireScriptLoad(url) {
+  var key = String(url == null ? "" : url);
+  var list = __lsmScriptCbs[key];
+  if (!list || !list.length) return;
+  delete __lsmScriptCbs[key];
+  for (var i = 0; i < list.length; i++) {
+    var el = list[i];
+    try { el.readyState = "complete"; } catch (e) {}
+    try {
+      if (typeof el.onreadystatechange === "function") el.onreadystatechange({ type: "readystatechange", target: el });
+    } catch (e) { __cerror("script onreadystatechange 失败: " + String((e && e.stack) || e)); }
+    try {
+      if (typeof el.onload === "function") el.onload({ type: "load", target: el });
+    } catch (e) { __cerror("script onload 失败: " + String((e && e.stack) || e)); }
+  }
+}
+
 // ---------- 元素工厂 ----------
 function __mk(n) {
   var attrs = n.attrs || {};
@@ -208,6 +181,8 @@ function __mk(n) {
     className: n.class || "",
     name: n.name || "",
     type: n.type || "",
+    title: attrs.title || "",
+    alt: attrs.alt || "",
     textContent: n.text || "",
     innerText: n.text || "",
     checked: !!n.checked,
@@ -260,14 +235,20 @@ function __mk(n) {
     },
     scrollIntoView: function () { __push({ type: "scroll_to", selector: n.sel }); },
     scrollTo: function (x, y) { __push({ type: "scroll", value: String(y || 0) }); },
-    querySelector: function (s) { return __queryOne(s); },
-    querySelectorAll: function (s) { return __query(s); },
+    querySelector: function (s) { return __lsmQueryOne(s, n.i); },
+    querySelectorAll: function (s) { return __lsmQuery(s, n.i); },
     appendChild: function (c) {
+      try { __lsmRegisterScriptLoad(c); } catch (e) {}
       if (c && c.__detached) __push({ type: "append_html", selector: n.sel, value: __serEl(c) });
+      else if (c && c.__lsm_node) __push({ type: "append_html", selector: n.sel, value: String((c.__lsm_node && c.__lsm_node.text) || "") });
       return c;
     },
-    insertBefore: function (c) {
-      if (c && c.__detached) __push({ type: "insert_html", selector: n.sel, value: __serEl(c) });
+    insertBefore: function (c, ref) {
+      try { __lsmRegisterScriptLoad(c); } catch (e) {}
+      var html = "";
+      try { html = (c && c.__detached) ? __serEl(c) : String((c && c.__lsm_node && c.__lsm_node.text) || ""); }
+      catch (e) { html = ""; }
+      __push({ type: "insert_html", selector: n.sel, value: html });
       return c;
     },
     removeChild: function (c) {
@@ -307,6 +288,28 @@ function __mk(n) {
     __lsmChecked[key] = !!v;
     __push({ type: "set_checked", selector: n.sel, value: v ? "true" : "false" });
   });
+  // 真实的父子关系:站点脚本常走 `el.parentNode.insertBefore(...)` 这类路径,
+  // 此前 parentNode 恒为 null、children 恒为空,脚本当场抛异常。
+  define("parentNode", function () {
+    var p = n.parent;
+    if (p == null || p < 0 || p >= __lsmNodes.length) return null;
+    var pn = __lsmNodes[p];
+    return pn ? __mk(pn) : null;
+  }, function (v) {});
+  define("parentElement", function () { return el.parentNode; }, function (v) {});
+  define("children", function () {
+    var out = [];
+    for (var i = 0; i < __lsmNodes.length; i++) {
+      if (__lsmNodes[i].parent === n.i) out.push(__mk(__lsmNodes[i]));
+    }
+    return out;
+  }, function (v) {});
+  define("childNodes", function () { return el.children; }, function (v) {});
+  define("firstChild", function () { return el.children.length ? el.children[0] : null; }, function (v) {});
+  define("lastChild", function () {
+    var c = el.children;
+    return c.length ? c[c.length - 1] : null;
+  }, function (v) {});
   define("textContent", function () {
     return Object.prototype.hasOwnProperty.call(__lsmText, key) ? __lsmText[key] : (n.text || "");
   }, function (v) {
@@ -366,8 +369,16 @@ function __newEl(tag) {
     getAttribute: function (k) { return Object.prototype.hasOwnProperty.call(this.__attrs, String(k)) ? this.__attrs[String(k)] : null; },
     hasAttribute: function (k) { return Object.prototype.hasOwnProperty.call(this.__attrs, String(k)); },
     removeAttribute: function (k) { delete this.__attrs[String(k)]; },
-    appendChild: function (c) { this.__kids.push(c); return c; },
-    insertBefore: function (c) { this.__kids.push(c); return c; },
+    appendChild: function (c) {
+      this.__kids.push(c);
+      try { __lsmRegisterScriptLoad(c); } catch (e) {}
+      return c;
+    },
+    insertBefore: function (c) {
+      this.__kids.push(c);
+      try { __lsmRegisterScriptLoad(c); } catch (e) {}
+      return c;
+    },
     removeChild: function (c) {
       var i = this.__kids.indexOf(c);
       if (i >= 0) this.__kids.splice(i, 1);
@@ -387,6 +398,13 @@ function __newEl(tag) {
   function def(name, getter, setter) {
     try { Object.defineProperty(el, name, { get: getter, set: setter, configurable: true, enumerable: true }); } catch (e) {}
   }
+  // 反射属性:站点用 `document.createElement("script").src = url` 动态插脚本,
+  // 属性必须真正落到 __attrs 上,否则序列化出来的标签是空的,宿主取不到脚本。
+  ["src", "href", "type", "rel", "media", "title", "alt", "charset", "name", "value",
+   "id", "class", "content", "async", "defer"].forEach(function (p) {
+    def(p, function () { return el.__attrs[p] == null ? "" : String(el.__attrs[p]); },
+      function (v) { el.__attrs[p] = String(v); });
+  });
   def("innerHTML", function () { return __serEl({ __tag: t, __attrs: {}, __kids: el.__kids, __text: "" }); },
     function (v) {
       el.__kids = [];
@@ -413,15 +431,15 @@ var document = {
   location: null,
   characterSet: "UTF-8",
   contentType: "text/html",
-  querySelector: __queryOne,
-  querySelectorAll: __query,
-  getElementById: function (id) { return __queryOne("#" + id); },
+  querySelector: __lsmQueryOne,
+  querySelectorAll: __lsmQuery,
+  getElementById: function (id) { return __lsmQueryOne("#" + id); },
   getElementsByTagName: function (t) {
-    if (t === "*") return __query("*");
-    return __query(String(t));
+    if (t === "*") return __lsmQuery("*");
+    return __lsmQuery(String(t));
   },
-  getElementsByClassName: function (c) { return __query("." + String(c)); },
-  getElementsByName: function (n) { return __query("[name=" + n + "]"); },
+  getElementsByClassName: function (c) { return __lsmQuery("." + String(c)); },
+  getElementsByName: function (n) { return __lsmQuery("[name=" + n + "]"); },
   createElement: function (tag) { return __newEl(tag); },
   createTextNode: function (t) { return { nodeType: 3, textContent: String(t), data: String(t) }; },
   createDocumentFragment: function () {
@@ -451,10 +469,10 @@ function __rebindDocNodes() {
   document.documentElement = __doc_nodes.filter(function (n) { return String(n.tag).toLowerCase() === "html"; }).map(__mk)[0] || null;
   document.head = __doc_nodes.filter(function (n) { return String(n.tag).toLowerCase() === "head"; }).map(__mk)[0] || null;
   document.body = __doc_nodes.filter(function (n) { return String(n.tag).toLowerCase() === "body"; }).map(__mk)[0] || null;
-  document.forms = __query("form");
-  document.links = __query("a[href]");
-  document.images = __query("img");
-  document.scripts = __query("script");
+  document.forms = __lsmQuery("form");
+  document.links = __lsmQuery("a[href]");
+  document.images = __lsmQuery("img");
+  document.scripts = __lsmQuery("script");
 }
 try {
   Object.defineProperty(document, "cookie", {
@@ -784,7 +802,10 @@ function __evalMedia(query) {
 }
 
 // ---------- window ----------
-var window = {
+// window 必须是"全局对象的门面":站点脚本普遍用 `window.foo = fn` 定义全局函数
+// (百度地图的 `alog` 即是如此)。若 window 只是普通对象,`window.alog` 不会成为
+// 全局标识符,裸 `alog` 调用直接 ReferenceError,页面初始化中断、UI 永远建不出来。
+var __lsmWin = {
   document: document, location: location, navigator: navigator, screen: screen, history: history,
   localStorage: localStorage, sessionStorage: sessionStorage, console: console,
   innerWidth: 1280, innerHeight: 720, outerWidth: 1280, outerHeight: 720,
@@ -849,6 +870,24 @@ var window = {
     getEntriesByType: function () { return []; }
   }
 };
+var window = __lsmWin;
+if (typeof Proxy === "function") {
+  window = new Proxy(__lsmWin, {
+    get: function (t, k) {
+      if (k in t) return t[k];
+      if (typeof globalThis !== "undefined" && k in globalThis) return globalThis[k];
+      return undefined;
+    },
+    set: function (t, k, v) {
+      try { t[k] = v; } catch (e) {}
+      // 同步为全局标识符:`window.foo = fn` 之后裸 `foo` 必须可见。
+      try {
+        if (typeof globalThis !== "undefined" && !(k in globalThis)) globalThis[k] = v;
+      } catch (e) {}
+      return true;
+    }
+  });
+}
 var getComputedStyle = function (el) { return window.getComputedStyle(el); };
 var matchMedia = function (q) { return window.matchMedia(q); };
 window.self = window; window.top = window; window.parent = window; window.frames = window;
@@ -860,6 +899,20 @@ try {
     configurable: true
   });
 } catch (e) {}
+// 把 window 的能力同步到全局对象(裸 `performance` / `innerWidth` 等全局标识符)。
+(function () {
+  if (typeof globalThis === "undefined") return;
+  var keys = Object.getOwnPropertyNames(__lsmWin);
+  for (var i = 0; i < keys.length; i++) {
+    var k = keys[i];
+    if (k === "window" || k === "self" || k === "top" || k === "parent" || k === "frames") continue;
+    try {
+      if (!(k in globalThis)) {
+        Object.defineProperty(globalThis, k, Object.getOwnPropertyDescriptor(__lsmWin, k));
+      }
+    } catch (e) {}
+  }
+})();
 
 // ---------- 事件系统 ----------
 function __mkEvent(type) {
@@ -872,7 +925,7 @@ function __mkEvent(type) {
   };
 }
 function __fire(sel, type) {
-  var node = __findBySel(sel);
+  var node = __lsmFindBySel(sel);
   if (!node) return { handled: false, defaultPrevented: false };
   var chain = __ancestorChain(node.i);
   var handled = false, prevented = false;
@@ -885,7 +938,7 @@ function __fire(sel, type) {
     } else {
       for (var j = 0; j < chain.length; j++) {
         var n2 = __lsmNodes[chain[j]];
-        if (n2 && __match(n2, L.sel)) { targetIdx = chain[j]; break; }
+        if (n2 && __lsmMatchSel(chain[j], L.sel)) { targetIdx = chain[j]; break; }
       }
     }
     if (targetIdx === -1) continue;
@@ -917,8 +970,23 @@ function __fireDocument(type) {
 }
 
 // ---------- 宿主驱动入口 ----------
+function __lsmErrText(e) {
+  if (e === null || e === undefined) return "unknown error";
+  var parts = [];
+  try { if (e.name) parts.push(String(e.name)); } catch (x) {}
+  try { if (e.message) parts.push(String(e.message)); } catch (x) {}
+  try { if (e.stack) parts.push(String(e.stack)); } catch (x) {}
+  try { if (e.lineNumber !== undefined) parts.push("line=" + e.lineNumber); } catch (x) {}
+  if (!parts.length) { try { parts.push(String(e)); } catch (x) { parts.push("unprintable error"); } }
+  return parts.join(" ");
+}
 function __lsmRunScript(src) {
-  try { (0, eval)(String(src)); } catch (e) { __cerror(String((e && e.stack) || e)); }
+  try { (0, eval)(String(src)); }
+  catch (e) {
+    // 带上出错脚本片段:只报 "TypeError: ..." 无法定位到具体哪段脚本炸了。
+    var head = String(src).replace(/\s+/g, " ").slice(0, 700);
+    __cerror(__lsmErrText(e) + " @ script: " + head);
+  }
   return true;
 }
 function __lsmEvalUser(src) {
@@ -984,3 +1052,16 @@ function __lsmCollect(ov) {
 }
 __lsmFatal = null;
 "##;
+
+/// 完整 PRELUDE 源码:主体 + 共享选择器引擎 + 共享标准全局。
+///
+/// 选择器引擎与标准全局抽成独立常量,阶段一(`js.rs`)与阶段二共用,
+/// 避免两套 PRELUDE 各改各的、行为悄悄漂移(历史上阶段二丢了 `el.title`)。
+pub static PRELUDE: once_cell::sync::Lazy<String> = once_cell::sync::Lazy::new(|| {
+    format!(
+        "{}\n{}\n{}",
+        PRELUDE_BODY,
+        super::env_js::SELECTOR_JS,
+        super::env_js::GLOBALS_JS
+    )
+});

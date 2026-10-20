@@ -486,6 +486,31 @@ impl StyleEngine {
         }
         st
     }
+
+    /// 元素是否真正参与渲染(自身或任一祖先 `display:none` 即整体不渲染)。
+    ///
+    /// 与布局层的剪枝规则(`layout/mod.rs` 里 `display:none` 跳过整棵子树)
+    /// 保持一致,避免出现"元素自报可见、却没有布局盒"的矛盾状态 ——
+    /// 那会让 Agent 把隐藏控件当成可交互目标。
+    pub fn is_rendered(&self, node: &NodeRef) -> bool {
+        let mut chain: Vec<NodeRef> = Vec::new();
+        let mut cur = Some(node.clone());
+        while let Some(n) = cur {
+            if n.as_element().is_some() {
+                chain.push(n.clone());
+            }
+            cur = n.parent();
+        }
+        chain.reverse();
+        let mut st = self.initial_style();
+        for n in chain {
+            st = self.computed(&n, &st);
+            if st.display == "none" {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 #[derive(Clone)]

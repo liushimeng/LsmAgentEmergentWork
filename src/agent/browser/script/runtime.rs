@@ -162,7 +162,7 @@ impl ThreadRuntime {
             NativeFunction::from_fn_ptr(native_btoa),
         )
         .map_err(|e| format!("注册 btoa 失败:{e}"))?;
-        ctx.eval(Source::from_bytes(PRELUDE))
+        ctx.eval(Source::from_bytes(PRELUDE.as_bytes()))
             .map_err(|e| format!("PRELUDE 初始化失败:{e}"))?;
         Ok(Self { ctx, queue })
     }
@@ -266,11 +266,26 @@ impl ThreadRuntime {
             return JsReply::error(e);
         }
         for s in scripts {
-            let src = format!(
-                "__lsmRunScript({})",
-                serde_json::to_string(&s.content).unwrap_or_else(|_| "\"\"".into())
-            );
-            self.eval_quiet(&src);
+            // 直接在宿主侧求值(而不是把源码塞进 JS 里再 eval):
+            // Boa 的错误对象带行号/列号,失败脚本能定位到具体位置;
+            // 语义与 `(0,eval)` 一致(都在全局作用域求值)。
+            if let Err(e) = self.eval_src(&s.content) {
+                let origin = if s.src_url.is_empty() { "(inline)".to_string() } else { s.src_url.clone() };
+                let msg = format!("脚本执行失败:{e} @ {origin}");
+                self.eval_quiet(&format!(
+                    "__cerror({})",
+                    serde_json::to_string(&msg).unwrap_or_else(|_| "\"error\"".into())
+                ));
+            }
+            // 外链脚本执行完要触发脚本元素的 load 事件:AMD 装载器靠它推进
+            // 模块解析,不触发就永远停在"等模块"状态(实测百度地图 widget 层)。
+            if !s.src_url.is_empty() {
+                let fire = format!(
+                    "__lsmFireScriptLoad({})",
+                    serde_json::to_string(&s.src_url).unwrap_or_else(|_| "\"\"".into())
+                );
+                self.eval_quiet(&fire);
+            }
             // 脚本间跑一次微任务,常见「立即 resolve 后继续」的链式逻辑可以衔接。
             self.drain_jobs();
         }

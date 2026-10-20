@@ -647,7 +647,7 @@ async fn click_inner(
     let selector = require_selector(params)?;
     let idx = nth(params);
     let timeout = timeout_ms(params, params, 60_000);
-    let (plan, rect, stable, toggled) = {
+    let (plan, rect, stable, toggled, laid_out) = {
         let inner = mgr.inner.lock().await;
         let tab = inner
             .tabs
@@ -661,7 +661,8 @@ async fn click_inner(
             EngineError::action_failed(format!("选择器未命中或索引越界:{selector}[{idx}]"))
         })?;
         let stable = Document::stable_selector(node);
-        let rect = tab.layout.rect_for(&stable).unwrap_or((0.0, 0.0, 0.0, 0.0));
+        let rect_opt = tab.layout.rect_for(&stable);
+        let rect = rect_opt.unwrap_or((0.0, 0.0, 0.0, 0.0));
         let tag = document::tag_name(node);
         let typ = document::attr(node, "type")
             .unwrap_or_default()
@@ -706,7 +707,7 @@ async fn click_inner(
                 }
             }
         }
-        (plan, rect, stable, toggled)
+        (plan, rect, stable, toggled, rect_opt.is_some())
     };
 
     if let Some((sel, value)) = toggled {
@@ -716,7 +717,7 @@ async fn click_inner(
         }
         return Ok(json!({
             "clicked": true, "x": rect.0, "y": rect.1, "mode": kind,
-            "selector": stable, "toggled": true,
+            "selector": stable, "toggled": true, "laid_out": laid_out,
         }));
     }
 
@@ -726,6 +727,7 @@ async fn click_inner(
         "y": rect.1,
         "mode": kind,
         "selector": stable,
+        "laid_out": laid_out,
     });
     // 阶段二:页面 listener 分发。preventDefault 或 JS 产生导航动作时优先按 JS 语义执行;
     // listener 未拦截时继续默认行为(handler 与默认导航并存,贴近真实浏览器)。
@@ -793,8 +795,13 @@ async fn act_hover(mgr: &LsmBrowserManager, pid: &str, params: &Value) -> Engine
     let nodes = doc.select(selector).map_err(EngineError::action_failed)?;
     let node = nodes.get(nth(params)).ok_or_else(|| EngineError::action_failed("选择器未命中"))?;
     let stable = Document::stable_selector(node);
+    let laid_out = tab.layout.rect_for(&stable).is_some();
     let rect = tab.layout.rect_for(&stable).unwrap_or((0.0, 0.0, 0.0, 0.0));
-    Ok(json!({"hovered": true, "selector": stable, "x": rect.0, "y": rect.1}))
+    Ok(json!({
+        "hovered": true, "selector": stable, "x": rect.0, "y": rect.1,
+        "laid_out": laid_out,
+        "note": if laid_out { Value::Null } else { json!("元素无布局盒(可能被祖先 display:none 隐藏或为非寻址行内元素),坐标不可靠") },
+    }))
 }
 
 async fn act_mouse_move(mgr: &LsmBrowserManager, pid: &str, params: &Value) -> EngineResult<Value> {
@@ -815,7 +822,7 @@ async fn act_mouse_move(mgr: &LsmBrowserManager, pid: &str, params: &Value) -> E
         (p_f64(params, "x").unwrap_or(0.0), p_f64(params, "y").unwrap_or(0.0))
     };
     tab.mouse = Some((x, y));
-    Ok(json!({"x": x, "y": y}))
+    Ok(json!({"x": x, "y": y, "note": "指针坐标为布局近似值(非真实设备像素)" }))
 }
 
 async fn act_input(mgr: &LsmBrowserManager, pid: &str, params: &Value) -> EngineResult<Value> {

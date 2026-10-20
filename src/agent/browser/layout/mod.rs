@@ -214,6 +214,18 @@ pub(crate) fn style_visible(style: &ComputedStyle) -> bool {
     style.visibility != "hidden" && style.visibility != "collapse" && style.opacity > 0.0
 }
 
+/// `position:relative|sticky` 的整体偏移(不改变占位)。
+pub(crate) fn relative_offset(style: &ComputedStyle) -> (f64, f64) {
+    if matches!(style.pos.position.as_str(), "relative" | "sticky") {
+        (
+            style.pos.left.unwrap_or(0.0) - style.pos.right.unwrap_or(0.0),
+            style.pos.top.unwrap_or(0.0) - style.pos.bottom.unwrap_or(0.0),
+        )
+    } else {
+        (0.0, 0.0)
+    }
+}
+
 pub(crate) struct LayoutCtx<'a> {
     engine: &'a StyleEngine,
     font: &'a FontSet,
@@ -550,18 +562,18 @@ impl<'a> LayoutCtx<'a> {
                 let mark_boxes = self.boxes.len();
                 self.y += style.margin_top;
                 let bx = x + style.margin_left;
-                let mut bw = (width
-                    - style.margin_left
-                    - style.margin_right
-                    - style.padding_left
-                    - style.padding_right)
-                    .max(40.0);
-                if let Some(w) = style.width {
-                    bw = w.max(40.0);
+                // 盒宽(border box,不含 margin):auto 时撑满父内容宽减 margin;
+                // 百分比按父内容宽求解;显式长度直接采用。
+                let mut bw = (width - style.margin_left - style.margin_right).max(40.0);
+                if let Some(p) = style.width_percent {
+                    bw = (p / 100.0 * width).max(1.0);
+                } else if let Some(w) = style.width {
+                    bw = w.max(1.0);
                 }
                 if let Some(mw) = style.max_width {
                     bw = bw.min(mw.max(1.0));
                 }
+                let content_w = (bw - style.padding_left - style.padding_right).max(1.0);
                 let start_y = self.y;
                 self.y += style.padding_top;
                 // 定位元素为后代 absolute 建立新的包含块(padding 盒);
@@ -579,15 +591,21 @@ impl<'a> LayoutCtx<'a> {
                 self.layout_children(
                     &child,
                     bx + style.padding_left,
-                    (bw - style.padding_left - style.padding_right).max(40.0),
+                    content_w,
                     buf,
                     depth + 1,
                     &style,
                     child_cb,
                 );
                 self.flush_inline(buf, width);
-                self.y += style.padding_bottom + style.margin_bottom.max(2.0);
-                let box_h = (self.y - start_y).max(1.0);
+                // 内容高(不含 padding);显式高度优先(百分比高度在父高未知时按 auto
+                // 处理,见 style/values.rs)。用高即占位高,显式高度时按声明值推进流。
+                let content_h = (self.y - (start_y + style.padding_top)).max(1.0);
+                let box_h = match style.height {
+                    Some(h) => h.max(1.0),
+                    None => (content_h + style.padding_top + style.padding_bottom).max(1.0),
+                };
+                self.y = start_y + box_h + style.margin_bottom.max(2.0);
                 self.boxes.push(ElementBox {
                     selector,
                     tag: document::tag_name(&child),
@@ -621,11 +639,49 @@ impl<'a> LayoutCtx<'a> {
                 continue;
             }
             // 行内元素:递归收集文本,保留自身样式。
-            self.collect_inline(&child, &style, buf, depth + 1, x);
+            self.collect_inline(&child, &style, buf, depth + 1, x, width);
         }
         if !deferred.is_empty() {
             position::layout_deferred(self, deferred, cb, depth);
         }
+    }
+
+    /// 行内级元素是否需要生成近似矩形(供 inspect/坐标点击/截图裁剪寻址)。
+    ///
+    /// 行内元素在 CSS 中生成行内盒而非块级盒,但 Agent 需要几何来定位与点击,
+    /// 故对"可寻址"的行内元素各生成一个近似矩形:交互元素、`inline-block`、
+    /// 以及带显式尺寸的行内元素。
+    fn inline_box_worthy(&self, node: &NodeRef, style: &ComputedStyle) -> bool {
+        let tag = document::tag_name(node);
+        if matches!(
+            tag.as_str(),
+            "a" | "button" | "input" | "select" | "textarea" | "label"
+        ) {
+            return true;
+        }
+        style.display == "inline-block"
+            || style.width.is_some()
+            || style.height.is_some()
+            || style.width_percent.is_some()
+    }
+
+    /// 行内盒的近似尺寸:显式 CSS 尺寸优先,其次按文本量估算。
+    ///
+    /// 百分比宽度按包含块宽度(`avail_w`)求解;百分比高度在父高未知时按 `auto`
+    /// 处理(CSS 中行内元素的百分比高度同样不生效)。
+    fn inline_box_size(&self, node: &NodeRef, style: &ComputedStyle, avail_w: f64) -> (f64, f64) {
+        let text = node.text_contents();
+        let text_w = self.font.text_width(&text, style.font_size);
+        let w = if let Some(p) = style.width_percent {
+            (p / 100.0 * avail_w).max(1.0)
+        } else {
+            style.width.unwrap_or_else(|| text_w.max(40.0)).max(1.0)
+        };
+        let h = style
+            .height
+            .unwrap_or_else(|| (style.font_size * 1.45).max(16.0))
+            .max(1.0);
+        (w, h)
     }
 
     fn collect_inline(
@@ -635,9 +691,27 @@ impl<'a> LayoutCtx<'a> {
         buf: &mut InlineBuf,
         depth: usize,
         line_x: f64,
+        avail_w: f64,
     ) {
         if depth > 40 || buf.chars > 200_000 {
             return;
+        }
+        // 行内元素自身建盒。此前只有"块级盒的直接行内子节点"才拿到盒子,
+        // 导致 `<div><input></div>` 这类结构完全取不到几何(inspect 的 rect 恒 0×0)。
+        if self.inline_box_worthy(node, style) {
+            let (w, h) = self.inline_box_size(node, style, avail_w);
+            let (dx, dy) = relative_offset(style);
+            self.boxes.push(ElementBox {
+                selector: Document::stable_selector(node),
+                tag: document::tag_name(node),
+                x: line_x + style.margin_left + style.padding_left + dx,
+                y: self.y + dy,
+                w,
+                h,
+                background: style.background,
+                visible: style_visible(style),
+                z_index: style.pos.z_index,
+            });
         }
         for child in node.children() {
             if let Some(text) = child.as_text() {
@@ -692,27 +766,9 @@ impl<'a> LayoutCtx<'a> {
                 buf.reserve_height(ih);
                 continue;
             }
-            // 交互类行内元素:记录近似矩形,供 inspect(elements) 与坐标点击使用。
-            if matches!(
-                tag.as_str(),
-                "a" | "button" | "input" | "select" | "textarea" | "label"
-            ) {
-                let selector = Document::stable_selector(&child);
-                let text = child.text_contents();
-                let w = self.font.text_width(&text, child_style.font_size).max(40.0);
-                self.boxes.push(ElementBox {
-                    selector,
-                    tag: tag.clone(),
-                    x: line_x + child_style.margin_left + child_style.padding_left,
-                    y: self.y,
-                    w,
-                    h: (child_style.font_size * 1.45).max(16.0),
-                    background: child_style.background,
-                    visible: style_visible(&child_style),
-                    z_index: child_style.pos.z_index,
-                });
-            }
-            self.collect_inline(&child, &child_style, buf, depth + 1, line_x);
+            // 交互类行内元素的矩形由 `collect_inline` 入口统一建盒(元素自身),
+            // 此处只负责继续收集其子树文本。
+            self.collect_inline(&child, &child_style, buf, depth + 1, line_x, avail_w);
         }
     }
 

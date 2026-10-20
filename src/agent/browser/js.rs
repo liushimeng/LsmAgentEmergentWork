@@ -208,11 +208,14 @@ fn clip_owned(s: String, n: usize) -> (String, bool) {
     (s.chars().take(n).collect(), true)
 }
 
-/// 注入前导脚本。动态部分用占位符替换。
-const PRELUDE: &str = r##"
+/// 注入前导脚本主体(动态部分用占位符替换)。
+///
+/// 共享的选择器引擎与标准全局在 IIFE **内部**注入(它们依赖 IIFE 局部变量
+/// `__lsmNodes`/`__mk`),见 `PRELUDE`。
+const PRELUDE_BODY: &str = r##"
 (function () {
   "use strict";
-  var __lsm_nodes = __LSM_NODES__;
+  var __lsmNodes = __LSM_NODES__;
   var __lsm_meta = __LSM_META__;
   var __lsm_user = __LSM_USER__;
   var __lsm_actions = [];
@@ -224,57 +227,6 @@ const PRELUDE: &str = r##"
   var __timer_budget = 64;
 
   function __push(a) { __lsm_actions.push(a); }
-  function __matchSimple(n, s) {
-    s = String(s || "").trim();
-    if (!s) return false;
-    var tag = (s.match(/^([a-zA-Z0-9*_-]+)/) || [])[1] || "";
-    if (tag && tag !== "*" && tag.toLowerCase() !== String(n.tag || "").toLowerCase()) return false;
-    var ids = s.match(/#([A-Za-z0-9_-]+)/g) || [];
-    for (var i = 0; i < ids.length; i++) {
-      if (String(n.id || "") !== ids[i].slice(1)) return false;
-    }
-    var classes = String(n.class || "").split(/\s+/);
-    var cls = s.match(/\.([A-Za-z0-9_-]+)/g) || [];
-    for (var j = 0; j < cls.length; j++) {
-      if (classes.indexOf(cls[j].slice(1)) < 0) return false;
-    }
-    var attrs = s.match(/\[([^\]]+)\]/g) || [];
-    for (var k = 0; k < attrs.length; k++) {
-      var expr = attrs[k].slice(1, -1);
-      var eq = expr.indexOf("=");
-      if (eq >= 0) {
-        var key = expr.slice(0, eq).trim();
-        var val = expr.slice(eq + 1).trim().replace(/^["']|["']$/g, "");
-        if (String((n.attrs || {})[key]) !== val) return false;
-      } else {
-        if (!Object.prototype.hasOwnProperty.call(n.attrs || {}, expr.trim())) return false;
-      }
-    }
-    return true;
-  }
-  function __match(n, s) {
-    s = String(s || "").trim();
-    if (!s) return false;
-    var parts = s.split(",");
-    for (var i = 0; i < parts.length; i++) {
-      var sel = parts[i].trim();
-      var tokens = sel.split(/\s+/).filter(function (x) { return x && x !== ">"; });
-      var right = tokens.length ? tokens[tokens.length - 1] : sel;
-      if (__matchSimple(n, right)) return true;
-    }
-    return false;
-  }
-  function __query(sel) {
-    var out = [];
-    for (var i = 0; i < __lsm_nodes.length; i++) {
-      if (__match(__lsm_nodes[i], sel)) out.push(__mk(__lsm_nodes[i]));
-    }
-    return out;
-  }
-  function __queryOne(sel) {
-    var all = __query(sel);
-    return all.length ? all[0] : null;
-  }
   function __mk(n) {
     var attrs = n.attrs || {};
     var el = {
@@ -286,6 +238,8 @@ const PRELUDE: &str = r##"
       className: n.class || "",
       name: n.name || "",
       type: n.type || "",
+      title: attrs.title || "",
+      alt: attrs.alt || "",
       textContent: n.text || "",
       innerText: n.text || "",
       innerHTML: n.text || "",
@@ -389,15 +343,15 @@ const PRELUDE: &str = r##"
     location: null,
     characterSet: "UTF-8",
     contentType: "text/html",
-    querySelector: __queryOne,
-    querySelectorAll: __query,
-    getElementById: function (id) { return __queryOne("#" + id); },
+    querySelector: __lsmQueryOne,
+    querySelectorAll: __lsmQuery,
+    getElementById: function (id) { return __lsmQueryOne("#" + id); },
     getElementsByTagName: function (t) {
-      if (t === "*") return __query("*");
-      return __query(String(t));
+      if (t === "*") return __lsmQuery("*");
+      return __lsmQuery(String(t));
     },
-    getElementsByClassName: function (c) { return __query("." + String(c)); },
-    getElementsByName: function (n) { return __query("[name=" + n + "]"); },
+    getElementsByClassName: function (c) { return __lsmQuery("." + String(c)); },
+    getElementsByName: function (n) { return __lsmQuery("[name=" + n + "]"); },
     createElement: function (tag) {
       return __mk({ i: -1, sel: "", tag: String(tag || "div"), id: "", class: "", name: "", type: "", value: "", href: "", checked: false, text: "", visible: true, attrs: {} });
     },
@@ -412,17 +366,17 @@ const PRELUDE: &str = r##"
     hasFocus: function () { return true; },
     queryCommandSupported: function () { return false; }
   };
-  var __doc_nodes = __lsm_nodes.filter(function (n) {
+  var __doc_nodes = __lsmNodes.filter(function (n) {
     var t = String(n.tag || "").toLowerCase();
     return t === "html" || t === "head" || t === "body";
   });
   document.documentElement = __doc_nodes.filter(function (n) { return String(n.tag).toLowerCase() === "html"; }).map(__mk)[0] || null;
   document.head = __doc_nodes.filter(function (n) { return String(n.tag).toLowerCase() === "head"; }).map(__mk)[0] || null;
   document.body = __doc_nodes.filter(function (n) { return String(n.tag).toLowerCase() === "body"; }).map(__mk)[0] || null;
-  document.forms = __query("form");
-  document.links = __query("a[href]");
-  document.images = __query("img");
-  document.scripts = __query("script");
+  document.forms = __lsmQuery("form");
+  document.links = __lsmQuery("a[href]");
+  document.images = __lsmQuery("img");
+  document.scripts = __lsmQuery("script");
   try {
     Object.defineProperty(document, "cookie", {
       get: function () { return __lsm_meta.cookies || ""; },
@@ -569,7 +523,9 @@ const PRELUDE: &str = r##"
   XMLHttpRequest.prototype.addEventListener = function (name, fn) { if (name === "load") this.onload = fn; };
   XMLHttpRequest.prototype.abort = function () {};
 
-  var window = {
+  // window 必须是"全局对象的门面":站点脚本用 `window.foo = fn` 定义全局函数,
+  // 若 window 只是普通对象,裸 `foo` 标识符不可见(百度地图的 `alog` 即是)。
+  var __lsmWin = {
     document: document, location: location, navigator: navigator, screen: screen, history: history,
     localStorage: localStorage, sessionStorage: sessionStorage, console: console,
     innerWidth: __lsm_meta.width, innerHeight: __lsm_meta.height,
@@ -591,6 +547,23 @@ const PRELUDE: &str = r##"
     atob: function (s) { return atob(s); }, btoa: function (s) { return btoa(s); },
     performance: { now: function () { return 0; }, timing: {}, getEntriesByType: function () { return []; } }
   };
+  var window = __lsmWin;
+  if (typeof Proxy === "function") {
+    window = new Proxy(__lsmWin, {
+      get: function (t, k) {
+        if (k in t) return t[k];
+        if (typeof globalThis !== "undefined" && k in globalThis) return globalThis[k];
+        return undefined;
+      },
+      set: function (t, k, v) {
+        try { t[k] = v; } catch (e) {}
+        try {
+          if (typeof globalThis !== "undefined" && !(k in globalThis)) globalThis[k] = v;
+        } catch (e) {}
+        return true;
+      }
+    });
+  }
   window.self = window; window.top = window; window.parent = window; window.frames = window;
   window.window = window;
   try {
@@ -600,26 +573,32 @@ const PRELUDE: &str = r##"
       configurable: true
     });
   } catch (e) {}
-
-  var __params = ["document", "window", "location", "navigator", "screen", "history",
-    "localStorage", "sessionStorage", "console", "alert", "confirm", "prompt",
-    "fetch", "XMLHttpRequest", "setTimeout", "setInterval", "clearTimeout",
-    "clearInterval", "requestAnimationFrame", "cancelAnimationFrame", "performance"];
-  var __args = [document, window, location, navigator, screen, history,
-    localStorage, sessionStorage, console, alert, confirm, prompt,
-    fetch, XMLHttpRequest, setTimeout, setInterval, clearTimeout,
-    clearInterval, requestAnimationFrame, cancelAnimationFrame, window.performance];
+  // 同步 window 能力到全局对象(裸 `performance` / `innerWidth` 等标识符)。
+  (function () {
+    if (typeof globalThis === "undefined") return;
+    var keys = Object.getOwnPropertyNames(__lsmWin);
+    for (var i = 0; i < keys.length; i++) {
+      var k = keys[i];
+      if (k === "window" || k === "self" || k === "top" || k === "parent" || k === "frames") continue;
+      try {
+        if (!(k in globalThis)) {
+          Object.defineProperty(globalThis, k, Object.getOwnPropertyDescriptor(__lsmWin, k));
+        }
+      } catch (e) {}
+    }
+  })();
 
   var __err = null, __r;
   try {
+    // 直接 eval(在 IIFE 作用域内求值,可见 document/window 等局部绑定)。
+    // 不用 `new Function`:Boa 0.20 在"嵌套箭头函数 + 内层 const"上会触发
+    // `must be declarative environment` 内部 panic,直接打穿整个进程。
     try {
-      var __fn = new Function(__params.join(","), "return (" + __lsm_user + "\n);");
-      __r = __fn.apply(null, __args);
+      __r = eval("(" + __lsm_user + "\n)");
     } catch (e1) {
       if (e1 && e1.name === "SyntaxError") {
         if (/\breturn\b/.test(__lsm_user)) {
-          var __fn2 = new Function(__params.join(","), __lsm_user);
-          __r = __fn2.apply(null, __args);
+          __r = eval("(function(){\n" + __lsm_user + "\n})()");
         } else {
           __r = eval(__lsm_user);
         }
@@ -629,6 +608,9 @@ const PRELUDE: &str = r##"
     }
   } catch (e) {
     __err = String((e && e.stack) || e);
+    if (typeof __lsm_console !== "undefined" && __lsm_console.length < 2048) {
+      __lsm_console.push({ level: "error", text: __err });
+    }
   }
   var __val = null;
   if (__err === null) {
@@ -643,8 +625,8 @@ const PRELUDE: &str = r##"
     actions: __lsm_actions,
     console: __lsm_console
   });
-})()
 "##;
+
 
 #[cfg(test)]
 mod tests {
@@ -745,3 +727,15 @@ mod tests {
         assert_eq!(out.value, "6");
     }
 }
+
+/// 完整阶段一 PRELUDE 源码:IIFE 主体 + 共享选择器引擎 + 共享标准全局。
+///
+/// 选择器引擎与标准全局与阶段二共用(`script::env_js`),避免两套实现漂移。
+pub static PRELUDE: once_cell::sync::Lazy<String> = once_cell::sync::Lazy::new(|| {
+    format!(
+        "{}\n{}\n{}\n}})()",
+        PRELUDE_BODY,
+        super::script::env_js::SELECTOR_JS,
+        super::script::env_js::GLOBALS_JS
+    )
+});

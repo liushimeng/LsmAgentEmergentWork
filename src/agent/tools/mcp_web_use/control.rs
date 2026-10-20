@@ -78,6 +78,8 @@ fn normalize_params(args: &mut Value) -> Value {
     for key in [
         "message", "reason", "options", "url", "timeout_ms", "force", "selector", "nth",
         "text", "key", "keys", "file_paths", "file_path", "name", "value", "kind", "items",
+        "save_path", "output_path", "path", "full_page", "ocr", "clip", "region",
+        "return_base64", "format", "duration_ms", "ms", "state", "values", "index",
     ] {
         if let Some(v) = args.get(key) {
             obj.entry(key.to_string()).or_insert_with(|| v.clone());

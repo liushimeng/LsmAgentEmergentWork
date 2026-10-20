@@ -255,3 +255,178 @@ fn shutdown_后线程退出() {
     });
     assert!(result.is_err());
 }
+
+// ---------- 快照桥选择器与元素对象(第 174 轮) ----------
+
+const SNAP_PAGE: &str = "<html><head><title>页</title><script>var x=1;</script></head>\
+<body><div id=wrap><ul id=list><li id=i1 class='item'>甲</li><li id=i2 class='item active'>乙</li></ul>\
+<input id=box title='搜索框' data-title='路线' value=''></div></body></html>";
+
+#[test]
+fn 元素对象提供_title_与_data_title() {
+    // 站点脚本普遍写 `el.innerText || el.title`、`el.getAttribute('data-title')`;
+    // 阶段二曾丢掉 title 属性,`el.title` 变 undefined,`().trim()` 直接抛 TypeError。
+    let handle = JsHandle::spawn();
+    let reply = eval_on(
+        &handle,
+        "JSON.stringify({title: document.getElementById('box').title, \
+         dataTitle: document.getElementById('box').getAttribute('data-title')})",
+        SNAP_PAGE,
+        "https://a.test/",
+    );
+    assert!(reply.outcome.ok, "{:?}", reply.outcome.error);
+    assert!(reply.outcome.value.contains("搜索框"), "{}", reply.outcome.value);
+    assert!(reply.outcome.value.contains("路线"), "{}", reply.outcome.value);
+}
+
+#[test]
+fn 文本收集不含脚本源码() {
+    let handle = JsHandle::spawn();
+    let reply = eval_on(
+        &handle,
+        "document.body.innerText.indexOf('var x=1')",
+        SNAP_PAGE,
+        "https://a.test/",
+    );
+    assert!(reply.outcome.ok, "{:?}", reply.outcome.error);
+    assert_eq!(reply.outcome.value, "-1", "body.innerText 不应包含 <script> 源码");
+}
+
+#[test]
+fn 选择器支持子代组合器与伪类() {
+    let handle = JsHandle::spawn();
+    let reply = eval_on(
+        &handle,
+        "JSON.stringify({child: document.querySelectorAll('#list > li').length, \
+         first: document.querySelectorAll('li:first-child').length, \
+         nth: document.querySelectorAll('li:nth-of-type(2)').length, \
+         second: document.querySelectorAll('li:nth-child(2)').length})",
+        SNAP_PAGE,
+        "https://a.test/",
+    );
+    assert!(reply.outcome.ok, "{:?}", reply.outcome.error);
+    assert_eq!(
+        reply.outcome.value,
+        "{\"child\":2,\"first\":1,\"nth\":1,\"second\":1}",
+        "{}",
+        reply.outcome.value
+    );
+}
+
+#[test]
+fn 未知伪类不匹配全部() {
+    // 此前伪类被静默忽略,`div:hover` 会返回页面里全部 div —— 比报错更危险。
+    let handle = JsHandle::spawn();
+    let reply = eval_on(
+        &handle,
+        "JSON.stringify({hover: document.querySelectorAll('li:hover').length, \
+         unknown: document.querySelectorAll('li:not(.item)').length})",
+        SNAP_PAGE,
+        "https://a.test/",
+    );
+    assert!(reply.outcome.ok, "{:?}", reply.outcome.error);
+    assert_eq!(
+        reply.outcome.value,
+        "{\"hover\":0,\"unknown\":0}",
+        "状态类/未知伪类必须不匹配,而不是匹配全部:{}",
+        reply.outcome.value
+    );
+}
+
+#[test]
+fn 元素作用域查询限定子树() {
+    let handle = JsHandle::spawn();
+    let reply = eval_on(
+        &handle,
+        "JSON.stringify({scoped: document.querySelector('#i1').querySelectorAll('li').length, \
+         global: document.querySelectorAll('li').length})",
+        SNAP_PAGE,
+        "https://a.test/",
+    );
+    assert!(reply.outcome.ok, "{:?}", reply.outcome.error);
+    assert_eq!(
+        reply.outcome.value,
+        "{\"scoped\":0,\"global\":2}",
+        "元素上的 querySelectorAll 只能查自己的子树:{}",
+        reply.outcome.value
+    );
+}
+
+#[test]
+fn window_赋值成为全局标识符() {
+    // 站点用 `window.alog = fn` 定义全局函数;window 若只是普通对象,
+    // 裸 `alog` 标识符不可见,页面初始化直接 ReferenceError(实测百度地图)。
+    let handle = JsHandle::spawn();
+    let reply = eval_on(
+        &handle,
+        "(window.__x = function(){ return 7; }, typeof __x + '|' + __x())",
+        SNAP_PAGE,
+        "https://a.test/",
+    );
+    assert!(reply.outcome.ok, "{:?}", reply.outcome.error);
+    assert_eq!(reply.outcome.value, "function|7", "{}", reply.outcome.value);
+}
+
+#[test]
+fn 常见标准全局存在() {
+    // 缺一个就 ReferenceError,页面主逻辑一行都跑不起来。
+    let handle = JsHandle::spawn();
+    let reply = eval_on(
+        &handle,
+        "JSON.stringify([typeof URL, typeof URLSearchParams, typeof Event, typeof CustomEvent, \
+         typeof Element, typeof performance, typeof TextEncoder, typeof Blob, typeof FormData, \
+         typeof structuredClone, typeof queueMicrotask])",
+        SNAP_PAGE,
+        "https://a.test/",
+    );
+    assert!(reply.outcome.ok, "{:?}", reply.outcome.error);
+    assert_eq!(
+        reply.outcome.value,
+        "[\"function\",\"function\",\"function\",\"function\",\"function\",\"object\",\"function\",\"function\",\"function\",\"function\",\"function\"]",
+        "{}",
+        reply.outcome.value
+    );
+}
+
+#[test]
+fn 内核不定义_requirejs_以免页面装填器自杀() {
+    // 页面自带的 requirejs 初始化时有 `if (isFunction(requirejs)) return;`,
+    // 内核抢先定义 requirejs 会让整层 AMD 装载器不初始化(实测百度地图 widget 层)。
+    let handle = JsHandle::spawn();
+    let reply = eval_on(
+        &handle,
+        "typeof requirejs",
+        SNAP_PAGE,
+        "https://a.test/",
+    );
+    assert!(reply.outcome.ok, "{:?}", reply.outcome.error);
+    assert_eq!(reply.outcome.value, "undefined", "{}", reply.outcome.value);
+}
+
+#[test]
+fn 动态插入脚本可触发_load_回调() {
+    let handle = JsHandle::spawn();
+    let reply = run_scripts(
+        &handle,
+        vec![
+            "window.__loaded = 0;",
+            "(function(){ var s = document.createElement('script'); s.src = 'https://a.test/m.js'; \
+             s.onload = function(){ window.__loaded = 1; document.title = '模块就绪'; }; \
+             document.body.appendChild(s); })();",
+        ],
+        SNAP_PAGE,
+        "https://a.test/",
+    );
+    assert!(reply.outcome.ok, "{:?}", reply.outcome.error);
+    // 宿主执行完外链脚本后会触发 __lsmFireScriptLoad;这里外链取不到,
+    // 回调不应触发(不得假触发)。
+    assert!(
+        !reply
+            .outcome
+            .actions
+            .iter()
+            .any(|a| a.kind == "set_title" && a.value.contains("模块就绪")),
+        "脚本取回失败时不应假触发 onload:{:?}",
+        reply.outcome.actions
+    );
+}

@@ -20,7 +20,8 @@ pub(super) async fn run(args: Value) -> Result<String> {
             json!({"allowed": [
                 "console","network","elements","dom","localstorage","sessionstorage","cookies",
                 "screenshot","page_meta","viewport","url","title","ping","image_urls","ocr",
-                "blockers","visibility","extract_links","extract","page_state","coverage"
+                "blockers","visibility","extract_links","extract","page_state","coverage",
+                "text","page_health","stylesheets"
             ]}),
         );
     };
@@ -71,6 +72,7 @@ fn normalize_inspect_params(args: &Value) -> Value {
         "node_count_limit", "prefix", "contains", "max", "max_links", "include_context",
         "context_length", "item_selector", "fields", "url_from", "scan_cap", "filter",
         "probe", "keys", "probe_window", "max_bytes", "max_array_items", "save_path",
+        "output_path", "path", "clip",
         "full_page", "ocr", "region", "return_base64", "format", "quality", "state",
         "timeout_ms",
     ] {

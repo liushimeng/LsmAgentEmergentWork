@@ -199,7 +199,7 @@ explore 一次做 ≤8 个观测。返回统一信封 {code,message,data}。"
                         "console", "network", "elements", "dom", "localstorage", "sessionstorage",
                         "cookies", "screenshot", "page_meta", "viewport", "url", "title", "ping",
                         "image_urls", "ocr", "blockers", "visibility", "extract_links", "extract",
-                        "page_state", "stylesheets", "coverage"
+                        "page_state", "stylesheets", "coverage", "text", "page_health"
                     ]
                 },
                 "params": { "type": "object", "description": "control/inspect 的动作参数" },

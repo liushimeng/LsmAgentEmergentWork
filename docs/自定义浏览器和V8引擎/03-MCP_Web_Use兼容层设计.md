@@ -99,7 +99,7 @@ src/agent/browser/               内核:窗口/标签页 / 网络 / DOM / 布局
 | `set_cookie` / `delete_cookie` | `name*`、`value`、`domain`、`path`、`url` | 全内存 Cookie Jar |
 | `set_storage` / `clear_storage` | `kind=local/session`、`items`/`key+value`、`keys` | 全内存存储 |
 | `set_viewport` | `width*`、`height*` | 调整视口并重排 |
-| `screenshot` | `save_path`、`full_page`、`format`、`ocr`、`return_base64` | 软件渲染 PNG；`ocr=true` 返回布局文本 |
+| `screenshot` | `save_path`（兼容别名 `output_path`/`path`）、`full_page`、`format`、`ocr`、`return_base64` | 软件渲染 PNG；`ocr=true` 返回布局可见文本并标注 `ocr_source` |
 | `download` | `url` 或 `selector`、`save_dir`、`filename` | HTTP 下载落盘 |
 | `heartbeat` | — | 返回标题 |
 | `focus` / `blur` | `selector*` | 记录焦点选择器 |
@@ -117,7 +117,7 @@ src/agent/browser/               内核:窗口/标签页 / 网络 / DOM / 布局
 | --- | --- |
 | `console` | `{events:[{level,text,at_ms}], count, collection_healthy, last_event_at}` |
 | `network` | `{events:[{url,method,status,content_type,bytes,elapsed_ms,redirect,at_ms}], count, ...}` |
-| `elements` | `{ok,tag,selector,id,classes,text,value,href,attributes,visible,rect{...},count,index}`；`params.include_style=true` 时附加 `computed_style:{...}` |
+| `elements` | `{ok,tag,selector,id,classes,text,value,href,attributes,visible,rect{...},count,index}`；`rect.laid_out` 区分"没有布局盒"与"零尺寸盒"，被祖先 `display:none` 剪枝时附 `render_blocked_by`；`params.include_style=true` 时附加 `computed_style:{...}` |
 | `stylesheets` | `{ok,count,rules,sheets:[{index,href,media,bytes,rules}],media:{width,height,prefers_dark,print}}` |
 | `dom` | `{ok,selector,node_count,tree}` 或 `{ok,selector,outer_html}` |
 | `localstorage` / `sessionstorage` | `{key: value}`（支持 `prefix`/`contains` 过滤） |
@@ -134,6 +134,8 @@ src/agent/browser/               内核:窗口/标签页 / 网络 / DOM / 布局
 | `extract` | `{items,total,returned,scanned,truncated,field_names,hostname,hint}`；`probe=true` 返回候选类名 |
 | `page_state` | `{found,jsonld,globals,window_globals,...}`（阶段一读取 JSON-LD） |
 | `coverage` | 进程级访问台账（与旧契约一致，仍要求 `page_id` 语法） |
+| `text` | 页面可见文本：`{text,source,chars,returned_chars,truncated}`。`source=layout` 与截图内容一致；`source=dom` 表示布局层没有可见文本（被剪枝或由页面脚本生成） |
+| `page_health` | 页面健康度：`{dom_nodes,layout_boxes,visible_boxes,layout_lines,visible_text_chars,page_height,console_events,console_errors,first_errors,blank_page,diagnosis,hint}`。把"渲染空白"翻译成可执行结论，Agent 据此改走非 JS 入口，而不是反复重试 |
 
 ## 七、page_id 约定
 
@@ -154,14 +156,17 @@ src/agent/browser/               内核:窗口/标签页 / 网络 / DOM / 布局
 
 ## 九、兼容参数处理原则
 
-1. **接受但不生效**的参数返回结构化说明，不返回 1001：
+1. **路径类参数接受常见别名**（不再静默忽略）：`screenshot` 的落盘路径接受
+   `save_path`/`output_path`/`path` 三种写法 —— LLM 常按直觉写别名，静默忽略会让
+   Agent 找不到自己要的截图。
+2. **接受但不生效**的参数返回结构化说明，不返回 1001：
    - `reuse_existing` / `connect_url` / `auto_relaunch` → **3002**（无外部浏览器可接管）；
    - `stealth` / `set_stealth` → `applied:false`；
    - `guard` / `overlay` / `set_guard` / `highlight` / `auto_follow` → 记录状态，`supported:false`；
    - `block_resources` / `execution_mode` → 接受并忽略。
-2. **已移除的 Chrome 身份治理**（频控冷却 / 整页抹除总账 / 反检测注入）不再产生 6002/6003/6004；
+3. **已移除的 Chrome 身份治理**（频控冷却 / 整页抹除总账 / 反检测注入）不再产生 6002/6003/6004；
    这些码保留在契约中，避免历史提示词/测试断裂。
-3. 任务锚点 6001 继续生效，接入点与旧实现一致（显式 URL 动作）。
+4. 任务锚点 6001 继续生效，接入点与旧实现一致（显式 URL 动作）。
 
 ## 十、阶段二/三的扩展点
 

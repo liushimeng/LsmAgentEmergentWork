@@ -161,7 +161,7 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 | 工具 | 能力 | 平台门控 | 设计文档 |
 |------|------|----------|----------|
 | **MCP_Window_Use** | 桌面窗口操控：`action` 枚举分发（`open`/`list`/`find`/`inspect`/`control`/`ocr`/`screenshot`）；双路线（Windows UIA Pattern 优先 + Win32 消息 + 物理鼠标键盘兜底；macOS AX 控件树 + 物理输入；Linux wmctrl/xdotool 物理层） | **仅 macOS/Windows** 运行时注册；Linux 走物理层兜底 | `docs/MCP_Window_Use/01-设计与解决方案.md` |
-| **MCP_Web_Use** | 浏览器操控（LsmAgentBrowser 进程内内核）：`action` 枚举分发（`open`/`list`/`close`/`control`/`inspect`/`sequence`/`batch`/`explore`）；`control_action` 48 个写操作；`inspect` 21 个观察维度；单步 + 连续（`sequence` ≤24 steps）；HTTP(S) + DOM + 布局 + 软件渲染 + Boa JS；全内存 Cookie/存储 | 跨 Windows/macOS/Linux；无外部浏览器进程 | `docs/自定义浏览器和V8引擎/03-MCP_Web_Use兼容层设计.md` |
+| **MCP_Web_Use** | 浏览器操控（LsmAgentBrowser 进程内内核）：`action` 枚举分发（`open`/`list`/`close`/`control`/`inspect`/`sequence`/`batch`/`explore`）；`control_action` 48 个写操作；`inspect` 23 个观察维度；单步 + 连续（`sequence` ≤24 steps）；HTTP(S) + DOM + 布局 + 软件渲染 + Boa JS；全内存 Cookie/存储 | 跨 Windows/macOS/Linux；无外部浏览器进程 | `docs/自定义浏览器和V8引擎/03-MCP_Web_Use兼容层设计.md` |
 | **Use_MCP** | 通用 MCP（Model Context Protocol）服务调用统一入口：**真 MCP 协议客户端**（JSON-RPC 2.0），连接外部 MCP server（stdio 子进程 / Streamable HTTP）；单工具 `action` 枚举分发 | 跨平台（由外部 MCP server 决定能力） | `docs/Use_MCP/01-设计与解决方案.md` |
 
 ### 自感知动态子 Agent（Self-Awareness SubAgent）
@@ -324,6 +324,7 @@ agent/
     js.rs          Boa 引导后端 + DOM 快照桥(阶段一回退路径)
     script/        阶段二页面脚本与动态 DOM(每 Tab 持久 JS 线程)
       mod.rs       管线(收集→预取→执行→动作应用→回写)+ 消息协议
+      env_js.rs    PRELUDE 共享件:快照选择器引擎 + 常见标准全局 + AMD 最小装载器(阶段一/二共用)
       runtime.rs   JS 线程主体(Boa Context/原生 fetch 桥/事件循环/微任务预算)
       prelude.rs   PRELUDE v2(持久全局 + 事件系统 + 虚拟时钟定时器)
       dom_ops.rs   动作→kuchikiki DOM 应用 + 脚本收集
@@ -426,6 +427,7 @@ Markdown Prompt 模板，两级发现：**项目级** `{工作目录}/.laew/comm
 - `docs/自定义浏览器和V8引擎/` — LsmAgentBrowser 内核、兼容层与阶段路线图
   - `08-阶段三布局引擎Flex与定位设计.md` — Flex + 定位体系(已完成)与 Phase 3 后续
   - `12-阶段四第二步缓存与安全接入主管线设计.md` — HttpCache/CSP/CORS 接入主管线 + clip 区域截图(已完成)
+  - `13-JS运行时兼容性与页面诊断能力.md` — 选择器引擎/AMD 装载/动态脚本 load/`page_health` 诊断(已完成)
 - `docs/Use_MCP/` — 通用 MCP 服务调用
 
 **上下文与会话**：

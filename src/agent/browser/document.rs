@@ -22,6 +22,14 @@ const BLOCK_TAGS: &[&str] = &[
 
 const SKIP_TEXT_TAGS: &[&str] = &["script", "style", "noscript", "template", "svg"];
 
+/// 不进快照的标签(纯元数据,子树无内容)。
+const SNAPSHOT_EXCLUDE_TAGS: &[&str] = &[
+    "title", "meta", "link", "base", "noscript", "template",
+];
+
+/// 进快照但子树不展开、文本置空的标签。
+const SNAPSHOT_LEAF_TAGS: &[&str] = &["script", "style", "svg"];
+
 /// 解析后的文档(局部值,不跨 await 保存)。
 pub struct Document {
     root: NodeRef,
@@ -340,9 +348,11 @@ impl Document {
 
     fn snapshot_nodes_inner(&self, engine: Option<&StyleEngine>) -> Vec<SnapshotNode> {
         let mut out = Vec::new();
+        // 起点用 `html` 而非 `body`:`document.documentElement` / `document.head`
+        // 必须是真实节点,站点脚本常直接往 head 里插脚本/样式,拿不到就抛异常。
         let start = self
             .root
-            .select_first("body")
+            .select_first("html")
             .ok()
             .map(|n| n.as_node().clone())
             .unwrap_or_else(|| self.root.clone());
@@ -384,6 +394,10 @@ fn snapshot_walk(
     }
     let mut child_parent = parent;
     let mut child_style = parent_style.clone();
+    // 入快照但子树不展开、文本置空的标签(script/style/svg):
+    // 站点脚本要用 `document.getElementsByTagName("script")[0]` 拿到锚点,
+    // 若 script 根本不在快照里,拿到的就是 undefined,脚本当场抛异常。
+    let mut leaf = false;
     if let Some(el) = node.as_element() {
         let tag = el.name.local.to_string();
         if engine.is_some() {
@@ -391,7 +405,8 @@ fn snapshot_walk(
                 .map(|e| e.computed(node, parent_style))
                 .unwrap_or_else(|| parent_style.clone());
         }
-        if !SKIP_TEXT_TAGS.contains(&tag.as_str()) {
+        leaf = SNAPSHOT_LEAF_TAGS.contains(&tag.as_str());
+        if !SNAPSHOT_EXCLUDE_TAGS.contains(&tag.as_str()) {
             let attrs = common_attrs(node);
             let idx = out.len();
             child_parent = idx;
@@ -409,7 +424,13 @@ fn snapshot_walk(
                     .and_then(|h| urlutil::resolve(base_url, &h))
                     .unwrap_or_default(),
                 checked: attr(node, "checked").is_some(),
-                text: truncate_chars(&collapse_ws(&node.text_contents()), 4000),
+                // 可见文本:`text_contents()` 会把 `<script>` 源码算进来,
+                // 导致 `body.innerText` 变成一整段 JS(实测百度地图即如此)。
+                text: if leaf {
+                    String::new()
+                } else {
+                    truncate_chars(&collapse_ws(&visible_text_of(node)), 4000)
+                },
                 visible: is_visible(node),
                 attrs,
                 css: if engine.is_some() {
@@ -420,16 +441,18 @@ fn snapshot_walk(
             });
         }
     }
-    for child in node.children() {
-        snapshot_walk(
-            &child,
-            child_parent,
-            depth + 1,
-            base_url,
-            out,
-            engine,
-            &child_style,
-        );
+    if !leaf {
+        for child in node.children() {
+            snapshot_walk(
+                &child,
+                child_parent,
+                depth + 1,
+                base_url,
+                out,
+                engine,
+                &child_style,
+            );
+        }
     }
 }
 
@@ -527,6 +550,17 @@ pub fn common_attrs(node: &NodeRef) -> HashMap<String, String> {
     for n in names {
         if let Some(v) = attr(node, n) {
             out.insert(n.to_string(), v);
+        }
+    }
+    // `data-*` / `aria-*` 全量保留:站点把可见文案大量放在 `data-title` 一类属性上
+    // (百度地图的导航项就是 `data-title="路线"`),固定白名单会把它们整体丢掉,
+    // Agent 于是"查不到任何按钮"。
+    if let Some(el) = node.as_element() {
+        for (k, v) in el.attributes.borrow().map.iter() {
+            let key = k.local.to_string();
+            if key.starts_with("data-") || key.starts_with("aria-") {
+                out.insert(key, v.value.clone());
+            }
         }
     }
     out
@@ -671,8 +705,14 @@ fn same_tag_index(node: &NodeRef, tag: &str) -> usize {
     index.max(1)
 }
 
-fn collect_text(node: &NodeRef, out: &mut String, depth: usize) {
-    if depth > 80 || out.len() >= 1_000_000 {
+/// 元素的可见文本(跳过 `<script>`/`<style>` 等非渲染内容)。
+fn visible_text_of(node: &NodeRef) -> String {
+    let mut out = String::new();
+    collect_text(node, &mut out, 0);
+    out
+}
+
+fn collect_text(node: &NodeRef, out: &mut String, depth: usize) {    if depth > 80 || out.len() >= 1_000_000 {
         return;
     }
     match node.data() {

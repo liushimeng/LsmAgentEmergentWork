@@ -196,6 +196,84 @@ pub async fn inspect(
         }
         "url" => Ok(json!({"url": tab.url})),
         "title" => Ok(json!({"title": tab.title})),
+        "text" => {
+            // 页面可见文本:优先取布局产出的文本行(与截图内容一致),
+            // 布局无文本时回退到 DOM 文本抽取。
+            let limit = p_u64(params, "limit").unwrap_or(20_000).min(200_000) as usize;
+            let layout_text = tab
+                .layout
+                .lines
+                .iter()
+                .filter(|l| l.visible)
+                .map(|l| l.text.trim())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let (text, source) = if layout_text.trim().is_empty() {
+                (document::collapse_ws(&doc.text()), "dom")
+            } else {
+                (layout_text, "layout")
+            };
+            let total = text.chars().count();
+            let clipped = document::truncate_chars(&text, limit);
+            Ok(json!({
+                "page_id": page_id,
+                "text": clipped,
+                "source": source,
+                "chars": total,
+                "returned_chars": clipped.chars().count(),
+                "truncated": total > clipped.chars().count(),
+                "note": "source=layout 表示这是截图里能看到的文字;source=dom 表示布局层没有产出文本(元素被 display:none 剪枝或页面内容由 JS 生成)",
+            }))
+        }
+        "page_health" => {
+            // 页面健康度:把"渲染空白"这类症状翻译成可诊断的结论,
+            // 避免 Agent 在一张空白截图前反复重试。
+            let dom_nodes = doc.select("*").map(|v| v.len()).unwrap_or(0);
+            let layout_text_chars = tab
+                .layout
+                .lines
+                .iter()
+                .filter(|l| l.visible)
+                .map(|l| l.text.chars().count())
+                .sum::<usize>();
+            let visible_boxes = tab.layout.boxes.iter().filter(|b| b.visible).count();
+            let errors: Vec<&super::ConsoleRecord> =
+                tab.console.iter().filter(|c| c.level == "error").collect();
+            let blank = layout_text_chars == 0 && visible_boxes == 0;
+            let (diagnosis, hint) = if !blank {
+                ("页面已渲染出内容", "")
+            } else if !errors.is_empty() {
+                (
+                    "页面脚本执行失败:主内容由 JS 生成,内核脚本运行时未能完成初始化,\
+                     导致内容节点保持初始隐藏态或未被创建",
+                    "先用 inspect(console) 看具体报错;若目标站点重度依赖 JS 渲染,\
+                     应改用该站点的非 JS 入口(如静态接口页/服务端渲染页)完成取证",
+                )
+            } else {
+                (
+                    "页面内容为空或全部被 display:none 隐藏(内核未渲染出任何可见内容)",
+                    "用 inspect(elements) 逐层查祖先是否有 display:none;\
+                     用 inspect(dom) 看静态 HTML 是否包含目标节点",
+                )
+            };
+            Ok(json!({
+                "page_id": page_id,
+                "url": tab.url,
+                "dom_nodes": dom_nodes,
+                "layout_boxes": tab.layout.boxes.len(),
+                "visible_boxes": visible_boxes,
+                "layout_lines": tab.layout.lines.len(),
+                "visible_text_chars": layout_text_chars,
+                "page_height": tab.layout.page_height(),
+                "console_events": tab.console.len(),
+                "console_errors": errors.len(),
+                "first_errors": errors.iter().take(3).map(|e| e.text.clone()).collect::<Vec<_>>(),
+                "blank_page": blank,
+                "diagnosis": diagnosis,
+                "hint": hint,
+            }))
+        }
         "ping" => Ok(json!({"ok": true, "page_id": page_id, "latency_ms": 0, "ts": super::now_ms()})),
         "image_urls" => {
             let max = p_u64(params, "max").unwrap_or(20).min(100) as usize;
@@ -264,6 +342,7 @@ fn inspect_elements(
     };
     let stable = Document::stable_selector(node);
     let rect = tab.layout.rect_for(&stable);
+    let rect_found = rect.is_some();
     let mut v = doc.element_json(node, idx, count, rect, &tab.form_values);
     if !p_bool(params, "include_text", true) {
         if let Some(obj) = v.as_object_mut() {
@@ -273,16 +352,26 @@ fn inspect_elements(
     if p_bool(params, "include_outer_html", false) {
         v["outer_html"] = json!(document::outer_html(node));
     }
-    // 可见性以计算样式为准(外链/内联 CSS 的 display/visibility 都生效)。
+    // 可见性以计算样式为准(外链/内联 CSS 的 display/visibility 都生效),
+    // 且必须与布局层剪枝规则一致:任一祖先 `display:none` 时整棵子树不参与
+    // 布局,此时元素没有几何 —— 不能自报"可见"却给不出矩形。
     let engine = style_engine(tab, doc);
     let computed = engine.computed_chain(node);
-    let visible = computed.display != "none"
+    let rendered = engine.is_rendered(node);
+    let visible = rendered
+        && computed.display != "none"
         && computed.visibility != "hidden"
         && computed.visibility != "collapse"
         && computed.opacity > 0.0;
     v["visible"] = json!(visible);
     if let Some(rect) = v.get_mut("rect").and_then(Value::as_object_mut) {
         rect.insert("visible".to_string(), json!(visible));
+        // `laid_out=false` 表示该元素没有布局盒(被剪枝或非可寻址行内元素),
+        // 与"有盒子但尺寸为 0"区分开,避免 Agent 误判。
+        rect.insert("laid_out".to_string(), json!(rect_found));
+    }
+    if !rendered {
+        v["render_blocked_by"] = json!("ancestor_display_none");
     }
     if p_bool(params, "include_style", false) {
         v["computed_style"] = json!(computed.to_map());
@@ -391,11 +480,17 @@ fn inspect_extract(doc: &Document, params: &Value) -> EngineResult<Value> {
         .map_err(EngineError::action_failed)?;
     let scanned = items_nodes.len();
     let limit = p_u64(params, "limit").unwrap_or(200).min(1000) as usize;
-    let fields = params
+    let mut fields = params
         .get("fields")
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    // 未声明 fields 时自动兜底:否则每条 item 都会是空对象 `{}`,
+    // Agent 拿到一堆无内容的记录却不知道缺了字段(实测踩坑)。
+    let auto_fields = fields.is_empty();
+    if auto_fields {
+        fields.insert("text".to_string(), json!({"selector": ""}));
+    }
     let url_from = p_str(params, "url_from").unwrap_or("a");
     let keywords: Vec<String> = params
         .get("filter")
@@ -471,8 +566,9 @@ fn inspect_extract(doc: &Document, params: &Value) -> EngineResult<Value> {
         "scanned": scanned,
         "truncated": scanned > limit,
         "field_names": field_names,
+        "auto_fields": auto_fields,
         "hostname": super::urlutil::host_of(&doc.base_url),
-        "hint": "阶段一按 CSS 选择器抽取;页面脚本渲染内容需阶段二支持",
+        "hint": "阶段一按 CSS 选择器抽取;页面脚本渲染内容需阶段二支持。未声明 fields 时自动抽取 text 字段",
     }))
 }
 
