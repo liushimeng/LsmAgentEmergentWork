@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use kuchikiki::NodeRef;
 
 pub use values::ComputedStyle;
+pub use values::FlexWrap;
 use values::ValueCtx;
 
 use super::document::{self, Document};

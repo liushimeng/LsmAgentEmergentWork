@@ -311,7 +311,8 @@ agent/
       values.rs     ComputedStyle、长度/颜色/关键字、var() 替换
       tests.rs      样式引擎单元测试
     resources.rs   外链样式表收集 / 宿主预取 / 原位内联 / 网络台账
-    layout.rs      块级布局 + 文本换行(消费 ComputedStyle)
+    layout/        布局引擎目录:块级流 + 文本换行(mod.rs)、Flex 容器(flex.rs,
+                   阶段三)、定位体系(position.rs,阶段三)、布局单测(tests.rs)
     render.rs      fontdue + tiny-skia 软件渲染 + PNG
     js.rs          Boa 引导后端 + DOM 快照桥(阶段一回退路径)
     script/        阶段二页面脚本与动态 DOM(每 Tab 持久 JS 线程)
@@ -416,6 +417,7 @@ Markdown Prompt 模板，两级发现：**项目级** `{工作目录}/.laew/comm
 **三个 MCP 风格工具**（按工具）：
 - `docs/MCP_Window_Use/` — 桌面窗口操控
 - `docs/自定义浏览器和V8引擎/` — LsmAgentBrowser 内核、兼容层与阶段路线图
+  - `08-阶段三布局引擎Flex与定位设计.md` — Flex + 定位体系(已完成)与 Phase 3 后续
 - `docs/Use_MCP/` — 通用 MCP 服务调用
 
 **上下文与会话**：

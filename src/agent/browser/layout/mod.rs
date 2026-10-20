@@ -1,14 +1,27 @@
-//! 块级流式布局 + 文本换行。
+//! 布局引擎:块级流式布局 + 文本换行 + Flex 容器 + 定位体系(阶段三)。
 //!
 //! 样式全部来自 `style::StyleEngine` 的计算样式;本模块只负责几何计算。
 //! 产出纯数据(`TextLine`/`ElementBox`),不持有 DOM 句柄,可跨 await 保存。
-//! 完整 Flex/Grid/定位在阶段三实现,接口保持不变。
+//! 目录分工:`mod.rs` 块级/行内主流,`flex.rs` Flex 格式化上下文,
+//! `position.rs` 定位体系,`tests.rs` 布局单测。
+
+mod flex;
+mod position;
+#[cfg(test)]
+mod tests;
 
 use kuchikiki::NodeRef;
 
 use super::document::{self, Document};
 use super::render::FontSet;
 use super::style::{ComputedStyle, MediaCtx, StyleEngine};
+
+/// 测量宽度的"无穷大":超过任何真实换行阈值,用于 max-content 度量。
+pub(crate) const MAX_CONTENT_WIDTH: f64 = 100_000.0;
+
+/// 包含块高度未知标记:布局期父盒高度未定时使用;此时 `bottom` 锚定退化
+/// 为 `top` 语义(见设计文档"已知边界")。
+pub(crate) const UNKNOWN_CB_H: f64 = f64::MAX / 2.0;
 
 #[derive(Debug, Clone)]
 pub struct TextLine {
@@ -32,6 +45,8 @@ pub struct ElementBox {
     pub h: f64,
     pub background: Option<[u8; 3]>,
     pub visible: bool,
+    /// 绘制序(阶段三):`compute_with` 返回前按 z-index 稳定排序。
+    pub z_index: i64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -73,6 +88,8 @@ pub fn compute_with(
         engine: &engine,
         font,
         width: viewport_width.max(320.0),
+        viewport_h: media.viewport_height.max(1.0),
+        text_base: 8.0,
         lines: Vec::new(),
         boxes: Vec::new(),
         y: 8.0,
@@ -93,9 +110,13 @@ pub fn compute_with(
     let body_style = engine.computed(&body, &parent_style);
     let mut buf = InlineBuf::default();
     let content_width = ctx.width - 16.0;
-    ctx.layout_children(&body, 8.0, content_width, &mut buf, 0, &body_style);
-    ctx.flush_inline(&mut buf);
+    // 初始包含块:整页坐标,高度未知(bottom 锚定退化)。
+    let icb = (0.0, 0.0, ctx.width, UNKNOWN_CB_H);
+    ctx.layout_children(&body, 8.0, content_width, &mut buf, 0, &body_style, icb);
+    ctx.flush_inline(&mut buf, content_width);
     let height = ctx.y + 8.0;
+    // 阶段三:按 z-index 稳定排序绘制序(同 z 保持 DOM/流内先后顺序)。
+    ctx.boxes.sort_by_key(|b| b.z_index);
     Layout {
         lines: ctx.lines,
         boxes: ctx.boxes,
@@ -104,16 +125,118 @@ pub fn compute_with(
     }
 }
 
-struct LayoutCtx<'a> {
+/// 局部布局片段:一次内容测量的产出,可整体平移后注入全局结果。
+#[derive(Default)]
+pub(crate) struct Fragment {
+    pub height: f64,
+    pub lines: Vec<TextLine>,
+    pub boxes: Vec<ElementBox>,
+}
+
+/// 平移片段内全部几何。
+pub(crate) fn translate(fragment: &mut Fragment, dx: f64, dy: f64) {
+    for l in &mut fragment.lines {
+        l.x += dx;
+        l.y += dy;
+    }
+    for b in &mut fragment.boxes {
+        b.x += dx;
+        b.y += dy;
+    }
+}
+
+/// 片段注入全局结果。
+pub(crate) fn append(ctx: &mut LayoutCtx, fragment: Fragment) {
+    ctx.lines.extend(fragment.lines);
+    ctx.boxes.extend(fragment.boxes);
+}
+
+/// 元素是否参与绘制(visibility/opacity)。
+pub(crate) fn style_visible(style: &ComputedStyle) -> bool {
+    style.visibility != "hidden" && style.visibility != "collapse" && style.opacity > 0.0
+}
+
+pub(crate) struct LayoutCtx<'a> {
     engine: &'a StyleEngine,
     font: &'a FontSet,
     width: f64,
+    viewport_h: f64,
+    /// 行内文本的 x 基准:块级流为 body 左边距 8.0,局部测量为 0.0。
+    text_base: f64,
     lines: Vec<TextLine>,
     boxes: Vec<ElementBox>,
     y: f64,
 }
 
 impl<'a> LayoutCtx<'a> {
+    /// 子元素计算样式(委托样式引擎)。
+    pub(crate) fn style_for(&self, node: &NodeRef, parent: &ComputedStyle) -> ComputedStyle {
+        self.engine.computed(node, parent)
+    }
+
+    pub(crate) fn font(&self) -> &FontSet {
+        self.font
+    }
+
+    /// 视口尺寸(页坐标宽度 / 视口高度),fixed 定位的包含块用。
+    pub(crate) fn viewport(&self) -> (f64, f64) {
+        (self.width, self.viewport_h)
+    }
+
+    pub(crate) fn cursor_y(&self) -> f64 {
+        self.y
+    }
+
+    pub(crate) fn advance_y(&mut self, dy: f64) {
+        self.y += dy;
+    }
+
+    pub(crate) fn push_box(&mut self, b: ElementBox) {
+        self.boxes.push(b);
+    }
+
+    pub(crate) fn boxes_len(&self) -> usize {
+        self.boxes.len()
+    }
+
+    /// 回填先占位盒的高度(flex 容器背景盒在内容布局前占位)。
+    pub(crate) fn set_box_height(&mut self, idx: usize, h: f64) {
+        if let Some(b) = self.boxes.get_mut(idx) {
+            b.h = h;
+        }
+    }
+
+    /// 在局部坐标(原点 0,0)下测量节点内容,返回片段;全局游标与已产出
+    /// 几何零副作用。`content_width` 为内容盒宽度(调用方已扣除 padding)。
+    pub(crate) fn measure_content(
+        &mut self,
+        node: &NodeRef,
+        content_width: f64,
+        style: &ComputedStyle,
+        depth: usize,
+    ) -> Fragment {
+        let y0 = self.y;
+        let lines0 = self.lines.len();
+        let boxes0 = self.boxes.len();
+        let base0 = self.text_base;
+        self.y = 0.0;
+        self.text_base = 0.0;
+        let mut buf = InlineBuf::default();
+        let cb = (0.0, 0.0, content_width.max(1.0), UNKNOWN_CB_H);
+        self.layout_children(node, 0.0, content_width, &mut buf, depth, style, cb);
+        self.flush_inline(&mut buf, content_width);
+        let height = self.y;
+        let lines = self.lines.split_off(lines0);
+        let boxes = self.boxes.split_off(boxes0);
+        self.y = y0;
+        self.text_base = base0;
+        Fragment {
+            height,
+            lines,
+            boxes,
+        }
+    }
+
     fn layout_children(
         &mut self,
         parent: &NodeRef,
@@ -122,15 +245,18 @@ impl<'a> LayoutCtx<'a> {
         buf: &mut InlineBuf,
         depth: usize,
         current: &ComputedStyle,
+        cb: (f64, f64, f64, f64),
     ) {
         if depth > 60 {
             return;
         }
+        // 阶段三:脱离流的定位元素延后到兄弟节点布置完再处理。
+        let mut deferred: Vec<(NodeRef, ComputedStyle)> = Vec::new();
         for child in parent.children() {
             if let Some(text) = child.as_text() {
                 let raw = text.borrow();
                 if !raw.trim().is_empty() {
-                    buf.push_styled(&raw, current);
+                    buf.push_styled(&raw, current, self.text_base);
                 }
                 continue;
             }
@@ -142,8 +268,20 @@ impl<'a> LayoutCtx<'a> {
                 continue;
             }
             let selector = Document::stable_selector(&child);
+            if matches!(style.pos.position.as_str(), "absolute" | "fixed") {
+                deferred.push((child.clone(), style));
+                continue;
+            }
+            // 阶段三:Flex 格式化上下文。
+            if style.display == "flex" {
+                self.flush_inline(buf, width);
+                flex::layout_container(self, &child, x, width, depth, &style, cb);
+                continue;
+            }
             if style.is_block() {
-                self.flush_inline(buf);
+                self.flush_inline(buf, width);
+                let mark_lines = self.lines.len();
+                let mark_boxes = self.boxes.len();
                 self.y += style.margin_top;
                 let bx = x + style.margin_left;
                 let mut bw = (width
@@ -160,6 +298,18 @@ impl<'a> LayoutCtx<'a> {
                 }
                 let start_y = self.y;
                 self.y += style.padding_top;
+                // 定位元素为后代 absolute 建立新的包含块(padding 盒);
+                // 高度布局期未知,bottom 锚定退化(见 UNKNOWN_CB_H)。
+                let child_cb = if style.pos.is_positioned() {
+                    (
+                        bx + style.padding_left,
+                        start_y + style.padding_top,
+                        (bw - style.padding_left - style.padding_right).max(0.0),
+                        UNKNOWN_CB_H,
+                    )
+                } else {
+                    cb
+                };
                 self.layout_children(
                     &child,
                     bx + style.padding_left,
@@ -167,8 +317,9 @@ impl<'a> LayoutCtx<'a> {
                     buf,
                     depth + 1,
                     &style,
+                    child_cb,
                 );
-                self.flush_inline(buf);
+                self.flush_inline(buf, width);
                 self.y += style.padding_bottom + style.margin_bottom.max(2.0);
                 self.boxes.push(ElementBox {
                     selector,
@@ -178,14 +329,31 @@ impl<'a> LayoutCtx<'a> {
                     w: bw,
                     h: (self.y - start_y).max(1.0),
                     background: style.background,
-                    visible: style.visibility != "hidden"
-                        && style.visibility != "collapse"
-                        && style.opacity > 0.0,
+                    visible: style_visible(&style),
+                    z_index: style.pos.z_index,
                 });
+                // 阶段三:relative/sticky 整体偏移(不影响占位)。
+                if matches!(style.pos.position.as_str(), "relative" | "sticky") {
+                    let dx = style.pos.left.unwrap_or(0.0) - style.pos.right.unwrap_or(0.0);
+                    let dy = style.pos.top.unwrap_or(0.0) - style.pos.bottom.unwrap_or(0.0);
+                    if dx != 0.0 || dy != 0.0 {
+                        for l in &mut self.lines[mark_lines..] {
+                            l.x += dx;
+                            l.y += dy;
+                        }
+                        for b in &mut self.boxes[mark_boxes..] {
+                            b.x += dx;
+                            b.y += dy;
+                        }
+                    }
+                }
                 continue;
             }
             // 行内元素:递归收集文本,保留自身样式。
             self.collect_inline(&child, &style, buf, depth + 1, x);
+        }
+        if !deferred.is_empty() {
+            position::layout_deferred(self, deferred, cb, depth);
         }
     }
 
@@ -204,7 +372,7 @@ impl<'a> LayoutCtx<'a> {
             if let Some(text) = child.as_text() {
                 let raw = text.borrow();
                 if !raw.trim().is_empty() {
-                    buf.push_styled(&raw, style);
+                    buf.push_styled(&raw, style, self.text_base);
                 }
                 continue;
             }
@@ -236,17 +404,16 @@ impl<'a> LayoutCtx<'a> {
                     w,
                     h: (child_style.font_size * 1.45).max(16.0),
                     background: child_style.background,
-                    visible: child_style.visibility != "hidden"
-                        && child_style.visibility != "collapse"
-                        && child_style.opacity > 0.0,
+                    visible: style_visible(&child_style),
+                    z_index: child_style.pos.z_index,
                 });
             }
             self.collect_inline(&child, &child_style, buf, depth + 1, line_x);
         }
     }
 
-    fn flush_inline(&mut self, buf: &mut InlineBuf) {
-        let max_w = (self.width - 24.0).max(80.0);
+    fn flush_inline(&mut self, buf: &mut InlineBuf, max_w: f64) {
+        let max_w = max_w.max(80.0);
         for run in buf.runs.drain(..) {
             let size = run.size.max(8.0);
             let line_height = run.line_height.max(size * 1.35);
@@ -325,7 +492,7 @@ impl<'a> LayoutCtx<'a> {
 }
 
 #[derive(Default)]
-struct InlineBuf {
+pub(crate) struct InlineBuf {
     runs: Vec<InlineRun>,
     chars: usize,
 }
@@ -344,12 +511,12 @@ struct InlineRun {
 }
 
 impl InlineBuf {
-    fn push_styled(&mut self, text: &str, st: &ComputedStyle) {
+    pub(crate) fn push_styled(&mut self, text: &str, st: &ComputedStyle, x_base: f64) {
         self.chars += text.chars().count();
         let size = st.font_size;
         let bold = st.font_weight >= 600;
         let visible = st.visibility != "hidden" && st.visibility != "collapse" && st.opacity > 0.0;
-        let x = 8.0 + st.margin_left + st.padding_left;
+        let x = x_base + st.margin_left + st.padding_left;
         let preserve = matches!(st.white_space.as_str(), "pre" | "pre-wrap" | "break-spaces");
         let wrap = !matches!(st.white_space.as_str(), "pre" | "nowrap");
         if let Some(last) = self.runs.last_mut() {
@@ -388,95 +555,5 @@ impl InlineBuf {
         if let Some(last) = self.runs.last_mut() {
             last.text.push('\n');
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn font() -> FontSet {
-        FontSet::fallback()
-    }
-
-    #[test]
-    fn 块级元素产生多行() {
-        let doc = Document::parse(
-            "<body><h1>Title</h1><p>Hello world</p><div><a href='/x'>link</a></div></body>",
-            "https://a.test/",
-        );
-        let layout = compute(&doc, 800.0, &font());
-        assert!(layout.lines.iter().any(|l| l.text == "Title"));
-        assert!(layout.lines.iter().any(|l| l.text.contains("Hello")));
-        assert!(layout.boxes.iter().any(|b| b.tag == "h1"));
-        assert!(layout.height > 40.0);
-    }
-
-    #[test]
-    fn 长文本按宽度换行() {
-        let text = "word ".repeat(400);
-        let html = format!("<body><p>{text}</p></body>");
-        let doc = Document::parse(&html, "https://a.test/");
-        let layout = compute(&doc, 400.0, &font());
-        assert!(layout.lines.len() > 5);
-    }
-
-    #[test]
-    fn display_none_不参与布局() {
-        let doc = Document::parse(
-            "<body><div style='display:none'>hidden</div><p>shown</p></body>",
-            "https://a.test/",
-        );
-        let layout = compute(&doc, 800.0, &font());
-        assert!(!layout.lines.iter().any(|l| l.text.contains("hidden")));
-        assert!(layout.lines.iter().any(|l| l.text.contains("shown")));
-    }
-
-    #[test]
-    fn 样式表字号生效() {
-        let doc = Document::parse(
-            "<head><style>h1{font-size:40px;color:#ff0000}</style></head><body><h1>X</h1></body>",
-            "https://a.test/",
-        );
-        let layout = compute(&doc, 800.0, &font());
-        let h1 = layout.lines.iter().find(|l| l.text == "X").unwrap();
-        assert!((h1.size - 40.0).abs() < 0.1);
-        assert_eq!(h1.color, [255, 0, 0]);
-    }
-
-    #[test]
-    fn 继承的颜色与字号作用于子元素() {
-        let doc = Document::parse(
-            "<head><style>body{color:#00ff00;font-size:24px}</style></head>\
-             <body><div><span>Child</span></div></body>",
-            "https://a.test/",
-        );
-        let layout = compute(&doc, 800.0, &font());
-        let line = layout.lines.iter().find(|l| l.text == "Child").unwrap();
-        assert_eq!(line.color, [0, 255, 0]);
-        assert!((line.size - 24.0).abs() < 0.1);
-    }
-
-    #[test]
-    fn visibility_hidden_保留布局空间() {
-        let doc = Document::parse(
-            "<body><div style='visibility:hidden'>ghost</div><p>after</p></body>",
-            "https://a.test/",
-        );
-        let layout = compute(&doc, 800.0, &font());
-        let ghost = layout.lines.iter().find(|l| l.text.contains("ghost")).unwrap();
-        assert!(!ghost.visible);
-        assert!(layout.lines.iter().any(|l| l.text.contains("after")));
-    }
-
-    #[test]
-    fn text_align_center_偏移行起点() {
-        let doc = Document::parse(
-            "<body><p style='text-align:center;width:400px'>mid</p></body>",
-            "https://a.test/",
-        );
-        let layout = compute(&doc, 800.0, &font());
-        let line = layout.lines.iter().find(|l| l.text == "mid").unwrap();
-        assert!(line.x > 100.0);
     }
 }

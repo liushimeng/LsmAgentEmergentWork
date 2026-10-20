@@ -31,10 +31,120 @@ pub struct ComputedStyle {
     pub max_width: Option<f64>,
     pub height: Option<f64>,
     pub opacity: f64,
-    /// 未建模属性的计算值文本(如 position/border-radius)。
+    /// 定位体系(阶段三):position/inset/z-index,全部非继承。
+    pub pos: PositionStyle,
+    /// Flex 容器属性(阶段三),全部非继承。
+    pub flex: FlexContainerStyle,
+    /// Flex 条目属性(阶段三),全部非继承。
+    pub flex_item: FlexItemStyle,
+    /// 未建模属性的计算值文本(如 border-radius)。
     pub extra: BTreeMap<String, String>,
     /// 自定义属性表(继承用,不进入 `to_map`)。
     pub custom: BTreeMap<String, String>,
+}
+
+/// 定位体系计算值。`sticky` 布局层按 `relative` 处理(见阶段三设计文档边界)。
+#[derive(Debug, Clone)]
+pub struct PositionStyle {
+    pub position: String,
+    pub top: Option<f64>,
+    pub right: Option<f64>,
+    pub bottom: Option<f64>,
+    pub left: Option<f64>,
+    /// `auto` 归一为 0;绘制序稳定排序使用。
+    pub z_index: i64,
+}
+
+impl Default for PositionStyle {
+    fn default() -> Self {
+        Self {
+            position: "static".to_string(),
+            top: None,
+            right: None,
+            bottom: None,
+            left: None,
+            z_index: 0,
+        }
+    }
+}
+
+impl PositionStyle {
+    /// 是否建立新的绝对定位包含块(static 之外的所有定位)。
+    pub fn is_positioned(&self) -> bool {
+        self.position != "static"
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlexDirection {
+    Row,
+    RowReverse,
+    Column,
+    ColumnReverse,
+}
+
+impl FlexDirection {
+    pub fn is_row(&self) -> bool {
+        matches!(self, FlexDirection::Row | FlexDirection::RowReverse)
+    }
+    pub fn is_reverse(&self) -> bool {
+        matches!(self, FlexDirection::RowReverse | FlexDirection::ColumnReverse)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlexWrap {
+    Nowrap,
+    Wrap,
+    WrapReverse,
+}
+
+/// Flex 容器计算值。
+#[derive(Debug, Clone)]
+pub struct FlexContainerStyle {
+    pub direction: FlexDirection,
+    pub wrap: FlexWrap,
+    pub justify: String,
+    pub align_items: String,
+    pub align_content: String,
+    pub row_gap: f64,
+    pub col_gap: f64,
+}
+
+impl Default for FlexContainerStyle {
+    fn default() -> Self {
+        Self {
+            direction: FlexDirection::Row,
+            wrap: FlexWrap::Nowrap,
+            justify: "flex-start".to_string(),
+            align_items: "stretch".to_string(),
+            align_content: "stretch".to_string(),
+            row_gap: 0.0,
+            col_gap: 0.0,
+        }
+    }
+}
+
+/// Flex 条目计算值。
+#[derive(Debug, Clone)]
+pub struct FlexItemStyle {
+    pub grow: f64,
+    pub shrink: f64,
+    pub basis: Option<f64>,
+    pub align_self: String,
+    pub order: i64,
+}
+
+impl Default for FlexItemStyle {
+    fn default() -> Self {
+        Self {
+            grow: 0.0,
+            shrink: 1.0,
+            basis: None,
+            align_self: "auto".to_string(),
+            order: 0,
+        }
+    }
 }
 
 impl Default for ComputedStyle {
@@ -62,6 +172,9 @@ impl Default for ComputedStyle {
             max_width: None,
             height: None,
             opacity: 1.0,
+            pos: PositionStyle::default(),
+            flex: FlexContainerStyle::default(),
+            flex_item: FlexItemStyle::default(),
             extra: BTreeMap::new(),
             custom: BTreeMap::new(),
         }
@@ -129,6 +242,45 @@ impl ComputedStyle {
         out.insert("max-width".into(), length_text(self.max_width));
         out.insert("height".into(), length_text(self.height));
         out.insert("opacity".into(), num(self.opacity));
+        // 定位体系(阶段三)
+        out.insert("position".into(), self.pos.position.clone());
+        for (name, v) in [
+            ("top", self.pos.top),
+            ("right", self.pos.right),
+            ("bottom", self.pos.bottom),
+            ("left", self.pos.left),
+        ] {
+            out.insert(name.to_string(), length_text(v));
+        }
+        out.insert("z-index".into(), self.pos.z_index.to_string());
+        // Flex(阶段三)
+        out.insert(
+            "flex-direction".into(),
+            match self.flex.direction {
+                FlexDirection::Row => "row".to_string(),
+                FlexDirection::RowReverse => "row-reverse".to_string(),
+                FlexDirection::Column => "column".to_string(),
+                FlexDirection::ColumnReverse => "column-reverse".to_string(),
+            },
+        );
+        out.insert(
+            "flex-wrap".into(),
+            match self.flex.wrap {
+                FlexWrap::Nowrap => "nowrap".to_string(),
+                FlexWrap::Wrap => "wrap".to_string(),
+                FlexWrap::WrapReverse => "wrap-reverse".to_string(),
+            },
+        );
+        out.insert("justify-content".into(), self.flex.justify.clone());
+        out.insert("align-items".into(), self.flex.align_items.clone());
+        out.insert("align-content".into(), self.flex.align_content.clone());
+        out.insert("row-gap".into(), format!("{}px", num(self.flex.row_gap)));
+        out.insert("column-gap".into(), format!("{}px", num(self.flex.col_gap)));
+        out.insert("flex-grow".into(), num(self.flex_item.grow));
+        out.insert("flex-shrink".into(), num(self.flex_item.shrink));
+        out.insert("flex-basis".into(), length_text(self.flex_item.basis));
+        out.insert("align-self".into(), self.flex_item.align_self.clone());
+        out.insert("order".into(), self.flex_item.order.to_string());
         for (k, v) in &self.extra {
             out.entry(k.clone()).or_insert_with(|| v.clone());
         }
@@ -450,13 +602,129 @@ pub fn apply_declaration(
                 st.opacity = v.clamp(0.0, 1.0);
             }
         }
+        // ============ 定位体系(阶段三) ============
+        "position" => {
+            let v = value.to_ascii_lowercase();
+            if matches!(
+                v.as_str(),
+                "static" | "relative" | "absolute" | "fixed" | "sticky"
+            ) {
+                st.pos.position = v;
+            }
+        }
+        "top" | "right" | "bottom" | "left" => {
+            let v = parse_length(value, st.font_size, ctx);
+            match key.as_str() {
+                "top" => st.pos.top = v,
+                "right" => st.pos.right = v,
+                "bottom" => st.pos.bottom = v,
+                _ => st.pos.left = v,
+            }
+        }
+        "z-index" => {
+            if value.eq_ignore_ascii_case("auto") {
+                st.pos.z_index = 0;
+            } else if let Ok(v) = value.parse::<i64>() {
+                st.pos.z_index = v;
+            }
+        }
+        // ============ Flex 容器(阶段三) ============
+        "flex-direction" => {
+            st.flex.direction = match value.to_ascii_lowercase().as_str() {
+                "row-reverse" => FlexDirection::RowReverse,
+                "column" => FlexDirection::Column,
+                "column-reverse" => FlexDirection::ColumnReverse,
+                _ => FlexDirection::Row,
+            };
+        }
+        "flex-wrap" => {
+            st.flex.wrap = match value.to_ascii_lowercase().as_str() {
+                "wrap" => FlexWrap::Wrap,
+                "wrap-reverse" => FlexWrap::WrapReverse,
+                _ => FlexWrap::Nowrap,
+            };
+        }
+        "justify-content" => {
+            if let Some(v) = normalize_flex_align(value) {
+                st.flex.justify = v;
+            }
+        }
+        "align-items" => {
+            if let Some(v) = normalize_cross_align(value) {
+                st.flex.align_items = v;
+            }
+        }
+        "align-content" => {
+            if let Some(v) = normalize_flex_align(value) {
+                st.flex.align_content = v;
+            } else if value.eq_ignore_ascii_case("stretch") {
+                st.flex.align_content = "stretch".to_string();
+            }
+        }
+        "gap" | "row-gap" | "column-gap" => {
+            let parts: Vec<Option<f64>> = value
+                .split_whitespace()
+                .map(|p| parse_length(p, st.font_size, ctx))
+                .collect();
+            match key.as_str() {
+                "gap" => {
+                    if let Some(first) = parts.first().copied().flatten() {
+                        st.flex.row_gap = first.max(0.0);
+                        st.flex.col_gap = parts
+                            .get(1)
+                            .copied()
+                            .flatten()
+                            .unwrap_or(first)
+                            .max(0.0);
+                    }
+                }
+                "row-gap" => {
+                    if let Some(v) = parts.first().copied().flatten() {
+                        st.flex.row_gap = v.max(0.0);
+                    }
+                }
+                _ => {
+                    if let Some(v) = parts.first().copied().flatten() {
+                        st.flex.col_gap = v.max(0.0);
+                    }
+                }
+            }
+        }
+        // ============ Flex 条目(阶段三) ============
+        "flex-grow" => {
+            if let Ok(v) = value.parse::<f64>() {
+                st.flex_item.grow = v.max(0.0);
+            }
+        }
+        "flex-shrink" => {
+            if let Ok(v) = value.parse::<f64>() {
+                st.flex_item.shrink = v.max(0.0);
+            }
+        }
+        "flex-basis" => {
+            let v = value.to_ascii_lowercase();
+            if matches!(v.as_str(), "auto" | "content" | "fill" | "fit-content" | "max-content") {
+                st.flex_item.basis = None;
+            } else {
+                st.flex_item.basis = parse_length(value, st.font_size, ctx).filter(|v| *v > 0.0);
+            }
+        }
+        "align-self" => {
+            let v = value.to_ascii_lowercase();
+            if matches!(
+                v.as_str(),
+                "auto" | "stretch" | "flex-start" | "flex-end" | "center" | "baseline"
+            ) {
+                st.flex_item.align_self = v;
+            }
+        }
+        "order" => {
+            if let Ok(v) = value.parse::<i64>() {
+                st.flex_item.order = v;
+            }
+        }
+        "flex" => apply_flex_shorthand(st, value, ctx),
         "background-image"
-        | "position"
-        | "top"
-        | "left"
-        | "right"
-        | "bottom"
-        | "z-index"
         | "border-radius"
         | "border"
         | "border-color"
@@ -472,12 +740,6 @@ pub fn apply_declaration(
         | "word-spacing"
         | "list-style"
         | "list-style-type"
-        | "flex"
-        | "flex-direction"
-        | "flex-wrap"
-        | "justify-content"
-        | "align-items"
-        | "gap"
         | "grid-template-columns"
         | "grid-template-rows"
         | "transform"
@@ -698,6 +960,75 @@ fn expand_box(values: &[f64]) -> Option<(f64, f64, f64, f64)> {
         3 => Some((values[0], values[1], values[2], values[1])),
         4 => Some((values[0], values[1], values[2], values[3])),
         _ => None,
+    }
+}
+
+// ===================== Flex / 定位辅助 =====================
+
+/// 主轴对齐关键字归一(justify-content / align-content)。
+fn normalize_flex_align(value: &str) -> Option<String> {
+    let v = match value.trim().to_ascii_lowercase().as_str() {
+        "start" | "left" => "flex-start",
+        "end" | "right" => "flex-end",
+        "flex-start" => "flex-start",
+        "flex-end" => "flex-end",
+        "center" => "center",
+        "space-between" => "space-between",
+        "space-around" => "space-around",
+        "space-evenly" => "space-evenly",
+        _ => return None,
+    };
+    Some(v.to_string())
+}
+
+/// 交叉轴对齐关键字归一(align-items)。
+fn normalize_cross_align(value: &str) -> Option<String> {
+    let v = match value.trim().to_ascii_lowercase().as_str() {
+        "start" | "self-start" => "flex-start",
+        "end" | "self-end" => "flex-end",
+        "flex-start" => "flex-start",
+        "flex-end" => "flex-end",
+        "center" => "center",
+        "stretch" => "stretch",
+        "baseline" => "baseline",
+        _ => return None,
+    };
+    Some(v.to_string())
+}
+
+/// `flex` 简写解析:`none` → 0 0 auto;`auto`/`initial` → 1 1 auto;
+/// 单数字 → `g 1 auto`;`g s` / `g s b` 组合。
+fn apply_flex_shorthand(st: &mut ComputedStyle, value: &str, ctx: &ValueCtx) {
+    let v = value.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "none" => {
+            st.flex_item.grow = 0.0;
+            st.flex_item.shrink = 0.0;
+            st.flex_item.basis = None;
+            return;
+        }
+        "auto" | "initial" => {
+            st.flex_item.grow = 1.0;
+            st.flex_item.shrink = 1.0;
+            st.flex_item.basis = None;
+            return;
+        }
+        _ => {}
+    }
+    let parts: Vec<&str> = v.split_whitespace().collect();
+    if parts.is_empty() {
+        return;
+    }
+    if let Ok(g) = parts[0].parse::<f64>() {
+        st.flex_item.grow = g.max(0.0);
+    }
+    if let Some(s) = parts.get(1) {
+        if let Ok(sh) = s.parse::<f64>() {
+            st.flex_item.shrink = sh.max(0.0);
+        }
+    }
+    if let Some(b) = parts.get(2) {
+        st.flex_item.basis = parse_length(b, st.font_size, ctx).filter(|v| *v > 0.0);
     }
 }
 
