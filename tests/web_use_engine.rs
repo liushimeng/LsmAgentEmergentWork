@@ -10,7 +10,16 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 /// 启动 mock 站点,返回 `http://127.0.0.1:{port}`。
+/// `with_headers=true` 时按路径返回缓存/CSP 等自定义响应头(阶段四第二步集成测试)。
 async fn start_site() -> String {
+    start_site_impl(false).await
+}
+
+async fn start_site_with_headers() -> String {
+    start_site_impl(true).await
+}
+
+async fn start_site_impl(with_headers: bool) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -39,17 +48,21 @@ async fn start_site() -> String {
                 let head = String::from_utf8_lossy(&buf).to_string();
                 let first = head.lines().next().unwrap_or("");
                 let path = first.split_whitespace().nth(1).unwrap_or("/");
-                let (status, ctype, body) = if path == "/logo.png" {
-                    ("200 OK", "image/png", png_bytes())
+                let (status, ctype, body, extra_headers) = if path == "/logo.png" {
+                    ("200 OK", "image/png", png_bytes(), vec![])
                 } else {
-                    let (s, b) = route(path);
-                    (s, "text/html; charset=utf-8", b.into_bytes())
+                    let (s, b, h) = route(path, with_headers);
+                    (s, "text/html; charset=utf-8", b.into_bytes(), h)
                 };
-                let mut resp = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                let mut header_str = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n",
                     body.len()
-                )
-                .into_bytes();
+                );
+                for (k, v) in &extra_headers {
+                    header_str.push_str(&format!("{k}: {v}\r\n"));
+                }
+                header_str.push_str("Connection: close\r\n\r\n");
+                let mut resp = header_str.into_bytes();
                 resp.extend_from_slice(&body);
                 let _ = socket.write_all(&resp).await;
                 let _ = socket.shutdown().await;
@@ -72,7 +85,8 @@ fn png_bytes() -> Vec<u8> {
     out.into_inner()
 }
 
-fn route(path: &str) -> (&'static str, String) {
+fn route(path: &str, with_headers: bool) -> (&'static str, String, Vec<(String, String)>) {
+    let _ = with_headers;
     if path == "/" {
         (
             "200 OK",
@@ -85,6 +99,7 @@ fn route(path: &str) -> (&'static str, String) {
              <button id=\"go\" type=\"submit\">搜索</button>\
              </form></body></html>"
                 .to_string(),
+            vec![],
         )
     } else if path == "/image-page" {
         (
@@ -93,12 +108,14 @@ fn route(path: &str) -> (&'static str, String) {
              <img id=\"logo\" src=\"/logo.png\" width=\"40\" height=\"20\">\
              <p>图片下方文本</p></body></html>"
                 .to_string(),
+            vec![],
         )
     } else if path == "/next" {
         (
             "200 OK",
             "<html><head><title>第二页</title></head><body><h2>Next Page</h2></body></html>"
                 .to_string(),
+            vec![],
         )
     } else if path == "/js-inline" {
         (
@@ -107,11 +124,13 @@ fn route(path: &str) -> (&'static str, String) {
              <script>document.getElementById('app').innerHTML = '<h1>内联渲染完成</h1><p>内容由脚本注入</p>';</script>\
              </body></html>"
                 .to_string(),
+            vec![],
         )
     } else if path == "/app.js" {
         (
             "200 OK",
             "document.getElementById('app').textContent = '外链脚本已执行';".to_string(),
+            vec![],
         )
     } else if path == "/js-external" {
         (
@@ -119,11 +138,13 @@ fn route(path: &str) -> (&'static str, String) {
             "<html><head><title>JS外链页</title><script src=\"/app.js\"></script></head>\
              <body><div id=\"app\">占位</div></body></html>"
                 .to_string(),
+            vec![],
         )
     } else if path == "/api/data" {
         (
             "200 OK",
             "{\"items\": [\"甲\", \"乙\", \"丙\"]}".to_string(),
+            vec![],
         )
     } else if path == "/js-fetch" {
         (
@@ -134,6 +155,7 @@ fn route(path: &str) -> (&'static str, String) {
              });</script>\
              </body></html>"
                 .to_string(),
+            vec![],
         )
     } else if path == "/js-timer" {
         (
@@ -142,6 +164,7 @@ fn route(path: &str) -> (&'static str, String) {
              <script>setTimeout(function(){ document.getElementById('later').textContent = '延迟渲染完成'; }, 2000);</script>\
              </body></html>"
                 .to_string(),
+            vec![],
         )
     } else if path == "/css-page" {
         (
@@ -152,12 +175,14 @@ fn route(path: &str) -> (&'static str, String) {
              <div id=\"hidden-by-css\">外链样式隐藏</div>\
              </body></html>"
                 .to_string(),
+            vec![],
         )
     } else if path == "/site.css" {
         (
             "200 OK",
             "#hidden-by-css{display:none} #styled{color:rgb(1, 2, 3);font-size:30px} body{font-size:20px}"
                 .to_string(),
+            vec![],
         )
     } else if path == "/js-click" {
         (
@@ -170,6 +195,7 @@ fn route(path: &str) -> (&'static str, String) {
              });</script>\
              </body></html>"
                 .to_string(),
+            vec![],
         )
     } else if path.starts_with("/search") {
         let q = path
@@ -186,11 +212,46 @@ fn route(path: &str) -> (&'static str, String) {
                 "<html><head><title>结果</title></head><body><h1>搜索结果</h1>\
                  <p id=\"query\">q={q}</p></body></html>"
             ),
+            vec![],
+        )
+    } else if path == "/cached-page" {
+        // 阶段四第二步：强缓存测试页（Cache-Control: max-age=60）。
+        (
+            "200 OK",
+            "<html><head><title>缓存页</title></head><body><h1>CacheMe</h1></body></html>".to_string(),
+            vec![("Cache-Control".to_string(), "max-age=60".to_string())],
+        )
+    } else if path == "/csp-inline" {
+        // 阶段四第二步：CSP 内联脚本拦截测试（script-src 'self'，无 unsafe-inline）。
+        (
+            "200 OK",
+            "<html><head><title>CSP页</title></head><body><div id=\"app\">原始</div>\
+             <script>document.getElementById('app').textContent = '内联脚本已执行';</script>\
+             </body></html>"
+                .to_string(),
+            vec![(
+                "Content-Security-Policy".to_string(),
+                "script-src 'self'".to_string(),
+            )],
+        )
+    } else if path == "/csp-allow" {
+        // 阶段四第二步：CSP 放行测试（script-src 'self' 'unsafe-inline'）。
+        (
+            "200 OK",
+            "<html><head><title>CSP放行页</title></head><body><div id=\"app\">原始</div>\
+             <script>document.getElementById('app').textContent = '内联脚本已执行';</script>\
+             </body></html>"
+                .to_string(),
+            vec![(
+                "Content-Security-Policy".to_string(),
+                "script-src 'self' 'unsafe-inline'".to_string(),
+            )],
         )
     } else {
         (
             "404 Not Found",
             "<html><head><title>404</title></head><body>not found</body></html>".to_string(),
+            vec![],
         )
     }
 }
@@ -720,6 +781,145 @@ async fn 图片子资源加载_解码_参与布局与渲染() {
     let px = decoded.get_pixel(12, 12).0;
     assert_eq!(&px[..3], &[255, 0, 0], "图片区域应渲染为红色");
     let _ = std::fs::remove_file(&path);
+
+    exec(&tool, json!({"action": "close", "page_id": page_id})).await;
+}
+
+// ============ 阶段四第二步：缓存/CSP/CORS 集成测试 ============
+
+#[tokio::test]
+async fn 强缓存_二次导航命中缓存() {
+    allow_loopback();
+    let base = start_site_with_headers().await;
+    let tool = McpWebUseTool;
+
+    let open = exec(&tool, json!({"action": "open", "url": format!("{base}/cached-page"), "mode": "hidden", "reuse": false})).await;
+    assert_eq!(open["code"], 0, "{open}");
+    let page_id = open["data"]["page_id"].as_str().unwrap().to_string();
+
+    // 第一次导航：网络请求，from_cache=false。
+    let net1 = exec(&tool, json!({"action": "inspect", "page_id": page_id, "info": "network"})).await;
+    let events1 = net1["data"]["events"].as_array().cloned().unwrap_or_default();
+    let cached1 = events1.iter().find(|e| e["url"].as_str().unwrap_or("").ends_with("/cached-page"));
+    assert!(cached1.is_some(), "首次导航应有主文档请求:{net1}");
+    assert_eq!(cached1.unwrap()["from_cache"], false, "首次应走网络");
+
+    // 第二次导航（同 URL）：命中强缓存，from_cache=true。
+    let nav = exec(&tool, json!({"action": "control", "page_id": page_id, "control_action": "navigate", "params": {"url": format!("{base}/cached-page")}})).await;
+    assert_eq!(nav["code"], 0, "{nav}");
+    let net2 = exec(&tool, json!({"action": "inspect", "page_id": page_id, "info": "network"})).await;
+    let events2 = net2["data"]["events"].as_array().cloned().unwrap_or_default();
+    let hits = events2.iter().filter(|e| e["url"].as_str().unwrap_or("").ends_with("/cached-page") && e["from_cache"] == true).count();
+    assert!(hits >= 1, "二次导航应命中缓存:{net2}");
+    // 缓存统计可见。
+    assert!(net2["data"]["cache_stats"].is_object(), "network 输出应含 cache_stats:{net2}");
+
+    exec(&tool, json!({"action": "close", "page_id": page_id})).await;
+}
+
+#[tokio::test]
+async fn csp_script_src_拦截内联脚本() {
+    allow_loopback();
+    let base = start_site_with_headers().await;
+    let tool = McpWebUseTool;
+
+    // script-src 'self'：内联脚本被拒。
+    let open = exec(&tool, json!({"action": "open", "url": format!("{base}/csp-inline"), "mode": "hidden", "reuse": false})).await;
+    assert_eq!(open["code"], 0, "{open}");
+    let page_id = open["data"]["page_id"].as_str().unwrap().to_string();
+    let el = exec(&tool, json!({"action": "inspect", "page_id": page_id, "info": "elements", "params": {"selector": "#app"}})).await;
+    assert_eq!(el["data"]["text"], "原始", "内联脚本应被 CSP 拦截:{el}");
+
+    exec(&tool, json!({"action": "close", "page_id": page_id})).await;
+
+    // script-src 'self' 'unsafe-inline'：内联脚本放行。
+    let open2 = exec(&tool, json!({"action": "open", "url": format!("{base}/csp-allow"), "mode": "hidden", "reuse": false})).await;
+    assert_eq!(open2["code"], 0, "{open2}");
+    let page_id2 = open2["data"]["page_id"].as_str().unwrap().to_string();
+    let el2 = exec(&tool, json!({"action": "inspect", "page_id": page_id2, "info": "elements", "params": {"selector": "#app"}})).await;
+    assert_eq!(el2["data"]["text"], "内联脚本已执行", "unsafe-inline 应放行:{el2}");
+
+    exec(&tool, json!({"action": "close", "page_id": page_id2})).await;
+}
+
+/// 启动带 CORS 头的 API mock 服务（独立端口 = 跨域）。
+async fn start_cors_api(with_cors: bool) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                loop {
+                    let Ok(n) = socket.read(&mut tmp).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                    if buf.len() > 64 * 1024 {
+                        return;
+                    }
+                }
+                let body = b"{\"ok\":true}";
+                let mut headers = String::new();
+                if with_cors {
+                    headers.push_str("Access-Control-Allow-Origin: *\r\n");
+                    headers.push_str("Access-Control-Allow-Methods: GET, POST\r\n");
+                }
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let mut out = resp.into_bytes();
+                out.extend_from_slice(body);
+                let _ = socket.write_all(&out).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    format!("http://{}", addr)
+}
+
+#[tokio::test]
+async fn cors_跨域fetch_无头拒绝_有头放行() {
+    allow_loopback();
+    let base = start_site_with_headers().await;
+    let tool = McpWebUseTool;
+
+    let api_no_cors = start_cors_api(false).await;
+    let api_cors = start_cors_api(true).await;
+    let open = exec(&tool, json!({"action": "open", "url": format!("{base}/"), "mode": "hidden", "reuse": false})).await;
+    assert_eq!(open["code"], 0, "{open}");
+    let page_id = open["data"]["page_id"].as_str().unwrap().to_string();
+
+    // 无 CORS 头的跨域 fetch → reject（两步：先触发写 window.__r，再读取）。
+    let t1 = exec(&tool, json!({"action": "control", "page_id": page_id, "control_action": "eval_js", "params": {"expression": format!("window.__r=null; fetch('{api_no_cors}').then(function(r){{return r.text();}}).then(function(t){{window.__r='ok:'+t;}}).catch(function(){{window.__r='reject';}}); 'triggered'")}})).await;
+    assert_eq!(t1["code"], 0, "{t1}");
+    let r1 = exec(&tool, json!({"action": "control", "page_id": page_id, "control_action": "eval_js", "params": {"expression": "window.__r || 'pending'"}})).await;
+    assert_eq!(r1["code"], 0, "{r1}");
+    assert!(
+        r1["data"]["result"].as_str().unwrap_or("").starts_with("reject"),
+        "无 CORS 头应 reject:{r1}"
+    );
+
+    // 有 CORS 头的跨域 fetch → 放行。
+    let t2 = exec(&tool, json!({"action": "control", "page_id": page_id, "control_action": "eval_js", "params": {"expression": format!("window.__r=null; fetch('{api_cors}').then(function(r){{return r.text();}}).then(function(t){{window.__r='ok:'+t;}}).catch(function(){{window.__r='reject';}}); 'triggered'")}})).await;
+    assert_eq!(t2["code"], 0, "{t2}");
+    let r2 = exec(&tool, json!({"action": "control", "page_id": page_id, "control_action": "eval_js", "params": {"expression": "window.__r || 'pending'"}})).await;
+    assert_eq!(r2["code"], 0, "{r2}");
+    assert!(
+        r2["data"]["result"].as_str().unwrap_or("").starts_with("ok:"),
+        "有 CORS 头应放行:{r2}"
+    );
 
     exec(&tool, json!({"action": "close", "page_id": page_id})).await;
 }

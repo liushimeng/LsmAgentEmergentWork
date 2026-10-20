@@ -68,6 +68,21 @@ impl FontSet {
         full_page: bool,
         images: &ImageStore,
     ) -> Vec<u8> {
+        self.render_pixmap(layout, viewport_w, viewport_h, scroll_y, full_page, images)
+            .map(|p| p.encode_png().unwrap_or_default())
+            .unwrap_or_default()
+    }
+
+    /// 渲染一页为 pixmap（阶段四第二步：供 clip 区域截图裁剪）。
+    pub fn render_pixmap(
+        &self,
+        layout: &Layout,
+        viewport_w: u32,
+        viewport_h: u32,
+        scroll_y: f64,
+        full_page: bool,
+        images: &ImageStore,
+    ) -> Option<Pixmap> {
         let width = viewport_w.clamp(64, 7680);
         let mut height = if full_page {
             (layout.page_height().ceil() as u32).clamp(64, 20_000)
@@ -79,10 +94,7 @@ impl FontSet {
         if width.saturating_mul(height) > MAX_PIXELS {
             height = (MAX_PIXELS / width).max(64);
         }
-        let mut pixmap = match Pixmap::new(width, height) {
-            Some(p) => p,
-            None => return Vec::new(),
-        };
+        let mut pixmap = Pixmap::new(width, height)?;
         pixmap.fill(Color::WHITE);
 
         for b in &layout.boxes {
@@ -124,7 +136,7 @@ impl FontSet {
             }
             self.draw_line(&mut pixmap, line, y);
         }
-        pixmap.encode_png().unwrap_or_default()
+        Some(pixmap)
     }
 
     fn draw_line(&self, pixmap: &mut Pixmap, line: &TextLine, top: f64) {
@@ -387,6 +399,39 @@ pub fn is_image_path(path: &Path) -> bool {
     )
 }
 
+/// 裁剪 pixmap 子区域并编码 PNG（阶段四第二步：clip 区域截图）。
+/// `x/y/w/h` 为源图像素坐标（浮点，内部取整并 clamp 到边界）。
+/// 区域完全越界时返回 None。
+pub fn crop_pixmap(src: &Pixmap, x: f64, y: f64, w: f64, h: f64) -> Option<Vec<u8>> {
+    let sw = src.width() as i64;
+    let sh = src.height() as i64;
+    let x0 = x.round() as i64;
+    let y0 = y.round() as i64;
+    let x1 = (x + w).round() as i64;
+    let y1 = (y + h).round() as i64;
+    let cx0 = x0.max(0).min(sw);
+    let cy0 = y0.max(0).min(sh);
+    let cx1 = x1.max(0).min(sw);
+    let cy1 = y1.max(0).min(sh);
+    if cx1 <= cx0 || cy1 <= cy0 {
+        return None;
+    }
+    let cw = (cx1 - cx0) as u32;
+    let ch = (cy1 - cy0) as u32;
+    let mut dst = Pixmap::new(cw, ch)?;
+    let src_pixels = src.pixels();
+    let dst_pixels = dst.pixels_mut();
+    for row in 0..ch as i64 {
+        let srow = (cy0 + row) as usize;
+        let soffset = srow * sw as usize + cx0 as usize;
+        let drow = row as usize;
+        let doffset = drow * cw as usize;
+        dst_pixels[doffset..doffset + cw as usize]
+            .copy_from_slice(&src_pixels[soffset..soffset + cw as usize]);
+    }
+    dst.encode_png().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,5 +489,47 @@ mod tests {
         let f = FontSet::fallback();
         assert!(f.char_width('中', 16.0) >= 16.0);
         assert!(f.char_width('a', 16.0) > 0.0);
+    }
+
+    #[test]
+    fn crop_pixmap_裁剪子区域() {
+        // 4x2 像素：左半红右半蓝。
+        let mut src = Pixmap::new(4, 2).unwrap();
+        let red = PremultipliedColorU8::from_rgba(255, 0, 0, 255).unwrap();
+        let blue = PremultipliedColorU8::from_rgba(0, 0, 255, 255).unwrap();
+        let pixels = src.pixels_mut();
+        for row in 0..2 {
+            for col in 0..4 {
+                pixels[row * 4 + col] = if col < 2 { red } else { blue };
+            }
+        }
+        // 裁剪右半（x=2, w=2）。
+        let cropped = crop_pixmap(&src, 2.0, 0.0, 2.0, 2.0).unwrap();
+        let decoded = image::load_from_memory(&cropped).unwrap().to_rgba8();
+        assert_eq!(decoded.width(), 2);
+        assert_eq!(decoded.height(), 2);
+        assert_eq!(&decoded.get_pixel(0, 0).0[..3], &[0, 0, 255]);
+        assert_eq!(&decoded.get_pixel(1, 1).0[..3], &[0, 0, 255]);
+    }
+
+    #[test]
+    fn crop_pixmap_越界区域返回_none() {
+        let src = Pixmap::new(4, 2).unwrap();
+        assert!(crop_pixmap(&src, 10.0, 10.0, 2.0, 2.0).is_none());
+        assert!(crop_pixmap(&src, -5.0, 0.0, 2.0, 2.0).is_none());
+    }
+
+    #[test]
+    fn render_pixmap_与_render_一致() {
+        let doc = Document::parse("<body><h1>Hi</h1></body>", "https://a.test/");
+        let font = FontSet::fallback();
+        let l = layout::compute(&doc, 320.0, &font);
+        let pm = font
+            .render_pixmap(&l, 320, 240, 0.0, false, &ImageStore::new())
+            .unwrap();
+        let png = pm.encode_png().unwrap();
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(pm.width(), 320);
+        assert_eq!(pm.height(), 240);
     }
 }

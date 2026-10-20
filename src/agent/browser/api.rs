@@ -72,6 +72,7 @@ async fn js_dispatch(
             &tab.user_agent,
             (tab.viewport.width, tab.viewport.height),
             &tab.session_storage,
+            tab.security.get_csp(&tab.url),
         );
         env.scroll_x = tab.scroll_x;
         env.scroll_y = tab.scroll_y;
@@ -198,6 +199,7 @@ async fn apply_js_reply(
             bytes: rec.bytes,
             elapsed_ms: rec.elapsed_ms,
             redirect: rec.redirect,
+            from_cache: false,
             at_ms: super::now_ms(),
         });
     }
@@ -242,6 +244,7 @@ async fn apply_js_reply(
                 bytes: rec.bytes,
                 elapsed_ms: rec.elapsed_ms,
                 redirect: rec.redirect,
+                from_cache: false,
                 at_ms: super::now_ms(),
             });
         }
@@ -314,6 +317,7 @@ async fn js_eval_thread(
             &tab.user_agent,
             (tab.viewport.width, tab.viewport.height),
             &tab.session_storage,
+            tab.security.get_csp(&tab.url),
         );
         env.scroll_x = tab.scroll_x;
         env.scroll_y = tab.scroll_y;
@@ -1490,6 +1494,7 @@ async fn act_eval(
                         bytes: 0,
                         elapsed_ms: 0,
                         redirect: false,
+                        from_cache: false,
                         at_ms: super::now_ms(),
                     });
                 }

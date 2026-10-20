@@ -75,15 +75,23 @@ pub async fn inspect(
                     json!({
                         "url": r.url, "method": r.method, "status": r.status,
                         "content_type": r.content_type, "bytes": r.bytes,
-                        "elapsed_ms": r.elapsed_ms, "redirect": r.redirect, "at_ms": r.at_ms,
+                        "elapsed_ms": r.elapsed_ms, "redirect": r.redirect,
+                        "from_cache": r.from_cache, "at_ms": r.at_ms,
                     })
                 })
                 .collect();
+            let stats = inner.http_cache.stats();
             Ok(json!({
                 "events": events,
                 "count": tab.network.len(),
                 "collection_healthy": true,
                 "last_event_at": tab.network.last().map(|r| r.at_ms),
+                "cache_stats": {
+                    "hits": stats.hits,
+                    "misses": stats.misses,
+                    "size_bytes": stats.size_bytes,
+                    "entry_count": stats.entry_count,
+                },
             }))
         }
         "elements" => inspect_elements(tab, &doc, params),

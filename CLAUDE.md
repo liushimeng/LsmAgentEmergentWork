@@ -85,6 +85,7 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 | `LAEW_WEB_MAX_STYLESHEETS` | 正整数(默认 `16`) | 单页外链样式表数量上限 |
 | `LAEW_WEB_MAX_CSS_BYTES` | 正整数(默认 `2097152`) | 单个外链样式表字节上限(总量 4MB) |
 | `LAEW_WEB_IMAGES` | `off`/`0`/`false`/`no` | 关闭图片子资源加载(页面照常打开,只是没有图)。见 `src/agent/browser/images.rs` |
+| `LAEW_WEB_CACHE` | `off`/`0`/`false`/`no` | 关闭全内存 HTTP 缓存(主文档+子资源强缓存读写)。见 `src/agent/browser/cache/`、`12-阶段四第二步缓存与安全接入主管线设计.md` |
 | `LAEW_WEB_MAX_IMAGES` | 正整数(默认 `48`) | 单页图片数量上限 |
 | `LAEW_WEB_MAX_IMAGE_BYTES` | 正整数(默认 `12582912`) | 单张图片字节上限(默认 12MB) |
 | `LAEW_WEB_IMAGE_BUDGET_MS` | 正整数(默认 `20000`) | 单页图片加载总预算(毫秒),超限跳过剩余图片 |
@@ -424,6 +425,7 @@ Markdown Prompt 模板，两级发现：**项目级** `{工作目录}/.laew/comm
 - `docs/MCP_Window_Use/` — 桌面窗口操控
 - `docs/自定义浏览器和V8引擎/` — LsmAgentBrowser 内核、兼容层与阶段路线图
   - `08-阶段三布局引擎Flex与定位设计.md` — Flex + 定位体系(已完成)与 Phase 3 后续
+  - `12-阶段四第二步缓存与安全接入主管线设计.md` — HttpCache/CSP/CORS 接入主管线 + clip 区域截图(已完成)
 - `docs/Use_MCP/` — 通用 MCP 服务调用
 
 **上下文与会话**：

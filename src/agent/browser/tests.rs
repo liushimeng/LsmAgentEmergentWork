@@ -164,3 +164,97 @@ fn 模式解析兼容三档() {
     assert_eq!(BrowserMode::from_arg("new_headless"), Some(BrowserMode::Hidden));
     assert_eq!(BrowserMode::from_arg("bogus"), None);
 }
+
+#[tokio::test]
+async fn clip_截图裁剪区域() {
+    let mgr = LsmBrowserManager::new();
+    let url = html_doc("<h1>ClipTest</h1>");
+    let out = mgr
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .await
+        .unwrap();
+    let dir = std::env::temp_dir().join(format!("lsm_clip_{}", now_ms()));
+    let path = dir.join("clip.png");
+    // clip 超出整页宽高时应 clamp 到页面实际范围。
+    let v = mgr
+        .screenshot(
+            &out.page_id,
+            &serde_json::json!({
+                "save_path": path.to_string_lossy(),
+                "full_page": true,
+                "clip": {"x": 0.0, "y": 0.0, "width": 4096.0, "height": 3000.0},
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(v["format"], "png");
+    assert!(v["clip"].is_object(), "响应应回显生效 clip");
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+    // 裁剪后尺寸不应超过 clip 请求值。
+    let decoded = image::load_from_memory(&bytes).unwrap();
+    assert!(decoded.width() <= 4096);
+    assert!(decoded.height() <= 3000);
+    let _ = std::fs::remove_dir_all(&dir);
+    mgr.shutdown().await;
+}
+
+#[test]
+fn csp_脚本门禁判定() {
+    use security::CspPolicy;
+    // script-src 'self'：内联被拒（'self' 不含内联语义，需显式 unsafe-inline）。
+    let p = CspPolicy::parse("script-src 'self'");
+    assert!(!p.is_script_allowed("inline", true), "内联应被拒");
+    // 显式 host 来源：外链白名单放行。
+    assert!(p.is_script_allowed("https://same.com/a.js", false) == false);
+    let p_host = CspPolicy::parse("script-src 'self' https://same.com");
+    assert!(p_host.is_script_allowed("https://same.com/a.js", false));
+    assert!(!p_host.is_script_allowed("https://other.com/a.js", false));
+    // unsafe-inline：内联放行。
+    let p2 = CspPolicy::parse("script-src 'self' 'unsafe-inline'");
+    assert!(p2.is_script_allowed("inline", true));
+    // 无策略：全部放行。
+    let p3 = CspPolicy::parse("");
+    assert!(p3.is_script_allowed("inline", true));
+    assert!(p3.is_script_allowed("https://any.com/a.js", false));
+    // connect-src 门禁。
+    let p4 = CspPolicy::parse("connect-src https://api.com");
+    assert!(p4.is_connect_allowed("https://api.com/data"));
+    assert!(!p4.is_connect_allowed("https://evil.com/data"));
+}
+
+#[test]
+fn cors_跨域校验判定() {
+    use security::{check_simple_request, CorsHeaders, CorsResult};
+    // 无 CORS 头 → 拒绝。
+    let cors = CorsHeaders::default();
+    assert!(matches!(
+        check_simple_request("https://a.com", "GET", &cors, false),
+        CorsResult::Denied(_)
+    ));
+    // 通配 origin + 方法 → 放行。
+    let cors = CorsHeaders {
+        allow_origin: Some("*".to_string()),
+        allow_methods: Some(vec!["GET".to_string()]),
+        ..Default::default()
+    };
+    assert!(matches!(
+        check_simple_request("https://a.com", "GET", &cors, false),
+        CorsResult::Allowed
+    ));
+    // 方法不在白名单 → 拒绝。
+    let cors = CorsHeaders {
+        allow_origin: Some("*".to_string()),
+        allow_methods: Some(vec!["POST".to_string()]),
+        ..Default::default()
+    };
+    assert!(matches!(
+        check_simple_request("https://a.com", "GET", &cors, false),
+        CorsResult::Denied(_)
+    ));
+    // 同源 → 跳过校验。
+    assert!(matches!(
+        check_simple_request("https://a.com", "GET", &CorsHeaders::default(), true),
+        CorsResult::SameOrigin
+    ));
+}

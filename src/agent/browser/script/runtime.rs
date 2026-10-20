@@ -59,6 +59,8 @@ struct ReqEnv {
     cookies: String,
     network: Vec<NetRecordLite>,
     deadline: Instant,
+    /// 当前页 CSP 快照（阶段四第二步：connect-src 门禁）。
+    csp: Option<super::super::security::CspPolicy>,
 }
 
 thread_local! {
@@ -67,6 +69,7 @@ thread_local! {
         cookies: String::new(),
         network: Vec::new(),
         deadline: Instant::now(),
+        csp: None,
     });
 }
 
@@ -218,6 +221,7 @@ impl ThreadRuntime {
             env_cell.cookies = env.cookies.clone();
             env_cell.network.clear();
             env_cell.deadline = deadline;
+            env_cell.csp = env.csp.clone();
         });
         self.eval_quiet("__lsmBegin()");
     }
@@ -599,6 +603,16 @@ fn blocking_fetch(
     let truncated = bytes.len() > MAX_FETCH_BODY;
     let bytes = if truncated { bytes[..MAX_FETCH_BODY].to_vec() } else { bytes };
     let body = crate::agent::browser::urlutil::decode_body(&bytes, &content_type);
+    // 阶段四第二步：CORS 校验（跨域响应必须有合法 Access-Control-Allow-* 头）。
+    if let Some(err) = check_cors(&base_url, target.as_str(), &method, &headers) {
+        record_network(url, &method, status, &content_type, 0, started);
+        return json!({"error": err});
+    }
+    // 阶段四第二步：CSP connect-src 门禁。
+    if let Some(err) = check_connect_csp(&base_url, target.as_str()) {
+        record_network(url, &method, status, &content_type, 0, started);
+        return json!({"error": err});
+    }
     record_network(url, &method, status, &content_type, bytes.len(), started);
     let mut header_map = serde_json::Map::new();
     for (k, v) in &headers {
@@ -647,4 +661,47 @@ fn build_blocking_client(insecure: bool) -> reqwest::blocking::Client {
         builder = builder.danger_accept_invalid_certs(true);
     }
     builder.build().unwrap_or_else(|_| reqwest::blocking::Client::new())
+}
+
+/// CORS 校验（阶段四第二步）：跨域响应必须有合法 `Access-Control-Allow-*` 头。
+/// 返回 None 表示放行；Some(原因) 表示按浏览器语义拒绝（fetch 走 error 通道）。
+fn check_cors(
+    base_url: &str,
+    target: &str,
+    method: &str,
+    headers: &[(String, String)],
+) -> Option<String> {
+    let base_origin = url::Url::parse(base_url)
+        .ok()
+        .map(|u| u.origin().ascii_serialization())?;
+    let target_origin = url::Url::parse(target)
+        .ok()
+        .map(|u| u.origin().ascii_serialization())?;
+    if base_origin == target_origin {
+        return None;
+    }
+    let cors = super::super::security::CorsHeaders::from_headers(headers);
+    match super::super::security::check_simple_request(&base_origin, method, &cors, false) {
+        super::super::security::CorsResult::Allowed
+        | super::super::security::CorsResult::SameOrigin => None,
+        super::super::security::CorsResult::Denied(why) => {
+            Some(format!("CORS 策略阻止:{why}"))
+        }
+    }
+}
+
+/// CSP connect-src 门禁（阶段四第二步）：页面 CSP 存在时，fetch/XHR 目标必须在
+/// connect-src（或 default-src 回退）允许范围内。
+fn check_connect_csp(base_url: &str, target: &str) -> Option<String> {
+    let _ = base_url;
+    REQ_ENV.with(|c| {
+        let env = c.borrow();
+        env.csp.as_ref().and_then(|p| {
+            if p.is_connect_allowed(target) {
+                None
+            } else {
+                Some("CSP connect-src 阻止请求".to_string())
+            }
+        })
+    })
 }

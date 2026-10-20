@@ -323,6 +323,7 @@ pub async fn load_images(
                     bytes: resp.bytes.len(),
                     elapsed_ms: resp.elapsed_ms,
                     redirect: resp.redirect_chain.len() > 1,
+                    from_cache: false,
                     at_ms: super::now_ms(),
                 });
                 if !(200..300).contains(&status) {

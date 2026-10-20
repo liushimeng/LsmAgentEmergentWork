@@ -113,6 +113,8 @@ pub struct NetworkRecord {
     pub bytes: usize,
     pub elapsed_ms: u64,
     pub redirect: bool,
+    /// 是否来自全内存 HTTP 缓存（命中强缓存时 elapsed_ms=0）。
+    pub from_cache: bool,
     pub at_ms: u128,
 }
 
@@ -166,6 +168,8 @@ pub struct TabState {
     pub js: Option<script::JsHandle>,
     /// 已解码图片缓存(阶段三第三步:URL → RGBA8,全内存)。
     pub images: images::ImageStore,
+    /// 安全上下文（CORS/CSP 缓存、页面源）。
+    pub security: security::SecurityContext,
 }
 
 #[derive(Debug, Clone)]
@@ -184,6 +188,8 @@ pub struct Inner {
     pub tabs: HashMap<String, TabState>,
     pub cookies: CookieJar,
     pub local_storage: HashMap<String, HashMap<String, String>>,
+    /// 全内存 HTTP 缓存（阶段四第二步接入主管线）。
+    pub http_cache: cache::HttpCache,
     pub seq: u64,
     pub window_seq: u64,
     pub started_ms: u128,
@@ -465,10 +471,12 @@ impl LsmBrowserManager {
             height: height.unwrap_or(DEFAULT_VIEWPORT_H).clamp(240, 4320),
             ..Default::default()
         };
-        let resp = self.fetch_main(&mut inner, &requested, &ua, timeout_ms).await?;
+        let (resp, from_cache) = self.fetch_main(&mut inner, &requested, &ua, timeout_ms).await?;
         let raw_html = resp.text();
         let content_type = resp.content_type();
         let empty_session = HashMap::new();
+        // 阶段四第二步：解析主文档 CSP 头，供脚本管线门禁。
+        let csp_policy = parse_csp_header(&resp.headers);
         // 外链样式表先预取内联,脚本执行与布局都消费同一份样式。
         let resources_out = resources::load_stylesheets(
             &mut inner,
@@ -487,6 +495,7 @@ impl LsmBrowserManager {
             &ua,
             (viewport.width, viewport.height),
             &empty_session,
+            csp_policy.as_ref(),
         )
         .await;
         let html = pipeline.html;
@@ -571,6 +580,7 @@ impl LsmBrowserManager {
                     bytes: resp.bytes.len(),
                     elapsed_ms: resp.elapsed_ms,
                     redirect: resp.redirect_chain.len() > 1,
+                    from_cache,
                     at_ms: now_ms(),
                 }];
                 recs.extend(resources_out.network.clone());
@@ -601,8 +611,16 @@ impl LsmBrowserManager {
             auto_follow: false,
             js: pipeline.js,
             images: images_out.store,
+            security: security::SecurityContext::new(),
         };
         inner.tabs.insert(page_id.clone(), tab);
+        // 阶段四第二步：CSP 策略与页面源写入安全上下文（供 fetch/XHR connect-src 门禁）。
+        if let Some(tab) = inner.tabs.get_mut(&page_id) {
+            tab.security.set_page_origin(&resp.final_url);
+            if let Some(policy) = &csp_policy {
+                tab.security.cache_csp(&resp.final_url, policy.clone());
+            }
+        }
         if let Some(w) = inner.windows.iter_mut().find(|w| w.id == window_id) {
             w.tabs.push(page_id.clone());
         }
@@ -704,22 +722,29 @@ impl LsmBrowserManager {
         let mut request = net::FetchRequest::get(url, timeout_ms.max(1_000));
         request.method = method.to_ascii_uppercase();
         request.body = body;
-        let resp = {
+        let (resp, from_cache) = if request.method == "GET" {
+            // 阶段四第二步：GET 统一走带缓存的取页通道。
             if ua != DEFAULT_UA {
                 request
                     .headers
                     .push(("user-agent".to_string(), ua.to_string()));
             }
-            self.http
+            self.fetch_main(inner, url, ua, timeout_ms).await?
+        } else {
+            let resp = self
+                .http
                 .fetch(request, &mut inner.cookies)
                 .await
                 .map_err(|e| {
                     EngineError::new(2001, e)
                         .with_data(json!({"reason": "connection_level", "retryable": true}))
-                })?
+                })?;
+            (resp, false)
         };
         let raw_html = resp.text();
         let content_type = resp.content_type();
+        // 阶段四第二步：解析主文档 CSP 头，供脚本管线门禁与安全上下文缓存。
+        let csp_policy = parse_csp_header(&resp.headers);
         // 外链样式表先预取内联(失败降级,不阻断导航)。
         let resources_out = resources::load_stylesheets(
             inner,
@@ -749,6 +774,7 @@ impl LsmBrowserManager {
             ua,
             (viewport_w, viewport_h),
             &session_snapshot,
+            csp_policy.as_ref(),
         )
         .await;
         let html = pipeline.html;
@@ -783,6 +809,11 @@ impl LsmBrowserManager {
         tab.form_values = pipeline.form_values.clone();
         tab.focused = None;
         tab.last_active_ms = now_ms();
+        // 阶段四第二步：CSP 策略与页面源写入安全上下文（供 fetch/XHR connect-src 门禁）。
+        tab.security.set_page_origin(&resp.final_url);
+        if let Some(policy) = &csp_policy {
+            tab.security.cache_csp(&resp.final_url, policy.clone());
+        }
         tab.console = resources_out.console.clone();
         tab.console.extend(pipeline.console.clone());
         tab.console.extend(images_out.console.clone());
@@ -815,6 +846,7 @@ impl LsmBrowserManager {
                 bytes: resp.bytes.len(),
                 elapsed_ms: resp.elapsed_ms,
                 redirect: resp.redirect_chain.len() > 1,
+                from_cache,
                 at_ms: now_ms(),
             },
         );
@@ -830,21 +862,44 @@ impl LsmBrowserManager {
         })
     }
 
+    /// 取主文档（GET）。阶段四第二步接入全内存 HTTP 缓存：
+    /// 命中强缓存直接返回（`from_cache=true`），未命中走网络并按需写缓存。
     async fn fetch_main(
         &self,
         inner: &mut Inner,
         url: &str,
         ua: &str,
         timeout_ms: u64,
-    ) -> EngineResult<net::FetchResponse> {
+    ) -> EngineResult<(net::FetchResponse, bool)> {
+        if cache_enabled() {
+            if let Some(entry) = inner.http_cache.get(url) {
+                return Ok((
+                    net::FetchResponse {
+                        final_url: url.to_string(),
+                        status: entry.status,
+                        headers: entry.headers.clone(),
+                        bytes: entry.bytes.clone(),
+                        redirect_chain: vec![],
+                        elapsed_ms: 0,
+                    },
+                    true,
+                ));
+            }
+        }
         let mut req = net::FetchRequest::get(url, timeout_ms.max(1_000));
         if ua != DEFAULT_UA {
             req.headers.push(("user-agent".to_string(), ua.to_string()));
         }
-        self.http
+        let resp = self
+            .http
             .fetch(req, &mut inner.cookies)
             .await
-            .map_err(|e| EngineError::new(2001, e).with_data(json!({"reason": "connection_level", "retryable": true})))
+            .map_err(|e| {
+                EngineError::new(2001, e)
+                    .with_data(json!({"reason": "connection_level", "retryable": true}))
+            })?;
+        cache_put(&mut inner.http_cache, url, &resp);
+        Ok((resp, false))
     }
 
     /// 后退/前进/刷新。返回导航结果。
@@ -1189,16 +1244,47 @@ impl LsmBrowserManager {
                 "note": "阶段一 OCR 返回内核可见文本;真实像素 OCR 在阶段五接入",
             }));
         }
-        let png = self.font.render(
-            &tab.layout,
-            tab.viewport.width,
-            tab.viewport.height,
-            tab.scroll_y,
-            full_page,
-            &tab.images,
-        );
+        // 阶段四第二步：clip 区域截图（文档坐标；full_page=false 时 y 相对视口）。
+        let clip = params.get("clip").and_then(Value::as_object).map(|c| {
+            (
+                c.get("x").and_then(Value::as_f64).unwrap_or(0.0),
+                c.get("y").and_then(Value::as_f64).unwrap_or(0.0),
+                c.get("width").and_then(Value::as_f64).unwrap_or(0.0),
+                c.get("height").and_then(Value::as_f64).unwrap_or(0.0),
+            )
+        });
+        let pixmap = self
+            .font
+            .render_pixmap(
+                &tab.layout,
+                tab.viewport.width,
+                tab.viewport.height,
+                tab.scroll_y,
+                full_page,
+                &tab.images,
+            )
+            .ok_or_else(|| EngineError::new(3001, "渲染失败(无法创建像素缓冲区)"))?;
+        let mut applied_clip = None;
+        let png = if let Some((cx, cy, cw, ch)) = clip {
+            if cw > 0.0 && ch > 0.0 {
+                // 文档坐标 → 渲染像素坐标（视口截图时 y 需加回 scroll_y 偏移）。
+                let py = if full_page { cy } else { cy + tab.scroll_y };
+                if let Some(cropped) = render::crop_pixmap(&pixmap, cx, py, cw, ch) {
+                    applied_clip = Some(json!({
+                        "x": cx, "y": cy, "width": cw, "height": ch,
+                    }));
+                    cropped
+                } else {
+                    pixmap.encode_png().unwrap_or_default()
+                }
+            } else {
+                pixmap.encode_png().unwrap_or_default()
+            }
+        } else {
+            pixmap.encode_png().unwrap_or_default()
+        };
         if png.is_empty() {
-            return Err(EngineError::new(3001, "渲染失败(无法创建像素缓冲区)"));
+            return Err(EngineError::new(3001, "渲染失败(无法编码 PNG)"));
         }
         let save_path = params
             .get("save_path")
@@ -1222,6 +1308,9 @@ impl LsmBrowserManager {
             "full_page": full_page,
             "viewport": {"width": tab.viewport.width, "height": tab.viewport.height},
         });
+        if let Some(clip) = applied_clip {
+            data["clip"] = clip;
+        }
         if !self.font.has_font() {
             data["render_note"] = json!("未找到系统字体,截图为占位色块");
         }
@@ -1392,6 +1481,48 @@ fn record_network(tab: &mut TabState, rec: NetworkRecord) {
     if tab.network.len() > 200 {
         tab.network.remove(0);
     }
+}
+
+/// 全内存 HTTP 缓存开关（阶段四第二步）：`LAEW_WEB_CACHE=off` 关闭。
+fn cache_enabled() -> bool {
+    !matches!(
+        std::env::var("LAEW_WEB_CACHE")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "off" | "0" | "false" | "no"
+    )
+}
+
+/// 解析主文档响应的 CSP 头（阶段四第二步）。
+/// report-only 模式不执行，返回 None。
+fn parse_csp_header(headers: &[(String, String)]) -> Option<security::CspPolicy> {
+    let header = net::header_value(headers, "content-security-policy")?;
+    if security::CspPolicy::is_report_only(&header) {
+        return None;
+    }
+    Some(security::CspPolicy::parse(&header))
+}
+
+/// 按响应头判断可缓存性并写入全内存缓存（阶段四第二步）。
+/// 只缓存 GET 2xx 且 Cache-Control 允许存储的响应。
+fn cache_put(cache: &mut cache::HttpCache, url: &str, resp: &net::FetchResponse) {
+    if !(200..300).contains(&resp.status) {
+        return;
+    }
+    let cc = net::header_value(&resp.headers, "cache-control").unwrap_or_default();
+    let policy = cache::parse_cache_control(&cc);
+    if !policy.is_cacheable() {
+        return;
+    }
+    cache.put(cache::CacheEntry::new(
+        url.to_string(),
+        resp.status,
+        resp.headers.clone(),
+        resp.bytes.clone(),
+        now_ms(),
+    ));
 }
 
 pub fn now_ms() -> u128 {

@@ -210,6 +210,41 @@ pub async fn load_stylesheets(
             fetched.push((link.href, data));
             continue;
         }
+        // 阶段四第二步：先查全内存 HTTP 缓存（强缓存命中跳过网络）。
+        if super::cache_enabled() {
+            if let Some(entry) = inner.http_cache.get(&link.href) {
+                let css = super::urlutil::decode_body(&entry.bytes, &super::net::header_value(&entry.headers, "content-type").unwrap_or_default());
+                if css.len() > max_bytes {
+                    out.skipped.push(format!("{} 超过单表上限", link.href));
+                    continue;
+                }
+                total += css.len();
+                if total > MAX_TOTAL_CSS_BYTES {
+                    out.skipped.push("样式总量超过上限".to_string());
+                    break;
+                }
+                out.sheets.push(LoadedSheet {
+                    url: link.href.clone(),
+                    media: link.media.clone(),
+                    bytes: css.len(),
+                    status: entry.status,
+                    inline: false,
+                });
+                out.network.push(NetworkRecord {
+                    url: link.href.clone(),
+                    method: "GET".to_string(),
+                    status: entry.status,
+                    content_type: super::net::header_value(&entry.headers, "content-type").unwrap_or_default(),
+                    bytes: css.len(),
+                    elapsed_ms: 0,
+                    redirect: false,
+                    from_cache: true,
+                    at_ms: super::now_ms(),
+                });
+                fetched.push((link.href, css));
+                continue;
+            }
+        }
         let mut req =
             net::FetchRequest::get(&link.href, timeout_ms.min(CSS_FETCH_TIMEOUT_MS).max(1_000));
         req.max_bytes = max_bytes;
@@ -228,6 +263,7 @@ pub async fn load_stylesheets(
                     bytes: resp.bytes.len(),
                     elapsed_ms: resp.elapsed_ms,
                     redirect: resp.redirect_chain.len() > 1,
+                    from_cache: false,
                     at_ms: super::now_ms(),
                 });
                 if !(200..300).contains(&status) {
@@ -255,6 +291,8 @@ pub async fn load_stylesheets(
                     status,
                     inline: false,
                 });
+                // 阶段四第二步：可缓存响应写入全内存缓存。
+                super::cache_put(&mut inner.http_cache, &link.href, &resp);
                 fetched.push((link.href, css));
             }
             Err(e) => {

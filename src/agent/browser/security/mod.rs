@@ -16,7 +16,7 @@ pub use mixed_content::{
 };
 
 /// 安全上下文：为单个标签页维护安全策略状态。
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SecurityContext {
     /// 页面源（origin）。
     page_origin: Option<String>,

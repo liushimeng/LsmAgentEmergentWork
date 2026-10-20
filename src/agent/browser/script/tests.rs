@@ -19,6 +19,7 @@ fn env(url: &str) -> PageEnv {
         scroll_y: 0.0,
         user_agent: "test".to_string(),
         prefers_dark: false,
+        csp: None,
     }
 }
 

@@ -31,6 +31,8 @@ pub struct PageEnv {
     pub user_agent: String,
     /// `prefers-color-scheme: dark` 求值结果(matchMedia 用)。
     pub prefers_dark: bool,
+    /// 当前页 CSP 快照（阶段四第二步：fetch/XHR connect-src 门禁）。
+    pub csp: Option<super::security::CspPolicy>,
 }
 
 /// 脚本来源:inline 文本或宿主预取的外链内容。
@@ -187,6 +189,7 @@ pub(crate) async fn run_pipeline(
     ua: &str,
     viewport: (u32, u32),
     session_storage: &HashMap<String, String>,
+    csp: Option<&super::security::CspPolicy>,
 ) -> PipelineOut {
     let mut out = PipelineOut {
         html: raw_html.to_string(),
@@ -212,6 +215,42 @@ pub(crate) async fn run_pipeline(
         }
         let mut scripts = collected.inline;
         for url in &collected.external_urls {
+            // 阶段四第二步：CSP script-src 门禁（外链脚本 URL 白名单）。
+            if let Some(policy) = csp {
+                if !policy.is_script_allowed(url, false) {
+                    out.console.push(super::ConsoleRecord {
+                        level: "warn".to_string(),
+                        text: format!("CSP script-src 阻止脚本 {url}"),
+                        at_ms: super::now_ms(),
+                    });
+                    continue;
+                }
+            }
+            // 阶段四第二步：先查全内存 HTTP 缓存（强缓存命中跳过网络）。
+            if super::cache_enabled() {
+                if let Some(entry) = inner.http_cache.get(url) {
+                    let text = super::urlutil::decode_body(&entry.bytes, &super::net::header_value(&entry.headers, "content-type").unwrap_or_default());
+                    if text.len() <= MAX_EXTERNAL_BYTES && !text.trim().is_empty() {
+                        out.network.push(super::NetworkRecord {
+                            url: url.clone(),
+                            method: "GET".to_string(),
+                            status: entry.status,
+                            content_type: super::net::header_value(&entry.headers, "content-type").unwrap_or_default(),
+                            bytes: text.len(),
+                            elapsed_ms: 0,
+                            redirect: false,
+                            from_cache: true,
+                            at_ms: super::now_ms(),
+                        });
+                        scripts.push(ScriptSource {
+                            kind: "external",
+                            content: text,
+                            src_url: url.clone(),
+                        });
+                    }
+                    continue;
+                }
+            }
             let mut req = super::net::FetchRequest::get(url, SCRIPT_FETCH_TIMEOUT_MS);
             req.max_bytes = MAX_EXTERNAL_BYTES;
             if ua != super::DEFAULT_UA {
@@ -229,6 +268,7 @@ pub(crate) async fn run_pipeline(
                             bytes: resp.bytes.len(),
                             elapsed_ms: resp.elapsed_ms,
                             redirect: resp.redirect_chain.len() > 1,
+                            from_cache: false,
                             at_ms: super::now_ms(),
                         });
                         scripts.push(ScriptSource {
@@ -236,12 +276,27 @@ pub(crate) async fn run_pipeline(
                             content: text,
                             src_url: url.clone(),
                         });
+                        // 阶段四第二步：可缓存响应写入全内存缓存。
+                        super::cache_put(&mut inner.http_cache, url, &resp);
                     }
                 }
                 Err(e) => {
                     out.console.push(super::ConsoleRecord {
                         level: "warn".to_string(),
                         text: format!("外链脚本加载失败 {url}:{e}"),
+                        at_ms: super::now_ms(),
+                    });
+                }
+            }
+        }
+        // 阶段四第二步：CSP 内联脚本门禁（无 'unsafe-inline' 时拒绝内联脚本）。
+        if let Some(policy) = csp {
+            if !scripts.is_empty() && scripts.iter().any(|s| s.kind == "inline") {
+                if !policy.is_script_allowed("inline", true) {
+                    scripts.retain(|s| s.kind == "external");
+                    out.console.push(super::ConsoleRecord {
+                        level: "warn".to_string(),
+                        text: "CSP script-src 阻止内联脚本(缺少 'unsafe-inline')".to_string(),
                         at_ms: super::now_ms(),
                     });
                 }
@@ -254,7 +309,7 @@ pub(crate) async fn run_pipeline(
             handle = Some(JsHandle::spawn());
         }
         let Some(h) = handle.clone() else { break };
-        let env = build_env(inner, base_url, &title_now, ua, viewport, session_storage);
+        let env = build_env(inner, base_url, &title_now, ua, viewport, session_storage, csp);
         // 快照后立即销毁 Document(NodeRef 非 Send,不能跨 await 存活)。
         let nodes = {
             let doc = super::document::Document::parse(&out.html, base_url);
@@ -299,6 +354,7 @@ pub(crate) async fn run_pipeline(
 }
 
 /// 组装线程请求用的 PageEnv(读 inner 的 Cookie/存储快照)。
+/// `csp` 为主文档响应解析出的当前页 CSP 策略（阶段四第二步）。
 pub(crate) fn build_env(
     inner: &super::Inner,
     url: &str,
@@ -306,6 +362,7 @@ pub(crate) fn build_env(
     ua: &str,
     viewport: (u32, u32),
     session_storage: &HashMap<String, String>,
+    csp: Option<&super::security::CspPolicy>,
 ) -> PageEnv {
     PageEnv {
         url: url.to_string(),
@@ -330,6 +387,7 @@ pub(crate) fn build_env(
                 .as_str(),
             "1" | "true" | "yes" | "on"
         ),
+        csp: csp.cloned(),
     }
 }
 
@@ -388,6 +446,7 @@ pub(crate) fn append_reply(
             bytes: rec.bytes,
             elapsed_ms: rec.elapsed_ms,
             redirect: rec.redirect,
+            from_cache: false,
             at_ms: super::now_ms(),
         });
     }

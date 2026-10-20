@@ -150,17 +150,24 @@
 - 原生窗口（winit 或平台原生）与多窗口/多标签 UI；
 - 鼠标、键盘、滚轮事件投递；
 - 页面缩放、滚动条、暗色模式；
-- 截图完整页、区域截图。
+- 截图完整页 ✅；**区域截图(clip)已实现**(2026-10，12 号文档)。
 
 **验收**：headed 模式可人工观看与操作；截图与页面视觉一致。
 
 ### Phase 4 — 网络与存储完整化
 
+> **基础框架已实现**(2026-10，11 号文档)：ResourceLoader、HttpCache、SecurityContext
+> 三模块 + Cookie SameSite + CORS/CSP/混合内容代码。
+>
+> **第二步已实现**(2026-10，12 号文档)：HttpCache 接入主管线（主文档+子资源强缓存、
+> from_cache 台账、cache_stats、LAEW_WEB_CACHE=off）；CSP 接入脚本管线（内联拦截+外链白名单
+> +connect-src 门禁）；CORS 接入页面 fetch/XHR（跨域响应校验）。
+
 - HTTP/2 完整、HTTP/3 可选、代理、连接池；
-- Cookie 属性（Domain/Path/Secure/HttpOnly/SameSite）、第三方 Cookie 隔离；
-- localStorage/sessionStorage/IndexedDB 内存实现；
-- 下载管理（进度、取消、重试）；
-- 缓存（强缓存/协商缓存，全内存 LRU）。
+- Cookie 属性（Domain/Path/Secure/HttpOnly/SameSite）✅；第三方 Cookie 隔离 ⏳；
+- localStorage/sessionStorage ✅；IndexedDB ⏳；
+- 下载管理（进度、取消、重试）⏳；
+- 缓存（强缓存/协商缓存，全内存 LRU）✅ 已接入主管线（协商缓存请求侧 ⏳）。
 
 ### Phase 5 — JS/Web API 扩展
 
