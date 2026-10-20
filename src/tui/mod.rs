@@ -150,8 +150,7 @@ impl TuiSession {
         }
         let db = Db::open(&paths).map_err(anyhow::Error::from)?;
         // 站点反爬声誉跨会话记忆(2026-10-19):注册进程级台账并回填历史抹除账,
-        // 使重跑任务第一次 open 即熔断、不拉起 Chrome。
-        crate::config::site_risk::init_with(&db);
+        // 使重跑任务第一次 open 即命中持久熔断。
         let db = Arc::new(Mutex::new(db));
         // 第 152 轮:产物统一落工作目录(不再逃逸到二进制所在目录)
         let plans_dir = crate::artifact_root::artifact_dir("plans");
@@ -299,7 +298,6 @@ impl TuiSession {
                 .map(|log| banner::log_file_line(&self.paths, log)),
             // 第 187 轮:站点熔断状态行(有熔断域才出现)—— 让用户不必翻 6004 信封
             // 就知道「为什么任务没动」,并给出 /risk 这个主动查询/解除入口。
-            site_risk: banner::site_risk_status_line(),
         };
         for line in banner::render(&data, 0, textfit::term_width_for_render()) {
             println!("{line}");
@@ -696,7 +694,7 @@ pub async fn run_with_debug(debug: bool, launch: TuiLaunch) -> Result<()> {
     // `main.rs` 注册的 `libc::atexit` + `cleanup_sync`。两点问题:
     // - `BrowserManager` 是 `OnceLock` 单例且**没有 Drop**,atexit 不跑就不会析构;
     // - `atexit` 守卫是 `#[cfg(unix)]`,**Windows 上既无 atexit 也无 Drop**,
-    //   TUI 退出后 Chrome 会直接留在后台。
+    //   TUI 退出后进程内页面状态不会自动释放。
     // 显式收口与 `-p` 单轮模式(main.rs 的同名调用)对齐,三平台行为一致。
     crate::agent::browser::BrowserManager::global().shutdown().await;
     Ok(())

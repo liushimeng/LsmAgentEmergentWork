@@ -1137,7 +1137,7 @@ unsafe fn run_win32(p: &DialogPayload) -> (String, String) {
         font_normal,
     );
     // 2026-10-13(二):「🎮 侵入式」互切按钮 + 触控板子窗口(缺省隐藏;事件经
-    // pad_wnd_proc 归一化后以 relay 中间行回放为 CDP 可信物理输入)。
+    // pad_wnd_proc 归一化后以 relay 中间行回放为宿主可信物理输入)。
     let intrusive_btn = create_control(
         hwnd,
         hinst,
@@ -1261,7 +1261,7 @@ unsafe fn run_win32(p: &DialogPayload) -> (String, String) {
     // 实测事故(BOSS 直聘任务):弹窗弹出瞬间抢占前台,用户正在其它窗口打字,
     // 下一次敲 Enter 落进弹窗触发默认按钮提交 →「假人工已响应」(选项1空输入
     // 交棒),复验不过→再弹窗→再误触,20~48s 一轮空转。与「焦点租约」治理的
-    // Chrome 抢焦是同一类病。现改:置顶显示(不激活) + 闪烁任务栏提示;人工
+    // 浏览器窗口抢焦是同一类病。现改:置顶显示(不激活) + 闪烁任务栏提示;人工
     // 点击弹窗任意位置后键盘焦点自然进入,输入框 Enter 提交由消息循环显式
     // 转发(见下方 WM_KEYDOWN 拦截)。
     let flash = FLASHWINFO {

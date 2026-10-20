@@ -104,7 +104,7 @@ hard（Plan → Main → SubAgent）→ Quality-Check → SessionContext 締め�
 | 🗜️ **Compact Agent** | 圧縮レイヤ：コンテキスト上限近くで 3 段階自動圧縮 | ツールなし |
 | 🧩 **WorkFlow Agent** | ワークフロー編排レイヤ：Goal 状態機械 + Squad スケジューリング | Bash / Read / Write |
 | 🪟 **WindowUse Agent** | デスクトップ操作レイヤ：Windows UIA / macOS AX | Read / Bash ホワイトリスト / Window* |
-| 🌐 **Chromium-WebUse Agent** | ブラウザ操作レイヤ(第 11 ロール)：CDP 駆動のメモリ内ヘッドレス Chrome(Chrome 優先、Edge/Chromium フォールバック)— ウェブ閲覧 / クローリング / ログイン後操作 / スクリーンショット / Console·Network·DOM·localStorage 観察;`page_id` マルチターン管理と派生タブ自動取り込み;ブラウザ未インストール時は構造化降級(code=3001 + インストール案内) | Read / BrowserNew / BrowserList / BrowserClose / BrowserControl / BrowserInspect |
+| 🌐 **WebUse(ツール)** | ブラウザ操作レイヤ：LsmAgentBrowser プロセス内自研エンジン(HTTP(S) + DOM + レイアウト + ソフトウェア描画 + Boa JS)— ウェブ閲覧 / クローリング / ログイン後操作 / スクリーンショット / DOM·Network·Console·localStorage 観察;`page_id` マルチターン管理と `spawned_page_id` 引き渡し;Cookie・ストレージは全メモリ | MCP_Web_Use |
 
 ### 編成トポロジー
 

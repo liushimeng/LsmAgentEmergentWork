@@ -237,7 +237,7 @@ pub fn ocr_window(hwnd: HWND, region: Option<Rect>, lang: Option<&str>) -> Resul
     recognize_png(&png, lang, cap.x - win.x, cap.y - win.y)
 }
 
-/// PNG 文件直识(CDP 截图字节落盘后的 OCR,2026-10-12 新增):
+/// PNG 文件直识(浏览器截图字节落盘后的 OCR,2026-10-12 新增):
 /// MCP_Web_Use `control(screenshot, ocr=true)` 的 Windows 实现入口,
 /// 与 [`ocr_window`] 共用同一识别核心,坐标为图像相对(偏移 0,0)。
 pub fn ocr_png_file(path: &std::path::Path, lang: Option<&str>) -> Result<Vec<OcrBlock>> {

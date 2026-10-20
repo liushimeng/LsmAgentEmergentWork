@@ -422,7 +422,7 @@ async fn run_dialog_process(payload_path: &std::path::Path) -> UiResult {
                         .guard_toggle_from_ui(id, unlock);
                 } else if let Some((id, event)) = parse_relay_line(&t) {
                     // 2026-10-13(二):弹窗「侵入式」触控板手势/会话行 → hub 转交
-                    // act_request_human 安装的中继 handler(CDP 可信物理输入回放)。
+                    // act_request_human 安装的中继 handler(宿主输入回放;阶段一未接入)。
                     crate::agent::human_assist::HumanAssistHub::global()
                         .relay_from_ui(id, event);
                 } else {

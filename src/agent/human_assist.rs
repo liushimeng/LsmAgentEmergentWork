@@ -123,7 +123,7 @@ pub struct HumanAssistDisplay {
     /// 恢复屏蔽」切换按钮的初始标题依据(false=「🔓 解除屏蔽」,true=「🔒 恢复屏蔽」)。
     pub guard_unlocked: bool,
     /// 2026-10-13(二):侵入式中继映射区(视口坐标 `{x,y,width,height}`,None = 全视口)。
-    /// 侵入式(弹窗触控板 → CDP 可信物理输入回放)的落点映射依据。
+    /// 侵入式(弹窗触控板 → 宿主输入回放)的落点映射依据(阶段一未接入)。
     pub relay_rect: Option<serde_json::Value>,
     pub timeout_ms: u64,
     /// 第 119 轮新增:输入提示符同行可视宽度(中文/全角算 2 列),

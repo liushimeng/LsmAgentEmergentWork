@@ -337,7 +337,20 @@ impl SubAgentRunner {
         // ★ 2026-09-18 第 89 轮:多轮浏览器页面复用(自原 WebUseRunner 第 79 轮平移)。
         // 存活页面探测(顺带让 list_pages 清理失效 entry),非空时注入
         // 「已打开的浏览器页面」提示块,免重新打开/登录;冷启动零开销不注入。
-        let live_pages = crate::agent::browser::BrowserManager::global().list_pages().await;
+        let live_pages: Vec<(String, String, String, String)> =
+            crate::agent::browser::BrowserManager::global()
+                .list_pages()
+                .await
+                .into_iter()
+                .map(|p| {
+                    (
+                        p.page_id,
+                        p.url,
+                        p.title,
+                        p.created_at.to_string(),
+                    )
+                })
+                .collect();
         let mut prompt = input.to_user_prompt();
         // 第 128 轮:锚点感知 —— 存活页面按「是否属于本任务目标站点」分组渲染,
         // 切断「上一轮猜错站点留下的页面被当成本轮权威上下文复用」的漂移洗白通道。
@@ -826,7 +839,7 @@ pub fn extract_page_reply_from_session(messages: &[ChatMessage]) -> Option<(Stri
             };
 
             // 先用候选字段集快速匹配,失败再走递归嵌套提取
-            // 候选字段涵盖主流 CDP 响应形态
+            // 候选字段涵盖主流工具响应形态
             const CANDIDATE_KEYS: &[&str] = &[
                 "text", "outer_html", "value", "html", "body",
                 "reply", "answer", "markdown", "content",

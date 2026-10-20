@@ -22,7 +22,7 @@ tokio-util = "0.7"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "gzip", "brotli", "deflate"], default-features = false }
 thiserror = "1"
 anyhow = "1"
 tracing = "0.1"
@@ -47,9 +47,13 @@ zeroize = "1"
 # D9-7 SSRF 防护(L1608/L1625):URL 解析 + 私网/CGNAT 拦截
 url = "2.5"
 
-# Chromium-WebUse Agent(第 11 角色,2026-09-16 第 61 轮):CDP 浏览器操控
-# 选型见 docs/浏览器CDP工具/04-Chromium-WebUse-Agent设计与解决方案.md
-chromiumoxide = "0.9"
+# LsmAgentBrowser:进程内自研浏览器内核(无 Chrome / 无 CDP)。
+# 设计见 docs/自定义浏览器和V8引擎/01-LsmAgentBrowser总体设计与分阶段路线图.md
+kuchikiki = "0.8"       # html5ever DOM + CSS 选择器(可变节点树)
+boa_engine = "0.20"     # 默认 JS 引导后端(纯 Rust,离线可编译)
+tiny-skia = "0.11"      # 软件光栅化
+fontdue = "0.9"         # 字体度量与字形栅格化
+encoding_rs = "0.8"     # 响应字符集解码(GBK/Shift_JIS 等)
 futures = "0.3"
 
 # 人工介入弹窗(第 137 轮):Windows 侧 PNG 解码重采样(macos 下另有 Vision OCR 用途);

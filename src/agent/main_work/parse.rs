@@ -431,7 +431,7 @@ pub fn parse_plan_markdown(content: &str) -> Result<WorkFlowPlan> {
     };
     dedup_workflow_ids(&mut plan);
     // 2026-09-16 F2/F3:Plan 文档路径同样做 depends_on 归一化 + delegate_to 自动纠正
-    // (修复「检视 Chrome 窗口」hard 任务拓扑失败 + 委派纠正的问题)
+    // (修复「检视浏览器窗口」hard 任务拓扑失败 + 委派纠正的问题)
     sanitize_depends_on(&mut plan);
     // 第 163 轮:从产物引用反推补齐缺边(实测因 depends_on 全空导致有数据依赖的
     // 单元被 Kahn 判为同层并发,消费方轮询等不到文件,浪费 ~195s)

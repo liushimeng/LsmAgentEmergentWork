@@ -52,8 +52,6 @@ pub struct BannerData {
     pub todo_summary: Option<String>,
     /// 运行日志文件(`--debug` / `--info` 时显示)
     pub log_file: Option<String>,
-    /// ⚠ 站点熔断状态(2026-10-19;有熔断域时显示,无则整行不出现)
-    pub site_risk: Option<String>,
 }
 
 /// 渲染横幅为等宽行集合(不含 `\n`)。
@@ -89,10 +87,6 @@ pub fn render(data: &BannerData, indent: usize, term_w: usize) -> Vec<String> {
     }
     if let Some(log) = &data.log_file {
         b = b.kv("日志文件", log.clone());
-    }
-    // 站点熔断行(2026-10-19):有熔断域才出现 —— 无熔断时零噪声,不占横幅高度
-    if let Some(risk) = data.site_risk.as_deref().filter(|s| !s.is_empty()) {
-        b = b.kv("⚠ 站点熔断", risk.to_string());
     }
     b.render(indent, term_w)
 }
@@ -132,33 +126,6 @@ pub fn log_file_line(paths: &Paths, log: &crate::logging::AgentLogInfo) -> Strin
         pathfmt::display_path(paths, &log.path),
         log.level
     )
-}
-
-/// 第 187 轮:「站点熔断」行内容(有熔断域返回 `Some`,无则 `None` —— 零噪声)。
-///
-/// 熔断 = 该站点已对 laew 拉起的浏览器环境做**指纹级打标**(累计整页抹除 ≥ 阈值),
-/// 继续 `open`/`navigate`/`close(all)`/`force` 全部无效,只会反复弹 Chrome。
-/// 把这行放进横幅,让用户**不必翻 6004 信封**就能知道「为什么任务没动」,
-/// 并给出 `/risk` 这个主动查询 + 人工解除的入口。
-pub fn site_risk_status_line() -> Option<String> {
-    let blocked = crate::agent::browser_pace::blocked_domains();
-    if blocked.is_empty() {
-        return None;
-    }
-    let domains = blocked
-        .iter()
-        .map(|(d, t, cause)| {
-            // 第 188 轮:按成因分别标注,否则「刷新循环」域会被读成「整页抹除」域,
-            // 引导用户去换 IP(而刷新循环的出路是接管真实浏览器,换 IP 未必奏效)。
-            if *cause == crate::agent::browser_pace::CAUSE_RELOAD_LOOP {
-                format!("{d}(页面持续重载 {t} 次)")
-            } else {
-                format!("{d}(抹除 {t} 次)")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("、");
-    Some(format!("{domains} · 详情与解除 /risk"))
 }
 
 /// D13 离线模式:连接状态行文本。
@@ -219,27 +186,7 @@ mod tests {
             connectivity: "Online ✓".into(),
             todo_summary: None,
             log_file: Some("llaew_20260924_123508.log (级别: DEBUG)".into()),
-            site_risk: None,
         }
-    }
-
-    /// 第 187 轮:站点熔断行「有值才出现」—— 无熔断时零噪声(不占横幅高度),
-    /// 有熔断时点名站点并给出 `/risk` 入口。
-    #[test]
-    fn 站点熔断行_有值时出现_无值时消失() {
-        let mut with_risk = sample();
-        assert!(
-            render(&with_risk, 0, 120).iter().all(|l| !l.contains("站点熔断")),
-            "无熔断时不得出现站点熔断行"
-        );
-        with_risk.site_risk = Some("liepin.com(抹除 3 次) · 详情与解除 /risk".into());
-        let lines = render(&with_risk, 0, 120);
-        let hit = lines
-            .iter()
-            .find(|l| l.contains("站点熔断"))
-            .expect("有熔断时必须出现站点熔断行");
-        assert!(hit.contains("liepin.com"), "应点名熔断站点");
-        assert!(hit.contains("/risk"), "应给出 /risk 入口");
     }
 
     #[test]

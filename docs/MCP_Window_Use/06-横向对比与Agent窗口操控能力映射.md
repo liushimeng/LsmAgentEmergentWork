@@ -21,7 +21,7 @@
 | **laew**(本项目) | `MCP_Window_Use` 单工具 | MCP 风格服务(in-proc) | macOS / Windows | **T1 无障碍 → T2 消息 → T3 物理** 四层链 | SubAgent-Work 工具集 |
 | **atomcode**(Rust) | `atomcode-code/src/mcp/window.rs` + `ToolActionProvider` | MCP server(独立 stdio) | 三平台 | **T1 UIA → T2 物理** 两层 | MCP client 工具集 |
 | **claudecode**(TS/Bun) | `computer-use` 工具 + Bash 兜底 | MCP server | macOS / Windows | **T1 截图识别 → T2 物理**(无系统 API) | Claude 工具集 |
-| **openclaw**(TS) | `mcp-playwright` + `mcp-window`(自研双栈) | MCP server | macOS / Windows / Linux | **T1 AX/UIA → T2 CDP/Playwright** 双栈 | MCP gateway + adapter |
+| **openclaw**(TS) | `mcp-playwright` + `mcp-window`(自研双栈) | MCP server | macOS / Windows / Linux | **T1 AX/UIA → T2 浏览器自动化/Playwright** 双栈 | MCP gateway + adapter |
 | **opencode**(TS/Bun) | 无窗口操控(纯命令行/浏览器) | — | — | — | — |
 | **pi**(TS) | 无窗口操控(纯 TUI) | — | — | — | — |
 | **deepseek-harness**(TS) | 无桌面 GUI(纯 CLI) | — | — | — | — |
@@ -71,11 +71,11 @@
 
 ### 2.4 openclaw `mcp-playwright` + `mcp-window` 双栈
 
-**架构**:`openclaw/mcp-window/` 自研 6300+ 行双栈(CDP/Playwright + 平台原生),
+**架构**:`openclaw/mcp-window/` 自研 6300+ 行双栈(浏览器自动化/Playwright + 平台原生),
 MCP server stdio 协议。
 
 **核心特色**:
-- **CDP/Playwright 主路线**(类似 laew MCP_Web_Use):浏览器场景统一;
+- **浏览器自动化/Playwright 主路线**:浏览器场景统一;
 - **平台原生桥路线**(AX/UIA):桌面 GUI 场景;
 - **openclaw Adapter 层**统一两栈调用,LLM 不知道差异;
 - **mcp-windows-mcp** 项目化封装,1700+ 行;
@@ -90,13 +90,13 @@ MCP server stdio 协议。
 | 维度 | laew | atomcode | claudecode | openclaw |
 |------|------|----------|------------|----------|
 | **形态** | MCP 风格 in-proc 工具 | MCP server stdio | 云端 API 工具 | MCP server stdio |
-| **链深度** | **4 层(T1 无障碍→T2 消息→T3 物理→T4 外部命令)** | 2 层 | 1 层(纯截图) | 2 栈(CDP/原生) |
+| **链深度** | **4 层(T1 无障碍→T2 消息→T3 物理→T4 外部命令)** | 2 层 | 1 层(纯截图) | 2 栈(浏览器自动化/原生) |
 | **失败策略** | **逐层降级 + 结构化 next_action** | 直接 Err | 云端重试 | Adapter 重试 |
 | **复合 action** | ✅ 5 个(chat_send/loop/input_batch/run_sequence/osascript_run) | ❌ | ❌ | ❌ |
 | **能力探测** | ✅ capability_probe(action=) | ❌ | ❌ | mcp_capability |
 | **焦点守护** | ✅ 三层渐进 + 连续 3 次止损 | ❌ | ❌ | ❌ |
-| **UI 装饰层过滤** | ✅ ControlViewWalker(98 轮 G9) | ❌ | N/A | ✅(CDP 天然无装饰层) |
-| **OCR 失败兜底** | ✅ capability_probe + osascript_fallback | ✅(Bash 兜底) | 云端重试 | CDP 截图 |
+| **UI 装饰层过滤** | ✅ ControlViewWalker(98 轮 G9) | ❌ | N/A | ✅(浏览器自动化天然无装饰层) |
+| **OCR 失败兜底** | ✅ capability_probe + osascript_fallback | ✅(Bash 兜底) | 云端重试 | 浏览器自动化截图 |
 | **中文 UI 同义词表** | ✅ Unicode Modifier Letter 归一 + 30+ 中文 UI 别名 | ❌ | N/A | 部分 |
 | **平台门控** | ✅ cfg!(macos/windows) | ✅(三平台) | 跨平台(Linux VM) | ✅(三平台) |
 | **Chat 原子发送** | ✅ chat_send(5 路线)+ chat_loop(N 轮) | ❌ | ❌ | ❌ |
@@ -125,7 +125,7 @@ MCP server stdio 协议。
 | **中文 UI 同义词 + Unicode 归一** | 第 62 轮 | 仅 laew |
 | **chat_log + sequence_log 落盘可追溯** | 第 86/91 轮 | claudecode 走云端无 |
 | **run_sequence assert_text/wait_for_text 自绘 UI OCR 兜底** | 第 93 轮 | 仅 laew |
-| **ControlViewWalker 装饰层过滤**(98 轮) | G9 | openclaw 通过 CDP 天然无,laew 通过 UIA 显式过滤 |
+| **ControlViewWalker 装饰层过滤**(98 轮) | G9 | openclaw 通过浏览器自动化天然无,laew 通过 UIA 显式过滤 |
 
 ## 6. 回填知识库对照(状态标记)
 

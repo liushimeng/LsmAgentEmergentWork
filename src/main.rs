@@ -143,15 +143,6 @@ enum Cmd {
     #[command(subcommand)]
     Mcp(McpCmd),
 
-    /// 内部隐藏子命令：由 BrowserManager 在 launch 后创建，禁止手工调用。
-    #[command(name = "__browser-watchdog", hide = true)]
-    BrowserWatchdog {
-        /// Chromium 主进程 PID。
-        browser_pid: u32,
-        /// launch 模式的一次性 user-data-dir。
-        user_data_dir: std::path::PathBuf,
-    },
-
     /// 内部隐藏子命令：人工介入(HITL)原生弹窗子进程（第 137 轮），由 human_ui
     /// 在桌面会话 spawn；macOS AppKit FFI / Windows Win32。禁止手工调用。
     #[command(name = "__hitl-dialog", hide = true)]
@@ -394,7 +385,6 @@ fn open_db() -> Result<(Paths, Db)> {
     // 站点反爬声誉跨会话记忆(2026-10-19):注册进程级台账并回填历史抹除账。
     // 注册放在这里而非门面内部惰性打开 —— 后者会让 `cargo test --lib` 的每个
     // 记账调用都写用户真实库(单测构造的 WebPace 也会落库)。
-    lsm_agent::config::site_risk::init_with(&db);
     Ok((paths, db))
 }
 
@@ -1014,38 +1004,6 @@ async fn cmd_export_provider(file_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-/// 第 78 轮:注册进程退出守卫,通过 libc::atexit 在进程退出时清理浏览器子进程。
-///
-/// 覆盖以下路径的浏览器清理:
-/// - main 函数正常返回(主动 shutdown 后的双重保险)
-/// - std::process::exit() 调用(触发 atexit handler)
-///
-/// 不覆盖:
-/// - SIGKILL / SIGSTOP(无法捕获,OS 限制)
-/// - panic(由 crash.rs panic_hook 中 cleanup_sync 处理)
-/// - abort() / 段错误(无法处理)
-///
-/// 第 90 轮(2026-09-19)修复:`libc` 是 `cfg(unix)` 依赖,此前无条件引用
-/// 导致 Windows 编译损坏;Unix 平台保留 atexit 守卫,Windows 改用运行时
-/// 注册表 Drop + 显式 shutdown 双保险(等价清理路径,见 browser.rs)。
-fn install_browser_cleanup_guard() {
-    #[cfg(unix)]
-    {
-        extern "C" fn atexit_cleanup() {
-            lsm_agent::agent::browser::BrowserManager::cleanup_sync();
-        }
-        unsafe {
-            libc::atexit(atexit_cleanup);
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        // Windows 无 atexit 守卫;浏览器清理依赖 BrowserManager 单例 Drop +
-        // main 收尾显式 shutdown(第 78 轮 L1/L3 层),本函数保留为空实现,
-        // 调用点无需平台分叉。
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     // SIGPIPE 必须早于任何 stdout 输出与 panic hook：`laew ... | head` 提前关闭
@@ -1062,9 +1020,6 @@ async fn main() -> Result<()> {
         eprintln!("[laew] signal handler 安装失败(已忽略): {e}");
     }
 
-    // 第 78 轮:注册进程退出守卫(atexit),作为浏览器清理的 L2 兜底。
-    // 覆盖正常 exit / main 返回路径;覆盖 panic 路径(crash.rs panic_hook 中也清理)。
-    install_browser_cleanup_guard();
 
     // 第 136 轮:终端守卫看门狗(必须在 Tokio runtime 内安装 —— 需要 Handle 回收
     //   浏览器子进程)。
@@ -1119,15 +1074,6 @@ async fn main() -> Result<()> {
         Cli::parse_from(args)
     };
 
-    // watchdog 是最小启动路径：不打开数据库、不初始化 tracing/TUI/Agent。
-    if let Some(Cmd::BrowserWatchdog {
-        browser_pid,
-        user_data_dir,
-    }) = &cli.cmd
-    {
-        return lsm_agent::agent::browser_watchdog::run(*browser_pid, user_data_dir).await;
-    }
-
     // 弹窗子进程同样走最小启动路径（第 137 轮）：读 payload → 原生弹窗 → stdout
     // 打印结果 JSON 后退出。同步阻塞（AppKit/Win32 事件循环）,不走 tokio。
     if let Some(Cmd::HitlDialog { payload }) = &cli.cmd {
@@ -1147,10 +1093,6 @@ async fn main() -> Result<()> {
     let default_level = if is_tui { "warn" } else { "info" };
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| default_level.into());
-    // 第 163 轮:屏蔽第三方 CDP 驱动的逐消息噪声(实测 --debug/-f 控制台 8896 行里
-    // 7161 行是同一句 "WS Invalid message")。用 EnvFilter 原生 directive:
-    // handler 模块降到 error(保留 "WS Connection error"),原始报文 dump 直接 off。
-    let env_filter = lsm_agent::logging::silence_cdp_noise(env_filter);
     // Agent 运行日志文件(2026-09-17 第 69 轮):`--debug` / `--info`(含单横线与
     // 大小写变体)时在工作目录生成 `llaew_{YYYYMMDD_HHMMSS}.log`(启动时刻命名),
     // `--debug` → DEBUG 级,`--info` → INFO 级;文件创建失败静默降级不影响主流程。
@@ -1249,7 +1191,6 @@ async fn main() -> Result<()> {
             Some(Cmd::Provider(p)) => cmd_provider(p).await,
             Some(Cmd::Mcp(c)) => cmd_mcp(c).await,
             // 已在 main 初始化前返回；此分支仅为穷尽性匹配。
-            Some(Cmd::BrowserWatchdog { .. }) => unreachable!("watchdog returned before setup"),
             Some(Cmd::HitlDialog { .. }) => unreachable!("hitl-dialog returned before setup"),
             None => {
                 // 纯函数斜杠命令前置检测(/diff 等不依赖 LLM 的命令在 -p 模式也可直接执行)

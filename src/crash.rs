@@ -108,7 +108,7 @@ pub fn install_panic_hook(report_dir: impl Into<PathBuf>) {
             // 步骤自身全部 `let _`,此层 catch_unwind 为纵深防御。
             let _ = std::panic::catch_unwind(crate::shutdown::terminal_restore_sync);
 
-            // 第 78 轮:panic 时优先清理浏览器子进程,防止孤儿 Chrome 进程泄漏。
+            // panic 时清理进程内浏览器状态(新内核无子进程)。
             // 第 127 轮起 cleanup_sync 为纯同步实现(零 tokio),此层 catch_unwind
             // 同样为纵深防御(旧版这里会因 TLS 销毁 panic 升级为 abort)。
             let _ = std::panic::catch_unwind(|| {

@@ -123,9 +123,9 @@ impl Agent {
     /// 单条工具调用的总执行超时预算(2026-10-16,`LAEW_TOOL_TIMEOUT_SECS`)。
     ///
     /// 背景:实测(`llaew_20261016_160508.log`)`open github.com/commits` 因大陆
-    /// 网络导航 stall 把 chromiumoxide handler 卡死,后续无界 CDP 调用永久排队,
+    /// 网络导航 stall 让页面操作长时间不返回,
     /// 单条工具挂死 → 整个 Agent 循环 22 分钟无声停摆直到人工杀进程。总超时是
-    /// 「单工具挂死 ≠ 任务挂死」的最后保险(各 CDP 点的有界化见 `browser_cdp`)。
+    /// 「单工具挂死 ≠ 任务挂死」的最后保险。
     const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 300;
 
     /// 执行单条工具调用(第 120 轮自 agent_loop 主循环机械抽取,语义零变化)。
@@ -151,16 +151,6 @@ impl Agent {
         }
         let executed = match self.profile.tools.get(name) {
             Ok(tool) => {
-                // 第 171 轮:活动台账埋点 —— 屏蔽页面进度栏第一行展示「当前动作」。
-                // 所有角色所有工具统一经此,浏览器相关动作由 `browser_status` 推页面。
-                if let Some(act) = crate::agent::web_activity::current() {
-                    act.set_tool(&format!(
-                        "{name} {}",
-                        crate::logging::clip(&crate::agent::runtime_hints::stable_json_string(
-                            &args
-                        ))
-                    ));
-                }
                 // Schema 预校验(校验失败 → 返回错误,不执行工具)
                 if let Err(e) = crate::agent::tool_schema_validator::validate_tool_args(
                     name,
@@ -170,7 +160,7 @@ impl Agent {
                     Some(Err(e))
                 } else {
                     // 2026-10-16:工具执行总超时(最后防线)——任何底层无界 await
-                    // (实测:导航 stall 卡死 chromiumoxide handler → CDP 调用永久排队)
+                    // (实测:导航 stall 使页面动作长时间不返回)
                     // 命中预算即返回结构化错误,Agent 循环继续,而不是无声停摆。
                     // 豁免:Bash(自带进程级超时)与 request_human(HITL 30 分钟上限)。
                     let fut = async {

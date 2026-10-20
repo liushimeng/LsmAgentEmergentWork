@@ -215,7 +215,7 @@ fn watch_loop(rt: tokio::runtime::Handle) {
 ///
 /// **刻意用 `std::process::exit` 而不是 `libc::_exit`**:前者会跑 `atexit` 守卫
 /// (`main.rs::install_browser_cleanup_guard` 注册的 `BrowserManager::cleanup_sync`),
-/// 后者不会 —— 用 `_exit` 会把 Chrome 子进程留在系统里,正是要根治的泄漏之一。
+/// 后者不会 —— 用 `_exit` 会跳过收尾清理。
 fn finish(rt: tokio::runtime::Handle, reason: &str, code: i32) {
     tracing::warn!("[终端守卫] {reason}");
 
@@ -240,7 +240,7 @@ fn finish(rt: tokio::runtime::Handle, reason: &str, code: i32) {
     force_terminal_restore();
 
     // 2) 回收浏览器子进程 —— 两条腿,互为兜底:
-    //    a) 派发异步 `shutdown()`(带 5s CDP 超时,走优雅关闭);
+    //    a) 派发异步 `shutdown()`(清理进程内页面状态);
     //    b) 同步 `cleanup_sync()`(进程级 kill,不依赖 tokio 调度器能否推进)。
     //    主线程此刻正卡在 crossterm 死转里,异步那条不保证能跑完,所以 b 是关键。
     rt.spawn(async {
@@ -251,7 +251,7 @@ fn finish(rt: tokio::runtime::Handle, reason: &str, code: i32) {
     crate::agent::browser::BrowserManager::cleanup_sync();
 
     // 3) 退出。用 `process::exit` 而非 `libc::_exit`:前者会跑 atexit 守卫
-    //    (main.rs 注册的 cleanup_sync),后者不会 —— 用 `_exit` 会把 Chrome 留在系统里。
+    //    (main.rs 注册的 cleanup_sync),后者不会 —— 用 `_exit` 会跳过收尾清理。
     std::process::exit(code);
 }
 

@@ -139,27 +139,6 @@ pub(crate) fn normalize_windows_drive_path(p: &str) -> std::borrow::Cow<'_, str>
     std::borrow::Cow::Borrowed(p)
 }
 
-/// Windows canonicalize 产生的 verbatim 前缀剥离(`\\?\C:\...` → `C:\...`、
-/// `\\?\UNC\srv\share` → `\\srv\share`);其他平台恒等返回。
-///
-/// 背景(2026-10-12 Windows 实测):`tokio::fs::canonicalize` 在 Windows 上返回
-/// verbatim 形态,直接喂给 Chrome `Browser.setDownloadBehavior(downloadPath=)`
-/// 会让下载**必然** `state=Canceled, received=0`(Chrome 建不出目标文件,实测
-/// `tests/web_use_smoke.rs` 真浏览器冒烟整步失败)。凡是要交给**外部进程 / 浏览器
-/// API** 的路径都必须先剥离该前缀;反之留在本进程内做 `Path` 运算的路径保持
-/// verbatim 反而更安全(不受 cwd 变化影响),故不做强制全局剥离。
-pub(crate) fn strip_windows_verbatim(p: &std::path::Path) -> std::path::PathBuf {
-    let s = p.to_string_lossy();
-    let stripped = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{rest}")
-    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
-        rest.to_string()
-    } else {
-        return p.to_path_buf();
-    };
-    std::path::PathBuf::from(stripped)
-}
-
 /// 工具注册表(保持注册顺序,保证 tools 列表稳定)
 #[derive(Default, Clone)]
 pub struct ToolRegistry {
@@ -326,7 +305,7 @@ pub fn main_work_registry_inner() -> ToolRegistry {
 /// 2026-09-18 第 84 轮:macOS / Windows 追加 MCP_Window_Use(桌面窗口操控统一入口,
 /// 平台门控见 [`mcp_window_use::mcp_window_use_available`])。
 /// 2026-09-18 第 89 轮:全平台追加 MCP_Web_Use(浏览器网页操控统一入口,
-/// CDP 三平台一致,未装浏览器返回结构化 3001 不崩溃,无需平台门控)。
+/// LsmAgentBrowser 三平台一致,错误返回结构化信封,无需平台门控)。
 /// 2026-09-22 第 114 轮:追加 SubAgent(自感知动态启动子 Agent 工具,
 /// 运行时经 task-local 注入;总开关 `LAEW_SELF_SPAWN=off` 时不注册)。
 /// 追加 Use_MCP(通用 MCP 服务调用,`LAEW_MCP_ENABLED=off` 不注册)。
@@ -570,29 +549,6 @@ mod names_tests {
     }
 
     #[test]
-    fn strip_windows_verbatim_removes_canonicalize_prefix() {
-        // Windows 实测事故:canonicalize 的 verbatim 路径喂给 Chrome downloadPath,
-        // 下载必然 state=Canceled/ received=0(Chrome 建不出目标文件)。
-        let cases = [
-            (r"\\?\C:\Users\me\dl", r"C:\Users\me\dl"),
-            (r"\\?\UNC\srv\share\dl", r"\\srv\share\dl"),
-            (r"\\?\D:", r"D:"),
-            (r"C:\Users\me\dl", r"C:\Users\me\dl"),
-            (r"\\srv\share\dl", r"\\srv\share\dl"),
-            ("/home/me/dl", "/home/me/dl"),
-            ("rel/dl", "rel/dl"),
-        ];
-        for (input, expected) in cases {
-            let got = strip_windows_verbatim(std::path::Path::new(input));
-            assert_eq!(
-                got.to_string_lossy().as_ref(),
-                expected,
-                "输入 {input:?}"
-            );
-        }
-    }
-
-    #[test]
     fn subagent_tool_schema_and_description_cover_all_actions() {
         let reg = sub_agent_work_registry();
         let tool = reg.get("SubAgent").expect("SubAgent 工具已注册");
@@ -673,7 +629,7 @@ mod names_tests {
 
     #[test]
     fn builtin_registry_mcp_web_use_all_platforms() {
-        // 2026-09-18 第 89 轮:MCP_Web_Use 全平台注册(CDP 三平台一致,
+        // 2026-09-18 第 89 轮:MCP_Web_Use 全平台注册(内核三平台一致,
         // 未装浏览器返回结构化 3001 信封,无需平台门控)。
         for reg in [builtin_registry(), builtin_registry_with_work_dir(PathBuf::from("."))] {
             let names = reg.names();

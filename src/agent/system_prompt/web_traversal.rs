@@ -34,34 +34,15 @@ pub(crate) const WEB_TRAVERSAL_PROMPT_SECTION: &str = r##"
     记录结果即可,不必对同一控件反复截图;证据以文本台账(DOM 片段/操作前后
     状态)为主,截图仅作辅助(Read 读图片只回存根,视觉判读走
     `control(screenshot, ocr=true)` / `inspect(info=ocr)`)。
-22.3 **整页抹除处置纪律**(页面曾正常加载、随后 URL 变 about:blank /
-    响应带 `page_health.reason=site_wipe` / `page_dead{reason=site_wipe}` /
-    `site_wipe` / 6004 时):
-    这是站点对本环境的反爬抹除,**不要反复 `close(page_id="all") + open`**
-    —— 每试一次多弹一台 Chrome 窗口,若该域是指纹级打标(对 CDP 拉起的
-    浏览器环境本身打标)换新 profile 照样被抹,只会形成拉起→被抹→再拉起的
-    风暴。正确处置:① 同域首次被抹可试 1 次 close(all) 换全新 profile;
-    ② **累计抹除 ≥2 次即判定「换全新 profile 已被实测无效」,不要再 close(all)
-    重开**,改用 `open(reuse_existing=true)` 接管**用户日常 Chrome 本体**
-    (需人工先用 `--remote-debugging-port=9222` 启动自己的日常 profile、
-    不加 `--user-data-dir`;注意 `auto_relaunch` 复制出来的调试实例仍属
-    CDP 拉起环境,同样会被抹),或 `request_human` 如实交还现场由人工处理;
-    ③ 工具层对该域 laew 身份累计抹除达阈值后**持久熔断**(6004,
-    `data.persistent=true`),且该结论**跨会话记住**(下次任务第一次 open
-    即直接熔断、不再拉起 Chrome),此时只剩接管日常浏览器或人工两条路,
-    硬闯请先说清理由再用 `force=true`;
-    ④ 拿到 `page_dead{reason=site_wipe}` 时**不要重新 open/navigate 重试**
-    —— 那正是该域已知无效的动作;按上面的改道走,或如实报告不可达。
-22.4 **导航未提交 ≠ 站点抹除**(响应带 `page_health.reason=nav_uncommitted` /
-    `site_wipe=false` 时):页面停在 about:blank 且站点侧**零内容下发证据**
-    (主文档无响应、同域子资源 <5)。这是导航本身没提交(慢网关 / 导航被中止),
-    **不是**反爬抹除,工具层也不会把它记进抹除账本。处置:`wait` 复查一次;
-    仍空白就原页 `control(navigate)` 重试一次。**不要**因此 `close(all)`
-    —— 那会丢登录态并再拉一台 Chrome。连续两次 nav_uncommitted 视为该 URL
-    不可达,如实报告并 request_human 确认。
-22.5 **无页也能问人工**(2026-10-19):`control(request_human)` **不需要
-    `page_id`** —— 整页抹除熔断(6004)时一台 Chrome 都没拉起,这正是唯一出路。
-    遇到 6004 / 站点不可达,**直接 request_human 说明情况并请人工在其自己
-    浏览器完成或提供数据**,不要为了凑 `page_id` 去 `open("about:blank")`
-    —— 那是凭空拉起一台 Chrome。
+22.3 **页面空白/不可达处置**:落地 `about:blank`(响应 `page_health.blank`)或
+    导航失败(2001)时,先用 `control(wait)` 复查一次,再 `control(navigate)`
+    重试一次;仍不可达就**如实报告并停止**,不要改用 Bash(curl/ping/nc)探测
+    目标站点,也不要为了“换环境”反复 close/open。整页空白可能是站点未下发内容
+    或网络中断,不是需要“伪装”的问题。
+22.4 **无页也能问人工**:`control(request_human)` **不需要 `page_id`** ——
+    站点不可达或没有打开任何页面时,直接 request_human 请人工提供数据/确认,
+    不要为了凑 `page_id` 去 `open("about:blank")`。
+22.5 **登录/验证码**:新内核不接管外部浏览器,`reuse_existing` 会返回 3002。
+    需要人工完成登录或验证码时,用 `control(request_human, reason="login"/
+    "captcha"/"sms")` 走桌面弹窗或 TUI 兜底;人工完成后继续 inspect 验证。
 "##;

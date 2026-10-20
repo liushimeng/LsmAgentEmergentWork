@@ -105,7 +105,7 @@ hard (Plan → Main → SubAgent) → Quality-Check → SessionContext wrap-up.
 | 🗜️ **Compact Agent** | Compaction layer: 3-tier auto-compaction near context limit | No tools |
 | 🧩 **WorkFlow Agent** | Workflow orchestration layer: Goal state machine + Squad scheduling | Bash / Read / Write |
 | 🪟 **WindowUse Agent** | Desktop control layer: Windows UIA / macOS AX | Read / Bash whitelist / Window* |
-| 🌐 **Chromium-WebUse Agent** | Browser control layer (11th role): CDP-driven in-memory headless Chrome (Chrome first, Edge/Chromium fallback) — web browsing / crawling / login flows / form automation / screenshots / Console·Network·DOM·localStorage inspection; `page_id` multi-turn session management with spawned-tab adoption; graceful degradation with install guidance (code=3001) when no browser is installed | Read / BrowserNew / BrowserList / BrowserClose / BrowserControl / BrowserInspect |
+| 🌐 **WebUse (tool)** | Browser control layer: LsmAgentBrowser in-process engine (HTTP(S) + DOM + layout + software rendering + Boa JS) — web browsing / crawling / login flows / form automation / screenshots / DOM·Network·Console·localStorage inspection; `page_id` multi-turn session management with `spawned_page_id` hand-off; all-in-memory cookies/storage | MCP_Web_Use |
 
 ### Orchestration Topology
 

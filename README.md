@@ -75,9 +75,9 @@
 | 能力 | 说明 |
 |------|------|
 | 🧠 **双协议** | Anthropic（anthropic-messages）+ OpenAI（openai-completions），统一消息模型隔离协议差异 |
-| 🌐 **浏览器操控** | Chromium-WebUse Agent（第 11 角色）：CDP 驱动内存无头 Chrome，网页浏览 / 爬虫 / 表单 / 截图 / Console·Network·DOM 观察 |
+| 🌐 **浏览器操控** | LsmAgentBrowser 进程内自研内核：无 Chrome / 无 CDP，网页浏览 / 爬虫 / 表单 / 截图 / DOM·Network·Console 观察 |
 | 🛠️ **6 工具** | Bash / Read / Write / Edit / Glob / Grep |
-| 🤖 **11 角色多 Agent** | Yolo / Plan / Main-Work / SubAgent-Work / Quality-Check / SessionContext / Compact / WorkFlow / WindowUse / Chromium-WebUse |
+| 🤖 **多角色 Agent** | Yolo / Plan / Main-Work / SubAgent-Work / Quality-Check / SessionContext / Debug / Compact / Reflection / WorkFlow / WindowUse（浏览器操控为 WebUse 工具） |
 | 📊 **三档分类** | simple / medium / hard，Yolo 自动分类后分层编排 |
 | 🖥️ **TUI** | crossterm 独立渲染引擎，alternate screen + raw mode + Screen 栈 + Tab 表单 |
 | 💾 **SQLite 持久化** | 根目录 `LsmAgentEmergentWork.db`，无配置文件 |
@@ -102,7 +102,7 @@
 | 🗜️ **Compact Agent** | 压缩层：上下文接近上限时三档自动压缩 | 无工具 |
 | 🧩 **WorkFlow Agent** | 工作流编排层：超大型任务 Goal 状态机 + Squad 调度 | Bash / Read / Write |
 | 🪟 **WindowUse Agent** | 桌面操控层：Windows UIA / macOS AX 读写桌面软件窗口 | Read / Bash 白名单 / Window* |
-| 🌐 **Chromium-WebUse Agent** | 浏览器操控层：CDP 驱动内存无头 Chrome（优先 Chrome，降级 Edge/Chromium），网页浏览 / 信息收集 / 爬虫 / 登录后页面操作 / 截图 / Console·Network·DOM·localStorage 观察；`page_id` 多轮会话管理，派生标签页自动 adopt；未安装浏览器时结构化降级（code=3001 + 安装引导） | Read / BrowserNew / BrowserList / BrowserClose / BrowserControl / BrowserInspect |
+| 🌐 **WebUse（工具）** | 浏览器操控层：LsmAgentBrowser 进程内自研内核（HTTP(S) + DOM + 布局 + 软件渲染 + Boa JS）；网页浏览 / 信息收集 / 爬虫 / 登录后页面操作 / 截图 / DOM·Network·Console·localStorage 观察；`page_id` 多轮会话管理，派生标签页经 `spawned_page_id` 回传；全内存 Cookie/存储 | MCP_Web_Use |
 
 ### 编排拓扑
 
@@ -274,11 +274,10 @@ LsmAgentEmergentWork/
 │   │   ├── system_prompt/   # SystemPrompt 组合与渲染 (mod / use_mcp_hint / skill_catalog)
 │   │   ├── tools/           # Tool trait + ToolRegistry + bash/read/write/edit/glob/grep/emit/todo/subagent/read_detect/bash_spill
 │   │   ├── tools/mcp_window_use/ # MCP_Window_Use 工具目录 (mod / query / open / inspect / vision / chat / explore / sequence / input_batch / tests)
-│   │   ├── tools/mcp_web_use/    # MCP_Web_Use 工具目录 (mod / control / inspect / tests)
+│   │   ├── tools/mcp_web_use/    # MCP_Web_Use 兼容层 (mod / control / inspect / visit_ledger / tests)
 │   │   ├── tools/use_mcp/        # Use_MCP 工具目录 (通用 MCP 服务调用, mod / tests)
 │   │   ├── window/          # 窗口操控平台驱动 (mod / windows / windows_input / windows_ocr / macos_axui / macos_vision_ocr / control_action / fallback / macos_legacy/)
-│   │   ├── browser.rs       # 浏览器 CDP 驱动层 (MCP_Web_Use 服务实现)
-│   │   ├── browser_watchdog.rs # Browser 子进程 watchdog (TUI 退出清理)
+│   │   ├── browser/         # LsmAgentBrowser 进程内内核 (mod / api / inspect / net / document / layout / render / js / storage / urlutil)
 │   │   ├── workflow/        # Goal 状态机 + Squad 调度 (mod / adaptive_loop / batch / goal / phase / quality_gate / squad / template)
 │   │   └── workflow_json_validate.rs # Workflow JSON 校验
 │   ├── llm/

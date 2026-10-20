@@ -81,34 +81,6 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_subagent_run_type
             ON subagent_run(agent_type, created_at DESC);
 
-        -- ========== 站点反爬声誉台账(2026-10-19,猎聘实测) ==========
-        -- 设计见 tmpPlan/20261019_111003_站点反爬声誉跨会话持久化与抹除早检根治.md。
-        -- 缺口:WebPace 的 wipe_total/wipe_streak 原为进程内 HashMap,进程退出即归零 ——
-        -- 猎聘这类自适应打标站点于是每个新任务都要把「open→3~6s 被抹→连击→冷却→
-        -- 熔断」整段 Chrome 风暴重付一遍(用户实测「反复启动很多次 Chrome」)。
-        -- 本表把「哪条域对本环境整页抹除过/频控过」跨会话记住,使重跑任务的第一次
-        -- open 就能在 guard_navigation 处熔断,**一台 Chrome 都不拉起**。
-        -- 衰减语义:last_wipe_at 超过 LAEW_SITE_RISK_TTL_DAYS(默认 7 天)不再参与熔断,
-        -- 站点修好 WAF 后能自动恢复试探(否则永久熔断表会把用户永远锁在门外)。
-        CREATE TABLE IF NOT EXISTS site_risk (
-            domain       TEXT PRIMARY KEY,
-            wipe_total   INTEGER NOT NULL DEFAULT 0,
-            wipe_streak  INTEGER NOT NULL DEFAULT 0,
-            rate_limit   INTEGER NOT NULL DEFAULT 0,
-            last_wipe_at TEXT,
-            note         TEXT NOT NULL DEFAULT '',
-            -- 第 188 轮:页面**原地自刷新循环**累计次数(与整页抹除并列的第二类反爬)。
-            -- 二者形态不同、处置不同,但同样必须跨会话记住:否则每开一个新会话都要把
-            -- 「反复刷新→人工输不进去→HITL 空转→再刷新」整段重付一遍,用户永远解不开。
-            -- last_reload_at **独立于** last_wipe_at:两类信号的新鲜度时钟各自推进,
-            -- 共用一列会让刷新循环事件把早已过期的抹除熔断续命(反之亦然不可发生,
-            -- 因为本列只写不清)。共用 last_wipe_at 会污染既有熔断语义,故不共用。
-            reload_loops  INTEGER NOT NULL DEFAULT 0,
-            last_reload_at TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_site_risk_wipe
-            ON site_risk(wipe_total DESC, last_wipe_at DESC);
-
         -- ========== WorkFlow Agent(第 10 角色)新表 ==========
 
         -- Goal 状态机表
@@ -270,31 +242,8 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
 pub fn migrate(conn: &Connection) -> Result<()> {
     migrate_providers_context_max_size(conn)?;
     migrate_providers_allow_private_endpoint(conn)?;
-    migrate_site_risk_reload_loops(conn)?;
     rebuild_role_check(conn, "session_memory")?;
     rebuild_role_check(conn, "agent_memory")?;
-    Ok(())
-}
-
-/// site_risk 表补 reload_loops 列(默认 0,存量记录保持原行为)。
-///
-/// 第 188 轮:站点「原地自刷新循环」此前只活在 page_liveness 的进程内 HashMap,
-/// 进程一退出即归零,与整页抹除(wipe_total 跨会话记忆)形成鲜明不对称 ——
-/// 用户每重开一次会话就把整段「刷新→人工输不进去」重付一遍。存量库自动补列。
-fn migrate_site_risk_reload_loops(conn: &Connection) -> Result<()> {
-    let mut stmt = conn.prepare("PRAGMA table_info(site_risk)")?;
-    let cols: Vec<String> = stmt
-        .query_map([], |r| r.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    for (name, ddl) in [
-        ("reload_loops", "INTEGER NOT NULL DEFAULT 0"),
-        ("last_reload_at", "TEXT"),
-    ] {
-        if cols.iter().any(|c| c == name) {
-            continue;
-        }
-        conn.execute(&format!("ALTER TABLE site_risk ADD COLUMN {name} {ddl}"), [])?;
-    }
     Ok(())
 }
 

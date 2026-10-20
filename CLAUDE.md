@@ -8,7 +8,7 @@
 
 由 LLM 驱动的 Rust Agent CLI（二进制名 **`laew`**）。支持 **Anthropic**（anthropic-messages）与
 **OpenAI**（openai-completions）双协议，**多 Agent 架构**（8 角色 + 三档难度），
-内置 Bash / Read / Write / Edit / Glob / Grep 六个核心工具 + MCP_Web_Use 浏览器操控
+内置 Bash / Read / Write / Edit / Glob / Grep 六个核心工具 + MCP_Web_Use 浏览器操控（自研进程内内核 LsmAgentBrowser，无 Chrome/CDP）
 + MCP_Window_Use 桌面窗口操控 + Use_MCP 通用 MCP 服务调用（真 MCP 协议客户端） + SubAgent 自感知动态委派
 + Skill 渐进式披露 + 决策审计 + 离线模式 + 上下文自动压缩 + 工作区感知。
 TUI 多轮对话 + `-p` 单轮模式 + `-f` 文件提示词模式 + `--debug`/`--info` 运行日志模式
@@ -78,32 +78,12 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 | `LAEW_SELF_SPAWN` | `off`/`0`/`false`/`no` | 关闭自感知动态子 Agent。见 `src/agent/self_awareness.rs` |
 | `LAEW_TARGET_ANCHOR` | `off`/`0`/`false`/`no` | 关闭任务锚点全部四层。详见「领域概念 · 任务锚点」 |
 | `LAEW_TARGET_ANCHOR_BLOCK` | `off`/`0`/`false`/`no` | 仅关闭 L3 工具级阻断，保留 L1/L2/L4（观察模式） |
-| `LAEW_BROWSER_MODE` | `headed`/`hidden`/`new_headless` | 浏览器启动模式显式覆盖。缺省有 GUI→`headed`，无 GUI→`hidden`。见 `src/agent/browser_mode.rs` |
-| `LAEW_WEB_HEADLESS_SOFTRENDER` | `on`/`1`/`true`/`yes` | 无头档恢复旧软渲染参数集（`--disable-gpu` + `--hide-scrollbars`）。见 `docs/MCP_Web_Use/37` |
-| `LAEW_WEB_EVIDENCE` | `off`/`0`/`false`/`no` | 关闭网页取证纪律硬闸门。见 `src/agent/safety/web_evidence.rs`、`docs/MCP_Web_Use/04-网页取证纪律.md` |
-| `LAEW_WEB_FINGERPRINT` | `off`/`0`/`false`/`no` | 关闭环境指纹体检与保真回填（legacy 杀开关；新代码用 `LAEW_WEB_STEALTH`）。见 `src/agent/fingerprint.rs` |
-| `LAEW_WEB_STEALTH` | `hardened`（缺省）/`fidelity`/`off` | 反检测档位。**侵入式 `hardened`（缺省）** = 保真档全部 + `Function.prototype.toString` 原生化。**非侵入式 `fidelity`** = 只移除自动化泄漏 + 回填本机真值。`off` = 零处置。见 `src/agent/stealth.rs`、`docs/MCP_Web_Use/26` + `31` |
-| `LAEW_WEB_SPAWN_ARM` | `off`/`0`/`false`/`no`/`关闭` | 关闭派生页早期武装 watcher。见 `src/agent/browser_spawn_arm.rs`、`docs/MCP_Web_Use/34` |
+| `LAEW_BROWSER_MODE` | `headed`/`hidden`/`new_headless` | 请求的浏览器模式。阶段一为进程内无头内核,`headed` 回退为 `hidden` 并在 `data.mode_hint` 说明。见 `src/agent/browser/mod.rs` |
+| `LAEW_WEB_EVIDENCE` | `off`/`0`/`false`/`no` | 关闭网页取证纪律硬闸门。见 `src/agent/safety/web_evidence.rs` |
 | `LAEW_READ_IMAGE_B64` | `1`/`true`/`yes`/`on` | 恢复 Read 工具图片 base64 全文返回（缺省为存根）。见 `src/agent/tools/read.rs` |
-| `LAEW_WEB_OVERLAY` | `off`/`0`/`false`/`no` | 关闭可视化蒙层与人工操作拦截（legacy 开关）。见 `src/agent/browser_overlay.rs` |
-| `LAEW_WEB_GUARD` | `locked`（缺省）/ `open` | 页面管控缺省档位。详见「领域概念 · 页面管控三档」 |
-| `LAEW_WEB_LOCKED_SCROLL` | `off`/`0`/`false`/`no` | 关闭 locked 档「可滚动观看」DOM 输入闸。见 `src/agent/browser_overlay.rs` |
-| `LAEW_WEB_HITL_SCOPE` | `off`/`0`/`false`/`no` | 关闭凭证区域探测。见 `src/agent/tools/mcp_web_use/unlock_zone.rs` |
-| `LAEW_WEB_BLOCKER_PROBE` | `off`/`0`/`false`/`no` | 关闭自动阻断感知。详见「领域概念 · 自动阻断感知」。见 `src/agent/tools/mcp_web_use/blocker_probe.rs` |
-| `LAEW_HITL_AUTO` | `off`/`0`/`false`/`no` | 关闭人工介入自动弹出（auto-HITL）。见 `src/agent/tools/mcp_web_use/control/hitl_ctl.rs` |
-| `LAEW_WEB_EVAL_TIMEOUT_MS` | 正整数（默认 `30000`） | eval_js 执行超时兜底。见 `src/agent/tools/mcp_web_use/mod.rs` |
-| `LAEW_WEB_MAX_WINDOWS` | 正整数（默认 `4`） | 多窗口并行上限。见 `docs/MCP_Web_Use/22-多窗口并行双站同时工作.md` |
-| `LAEW_WEB_MAX_TABS` | 正整数（默认 `8`，下限 `2`） | 标签页总量上限 |
-| `LAEW_WEB_GEO` | `grant`（默认）/ `deny` / `prompt` | Chrome 原生地理位置授权弹窗自动处置。见 `src/agent/browser_perm.rs` |
-| `LAEW_WEB_BACKGROUND_GATE` | `off`/`0`/`false`/`no` | 关闭多标签页后台挂起治理。见 `src/agent/tools/mcp_web_use/page_activity.rs` |
-| `LAEW_WEB_FOCUS` | `keep`（默认）/ `always` / `never` | 焦点租约。见 `src/agent/browser_focus.rs` |
-| `LAEW_WEB_PACE` | `off`/`0`/`false`/`no` | 关闭站点导航节奏治理。见 `src/agent/browser_pace.rs` |
-| `LAEW_WEB_WIPE_COOLDOWN_SECS` | 正整数（默认 `90`） | 整页抹除冷却时长 |
-| `LAEW_WEB_WIPE_TOTAL_THRESHOLD` | 正整数（默认 `3`） | 整页抹除总账阈值 |
-| `LAEW_SITE_RISK_PERSIST` | `off`/`0`/`false`/`no` | 关闭站点反爬声誉跨会话持久化。见 `src/config/site_risk.rs` |
-| `LAEW_SITE_RISK_TTL_DAYS` | 正整数（默认 `7`） | 站点声誉记录新鲜度窗口（天） |
-| `LAEW_SITE_RISK_PREFLIGHT` | `off`/`0`/`false`/`no` | 关闭站点可达性预检门。见 `src/agent/orchestrator/pipeline.rs` |
-| `LAEW_WEB_RISK_COOLDOWN_SECS` | 正整数（默认 `300`） | 风控挑战冷却时长 |
+| `LAEW_WEB_EVAL_TIMEOUT_MS` | 正整数(默认 `30000`) | eval_js 执行预算(阶段一做脚本长度上限与结果截断) |
+| `LAEW_WEB_MAX_WINDOWS` | 正整数(默认 `4`) | 逻辑窗口上限 |
+| `LAEW_WEB_MAX_TABS` | 正整数(默认 `8`,下限 `2`) | 标签页总量上限 |
 | `LAEW_SUBAGENT_MAX_DEPTH` | 0..=3 | 动态子 Agent 嵌套层数上限，默认 `1` |
 | `LAEW_SUBAGENT_MAX_PARALLEL` | 1..=8 | 会话级并发槽位，默认 `3` |
 | `LAEW_SUBAGENT_MAX_TOTAL` | 1..=64 | 会话级累计启动预算，默认 `8` |
@@ -111,7 +91,6 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 | `LAEW_SUBAGENT_TIMEOUT_SECS` | 10..=3600 | 单个子 Agent 墙钟超时，默认 `300` |
 | `LAEW_SUBAGENT_PERSIST` | `off`/`0`/`false`/`no` | 关闭动态子 Agent 运行记录持久化。见 `src/config/subagent_run.rs` |
 | `LAEW_SUBAGENT_RUN_KEEP` | 0..=20000 | 启动期保留的最新运行记录条数，默认 `500` |
-| `LAEW_CHROME_DEBUG_PORT` | 正整数（默认 `9222`） | 复用已登录浏览器的 CDP 调试端口探测覆盖。见 `src/agent/browser_reuse.rs` |
 | `LAEW_WIN_THEME` | `off`/`0`/`false`/`no` | 关闭 Windows 弹窗 macOS 风格主题。见 `src/agent/human_ui/windows_theme.rs` |
 
 ## 领域概念（改代码前必读）
@@ -130,16 +109,11 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 - **TUI 多行粘贴保真**：bracketed paste 整体接收，≥2 行粘贴一律转 marker 保真。Windows conhost / 部分 ConPTY 不支持 bracketed paste，通过三级粘贴判定（40ms 队列探测 → 击键节奏武装 → 正常提交）根治多行提示词被逐行拆成多次提交。实现见 `tui/paste.rs` + `tui/input/mod.rs`。
 - **死循环守卫(两级)**：`src/agent/loop_guard.rs` 是**工具级**守卫(判定键 = 相邻两轮的 工具+参数+结果,抓「同动作同结果」);`src/agent/dead_loop/` 是**LLM 交互级**守卫(判定键 = 「模型已见信息集合」指纹 + 输出全量指纹,跨轮次做尾部周期扫描 + 低新颖度检测),补齐前者的三条盲区:换序打转 `A→B→A→B`、换工具打转、上下文自锁。两级同轮命中时**工具级优先**(证据更硬、可逐项复算)。止损后的根因归类与换路径裁决由 Quality-Check Agent 承担(`quality/dead_loop.rs::check_dead_loop`)。设计见 `docs/LLM交互死循环指纹检测与质检裁决/01-设计与解决方案.md`。
 - **终端守卫**：`src/tui/term_guard.rs`。终端窗口关闭后 crossterm `event::read` 永久 hang，通过独立看门狗线程轮询 `POLLHUP` + 0 超时挂断探测根治。
-- **注入命名空间隐身**：向页面注入的 guard/highlight/follow/探测脚本全部改用进程级随机命名空间（`src/agent/browser_ns.rs`），脚本尾部把全部 API 入口改**不可枚举**。第 179 轮起窗口面 API 挂 `Symbol.for` 命名空间对象、DOM 面用独立 token。
-- **反检测档位（`src/agent/stealth.rs`）**：三档 `off`/`fidelity`/`hardened`（缺省）。注入脚本由三块按档组合（`CORE_JS` → `FIDELITY_JS` → `HARDENED_JS`），`stealth_js_for(mode)` 唯一真源。三条铁律：① 被改写属性/函数的描述符形态必须与原生一致；② 同档重复注入必须零动作（幂等闸）；③ 回填值必须与原生对象形态同洽。**隐身脚本必须在 `page.goto` 之前注册**。connect 模式（接管用户浏览器）零注入契约不变。
-- **页面管控三档（guard，`browser_overlay.rs`）**：`locked`（缺省，人工可看不可点）/ `open`（非屏蔽）/ `partial`（部分屏蔽，DOM 盾区）。locked 缺省用 DOM 选择性事件闸（只拦 `isTrusted=true`，放行滚轮/滚动），闸注入失败 fail-closed 回退 CDP。工具面 `open(guard?/allow_selectors?/block_selectors?)` + `control(set_guard)`。
-- **人工介入弹窗 UI**：见 `docs/MCP_Web_Use/03` + `27`。Windows 弹窗 macOS 风格主题唯一真源 `src/agent/human_ui/windows_theme.rs`。
-- **站点频控节奏治理（`browser_pace.rs`）**：两条防线：① 同注册域两次显式导航最小间隔（默认 2.5s）；② 频控横幅命中即标记同域冷却（默认 240s），冷却期内同域导航返 **6004**。杀开关 `LAEW_WEB_PACE=off`。
-- **整页抹除(site_wipe)治理**：部分站点对 CDP 会话做会话/指纹级打标，被标会话每次页面完整加载后数秒内被站点脚本 `location→about:blank` 整页抹除。治理：连击熔断 + 总账跨实例持久化（`site_risk` 表）+ 延迟抹除复查 + 空白页清扫。`close(page_id="all")` 回收浏览器时冷却与连击清零（但总账不清）。
-- **自动阻断感知与输入硬闸（`blocker_probe.rs`）**：风控弹层的题面常常没有"验证码"关键词，所以不能只做关键词匹配。① 推送式探针：输入类动作/`wait`/导航类/`eval_js` 收尾各探测一次，按结构打分；② `inspect(blockers)` 双通道 = 全文关键词 ∪ 弹层语义；③ 输入前置硬闸 6002：只认结构证据，命中即拦截；④ 子类型区分：只有真能填码的形态才叫 `captcha`；⑤ auto-HITL 自动弹出。杀开关 `LAEW_WEB_BLOCKER_PROBE=off`。
-- **多标签页后台挂起治理（`page_activity.rs`）**：Chrome 一个窗口只有一个激活标签页，其余转后台挂起。① `control(screenshot)`/`inspect(screenshot|ocr)` 在后台页执行前返 **6003**；② 其余动作放行但响应附 `page_background` 提示；③ `list` 逐页 `foreground` 标记；④ `close(page_id="background")` 批量关后台页；⑤ `control(bring_to_front)` 标签页前台化。杀开关 `LAEW_WEB_BACKGROUND_GATE=off`。
-- **复用已登录浏览器（connect 模式，`browser_reuse.rs`）**：`open(reuse_existing=true)` 探测本机 CDP 调试端口并 `Browser::connect` 接管保留登录态；探测失败返 **3002**。connect 语义：close 只断连、页面管控恒 open 且零注入。
-- **浏览器可见模式与窗口几何**：缺省 = 可见 `headed`；无 GUI 会话自动回退 `hidden`。窗口尺寸规则：headed 导航完成后保持当前窗口尺寸（用户手动调整过以其为准），超屏收边。页面视口铺满窗口内容区。多标签页断流根治：`is_noise_page` 对 new-tab-page 系列不看标题直接判噪声。首启空标签页清扫 + 空白页诊断 + 句柄自愈。
+- **LsmAgentBrowser 内核**：`src/agent/browser/` 是进程内自研浏览器——窗口/标签页、HTTP(S) 网络栈、DOM、布局、软件渲染、JS 执行全部在本进程，**不存在外部浏览器进程、调试端口或 CDP 协议**。设计见 `docs/自定义浏览器和V8引擎/`。阶段一 `mode=headed` 回退为无头内核并在 `data.mode_hint` 说明；原生窗口在阶段三实现。
+- **页面模型**：`page_id` 格式 `p_` + 8 位十六进制；窗口/标签页、历史栈、Cookie Jar、localStorage/sessionStorage 全部内存驻留，`close(page_id="all")` 或进程退出即销毁。`open` 支持同 URL/同站复用，`new_tab`/`_blank` 返回 `spawned_page_id`。
+- **JS 引擎**：`JsRuntime` 抽象；阶段一默认 `boa_engine`（纯 Rust，离线可编译），DOM 通过快照桥暴露 `document/window/location/storage`；`rusty_v8` 作为可选目标后端（`v8-backend` 特性），上层接口不变。
+- **页面能力与安全**：网络请求走本进程 `reqwest`（rustls），沿用 `LAEW_TLS_INSECURE` 与 SSRF 私网拦截；任务锚点 6001 继续在显式 URL 动作入口生效；页面脚本执行、原生窗口、资源加载器分别在阶段二/三/四补齐。
+- **人工介入**：`control(request_human)` 桥接 `human_assist`（桌面原生弹窗 / TUI），返回 0/4001/4002；取消任务同时置位进程级旗标。弹窗实现见 `src/agent/human_ui/`。
 
 ### 多 Agent 架构（8 角色）
 
@@ -174,7 +148,7 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 | 工具 | 能力 | 平台门控 | 设计文档 |
 |------|------|----------|----------|
 | **MCP_Window_Use** | 桌面窗口操控：`action` 枚举分发（`open`/`list`/`find`/`inspect`/`control`/`ocr`/`screenshot`）；双路线（Windows UIA Pattern 优先 + Win32 消息 + 物理鼠标键盘兜底；macOS AX 控件树 + 物理输入；Linux wmctrl/xdotool 物理层） | **仅 macOS/Windows** 运行时注册；Linux 走物理层兜底 | `docs/MCP_Window_Use/01-设计与解决方案.md` |
-| **MCP_Web_Use** | 浏览器操控：`action` 枚举分发（`open`/`list`/`close`/`control`/`inspect`/`sequence`/`batch`/`explore`）；`control_action` 44 个写操作；`inspect` 21 个观察维度；单步 + 连续（`sequence` ≤24 steps）；视口基准 1080p + 2K 自动扩展；蓝色选中边框 + 注入 UI 挂 closed Shadow DOM | 跨 Windows/macOS/Linux；Chrome→Edge→Chromium→Brave 自动探测 | `docs/MCP_Web_Use/01-设计与解决方案.md` |
+| **MCP_Web_Use** | 浏览器操控（LsmAgentBrowser 进程内内核）：`action` 枚举分发（`open`/`list`/`close`/`control`/`inspect`/`sequence`/`batch`/`explore`）；`control_action` 48 个写操作；`inspect` 21 个观察维度；单步 + 连续（`sequence` ≤24 steps）；HTTP(S) + DOM + 布局 + 软件渲染 + Boa JS；全内存 Cookie/存储 | 跨 Windows/macOS/Linux；无外部浏览器进程 | `docs/自定义浏览器和V8引擎/03-MCP_Web_Use兼容层设计.md` |
 | **Use_MCP** | 通用 MCP（Model Context Protocol）服务调用统一入口：**真 MCP 协议客户端**（JSON-RPC 2.0），连接外部 MCP server（stdio 子进程 / Streamable HTTP）；单工具 `action` 枚举分发 | 跨平台（由外部 MCP server 决定能力） | `docs/Use_MCP/01-设计与解决方案.md` |
 
 ### 自感知动态子 Agent（Self-Awareness SubAgent）
@@ -314,24 +288,23 @@ agent/
     subagent.rs    SubAgentTool
     read_detect.rs ReadTool 二进制/编码自动探测
     mcp_window_use/  MCP_Window_Use 工具目录
-    mcp_web_use/     MCP_Web_Use 工具目录
+    mcp_web_use/     MCP_Web_Use 兼容层(mod/control/inspect/visit_ledger)
     use_mcp/         Use_MCP 工具目录
 
   window/          窗口操控平台驱动层
-  browser.rs       浏览器 CDP 驱动层
-  browser_mode.rs  浏览器启动模式决策唯一真源
-  browser_noise.rs   幽灵标签页判定
-  browser_follow.rs  自动跟随滚动
-  browser_overlay.rs 页面管控模块
-  browser_status.rs 屏蔽页面状态栏/进度栏模块
-  browser_spawn_arm.rs 派生页首文档早期武装
-  browser_env_emulation.rs 无头档指针/悬停媒体仿真
-  cdp_ext.rs       chromiumoxide 0.9 类型化 CDP 命令补丁层
+  browser/         LsmAgentBrowser 进程内内核(无 Chrome / 无 CDP)
+    mod.rs         单例 / 窗口 / 标签页 / page_id / 导航 / 关闭 / 截图 / 下载 / 存储
+    api.rs         control_action 实现(点击/输入/选择/按键/滚动/JS/视口)
+    inspect.rs     inspect info 实现(elements/dom/text/network/extract 等)
+    net.rs         HTTP(S) 网络栈 / 重定向 / Cookie / 字符集 / SSRF / TLS
+    document.rs    DOM / 选择器 / 稳定选择器 / 文本抽取 / 表单序列化
+    layout.rs      块级布局 + 简化 CSS 级联
+    render.rs      fontdue + tiny-skia 软件渲染 + PNG
+    js.rs          Boa 引导后端 + DOM 快照桥(JsRuntime 抽象)
+    storage.rs     Cookie Jar / localStorage / sessionStorage
+    urlutil.rs     URL 解析 / 字符集解码 / 文件名净化
+    tests.rs       内核单元测试
   display_topology.rs OS 显示器拓扑真值
-  fingerprint.rs   反检测指纹体检
-  web_activity.rs Agent 活动台账
-  browser_viewport.rs 窗口与视口尺寸决策
-  browser_watchdog.rs Browser 子进程 watchdog
   workflow/        Goal 状态机 + Squad 调度工作流层
   workflow_json_validate.rs Workflow JSON 校验
 
@@ -423,7 +396,7 @@ Markdown Prompt 模板，两级发现：**项目级** `{工作目录}/.laew/comm
 
 **三个 MCP 风格工具**（按工具）：
 - `docs/MCP_Window_Use/` — 桌面窗口操控
-- `docs/MCP_Web_Use/` — 浏览器操控
+- `docs/自定义浏览器和V8引擎/` — LsmAgentBrowser 内核、兼容层与阶段路线图
 - `docs/Use_MCP/` — 通用 MCP 服务调用
 
 **上下文与会话**：
@@ -475,10 +448,8 @@ Markdown Prompt 模板，两级发现：**项目级** `{工作目录}/.laew/comm
 | `tests/agent_loop.rs` | Agent 主循环功能 |
 | `tests/cli_provider.rs` | 真实二进制 CLI：`provider` / `mcp` 增删列切 |
 | `tests/project_context.rs` | 项目说明文件五级发现链 + 注入幂等 |
-| `tests/web_use_smoke.rs` | MCP_Web_Use 真浏览器冒烟（默认 `#[ignore]`） |
-| `tests/stealth_reveal_smoke.rs` | 反检测的服务端侧取证 + 回填替身真机差分 |
+| `tests/web_use_engine.rs` | MCP_Web_Use × LsmAgentBrowser 端到端（mock HTTP,无外网/无浏览器） |
 | `tests/macos_ax_smoke.rs` | macOS Accessibility 冒烟（依赖宿主 TCC 授权） |
-| `tests/browser_watchdog.rs` | 浏览器子进程回收 |
 
 ### 写集成测试的规矩
 

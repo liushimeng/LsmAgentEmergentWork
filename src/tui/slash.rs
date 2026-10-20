@@ -204,10 +204,6 @@ impl TuiSession {
             "workspace" | "ws" => {
                 self.run_workspace(rest_args);
             }
-            // 第 187 轮:站点反爬熔断状态面板 + 人工解除(/risk release <domain>)。
-            "risk" | "risks" => {
-                self.run_risk(rest_args);
-            }
             "" => {}
             other => {
                 // 内置未命中 → 查自定义命令(D2);命中则渲染模板并送编排。
@@ -750,65 +746,6 @@ impl TuiSession {
             println!("  注入状态: 会话级已并入 PROJECT_CONTEXT;每次 LLM 调用另附运行时 brief。");
         }
         println!("  用法: /workspace refresh  强制重新采集(默认命中 5s 缓存)。");
-    }
-
-    /// 第 187 轮:站点反爬熔断状态面板 + 人工解除。
-    ///
-    /// - `/risk`:列出已对 laew 环境**持久熔断**的站点(累计整页抹除 ≥ 阈值)、
-    ///   阈值与人工解除方式 —— 让用户不必翻 6004 信封就知道「为什么任务没动」;
-    /// - `/risk release <domain>`:清该域内存账 + 持久化台账(换 IP / 站点 WAF
-    ///   修复后用;**内存与库必须同清**,否则下次启动回填又把旧账灌回来)。
-    fn run_risk(&self, arg: &str) {
-        use crate::agent::browser_pace as pace;
-        let arg = arg.trim();
-        let lower = arg.to_ascii_lowercase();
-        let domain = lower
-            .strip_prefix("release ")
-            .or_else(|| lower.strip_prefix("clear "))
-            .map(str::trim)
-            .map(|s| s.trim_matches(|c| c == '"' || c == '\''))
-            .filter(|s| !s.is_empty());
-        if let Some(domain) = domain {
-            let host = pace::host_of(&format!("https://{domain}")).unwrap_or_else(|| domain.to_string());
-            let released = pace::WebPace::global().release_domain(&host);
-            if released {
-                println!("  ✓ 已解除 `{host}` 的持久熔断(内存账 + 持久化台账已清)。");
-                println!("    下次对该站点的导航不再被 6004 拦截;若站点仍在打标,会再次被抹并重新记账。");
-            } else {
-                println!("  `{host}` 当前没有熔断账(无需解除)。");
-            }
-            return;
-        }
-        if !arg.is_empty() {
-            println!("  用法: /risk  查看熔断站点;/risk release <domain>  人工解除。");
-            return;
-        }
-        let threshold = pace::wipe_total_threshold();
-        let reload_threshold = pace::WebPace::reload_loop_threshold();
-        let blocked = pace::blocked_domains();
-        println!("  站点反爬熔断(/risk):");
-        if blocked.is_empty() {
-            println!("    (无)当前没有站点被持久熔断。");
-        } else {
-            for (domain, total, cause) in &blocked {
-                // 第 188 轮:按成因分流展示 —— 两类的出路不同(抹除换 IP,重载接管
-                // 真实浏览器),混成一句话会把用户引到无效动作上。
-                if *cause == pace::CAUSE_RELOAD_LOOP {
-                    println!("    - {domain}: 页面持续重载 {total} 次(阈值 {reload_threshold})");
-                } else {
-                    println!("    - {domain}: 累计整页抹除 {total} 次(阈值 {threshold})");
-                }
-            }
-            println!("    含义(整页抹除): 站点已对 laew 拉起的浏览器环境(含全新 profile 与调试实例)");
-            println!("          做指纹级打标,继续 open/navigate/close(all)/force 全部无效,");
-            println!("          只会反复弹 Chrome 并再吃一次风控;打标通常含 IP 维度 → 换 IP 重试。");
-            println!("    含义(页面持续重载): 站点每隔几秒把页面整个重建一次,页面能打开但");
-            println!("          Agent 点不准、**人工也输不进去**(输入随文档销毁丢失),");
-            println!("          故 request_human 是死路 → 改用 open(reuse_existing=true)");
-            println!("          接管本机已登录的真实浏览器(零注入、真实指纹)。");
-            println!("    解除: /risk release <domain>  (或设 LAEW_SITE_RISK_PERSIST=off 跑一次)");
-        }
-        println!("  用法: /risk release <domain>  人工解除该域熔断。");
     }
 
     /// `/rewind [N]`(D3,2026-09-10 第二十四轮):列出轮次或回退到第 N 轮之前。

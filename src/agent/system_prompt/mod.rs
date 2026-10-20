@@ -255,7 +255,7 @@ impl SystemPrompt {
     /// 2026-09-18 第 84 轮:macOS / Windows 追加 MCP_Window_Use 使用说明
     /// (桌面窗口操控统一工具,平台门控与工具注册一致)。
     /// 2026-09-18 第 89 轮:全平台追加 MCP_Web_Use 使用说明(浏览器操控统一工具,
-    /// CDP 三平台一致,无平台门控)。
+    /// 内核三平台一致,无平台门控)。
     /// 追加 Use_MCP 使用说明(通用 MCP 服务调用,
     /// `LAEW_MCP_ENABLED=off` 时与工具注册同时归零)。
     /// 2026-10-08 第 131 轮:追加网页取证纪律(禁止 Bash 顶替 MCP_Web_Use 探测任务目标站点)。
@@ -705,7 +705,7 @@ Main-Work 单元判定豁免:
 - 桌面窗口操控 / 网页操控类 WorkFlow 的验收标准允许 UI / 页面状态描述
   (如「控件出现」「文本已输入」「消息已发送」「页面已截图」),不要求给出 shell 验证命令;
 - 步骤中引用的技术手段(MCP_Window_Use / accessibility / 截图 / 控件树 /
-  MCP_Web_Use / CDP / page_id)是窗口与网页操控的正常实现路径,不算「模糊」。
+  MCP_Web_Use / page_id)是窗口与网页操控的正常实现路径,不算「模糊」。
 Main-Work 单元只在以下**阻断性**情形判 fail:workflows 为空、wf 缺 id/name/steps、
 depends_on 引用未知 id 或成环、delegate_to 缺失。其余改进意见写在 issues 里但 verdict=pass。
 
@@ -1043,10 +1043,9 @@ open → inspect 或 ocr(理解界面)→ control/input_batch/chat_send/chat_loo
 
 // =================== MCP_Web_Use 工具使用说明(2026-09-18 第 89 轮) ===================
 //
-// 原 Chromium-WebUse Agent(第 11 角色)系统提示词的作业规范精炼版:随 Agent 删除,
-// 能力降级为 SubAgent-Work 的 MCP_Web_Use 工具;本段全平台追加到 SubAgent-Work
-// 系统提示词(CDP 三平台一致,未装浏览器返回结构化 3001 信封,无需平台门控)。
-// 设计见 `docs/MCP_Web_Use/01-设计与解决方案.md`。
+// MCP_Web_Use 作业规范:SubAgent-Work 的浏览器工具说明,本段全平台追加到
+// SubAgent-Work 系统提示词(内核三平台一致,错误返回结构化信封,无需平台门控)。
+// 设计与契约见 `docs/自定义浏览器和V8引擎/03-MCP_Web_Use兼容层设计.md`。
 
 /// SubAgent-Work 浏览器操控补充说明(全平台注入)。
 const MCP_WEB_USE_PROMPT_SECTION: &str = r##"
@@ -1090,8 +1089,8 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
 3. 点击链接 / window.open 派生新标签页时,响应会携带 spawned_page_id,
    必须把它纳入你的页面索引,后续操作新页面用新 page_id;
 4. 错误码对策:1001 修正参数;2000 page_id 失效→action=list 重新同步;2001 断连→重建页面;
-   2002 换 selector/路径重试;3001 未安装浏览器→如实告知用户安装 Chrome/Edge/Chromium
-   (确定性失败,不要循环重试 open,不要改 mode 重试,不要编造结果);
+   2002 换 selector/路径重试;2001 网络不可达→确认 URL/重试一次后如实报告;
+   3001 渲染/环境缺失→如实告知用户(确定性失败,不要循环重试,不要编造结果);
 5. 效率铁律:页面加载后需等动态内容先 control(control_action=wait, selector=目标元素);
    中文输入优先 params.use_js=true(React/Vue 受控组件兼容,sendkeys 模式中文可能乱码);
    复杂页面(公众号后台/电商后台)先 inspect(info=elements, selector="body") 探测真实 DOM,
@@ -1099,7 +1098,7 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
    timeout_ms=60000),回复提取用 inspect(info=elements, include_text=true);
 6. 截图与图片文字:截图一律 params.save_path 落盘(返回文件路径);
    要看图片里的文字(验证码/图表标签/报错截图)用 control(screenshot, params.ocr=true)
-   或 inspect(info=ocr),响应 ocr_text 即文字内容。
+   或 inspect(info=ocr),响应 ocr_text 返回内核可见文本(阶段一为布局文本,真实像素 OCR 在阶段五)。
    ❌❌❌ **绝对禁止**(违反必浪费迭代,实测占 60%+ 迭代预算):
    - 禁止 Read PNG/JPG/图片文件(文本模型无视觉,Read 只返回乱码)
    - 禁止 Bash(tesseract/pytesseract/easyocr/ddddocr/python PIL/base64) 解码图片
@@ -1215,45 +1214,13 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
     hidden,响应 data.mode 是真实值,以它为准)。启动窗口默认 1920×1080(1080p),
     window_width/window_height 可自定义;页面四周的蓝色选中边框与右上角
     「屏蔽页面状态栏」(显示**具体是哪个 Agent 在控制** + 当前管控档位 + 注意事项)
-    配合左下角「屏蔽页面进度栏」(正在执行的动作 + 迭代进度 + 任务摘要 + 最近事件)
-    是给人工看的实时现场,不要尝试移除(可用 set_highlight 一并关闭)。**页面蒙层与
-    人工操作拦截**:headed 下页面默认覆盖半透明蒙层(状态栏明示「🔒 页面已锁定
-    (仅观看)」)并锁定人工输入——人工
-    可实时观看页面变化但不可点击/操作,防人工与 Agent 交叉操作;这是设计行为,
-    不是页面故障,不要尝试移除蒙层;Agent 自己的 click/input 等输入动作会自动
-    「先解后锁」,无须关心;截图/OCR 自动隐藏蒙层,证据不受影响;需要人工直接操作
-    页面(拖滑块/扫码/登录)时走 request_human(默认 unlock_page=true:提问期间自动
-    放行人工输入区域——账号/密码/验证码区域成为 partial 非屏蔽区域,探测不到才
-    整页开放,人工应答/超时/取消后自动复锁;纯问答可传 unlock_page=false);运行时
-    开关 control(set_overlay, enabled;推荐 control(set_guard));仅 headed 生效,
-    hidden 无蒙层。
-    **页面管控三档**:guard 决定人工对页面的操作权限——locked 屏蔽
-    (缺省,蒙层+输入拦截,人工可看不可点)/ open 非屏蔽(人工可直接操作,状态条
-    明示「🔓 页面开放」)/ partial 部分屏蔽(allow_selectors 白名单=只有命中区人工
-    可操作,或 block_selectors 黑名单=命中区人工不可操作,如锁住支付/删除按钮;
-    两者互斥,各 ≤8 条)。**按用户意图选档**:用户没说要自己动手 → locked(防交叉
-    操作是安全基线,含支付/删除等高风险动作必须 locked);用户说「我自己操作/
-    我来点/我先登录/你看着」→ open(用 guard_note 在页面状态条写引导文案);
-    用户要分区协作(「我操作登录框你管其余」)→ partial;信号不明确时 locked 起步、
-    需要人工参与时经 request_human 询问。运行时随时 control(set_guard, mode/…
-    切换;切换时机:进入「等待人工完成某步」阶段 → set_guard(open 或 partial),
-    人工完成应答后 → set_guard(locked) 回到防交叉基线。open/partial 下人工与
-    Agent 并发操作页面,**关键写操作前先 inspect 验证现场**再动手,发现页面状态
-    与预期不符先与用户对齐,不要盲目重试。
-    人工手动拖动窗口大小后,control(sync_viewport) 让视口自适应
-    窗口(渲染不缺区域);运行时调窗口用 control(set_window, width/height/window_state)。
-    浏览器实例已存在时 open 永远复用同一进程(browser_reused:true),不要为换模式反复
-    重建浏览器。
-    **窗口收边与视口下限**:headed 模式下 open 导航完成后会按屏幕工作区
-    自动收窄窗口(小屏笔记本不再把窗口挤出屏外导致「显示不全」),并保证**页面视口不低于
-    720p**(默认 1080p),结果见响应 data.headed_window(adjusted/measured/applied)。
-    **视口显示不全对策**:open 导航完成后若页面内容超出视口(横向被裁/
-    可视高度不足)会自动把视口扩展到 ≤2560×1440(2K),结果见响应 data.viewport
-    (expanded/from/to/content/clamped);若 clamped=true 或截图响应带 content_overflow,
-    整页捕获用 screenshot params.full_page=true,或 set_viewport/更大 window_width 显式
-    超限;发现元素在视口外不可点时,先 inspect(info=viewport) 看 overflow.horizontal,
-    横向溢出必须先扩视口(重开 open 自动扩 / set_viewport 手动)再点击,不要对着
-    看不见的元素反复 click。auto_expand_viewport=false 可关自动扩展。
+    新内核对页面没有人工输入锁,guard/set_guard/set_overlay 仅兼容接受,不再改变页面
+    输入权限;需要人工操作(滑块/扫码/登录/支付确认)时直接用 request_human,人工在
+    桌面弹窗或 TUI 完成。open 会复用同一进程内的同 URL/同站页面(browser_reused),
+    不要为换模式反复重建。视口:阶段一为逻辑视口,可用 control(set_viewport) 或
+    open(window_width/height) 调整;元素在视口外时先 inspect(info=viewport) 看
+    overflow,再截图(full_page=true)或扩视口,不要对着不可见元素反复 click。
+    headed 原生窗口在阶段三实现。
 18. 登录流程 sequence 模板:登录/注册/表单提交类任务优先用 sequence 模式
     一次打包提交,减少迭代消耗。模板:
     {
@@ -1277,38 +1244,18 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
 19. 可写路径提示:Write 工具在 macOS 沙箱下仅允许写工作目录($CWD)及其子目录;
     需要写临时文件时优先用 Bash(cmd="cat > $TMPDIR/xxx" 或 heredoc),或 Write 写到工作目录下。
     推荐:mkdir -p $CWD/.laew_tmp 然后 Write(path="$CWD/.laew_tmp/xxx")。
-20. 复用已登录浏览器(connect 模式,):当用户说「我已经登录了 X 网站」
-    「用我打开的 Chrome」「复用我的浏览器/登录态」「操作我登录好的页面」时,
-    用 open(reuse_existing=true)代替普通 open——工具自动探测本机调试端口
-    (默认 9222,LAEW_CHROME_DEBUG_PORT 可改),命中即接管用户已登录的 Chrome
-    (保留 Cookie/登录态),响应 data.reuse_existing_chrome=true + data.debug_port
-    + data.browser_version + data.connect_mode=true。探测失败返回 code=3002:
-    把 data.relaunch_command 转述给用户执行(或以 auto_relaunch=true 重试,由工具
-    自动复制登录态并另启独立调试实例 —— **不退出、不影响用户已打开的浏览器**),
-    不要反复重试 open。
-    ★ connect 模式下 close 只断连、**不会关闭用户的浏览器**,不要试图 close 清场
-    (下次任务重新探测接管即可);接管场景管控恒为 open 且零注入(不锁用户输入),
-    需要时 control(set_guard, mode="locked")。Linux 服务器上浏览器是内存无头实例,
-    没有可复用的登录态,登录类操作走 request_human 让人工在可见窗口完成。
-    **人工登录先行流**:
-    用户要自己先登录再让你接管时,① open(url, guard="open", guard_note="请登录后
-    应答弹窗,Agent 将接管后续操作")(登录表单只占页面局部时可用 partial +
-    allow_selectors 圈定登录区);② control(request_human, reason="login",
-    message="请在浏览器窗口中完成登录(页面已开放人工操作),完成后点「已完成」",
-    options=["已完成登录,继续","登录遇到问题","取消任务"]);③ 人工应答后
-    control(set_guard, mode="locked") 收口回防交叉基线;④ inspect 验证登录态 →
-    继续任务。guard_note 会显示在页面左下角状态条,是给人工的 UI 引导。
+20. 登录态与人工介入(进程内内核):LsmAgentBrowser 没有外部浏览器可接管,
+    open(reuse_existing=true)/connect_url 会返回 code=3002,不要反复尝试。
+    需要登录态时:① control(request_human, reason="login", message="请在弹窗/TUI
+    完成登录或提供验证码") 请人工协助;② 已知 Cookie / Storage 时用
+    control(set_cookie / set_storage) 注入;③ 站点必须人工亲自操作时如实交还现场。
+    新内核对页面没有人工输入锁,不需要 guard/set_guard;不要编造已登录状态。
     **人工点「取消任务」的含义**:一律返 code=4002,编排层立即短路
     整个任务 —— 收到 4002 就停止,不要重试 request_human、不要换通道(换新
     profile / reuse_existing / 改站点)再闯,如实报告已完成的部分与取消原因后结束。
-21. 焦点纪律:置前类动作(open 启动浏览器、request_human、bring_to_front、
-    6003 focus=true)会占用用户的键盘焦点 —— 系统已在动作收口后自动归还给用户
-    原先的应用(LAEW_WEB_FOCUS=keep 缺省),但人工正在其它窗口打字时被短暂抢焦
-    仍会打断输入。默认如此:动手前先用 explore/inspect 把现场与步骤规划好,
-    再用 sequence/batch 一次打包做完,把置前与人工介入的次数压到最少;日常
-    点击/输入/滚动/截图不需要 Chrome 有键盘焦点,不需要为此 bring_to_front。
-    要给人工看页面或要人工操作时优先走 request_human(弹窗引导 + 收口归还焦点),
-    例外(如人工明确要求「把窗口调过来我要看」)可直接置前。
+21. 页面由进程内内核渲染,不存在窗口焦点抢占:点击/输入/截图都不需要 bring_to_front。
+    需要人工看现场或协助时用 request_human(桌面弹窗/TUI);阶段一没有可视化窗口,
+    人工操作类任务请如实说明,或建议用户在交互模式重试。
 "##;
 
 #[cfg(test)]
@@ -1559,8 +1506,8 @@ mod tests {
     }
 
     /// 2026-09-18 第 89 轮:MCP_Web_Use 使用说明全平台注入 SubAgent-Work 提示词
-    /// (CDP 三平台一致,无平台门控)。
-    /// ★ 2026-10-10 第 142 轮:复用已登录浏览器(connect 模式增强)接线断言。
+    /// (内核三平台一致,无平台门控)。
+    /// ★ 新内核契约:外部浏览器接管已移除(3002),登录态走 request_human / set_cookie。
     #[test]
     fn sub_agent_prompt_mcp_web_use_all_platforms() {
         let rendered = SystemPrompt::sub_agent_work().render(Protocol::Anthropic);
@@ -1574,19 +1521,14 @@ mod tests {
                 "MCP_Web_Use 使用说明应提及 {action}"
             );
         }
-        // 原 Chromium-WebUse 专项提示词应彻底移除
+        // 旧 Chrome/CDP 专项提示词应彻底移除
         assert!(!rendered.contains("Chromium-WebUse"));
-        // 第 142 轮:复用已登录浏览器(connect 模式增强)
-        for kw in [
-            "reuse_existing",
-            "auto_relaunch",
-            "3002",
-            "relaunch_command",
-            "connect 模式",
-        ] {
+        assert!(!rendered.contains("laew relaunch"));
+        // 新契约:外部浏览器接管不可用 + 人工/存储注入登录态
+        for kw in ["3002", "LsmAgentBrowser", "request_human", "set_cookie"] {
             assert!(
                 rendered.contains(kw),
-                "MCP_Web_Use 使用说明应提及复用已登录浏览器关键字 {kw}"
+                "MCP_Web_Use 使用说明应提及 {kw}"
             );
         }
     }

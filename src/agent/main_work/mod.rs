@@ -247,7 +247,7 @@ impl MainWorkRunner {
                MCP_Window_Use 工具承担(macOS / Windows);网页/浏览器操作类任务(打开网址、\n\
                浏览网页、网页登录、点击/输入/滚动页面、网页截图、抓取页面信息、爬虫采集、\n\
                查看 Console/Network/DOM)由 SubAgent-Work 的 MCP_Web_Use 工具承担\n\
-               (CDP 内存无头浏览器,全平台)—— 两类任务照常描述步骤即可,不需要特殊 delegate 值。\n\
+               (LsmAgentBrowser 进程内自研内核,全平台)—— 两类任务照常描述步骤即可,不需要特殊 delegate 值。\n\
              - 同一桌面应用的连续 UI 操作链(打开/激活 → 等待窗口 → 搜索 → 选择会话 → 输入 → 校验 →\n\
                发送/提交)必须合并为一个 subagent WorkFlow,不要按每个按钮拆成多个串行单元;\n\
                跨单元会丢失真实焦点与控件状态。只有不同应用或互不依赖的窗口操作才允许拆分。\n\

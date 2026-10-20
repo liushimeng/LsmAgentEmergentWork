@@ -259,7 +259,7 @@ pty master 关闭（终端窗口/标签被关、SSH 断线）后，slave 上的 
    `drain_paste_burst`、**`engine.rs::read_key`（`/provider *` 子屏，与主屏同源同病）**。
 4. **相邻缺陷**：`tui/mod.rs` 两条提前 `return Err` 路径跳过 `terminal_restore()`
    （关掉后终端滚动区/底部面板残留）；TUI 所有退出路径都不调 `BrowserManager::shutdown()`
-   （纯靠 `#[cfg(unix)]` 的 atexit，**Windows 上既无 atexit 也无 Drop**，Chrome 留在后台）；
+   （纯靠 `#[cfg(unix)]` 的 atexit，**Windows 上既无 atexit 也无 Drop**，浏览器进程留在后台）；
    `macos_legacy` 的 `Command::new("open").spawn()` 返回值被丢弃（每次调用泄漏一个 zombie）；
    `human_ui` 的 payload 临时文件用「await 之后 remove_file」清理（弹窗取消会 drop
    整个 future，await 之后不执行 → 每次漏一个 `/tmp/*.json`）。
