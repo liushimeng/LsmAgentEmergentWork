@@ -129,6 +129,20 @@ pub struct ExecutionTrace {
     /// 即使 `LAEW_REACT_GUARD=off` 也统计(可观测性不丢)。
     #[serde(default)]
     pub doom_loop_repeats: usize,
+    /// 死循环诊断(LLM 交互级指纹检测,`dead_loop::DeadLoopGuard`)。
+    ///
+    /// 与 `doom_loop_repeats`(工具级相邻重复)的分工:本字段捕捉**跨轮次任意
+    /// 周期**的循环 —— 换序打转(`A→B→A→B`)、换工具打转、上下文自锁,
+    /// 都是工具级相邻比较结构上抓不到的形态。`None` 表示本单元未命中。
+    ///
+    /// 写盘后由 Quality-Check 消费:① 机械门(有诊断 + pass → 降级 Fail);
+    /// ② 根因归类通道 `check_dead_loop`。旧 trace 反序列化为 `None`。
+    #[serde(default)]
+    pub dead_loop: Option<crate::agent::dead_loop::DeadLoopDiagnosis>,
+    /// 本单元观测到的最大循环重复次数(`DeadLoopGuard::max_repeats`)。
+    /// 即便 `LAEW_DEAD_LOOP=off` 也统计(可观测性不丢)。
+    #[serde(default)]
+    pub dead_loop_repeats: usize,
 }
 
 /// 单次工具调用摘要(2026-09-16 第 56 轮 + 第 57 轮)。
@@ -213,6 +227,8 @@ impl Default for ExecutionTrace {
             parallel_tool_batches: 0,
             parallel_tool_calls: 0,
             doom_loop_repeats: 0,
+            dead_loop: None,
+            dead_loop_repeats: 0,
         }
     }
 }
@@ -365,6 +381,16 @@ impl ExecutionTrace {
             signals.push(format!("doom_loop:{}x", self.doom_loop_repeats));
         }
 
+        // 5.8) LLM 交互级死循环信号(dead_loop):跨轮次任意周期的小循环/大循环。
+        // 与 5.7 的差异:5.7 只比**相邻**两轮(工具+参数+结果),换序打转
+        // (`A→B→A→B`)、换工具打转、上下文自锁三类形态结构上抓不到;
+        // 本信号基于「模型已见信息集合」指纹冻结 + 输出指纹的尾部周期扫描。
+        // 强信号(进 `is_failed()` 的口径由调用方按 early_terminated 承担,
+        // 这里只做留痕;QC 机械门另行按本字段拦截 pass)。
+        if let Some(d) = &self.dead_loop {
+            signals.push(format!("dead_loop:{}", d.headline()));
+        }
+
         self.failure_signals = signals;
     }
 
@@ -472,6 +498,14 @@ impl ExecutionTrace {
             base.push_str(&format!(
                 "\n- react: parallel_batches={} parallel_calls={} no_progress_repeats={}",
                 self.parallel_tool_batches, self.parallel_tool_calls, self.doom_loop_repeats
+            ));
+        }
+        // 死循环诊断全文:QC 必须看到「形态 + 周期 + 取样」才谈得上归类根因,
+        // 否则只能看到一句 early_terminate_reason,无法区分"换哪条路"。
+        if let Some(d) = &self.dead_loop {
+            base.push_str(&format!(
+                "\n- dead_loop(LLM 交互级指纹检测, process 级事实, 不可被 QC 覆盖):\n{}",
+                d.render()
             ));
         }
 

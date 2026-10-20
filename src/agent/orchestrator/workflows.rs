@@ -545,7 +545,7 @@ pub(super) async fn run_wf_unit(
             outcome.text,
             crate::agent::tools::mcp_web_use::visit_ledger::footprint_since(nav_seq0),
         );
-        let (qc, qc_usage) = quality
+        let (mut qc, qc_usage) = quality
             .check_subagent_with_source(
                 AgentRole::SubAgent,
                 &goal,
@@ -590,6 +590,52 @@ pub(super) async fn run_wf_unit(
                 }
             ),
         );
+
+        // ===== 死循环根因裁决(Quality-Check 专用通道) =====
+        // 仅当轨迹带 `dead_loop` 诊断时追加一次 QC 调用:把「止损之后换哪条路」
+        // 从 `abort_fallback_text` 的固定机械文案,升级成 QC 的结构化裁决
+        // (根因枚举 + 可执行换路径 + retryable),并前置并入本单元重试 hint。
+        // 未命中死循环的单元零开销。`LAEW_DEAD_LOOP=off` 时整段跳过。
+        if let Some(diag) = outcome
+            .trace
+            .dead_loop
+            .as_ref()
+            .filter(|_| crate::agent::dead_loop::dead_loop_enabled())
+        {
+            match quality
+                .check_dead_loop(
+                    &input.description,
+                    &input.expected_output,
+                    &outcome.text,
+                    diag,
+                    &session_id,
+                )
+                .await
+            {
+                Ok((resolution, u)) => {
+                    acc_usage = add_usage(acc_usage, u);
+                    resolution.merge_into(&mut qc);
+                    emit_progress(
+                        &progress,
+                        format!(
+                            "[laew] {} 死循环根因裁决: {} → {}",
+                            input.id,
+                            diag.headline(),
+                            truncate_progress_text_default(&qc.suggestion, 180)
+                        ),
+                    );
+                }
+                Err(e) => {
+                    // fail-open:裁决通道失败不应扩大失败面(单元本就在失败路径上)。
+                    tracing::warn!(
+                        session = %session_id,
+                        wf_id = %input.id,
+                        error = %e,
+                        "死循环根因裁决通道失败,fail-open:沿用常规 QC 结论"
+                    );
+                }
+            }
+        }
 
         if qc.verdict == Verdict::Fail {
             // ===== Reflection(反思)模式:复盘推理路径,产出跨 attempt 累积的教训 =====

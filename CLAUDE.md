@@ -63,7 +63,9 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 | `LAEW_AUDIT` | `off`/`0`/`false`/`no` | 关闭决策审计写入（默认开启）。见 `src/agent/decision_audit.rs` |
 | `LAEW_PARALLEL_TOOLS` | `off`/`0`/`false`/`no` | 关闭「同批只读工具并发执行」，回退到全串行。见 `src/agent/tool_exec.rs` |
 | `LAEW_MAX_PARALLEL_TOOLS` | 正整数（默认 `4`） | 单批并发上限。见 `src/agent/tools/mod.rs::max_parallel_tools_from` |
-| `LAEW_REACT_GUARD` | `off`/`0`/`false`/`no` | 关闭 ReAct 循环守卫。见 `src/agent/loop_guard.rs` |
+| `LAEW_REACT_GUARD` | `off`/`0`/`false`/`no` | 关闭 ReAct 循环守卫(工具级无进展检测)。见 `src/agent/loop_guard.rs` |
+| `LAEW_DEAD_LOOP` | `off`/`0`/`false`/`no` | 关闭 LLM 交互级死循环守卫(裁决 + QC 根因裁决通道),**检测统计仍保留**。见 `src/agent/dead_loop/` |
+| `LAEW_DEAD_LOOP_LONG_WINDOW` | 正整数(默认 `12`) | 大循环「低新颖度」检测窗口长度(轮) |
 | `LAEW_MAINWORK_TIMEOUT` | 正整数(秒,默认 `300`) | Main-Work 拆解墙钟超时。见 `src/agent/orchestrator/pipeline.rs` |
 | `LAEW_TOOL_TIMEOUT_SECS` | 正整数(秒,默认 `300`) | 单条工具调用总执行超时。豁免:`Bash`与 `request_human`。见 `src/agent/tool_exec.rs` |
 | `LAEW_WF_SERIAL_FALLBACK` | `off`/`0`/`false`/`no` | 关闭零依赖计划串行链兜底。见 `src/agent/main_work/topo.rs` |
@@ -126,6 +128,7 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 - **人工介入可见性**：`request_human` 的「该走人工」响应附 `next_action` + 完整 `human_assist` 载荷；输入硬闸 6002 与收尾探针首次命中则**直接自动弹出**（auto-HITL）。「取消任务」是真取消（返 `code=4002` 并置位进程级旗标 `human_cancel`）。`request_human` 不强制 `page_id`（无页可解锁时走任务级提问）。
 - **人工介入弹窗 = Rust 原生子进程（`human_ui/`）**：`laew __hitl-dialog <payload.json>` 隐藏子进程——macOS 走 AppKit FFI、Windows 走 Win32。铁律：布局是 Rust 纯函数单一真源，最大化/还原只用自身设定值重排、**永不回读窗口 frame**。支持选项多选、auto-HITL 自动弹出、焦点不抢夺、Windows macOS 风格主题。
 - **TUI 多行粘贴保真**：bracketed paste 整体接收，≥2 行粘贴一律转 marker 保真。Windows conhost / 部分 ConPTY 不支持 bracketed paste，通过三级粘贴判定（40ms 队列探测 → 击键节奏武装 → 正常提交）根治多行提示词被逐行拆成多次提交。实现见 `tui/paste.rs` + `tui/input/mod.rs`。
+- **死循环守卫(两级)**：`src/agent/loop_guard.rs` 是**工具级**守卫(判定键 = 相邻两轮的 工具+参数+结果,抓「同动作同结果」);`src/agent/dead_loop/` 是**LLM 交互级**守卫(判定键 = 「模型已见信息集合」指纹 + 输出全量指纹,跨轮次做尾部周期扫描 + 低新颖度检测),补齐前者的三条盲区:换序打转 `A→B→A→B`、换工具打转、上下文自锁。两级同轮命中时**工具级优先**(证据更硬、可逐项复算)。止损后的根因归类与换路径裁决由 Quality-Check Agent 承担(`quality/dead_loop.rs::check_dead_loop`)。设计见 `docs/LLM交互死循环指纹检测与质检裁决/01-设计与解决方案.md`。
 - **终端守卫**：`src/tui/term_guard.rs`。终端窗口关闭后 crossterm `event::read` 永久 hang，通过独立看门狗线程轮询 `POLLHUP` + 0 超时挂断探测根治。
 - **注入命名空间隐身**：向页面注入的 guard/highlight/follow/探测脚本全部改用进程级随机命名空间（`src/agent/browser_ns.rs`），脚本尾部把全部 API 入口改**不可枚举**。第 179 轮起窗口面 API 挂 `Symbol.for` 命名空间对象、DOM 面用独立 token。
 - **反检测档位（`src/agent/stealth.rs`）**：三档 `off`/`fidelity`/`hardened`（缺省）。注入脚本由三块按档组合（`CORE_JS` → `FIDELITY_JS` → `HARDENED_JS`），`stealth_js_for(mode)` 唯一真源。三条铁律：① 被改写属性/函数的描述符形态必须与原生一致；② 同档重复注入必须零动作（幂等闸）；③ 回填值必须与原生对象形态同洽。**隐身脚本必须在 `page.goto` 之前注册**。connect 模式（接管用户浏览器）零注入契约不变。
@@ -146,7 +149,7 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 | **Plan Agent** | `LsmAgentEmergentWork-Plan` | 规划层：仅在 hard 任务时启用；输出 Markdown 方案到 `plans/{session_id}-{seq}.md` | `Read`/`Write` |
 | **Main-Work Agent** | `LsmAgentEmergentWork-Main-Work` | 流程层：接收 medium/hard 任务，拆 WorkFlow 列表（Kahn 分层 + 同层并行）；编排循环 ReAct 化；复用 LoopGuard 编排层原地打转同样止损 | `Bash`/`Read`/`Glob`/`Grep`/`MCP_Web_Use`（编排前探查）/ `TodoWrite`/`SubAgent` |
 | **SubAgent-Work Agent** | `LsmAgentEmergentWork-SubAgent-Work` | 执行层最小单元，每个流程处理单元委派一个 SubAgent；提示词 ReAct 化 + 工具连续工作模式 + 无进展止损 | `Bash`/`Read`/`Write`/`Edit`/`Glob`/`Grep` + `MCP_Window_Use`（仅 macOS/Windows）+ `MCP_Web_Use` + `Use_MCP` + `TodoWrite` |
-| **Quality-Check Agent** | `LsmAgentEmergentWork-Quality-Check` | 质检层：每个执行单元完成后必经 QC；**目标一致性硬门**：用户指定 X、实际操作 Y 一律判 Fail + `retryable=false` | 可选 `Read` |
+| **Quality-Check Agent** | `LsmAgentEmergentWork-Quality-Check` | 质检层：每个执行单元完成后必经 QC；**目标一致性硬门**：用户指定 X、实际操作 Y 一律判 Fail + `retryable=false`；**死循环硬门 + 根因裁决通道**：轨迹带 `dead_loop` 诊断时 pass 一律被机械门拒收，并由 `check_dead_loop` 归类根因(`same_action`/`same_target`/`context_stuck`/`budget_starved`)+ 给出可执行换路径,注入单元局部重试 hint | 可选 `Read` |
 | **SessionContext Agent** | `LsmAgentEmergentWork-SessionContext` | 会话层：每个用户任务完成后汇总并写入 `session_memory` 表；Yolo 下次处理时自动注入最近 N 条历史摘要 | 无工具 |
 | **Debug Agent** | `LsmAgentEmergentWork-Debug` | 调试层：仅在 `-debug` 调试模式下启用；任务结束后对采集的 trace 做评估，产出四章节报告 | 无工具 |
 | **Compact Agent** | `LsmAgentEmergentWork-Compact` | 压缩层：上下文估算 token 达到 `context_max_size` 的 80% 时自动触发，按超出幅度自动选三档压缩率，LLM 摘要失败降级本地硬截断；**溢出兜底（reactive）**：真实溢出时自动三级恢复（排水→折叠→暴露） | 无工具 |
@@ -254,7 +257,8 @@ agent/
   agent_message.rs Agent 消息模型
   attachments.rs   @ 文件提及附件注入
   tool_exec.rs     工具调用执行底座
-  loop_guard.rs    ReAct 循环守卫
+  loop_guard.rs    ReAct 循环守卫(工具级无进展)
+  dead_loop/       死循环守卫(LLM 交互级指纹检测:小循环/大循环)
   runtime_hints.rs Agent 循环运行时辅助
   context.rs       Agent-Context 独立实时上下文
   extrace.rs       提取/抽取工具输出关键信息的助手
@@ -287,7 +291,7 @@ agent/
   yolo.rs          YoloRunner 双 Agent 编排器
   main_work/       Main-Work 流程层目录
   orchestrator/    MultiAgentOrchestrator 总编排器目录
-  quality.rs       Quality-Check Agent + 单元 QC 提示词构建
+  quality/         Quality-Check Agent(mod.rs 结构体+构造器+提示词构建;dead_loop.rs 死循环根因裁决通道;tests.rs)
   debug.rs         Debug Agent
   compact.rs       CompactRunner
   subagent_workflow.rs SubAgent 工作流编排
@@ -431,6 +435,10 @@ Markdown Prompt 模板，两级发现：**项目级** `{工作目录}/.laew/comm
 - `docs/自感知SubAgent动态启动/` — D114 基础委派
 - `docs/自感知SubAgent自定义类型与运行持久化/` — D115
 - `docs/自感知SubAgent工作流编排/` — D116
+
+**守卫与止损**：
+- `docs/LLM交互死循环指纹检测与质检裁决/` — LLM 交互级死循环指纹检测 + QC 根因裁决
+- `docs/Reflection反思模式/`
 
 **Skill / HITL / 离线 / 审计**：
 - `docs/Skill系统与渐进式披露/`

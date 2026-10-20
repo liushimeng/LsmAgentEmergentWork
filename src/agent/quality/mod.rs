@@ -1,5 +1,7 @@
 //! Quality-Check Agent:质检层,对 SubAgent-Work / Main-Work / Plan 单元做质量校验。
 
+mod dead_loop;
+
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -12,6 +14,13 @@ use crate::config::Db;
 use crate::error::Result;
 use crate::llm::{ChatMessage, Usage};
 use crate::session;
+
+// 死循环根因裁决通道的实现拆入子模块(工程 1800 行拆分规范);
+// 对外类型原路径 `crate::agent::quality::LoopRootCause` 零改动。
+pub use dead_loop::{LoopResolution, LoopRootCause};
+// 裁决通道的纯函数仅单测直接调用;运行时代路径走 `QualityRunner::check_dead_loop`。
+#[cfg(test)]
+use dead_loop::{build_dead_loop_prompt, parse_loop_resolution};
 
 /// 第 99 轮:QC 输出 JSON 形状硬性提示(三个 QC 提示词共用;实测 LLM 偶发漏掉
 /// verdict 字段导致反序列化失败白耗局部重试预算,提示词 + 解析端修复双保险)。
@@ -175,13 +184,44 @@ pub(crate) fn clip_qc_input(s: &str) -> String {
 /// 第 93 轮:`original_prompt`(用户原始输入)作为第一性事实插入 ——
 /// 实测「主动聊天」被编排层降级为「保活等待」时,单元职责/期望输出均已失真,
 /// QC 只对照失真标准必然蒙混通过;有原始输入时 QC 可识别「验收标准本身偏离任务」。
-fn build_unit_qc_prompt(
+///
+/// 死循环硬门段:轨迹带 `dead_loop` 诊断时,QC 必须判 Fail 并归类根因。
+/// 单元 QC 提示词(无死循环段)。
+///
+/// 绝大多数调用方(含既有单测)不需要关心死循环段 —— 保持 6 参签名不变,
+/// 避免为一个条件段改动全部调用点。带诊断的运行时路径走
+/// [`build_unit_qc_prompt_full`]。
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_unit_qc_prompt(
     goal: &str,
     unit_scope: &str,
     expected_output: &str,
     actual_output: &str,
     trace_summary: &str,
     original_prompt: Option<&str>,
+) -> String {
+    build_unit_qc_prompt_full(
+        goal,
+        unit_scope,
+        expected_output,
+        actual_output,
+        trace_summary,
+        original_prompt,
+        "",
+    )
+}
+
+
+
+#[allow(clippy::too_many_arguments)]
+fn build_unit_qc_prompt_full(
+    goal: &str,
+    unit_scope: &str,
+    expected_output: &str,
+    actual_output: &str,
+    trace_summary: &str,
+    original_prompt: Option<&str>,
+    dead_loop_section: &str,
 ) -> String {
     let unit_label = "SubAgent 单元";
     let original_section = match original_prompt.map(str::trim).filter(|s| !s.is_empty()) {
@@ -234,8 +274,41 @@ fn build_unit_qc_prompt(
          它由工具层统计(open/navigate/new_tab 导航记账,零幻觉):distinct_pages 不足或 top_repeats 异常集中\
          (同一页 ≥4 次)即覆盖未达成,issues 引用足迹原文;足迹达标的子项不要凭想象判 Fail。\n\
          截图证据不作视觉判读依据(Read 读图片只回元信息存根),以文本台账/DOM 片段/操作前后状态为准。\n\
-         若本单元是“验证预期失败”的负例,底层 Bash 非零本身可能是通过条件;此时必须在 evidence 中说明预期性,并引用最终验收输出 EXPECTED_NEGATIVE_OK。{degradation_rule}{QC_JSON_SHAPE_HINT}",
+         若本单元是“验证预期失败”的负例,底层 Bash 非零本身可能是通过条件;此时必须在 evidence 中说明预期性,并引用最终验收输出 EXPECTED_NEGATIVE_OK。{degradation_rule}{dead_loop_section}{QC_JSON_SHAPE_HINT}",
         clip_qc_input(actual_output),
+    )
+}
+
+/// 死循环硬门提示词段:轨迹带 `dead_loop` 诊断时拼进单元 QC 提示词。
+///
+/// 与 `degradation_rule` 同款「条件段」写法:无诊断时空串,提示词逐字节不变。
+///
+/// 设计意图:让 QC 不只是看到「早终止」三个字,而是看到**形态 + 周期 + 取样**,
+/// 从而有依据做根因归类;并把「换路径」从自由发挥变成有硬性要求的字段。
+fn build_dead_loop_gate(diag: Option<&crate::agent::dead_loop::DeadLoopDiagnosis>) -> String {
+    let Some(d) = diag else {
+        return String::new();
+    };
+    format!(
+        "\n\
+         ★ 死循环硬门(最高优先级,高于上面的反降级与目标一致性门):\n\
+         执行轨迹带有**进程级不可伪造**的死循环诊断 —— 对每轮 LLM 交互的输入状态指纹\n\
+         (「模型已见信息集合」折叠值)与输出指纹分别取 64 位哈希写入内存索引表,对轮次键序列\n\
+         做尾部周期扫描 + 长窗口低新颖度检测,命中如下:\n{detail}\n\
+         判定规则:\n\
+         ① 命中死循环诊断的单元**一律判 Fail**,无论终答文本写得多漂亮 —— 在原地打转的\n\
+         \x20 过程中反复声明「已完成」不构成完成证据(与「跑满上限 + 零产物」同性质);\n\
+         ② issues 必须归类根因,用下列**固定枚举之一**开头(供编排器程序化消费):\n\
+         \x20 - `same_action`:同一动作原地打转,换个工具/参数/路径即可;\n\
+         \x20 - `same_target`:目标不可达(页面/接口/权限/数据不存在),重试无用,应换目标层级;\n\
+         \x20 - `context_stuck`:上下文自锁,模型在复述/重写,应压缩上下文后重新下达指令或直接收口;\n\
+         \x20 - `budget_starved`:方向正确但预算被无效动作烧光,应砍步骤只做最关键的一件事;\n\
+         ③ `retryable`:根因是「路径选择错误」(same_action / context_stuck / budget_starved)\n\
+         \x20 时可重试,前提是 suggestion 给出**具体的换路径动作**;根因是 `same_target` 且\n\
+         \x20 目标客观不可达时判 retryable=false(重试只会再烧一轮预算);\n\
+         ④ `suggestion` 禁止只写「请重试」或「换个方式试试」,必须写明下一步**具体做什么**\n\
+         \x20 (换哪个工具 / 换哪个路径 / 换哪一层目标 / 直接以现有信息收口)。",
+        detail = d.render(),
     )
 }
 
@@ -303,13 +376,14 @@ impl QualityRunner {
         original_prompt: Option<&str>,
     ) -> Result<(QualityReport, Usage)> {
         let trace_summary = trace.render_prompt();
-        let prompt = build_unit_qc_prompt(
+        let prompt = build_unit_qc_prompt_full(
             goal,
             unit_scope,
             expected_output,
             actual_output,
             &trace_summary,
             original_prompt,
+            &build_dead_loop_gate(trace.dead_loop.as_ref()),
         );
         self.run_check(prompt, source, actual_output, session_id, Some(trace))
             .await
@@ -428,6 +502,7 @@ impl QualityRunner {
         let _ = actual;
         Ok((report, usage))
     }
+
 }
 
 /// 用不可伪造的执行轨迹约束 Quality-Check 的“通过”结论。
@@ -450,6 +525,34 @@ fn gate_report_on_trace(
 ) -> QualityReport {
     if report.verdict == Verdict::Fail {
         return report;
+    }
+
+    // 死循环硬门(进程级事实):轨迹带 `dead_loop` 诊断时,LLM 的 pass 一律被拒。
+    // 与 `early_terminate` / `high_error_rate` 同级 —— 这条门存在的理由是
+    // 「循环过程中模型常会反复声明『已完成』」,语义判断很容易被文本说服,
+    // 而死循环诊断是进程级机械判定,不可被覆盖。
+    if trace.dead_loop.is_some() {
+        let diag = trace
+            .dead_loop
+            .as_ref()
+            .expect("刚判过 is_some")
+            .headline();
+        tracing::warn!(
+            source = %source.as_str(),
+            diagnosis = %diag,
+            "Quality-Check 的 pass 结论被死循环硬门拒绝(进程级事实不可被覆盖)"
+        );
+        let mut gated = QualityReport::fail(
+            source,
+            vec![format!(
+                "执行轨迹命中 LLM 交互级死循环({diag}),在原地打转的过程不构成完成证据"
+            )],
+            "按诊断给出的形态换路径重跑:换工具/换参数/换目标层级,或基于已获信息直接收口;\
+             不要重复同一动作。",
+            true,
+        );
+        gated.evidence = trace.render_prompt();
+        return gated;
     }
 
     // 负例测试契约:底层命令非零是“通过条件”,最终断言必须返回零并输出
@@ -774,662 +877,4 @@ fn extract_standalone_json(text: &str) -> Option<&str> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ==================== 第 140 轮:QC 输入裁剪 ====================
-
-    #[test]
-    fn clip_qc_input_short_is_identity() {
-        let s = "短输入原样返回";
-        assert_eq!(clip_qc_input(s), s);
-    }
-
-    #[test]
-    fn clip_qc_input_long_keeps_head_and_tail_with_marker() {
-        let head: String = std::iter::repeat('H').take(6000).collect();
-        let mid: String = std::iter::repeat('M').take(5000).collect();
-        let tail: String = std::iter::repeat('T').take(2000).collect();
-        let s = format!("{head}{mid}{tail}");
-        let out = clip_qc_input(&s);
-        assert!(out.starts_with(&head), "头部 6000 字符应保留");
-        assert!(out.ends_with(&tail), "尾部 2000 字符应保留");
-        assert!(out.contains("中段省略 5000 字符"), "应标注省略量,实际: {}", &out[6000..6100]);
-        assert!(out.contains("原文 13000 字符"), "应标注原文总长");
-        assert!(out.len() < s.len(), "裁剪后应更短");
-    }
-
-    #[test]
-    fn quality_report_pass_default() {
-        let r = QualityReport::pass(AgentRole::SubAgent);
-        assert_eq!(r.verdict, Verdict::Pass);
-        assert_eq!(r.source, AgentRole::SubAgent);
-    }
-
-    #[test]
-    fn quality_report_fail_sets_retryable() {
-        let r = QualityReport::fail(AgentRole::SubAgent, vec!["x".into()], "再试一次", true);
-        assert_eq!(r.verdict, Verdict::Fail);
-        assert!(r.retryable);
-        assert_eq!(r.suggestion, "再试一次");
-    }
-
-    // ========== 第 93 轮:QC prompt 反降级(原始输入透传) ==========
-
-    #[test]
-    fn qc_prompt_includes_original_prompt_and_anti_degradation_rule() {
-        let p = build_unit_qc_prompt(
-            "启动微信保持10分钟",
-            "打开微信并维持对话功能10分钟",
-            "保活≥600s",
-            "已保活612s",
-            "iter=10 tools=9",
-            Some("打开微信并主动与赵玲玲聊天,每分钟2次,保存 Markdown 报告"),
-        );
-        assert!(p.contains("第一性事实 · 用户原始输入"));
-        assert!(p.contains("赵玲玲"));
-        assert!(p.contains("反降级规则"));
-        assert!(p.contains("纯等待/时间差/进程存活不构成任何 UI 操作的完成证据"));
-    }
-
-    #[test]
-    fn qc_prompt_without_original_prompt_has_no_degradation_rule() {
-        let p = build_unit_qc_prompt("g", "scope", "exp", "act", "trace", None);
-        assert!(!p.contains("第一性事实"));
-        assert!(!p.contains("反降级规则"));
-        // 空白原始输入视同无
-        let p2 = build_unit_qc_prompt("g", "scope", "exp", "act", "trace", Some("  \n "));
-        assert!(!p2.contains("第一性事实"));
-    }
-
-    // ========== 第 109 轮:桌面目标保真(网页版不构成等效完成) ==========
-
-    #[test]
-    fn qc_prompt_desktop_fidelity_rule_present() {
-        let p = build_unit_qc_prompt(
-            "找到软件豆包,输入信息,读取对话返回的结果",
-            "在豆包中输入查询并读取结果",
-            "chat_log 含 [SEND] 行",
-            "已在网页版完成",
-            "iter=8 tools=MCP_Web_Use",
-            Some("找到软件 豆包 , 输入信息,读取对话返回的结果,显示相关的对话信息"),
-        );
-        // 反降级规则必须包含桌面目标保真条款
-        assert!(p.contains("桌面目标保真"), "{p}");
-        assert!(p.contains("不构成等效完成"), "{p}");
-        // suggestion 层面禁止推荐网页版
-        assert!(p.contains("禁止推荐「改用网页版"), "{p}");
-        assert!(p.contains("MCP_Web_Use"), "{p}");
-    }
-
-    // ========== 第 128 轮:目标一致性硬门(禁止改派目标站点) ==========
-
-    #[test]
-    fn qc_prompt_target_consistency_gate_present() {
-        let p = build_unit_qc_prompt(
-            "抓取 anthropic.com 最新 3 篇文章",
-            "打开目标网站并 explore 首页结构",
-            "final_url 主域 = anthropic.com",
-            "已在 ithome.com 抓到 3 篇文章",
-            "iter=4 tools=5 target_drift:ithome.com",
-            Some("打开 https://www.anthropic.com/ ,找出最新的 3 篇文章,显示标题和 URL"),
-        );
-        assert!(p.contains("目标一致性"), "{p}");
-        assert!(p.contains("最高优先级硬门"), "{p}");
-        // 改派必须判不可重试(重试只会在错误目标上把产出做得更完整)
-        assert!(p.contains("retryable=false"), "{p}");
-        // 对账句式 + 禁止推荐替代品
-        assert!(p.contains("用户指定 X,实际操作 Y"), "{p}");
-        assert!(p.contains("严禁」推荐") || p.contains("严禁**推荐") || p.contains("严禁"), "{p}");
-        assert!(p.contains("搜索引擎"), "{p}");
-        // 机械判据必须写进提示词,QC 才能引用
-        assert!(p.contains("6001"), "{p}");
-        assert!(p.contains("target_drift"), "{p}");
-        // 漂亮地完成错误目标仍是 Fail
-        assert!(p.contains("完成得很漂亮"), "{p}");
-        assert!(p.contains("session_memory"), "{p}");
-    }
-
-    #[test]
-    fn qc_prompt_target_consistency_has_open_task_exception() {
-        // 用户没指定站点时不得套用目标一致性门,否则合法开放任务会被误判
-        let p = build_unit_qc_prompt(
-            "搜索最新 Rust 新闻",
-            "打开站点并抓取",
-            "3 条标题+链接",
-            "已在 ithome.com 抓到",
-            "iter=3 tools=4",
-            Some("搜一下最新的 Rust 语言新闻,给我 3 条标题和链接"),
-        );
-        assert!(p.contains("例外"), "{p}");
-        assert!(p.contains("自主选择站点属正常行为"), "{p}");
-    }
-
-    #[test]
-    fn qc_prompt_target_consistency_absent_without_original_prompt() {
-        let p = build_unit_qc_prompt("g", "scope", "exp", "act", "trace", None);
-        assert!(!p.contains("目标一致性"), "无原始输入时不得注入该门: {p}");
-    }
-
-    #[test]
-    fn parse_quality_report_from_block() {
-        let text = r#"
-```json
-{
-  "verdict": "pass",
-  "source": "subagent",
-  "issues": [],
-  "suggestion": "",
-  "retryable": false,
-  "evidence": ""
-}
-```"#;
-        let r = parse_quality_report(text, AgentRole::SubAgent).unwrap();
-        assert_eq!(r.verdict, Verdict::Pass);
-    }
-
-    // ========== P0 fail-closed 测试 ==========
-    // 验证 JSON 解析失败时返回 Verdict::Fail + retryable=true
-    // (替代历史的 fail-open 默认 Pass)
-
-    #[test]
-    fn parse_quality_report_no_json_fails_closed() {
-        // 完全无 JSON → 应返回 Err(让上游 fail-closed 转为 Fail)
-        let text = "这是一段不含 JSON 的自然语言,无法被解析为质检报告。";
-        let err = parse_quality_report(text, AgentRole::SubAgent).unwrap_err();
-        assert!(format!("{err}").contains("JSON"));
-    }
-
-    #[test]
-    fn parse_quality_report_truncated_json_fails_closed() {
-        // JSON 被截断 / 不合法 → 应返回 Err
-        let text = r#"以下是质检报告:
-```json
-{
-  "verdict": "pass",
-  "source": "subagent",
-  "issues": [],
-  // 后面被截断"#;
-        let err = parse_quality_report(text, AgentRole::SubAgent).unwrap_err();
-        assert!(format!("{err}").contains("JSON"));
-    }
-
-    #[test]
-    fn parse_quality_report_missing_required_field_fails_closed() {
-        // 缺 verdict 字段 → serde 反序列化失败 → Err
-        let text = r#"```json
-{
-  "source": "subagent",
-  "issues": [],
-  "retryable": false
-}
-```"#;
-        let err = parse_quality_report(text, AgentRole::SubAgent).unwrap_err();
-        assert!(format!("{err}").contains("verdict"));
-    }
-
-    #[test]
-    fn quality_report_fail_constructor_sets_retryable() {
-        // 验证 fail-closed 路径所需的构造函数
-        let r = QualityReport::fail(
-            AgentRole::SubAgent,
-            vec!["Quality 报告解析失败: 字段缺失".to_string()],
-            "请确保 LLM 输出合法 JSON verdict/report 字段",
-            true,
-        );
-        assert_eq!(r.verdict, Verdict::Fail);
-        assert!(r.retryable);
-        assert!(r.issues.iter().any(|i| i.contains("解析失败")));
-        assert!(r.suggestion.contains("JSON"));
-    }
-
-    // ========== 2026-09-17 第 82+ 轮 P0-3 测试 ==========
-    // 文本关键词降级:JSON 完全无法提取时,从正文关键词推断 verdict / retryable / source,
-    // 避免 Provider 网关截断 verdict 字段导致整轮 fail。
-
-    #[test]
-    fn parse_quality_report_text_fallback_pass() {
-        // 自然语言结论 + 「通过」关键词 → 降级 Pass
-        let text = "经过核查,本单元所有子任务均完成,验收材料齐全,结论:通过";
-        let r = parse_quality_report(text, AgentRole::SubAgent).unwrap();
-        assert_eq!(r.verdict, Verdict::Pass);
-        assert_eq!(r.source, AgentRole::SubAgent);
-        assert!(r.issues[0].contains("JSON 解析失败"));
-    }
-
-    #[test]
-    fn parse_quality_report_text_fallback_fail_with_retry() {
-        // 含「失败」+「重试」 → 降级 Fail + retryable=true
-        let text = "子任务超时,前置未达成,结论:失败,建议重试";
-        let r = parse_quality_report(text, AgentRole::SubAgent).unwrap();
-        assert_eq!(r.verdict, Verdict::Fail);
-        assert!(r.retryable);
-    }
-
-    // ========== 第 163 轮:verdict/issues 一致性消解 ==========
-
-    #[test]
-    fn qc_pass_with_issues_is_reconciled_to_fail() {
-        // 实测事故形态:Plan 的 QC verdict=pass / retryable=false,issues 却点名
-        // 「depends_on 全部为空,未声明链式依赖」—— 已被点名的硬缺陷原样进了执行层。
-        let text = r#"```json
-{"verdict":"pass","source":"plan","issues":["wf-2~wf-5 存在数据流依赖,但 depends_on 全部为空,未声明链式依赖,并行调度时可能乱序执行"],"suggestion":"","retryable":false,"evidence":"5 个 WorkFlow 已落盘"}
-```"#;
-        let r = parse_quality_report(text, AgentRole::Plan).unwrap();
-        assert_eq!(r.verdict, Verdict::Fail, "pass + 非空 issues 必须消解为 Fail");
-        // retryable 仍采信模型判定(不引入新的价值判断)
-        assert!(!r.retryable);
-        assert_eq!(r.issues.len(), 1);
-        assert!(r.evidence.contains("一致性消解"), "消解必须留痕: {}", r.evidence);
-        // 模型原有证据不被覆盖
-        assert!(r.evidence.contains("5 个 WorkFlow 已落盘"));
-    }
-
-    #[test]
-    fn qc_pass_without_issues_is_untouched() {
-        let text = r#"{"verdict":"pass","source":"subagent","issues":[],"suggestion":"","retryable":false,"evidence":"产物齐全"}"#;
-        let r = parse_quality_report(text, AgentRole::SubAgent).unwrap();
-        assert_eq!(r.verdict, Verdict::Pass);
-        assert!(!r.evidence.contains("一致性消解"), "正常 Pass 不该被加证据串");
-        assert_eq!(r.evidence, "产物齐全", "模型证据原样保留");
-    }
-
-    #[test]
-    fn qc_text_fallback_pass_is_not_reconciled() {
-        // 降级路径的 issues 装的是「JSON 解析失败」这类降级说明,不是缺陷,
-        // 不能拿它否定降级出来的 Pass。
-        let text = "经过核查,本单元所有子任务均完成,验收材料齐全,结论:通过";
-        let r = parse_quality_report(text, AgentRole::SubAgent).unwrap();
-        assert_eq!(r.verdict, Verdict::Pass);
-        assert!(r.issues[0].contains("JSON 解析失败"));
-    }
-
-    // ===== 2026-10-12:反向一致性消解(实测 llaew_20261012_212828.log 文心一言任务) =====
-
-    /// 实测事故形态:QC 判 `fail` 但一条阻断缺陷都没给,issues 里装的是它自己
-    /// 都标了「非阻断」的观察,模型还给了 `retryable=false` —— 旧规则只认
-    /// pass+issues→Fail 一个方向,这份被"按措辞判死"的合格方案一路放行到
-    /// 任务以 `outcome=failed` 收口(340s / 19 万 input token、零执行单元)。
-    /// 新增反向消解:判失败却无阻断缺陷 → 按 notes 放行。
-    #[test]
-    fn qc_fail_without_blocking_issues_is_reconciled_to_pass() {
-        let text = r#"```json
-{"verdict":"fail","source":"main","issues":[],"notes":["非阻断-范围越界:建议把素材研读移出关键路径","非阻断-依赖链风险:素材目录不可读会导致对话链停摆"],"suggestion":"","retryable":false,"evidence":"三项阻断条件均不成立"}
-```"#;
-        let r = parse_quality_report(text, AgentRole::MainWork).unwrap();
-        assert_eq!(
-            r.verdict,
-            Verdict::Pass,
-            "fail + 空 issues(仅 notes)应反向消解为 Pass,不能按措辞杀方案"
-        );
-        assert!(r.evidence.contains("反向一致性消解"), "消解必须留痕: {}", r.evidence);
-        assert!(r.evidence.contains("范围越界"), "notes 原文应留痕供回看");
-        // 模型原有证据不被覆盖
-        assert!(r.evidence.contains("三项阻断条件均不成立"));
-        // retryable 仍完全采信模型
-        assert!(!r.retryable);
-    }
-
-    /// 反向消解的边界:`fail` + 非空 issues =模型确实认定了阻断缺陷,保持 Fail。
-    #[test]
-    fn qc_fail_with_blocking_issues_stays_fail() {
-        let text = r#"{"verdict":"fail","source":"main","issues":["wf-3 素材路径写成裸文件名,Read 必然 FileNotFound"],"notes":["措辞口径可再统一"],"suggestion":"改用绝对路径","retryable":true,"evidence":"已回读方案文件"}"#;
-        let r = parse_quality_report(text, AgentRole::MainWork).unwrap();
-        assert_eq!(r.verdict, Verdict::Fail, "有阻断缺陷时保持 Fail");
-        assert!(
-            !r.evidence.contains("一致性消解"),
-            "本来就没有矛盾,不该加消解痕迹: {}",
-            r.evidence
-        );
-        assert!(r.retryable);
-    }
-
-    /// 新旧两个方向互不干扰:pass+issues(有阻断缺陷)→ Fail;
-    /// fail+空 issues → Pass;pass+空 issues → 原样 Pass。
-    #[test]
-    fn qc_reconcile_both_directions_are_covered() {
-        let pass_clean = r#"{"verdict":"pass","source":"plan","issues":[],"notes":["建议补充阈值"],"retryable":false,"evidence":"结构齐全"}"#;
-        assert_eq!(
-            parse_quality_report(pass_clean, AgentRole::Plan).unwrap().verdict,
-            Verdict::Pass
-        );
-
-        let pass_with_blocking = r#"{"verdict":"pass","source":"plan","issues":["depends_on 全部为空,存在硬缺陷"],"retryable":false,"evidence":"已落盘"}"#;
-        assert_eq!(
-            parse_quality_report(pass_with_blocking, AgentRole::Plan).unwrap().verdict,
-            Verdict::Fail
-        );
-
-        let fail_without_blocking = r#"{"verdict":"fail","source":"plan","issues":[],"notes":["非阻断观察"],"retryable":false,"evidence":"已落盘"}"#;
-        assert_eq!(
-            parse_quality_report(fail_without_blocking, AgentRole::Plan).unwrap().verdict,
-            Verdict::Pass
-        );
-    }
-
-    /// QC 提示词必须说清 issues(阻断)与 notes(非阻断)的区别,
-    /// 否则模型仍会沿用"pass + 观察写进 issues"的旧习惯(第 163 轮规则的误杀源)。
-    #[test]
-    fn qc_prompt_distinguishes_blocking_issues_from_notes() {
-        assert!(
-            QC_JSON_SHAPE_HINT.contains("\"notes\""),
-            "schema 提示必须给出 notes 字段"
-        );
-        assert!(
-            QC_JSON_SHAPE_HINT.contains("阻断性") && QC_JSON_SHAPE_HINT.contains("非阻断"),
-            "schema 提示必须区分阻断/非阻断"
-        );
-    }
-
-    /// 实测故障(2026-10-13 闲鱼任务,llaew_20261013_084832.log 09:51:26):
-    /// 模型把 notes 输出成「内嵌 JSON 数组的字符串」,严格反序列化失败 →
-    /// fail-closed 判 Fail → 合格方案被杀、任务以 failed 收口。
-    /// 归一化后必须按数组展开,verdict/retryable 语义不受影响。
-    #[test]
-    fn qc_notes_as_embedded_json_array_string_is_normalized() {
-        let text = r#"{"verdict":"pass","source":"main","issues":[],"notes":"[\"wf-1 占位\",\"wf-3 放宽口径未量化\"]","suggestion":"","retryable":false,"evidence":"结构齐全"}"#;
-        let r = parse_quality_report(text, AgentRole::MainWork).unwrap();
-        assert_eq!(r.verdict, Verdict::Pass, "notes 形状修复后不得 fail-closed");
-        assert_eq!(r.notes.len(), 2, "内嵌 JSON 数组字符串应展开为 2 条 notes");
-        assert!(r.notes[0].contains("占位"));
-        assert!(!r.retryable);
-    }
-
-    /// 同上形态的 issues 字符串化也要容错(阻断缺陷不能因为形状问题丢失)。
-    #[test]
-    fn qc_issues_as_plain_string_is_wrapped() {
-        let text = r#"{"verdict":"fail","source":"subagent","issues":"产物文件不存在","notes":"无","suggestion":"重新生成","retryable":true,"evidence":"Read 失败"}"#;
-        let r = parse_quality_report(text, AgentRole::SubAgent).unwrap();
-        assert_eq!(r.verdict, Verdict::Fail);
-        assert_eq!(r.issues, vec!["产物文件不存在".to_string()]);
-        assert_eq!(r.notes, vec!["无".to_string()]);
-        assert!(r.retryable);
-    }
-
-    /// suggestion/evidence 输出成数组或数字时同样兜底,不再整条作废。
-    #[test]
-    fn qc_suggestion_and_evidence_shape_normalized() {
-        let text = r#"{"verdict":"pass","source":"plan","issues":[],"notes":[],"suggestion":["改用绝对路径","补充验收"],"retryable":false,"evidence":123}"#;
-        let r = parse_quality_report(text, AgentRole::Plan).unwrap();
-        assert_eq!(r.verdict, Verdict::Pass);
-        assert_eq!(r.suggestion, "改用绝对路径 补充验收");
-        assert_eq!(r.evidence, "123");
-    }
-
-    /// null 形状归一化为缺省空数组,不阻断解析。
-    #[test]
-    fn qc_null_array_fields_default_to_empty() {
-        let text = r#"{"verdict":"pass","source":"plan","issues":null,"notes":null,"suggestion":null,"retryable":false,"evidence":null}"#;
-        let r = parse_quality_report(text, AgentRole::Plan).unwrap();
-        assert_eq!(r.verdict, Verdict::Pass);
-        assert!(r.issues.is_empty() && r.notes.is_empty());
-        assert!(r.suggestion.is_empty() && r.evidence.is_empty());
-    }
-
-    #[test]
-    fn parse_quality_report_text_fallback_no_strong_signal_fails_closed() {        // 无强信号关键词 → 仍 fail-closed(避免误判)
-        let text = "今天天气很好,适合出门散步";
-        let err = parse_quality_report(text, AgentRole::SubAgent).unwrap_err();
-        assert!(format!("{err}").contains("JSON"));
-    }
-
-    #[test]
-    fn parse_quality_report_text_fallback_source_inference() {
-        // 含「quality_check」→ 推断 source=QualityCheck(即便传入其它角色)
-        let text = "QC pass:quality_check 单元所有动作完成";
-        let r = parse_quality_report(text, AgentRole::SubAgent).unwrap();
-        assert_eq!(r.verdict, Verdict::Pass);
-        assert_eq!(r.source, AgentRole::QualityCheck);
-    }
-
-    // ========== 2026-09-18 第 87 轮 ==========
-    // JSON 块提取成功但顶层畸形(缺 verdict)时,不再立即 Err ——
-    // 继续走文本关键词降级,正文里的 fail 信号不应被浪费(实测:QC 输出
-    // `{"$text":...}` 畸形 JSON 触发无谓回流)。
-
-    #[test]
-    fn parse_quality_report_malformed_json_falls_back_to_text_keywords() {
-        let text = r#"```json
-{
-  "$text": "subagent 自我归因错误:声称工具未暴露,但日志显示已真实执行",
-  "item": {"$text": "期望输出缺失:发送记录 0 条,任务失败,建议重试"}
-}
-```"#;
-        let r = parse_quality_report(text, AgentRole::SubAgent).unwrap();
-        assert_eq!(r.verdict, Verdict::Fail);
-        assert!(r.retryable);
-        assert!(r.issues[0].contains("JSON 解析失败"));
-    }
-
-    #[test]
-    fn parse_quality_report_malformed_json_without_signal_still_fails_closed() {
-        // 畸形 JSON 且正文无 verdict 强信号 → 仍 fail-closed Err(语义不变)
-        let text = r#"```json
-{
-  "$text": "今天天气很好",
-  "item": {"$text": "适合出门散步"}
-}
-```"#;
-        let err = parse_quality_report(text, AgentRole::SubAgent).unwrap_err();
-        assert!(format!("{err}").contains("verdict"));
-    }
-
-    #[test]
-    fn trace_gate_rejects_empty_evidence_for_bash_nonzero() {
-        let mut trace = ExecutionTrace::default();
-        trace.bash_exit_nonzero_count = 1;
-        trace.last_bash_exit_code = 1;
-        trace.collect_failure_signals("完成");
-
-        let gated = gate_report_on_trace(
-            QualityReport::pass(AgentRole::SubAgent),
-            AgentRole::SubAgent,
-            &trace,
-            "完成",
-        );
-
-        assert_eq!(gated.verdict, Verdict::Fail);
-        assert!(gated.retryable);
-        assert!(gated.evidence.contains("bash_exit_nonzero=1"));
-    }
-
-    #[test]
-    fn trace_gate_allows_expected_bash_nonzero_with_evidence() {
-        let mut trace = ExecutionTrace::default();
-        trace.bash_exit_nonzero_count = 1;
-        trace.last_bash_exit_code = 2;
-        trace.collect_failure_signals("负向用例按预期返回非零");
-
-        let mut report = QualityReport::pass(AgentRole::SubAgent);
-        report.evidence = "exit=2 是本负向用例的预期结果".into();
-        let gated = gate_report_on_trace(report, AgentRole::SubAgent, &trace, "完成");
-
-        assert_eq!(gated.verdict, Verdict::Pass);
-    }
-
-    #[test]
-    fn trace_gate_rejects_strong_failure_even_with_evidence() {
-        let mut trace = ExecutionTrace::default();
-        trace.early_terminated = true;
-        trace.early_terminate_reason = "max_iter:2".into();
-        trace.collect_failure_signals("完成");
-
-        let mut report = QualityReport::pass(AgentRole::SubAgent);
-        report.evidence = "模型解释这是预期情况".into();
-        let gated = gate_report_on_trace(report, AgentRole::SubAgent, &trace, "完成");
-
-        assert_eq!(gated.verdict, Verdict::Fail);
-        assert!(gated.issues[0].contains("强失败信号"));
-    }
-
-    #[test]
-    fn trace_gate_allows_explicit_negative_confirmation_without_qc_evidence() {
-        let mut trace = ExecutionTrace::default();
-        trace.bash_exit_nonzero_count = 1;
-        trace.last_bash_exit_code = 0;
-        trace.collect_failure_signals("EXPECTED_NEGATIVE_OK");
-
-        let output = "工具输出摘录\nEXPECTED_NEGATIVE_OK\n<exit_code>0</exit_code>";
-        let gated = gate_report_on_trace(
-            QualityReport::pass(AgentRole::SubAgent),
-            AgentRole::SubAgent,
-            &trace,
-            output,
-        );
-
-        assert_eq!(gated.verdict, Verdict::Pass);
-    }
-
-    #[test]
-    fn trace_gate_rejects_negative_marker_without_final_success() {
-        let mut trace = ExecutionTrace::default();
-        trace.bash_exit_nonzero_count = 1;
-        trace.last_bash_exit_code = 1;
-        trace.collect_failure_signals("EXPECTED_NEGATIVE_OK");
-
-        let gated = gate_report_on_trace(
-            QualityReport::pass(AgentRole::SubAgent),
-            AgentRole::SubAgent,
-            &trace,
-            "EXPECTED_NEGATIVE_OK",
-        );
-
-        assert_eq!(gated.verdict, Verdict::Fail);
-        assert!(gated.issues[0].contains("Bash 命令非零退出"));
-    }
-
-    #[test]
-    fn trace_gate_allows_text_phrase_with_expected_negative_contract() {
-        // LA-3:终答摘录引用了 AssertionError 日志(误触发 text_failure_phrase),
-        // 但预期负例契约确认(先非零复现 + 最终断言命令 exit=0 + EXPECTED_NEGATIVE_OK)
-        // 应保持 pass,不应反复回流重试。
-        let mut trace = ExecutionTrace::default();
-        trace.bash_exit_nonzero_count = 1;
-        trace.last_bash_exit_code = 0;
-        trace.collect_failure_signals(
-            "MOCK_FINAL_ANSWER: 验证通过。\n\n[工具输出摘录]\nAssertionError: producer error: 有 queue.Full 未处理",
-        );
-        assert!(trace
-            .failure_signals
-            .iter()
-            .any(|s| s == "text_failure_phrase"));
-
-        let output = "AssertionError 摘录\nEXPECTED_NEGATIVE_OK\n<exit_code>0</exit_code>";
-        let gated = gate_report_on_trace(
-            QualityReport::pass(AgentRole::SubAgent),
-            AgentRole::SubAgent,
-            &trace,
-            output,
-        );
-
-        assert_eq!(gated.verdict, Verdict::Pass);
-    }
-
-    #[test]
-    fn trace_gate_rejects_text_phrase_without_contract_or_evidence() {
-        // LA-3:纯文本失败措辞(无契约确认、无 QC evidence)仍必须拒绝,
-        // 防止模型口头上声称成功、引用失败日志蒙混过关。
-        let mut trace = ExecutionTrace::default();
-        trace.collect_failure_signals("执行失败: 无法完成队列写入");
-
-        let gated = gate_report_on_trace(
-            QualityReport::pass(AgentRole::SubAgent),
-            AgentRole::SubAgent,
-            &trace,
-            "任务完成",
-        );
-
-        assert_eq!(gated.verdict, Verdict::Fail);
-        assert!(gated.issues[0].contains("失败措辞"));
-    }
-
-    #[test]
-    fn trace_gate_allows_text_phrase_with_qc_evidence() {
-        // LA-3:QC 用非空 evidence 说明"该失败措辞来自预期负例日志摘录"→ 放行
-        let mut trace = ExecutionTrace::default();
-        trace.collect_failure_signals("AssertionError: 预期复现摘录");
-
-        let mut report = QualityReport::pass(AgentRole::SubAgent);
-        report.evidence = "终答中的 AssertionError 是负例脚本预期输出,断言已确认捕获".into();
-        let gated = gate_report_on_trace(report, AgentRole::SubAgent, &trace, "任务完成");
-
-        assert_eq!(gated.verdict, Verdict::Pass);
-    }
-
-    #[test]
-    fn trace_gate_hard_failure_still_rejects_with_text_phrase_present() {
-        // LA-3:early_terminate 与 text_failure_phrase 并存时按进程级硬信号无条件拒绝
-        let mut trace = ExecutionTrace::default();
-        trace.early_terminated = true;
-        trace.early_terminate_reason = "max_iter:2".into();
-        trace.collect_failure_signals("[MaxIterationsExceeded] 迭代达到 2 次上限未得到最终答案");
-
-        let mut report = QualityReport::pass(AgentRole::SubAgent);
-        report.evidence = "模型解释这是预期情况".into();
-        let gated = gate_report_on_trace(report, AgentRole::SubAgent, &trace, "任务完成");
-
-        assert_eq!(gated.verdict, Verdict::Fail);
-        assert!(gated.issues[0].contains("强失败信号"));
-    }
-
-    // ========== 2026-09-20 第 99 轮:verdict 缺失语义修复测试 ==========
-    // 实测场景:QC LLM 输出合法 JSON 但漏 verdict → 反序列化失败 → fail-closed
-    // 白耗一次局部重试预算。修复链在语法修复前按信号推断补字段。
-
-    #[test]
-    fn repair_quality_report_missing_verdict_with_result_string() {
-        let text = r#"```json
-{
-  "source": "subagent",
-  "result": "fail",
-  "issues": ["未执行切换子账号操作"],
-  "suggestion": "先 click 切换子账号 Tab"
-}
-```"#;
-        let r = parse_quality_report(text, AgentRole::SubAgent).unwrap();
-        assert_eq!(r.verdict, Verdict::Fail);
-        assert!(r.retryable, "verdict 推断为 fail 时 retryable 应补 true");
-        assert!(r.issues.iter().any(|i| i.contains("子账号")));
-    }
-
-    #[test]
-    fn repair_quality_report_missing_verdict_with_pass_bool() {
-        let text = r#"{"pass": true, "issues": [], "retryable": false}"#;
-        let r = parse_quality_report(text, AgentRole::MainWork).unwrap();
-        assert_eq!(r.verdict, Verdict::Pass);
-        assert_eq!(r.source, AgentRole::MainWork, "缺失 source 应被调用方补齐");
-    }
-
-    #[test]
-    fn repair_quality_report_missing_verdict_with_nonempty_issues() {
-        // issues 非空 + 无其它信号 → 推断 Fail
-        let text = r#"{"issues": ["登录按钮未点击"], "suggestion": "重试"}"#;
-        let r = parse_quality_report(text, AgentRole::SubAgent).unwrap();
-        assert_eq!(r.verdict, Verdict::Fail);
-    }
-
-    #[test]
-    fn repair_quality_report_missing_all_signals_still_fails_closed() {
-        // 无任何可推断信号 → 保持 fail-closed Err(不误判)
-        let text = r#"{"source": "subagent", "issues": [], "retryable": false}"#;
-        let err = parse_quality_report(text, AgentRole::SubAgent).unwrap_err();
-        assert!(format!("{err}").contains("verdict"));
-    }
-
-    #[test]
-    fn repair_quality_report_conclusion_chinese_keyword() {
-        let text = r#"{"conclusion": "验收通过", "evidence": "菜单已抓取"}"#;
-        let r = parse_quality_report(text, AgentRole::SubAgent).unwrap();
-        assert_eq!(r.verdict, Verdict::Pass);
-    }
-
-    #[test]
-    fn quality_prompt_contains_json_shape_hint() {
-        // 提示词硬化:三个 QC 提示词都必须携带 JSON 形状硬性要求
-        let p = build_unit_qc_prompt(
-            "目标", "职责", "期望", "实际", "执行轨迹", None,
-        );
-        assert!(p.contains("第一个字段必须是 verdict"), "单元 QC 提示词应含形状提示");
-    }
-
-}
+mod tests;

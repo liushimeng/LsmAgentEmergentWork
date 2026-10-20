@@ -156,6 +156,8 @@ impl Agent {
         let mut last_fail_key: Option<String> = None;
         let mut consecutive_failures: usize = 0;
 
+
+
         // 关联报告: 2026-09-09_05 E-001 「无文本收敛短路」
         // 对称短路:当 LLM 在多轮迭代中持续产生 tool_use 但**始终没有输出 final_text**
         // (典型表现:不停探查/验证/重写同一目标),即使成功调用把失败计数重置了,
@@ -184,6 +186,13 @@ impl Agent {
         // 重复同一动作」(失败计数被成功重置,无文本计数要等到第 8 轮才响)。
         // 进展键含 Observation 摘要,轮询等待类合法重复零误伤;`LAEW_REACT_GUARD=off` 可关。
         let mut loop_guard = LoopGuard::new();
+        // LLM 交互级死循环守卫(小循环/大循环指纹检测)。与 `loop_guard` 分工:
+        // 后者比**相邻**两轮的「工具+参数+结果」,抓不到换序打转(A→B→A→B)、
+        // 换工具打转与上下文自锁三类形态;本守卫把判定键上移到
+        // 「模型已见信息集合」指纹 + 输出指纹,跨轮次做周期扫描。
+        let mut dead_loop = DeadLoopGuard::new();
+        // 本轮工具名清单(参与输入指纹盐值,让「工具面变化」成为可见状态变化)。
+        let tool_names: Vec<String> = tool_defs.iter().map(|d| d.name.clone()).collect();
 
         // 关联报告: 2026-09-09_06 F-002 — 最近工具调用历史(用于无文本收敛短路时
         // 输出「叙事化摘要」,而非纯机械的次数统计;最多保留 RECENT_TOOL_HISTORY_LIMIT
@@ -325,6 +334,7 @@ impl Agent {
             // (实测 hints 拼 system 时 cache_read 塌到 188)。workspace_hint 准静态,
             // 仍拼 system 末尾(D4 wire 契约不变)。
             let loop_nudge = loop_guard.take_nudge();
+            let dead_nudge = dead_loop.take_nudge();
             let runtime_hints = build_runtime_hints_with(&RuntimeHintCtx {
                 trace: &trace,
                 consecutive_failures,
@@ -333,6 +343,13 @@ impl Agent {
                 silent_rounds: consecutive_no_text_rounds,
                 deadline: deadline_hint,
             });
+            // 死循环软提醒并入 runtime_tail(消息尾注),与 loop_nudge 同款处理:
+            // 只在消息流末尾追加,不碰 system 块,prompt cache 前缀逐字节稳定。
+            let runtime_hints = match dead_nudge {
+                Some(dn) if !runtime_hints.trim().is_empty() => format!("{runtime_hints}\n{dn}"),
+                Some(dn) => dn,
+                None => runtime_hints,
+            };
             meta.runtime_tail = if runtime_hints.trim().is_empty() {
                 None
             } else {
@@ -357,11 +374,67 @@ impl Agent {
             // 上下文溢出自动恢复(L1038/L1044,2026-09-09 第 06 轮):
             // LLM 调用命中 prompt-too-long 类溢出错误时,自动执行
             // 排水(Level 1)→ 折叠(Level 2)→ 重试;两轮无效则上抛(三级暴露)。
+            // 死循环守卫的**输入指纹**在本轮 LLM 调用前采集(设计文档 §4)。
+            let dead_iter = dead_loop.begin_turn(
+                &self.profile.name,
+                session.context(),
+                meta.forced_tool.as_deref(),
+                &tool_names,
+            );
             let completion: Completion = self
                 .complete_with_overflow_recovery(
                     session, cancel, &system, &tool_defs, &meta, &mut trace,
                 )
                 .await?;
+            // 死循环守卫的**输出指纹**在响应回来后立刻采集 —— 必须早于工具执行,
+            // 这样止损能拦住本轮全部工具调用(不产生孤儿 tool_use)。
+            let dead_calls: Vec<(String, serde_json::Value)> = completion
+                .tool_calls
+                .iter()
+                .map(|c| (c.name.clone(), c.arguments.clone()))
+                .collect();
+            let dead_verdict = dead_loop.end_turn(
+                dead_iter,
+                &completion.text,
+                &completion.thinking,
+                &dead_calls,
+            );
+            // 裁决落地:
+            // - `Progress` / `Nudge`:软提醒已暂存守卫,下一轮经 runtime_tail 注入
+            //   (文案在 `take_nudge` 处已消费,此处无需动作);
+            // - `Grace`:强提醒**延迟到本轮全部 tool_result 回填完**再作为 user
+            //   消息推入 —— 插在 tool_result 之间会破坏 assistant tool_use ↔
+            //   tool_result 配对(Anthropic 直接 400);
+            // - `Abort`:与工具级 doom_abort 同款处理,本轮剩余调用只回填不执行。
+            let mut dead_grace_text: Option<String> = None;
+            let mut dead_abort: Option<crate::agent::dead_loop::DeadLoopDiagnosis> = None;
+            match dead_verdict {
+                DeadLoopVerdict::Progress | DeadLoopVerdict::Nudge(_) => {}
+                DeadLoopVerdict::Grace(text) => {
+                    warn!(
+                        agent = %self.profile.name,
+                        "死循环宽限轮强提醒已排队,本轮 tool_result 回填完后送达"
+                    );
+                    dead_grace_text = Some(text);
+                }
+                DeadLoopVerdict::Abort(diag) => {
+                    warn!(
+                        agent = %self.profile.name,
+                        kind = diag.kind.as_str(),
+                        period = ?diag.period,
+                        reps = diag.reps,
+                        "LLM 交互死循环止损:输入状态指纹冻结 + 输出重复,终止本单元"
+                    );
+                    trace.dead_loop = Some(diag.clone());
+                    dead_abort = Some(diag);
+                }
+            }
+            trace.dead_loop_repeats = dead_loop.max_repeats();
+            // 诊断一律留痕(即便只到软提醒/宽限轮、未止损):QC 与 Debug 报告
+            // 都需要知道「本单元已经检测到循环形态」,不能只靠 early_terminate。
+            if trace.dead_loop.is_none() {
+                trace.dead_loop = dead_loop.diagnosis().cloned();
+            }
 
             // 累计 usage
             total_usage.input_tokens = total_usage
@@ -727,6 +800,17 @@ impl Agent {
                     ));
                     continue;
                 }
+                if dead_abort.is_some() {
+                    // 刻意**不**在工具级 doom_abort 之前跳过本轮调用。
+                    //
+                    // 跳过会让 LoopGuard 拿不到本轮 Observation,从而丢掉「同动作 +
+                    // 同结果」这条**更硬、可逐项复算**的证据,让诊断退化成只有形态
+                    // 与周期。代价对比:多跑一轮(模型已经发出这些调用了),换回
+                    // 精确的根因归因,且**终止决策仍在同一轮做出**,不多烧一轮预算。
+                    //
+                    // 因此这里只做「跳过登记」的反向动作:什么都不做,让工具照常执行,
+                    // 由本轮末尾的 abort 站点按「工具级优先」裁决。
+                }
 
                 // 工具调用(2026-09-17 第 70 轮运行日志):名称 + 参数(截断)入日志,
                 // 所有角色所有工具(Bash/Read/Write/Window*/Browser*)统一经此记录。
@@ -994,6 +1078,17 @@ impl Agent {
             if let Some(text) = pending_grace.take() {
                 session.context_mut().push(ChatMessage::user(text));
             }
+            // 死循环宽限轮强提醒:与工具级宽限轮同款处理(本轮 tool_result 已回填完,
+            // 此时插 user 消息不破坏 assistant tool_use ↔ tool_result 配对)。
+            // 注意:该消息带 `<<<LAEW:` 前缀豁免语义 —— 守卫的输入指纹在
+            // `begin_turn` 里跳过 `<<<LAEW:` 控制消息,自己的提醒不会刷新
+            // 「模型已见信息集合」,不会把死循环伪装成有进展(自反馈污染)。
+            if let Some(text) = dead_grace_text.take() {
+                session
+                    .context_mut()
+                    .push(ChatMessage::user(format!("<<<LAEW:DEAD_LOOP_GRACE>>>\n{text}")));
+            }
+
 
             // 第 120 轮 ReAct 循环守卫:无进展止损。
             // - **已有工具产出** → 优雅收尾交 QC(对齐第 70 轮 no_tool_use 的降级语义:
@@ -1029,6 +1124,43 @@ impl Agent {
                 });
             }
 
+            // LLM 交互级死循环止损。**排在工具级 doom_abort 之后**:两者可同时
+            // 命中,此时以工具级结论为准 —— 它的证据更硬(同动作 + 同结果,逐项
+            // 可复算),而 LLM 级只给出形态与周期。本守卫的定位是**兜底**:
+            // 只在工具级相邻比较结构上抓不到的形态(换序打转 / 换工具打转 /
+            // 上下文自锁)上生效。二者语义与工具级 doom_abort 完全一致:
+            // - **已有工具产出** → 优雅收尾交 QC(硬失败会把真实成果吞掉);
+            // - **全程零产出** → Err 走 Yolo 失败回流。
+            if let Some(diag) = dead_abort {
+                let fallback = dead_loop_abort_text(&diag);
+                trace.early_terminated = true;
+                trace.early_terminate_reason = format!("dead_loop {}", diag.headline());
+                let attempts = diag.reps;
+                let kind_tag = diag.kind.as_str();
+                trace.dead_loop = Some(diag);
+                trace.dead_loop_repeats = dead_loop.max_repeats();
+                trace.collect_failure_signals(&accumulated_text);
+                if trace.tool_calls > 0 {
+                    let text = if accumulated_text.trim().is_empty() {
+                        fallback
+                    } else {
+                        format!("{accumulated_text}\n\n{fallback}")
+                    };
+                    return Self::finalize_logged(
+                        &self.profile.name,
+                        trace,
+                        &text,
+                        total_usage,
+                        max_tokens_state.as_ref(),
+                    );
+                }
+                return Err(AgentError::RepeatedToolFailure {
+                    tool: format!("dead_loop:{kind_tag}"),
+                    attempts,
+                    last_error: fallback,
+                    trace: Box::new(trace),
+                });
+            }
             // 关联报告: 2026-09-09_05 E-001 —— 无文本收敛计数
             // 本轮:有 tool_use 但 completion.text 为空(LLM 只输出工具调用指令没附文本)
             // → 增加计数;否则(有文本 / 无工具调用)归零

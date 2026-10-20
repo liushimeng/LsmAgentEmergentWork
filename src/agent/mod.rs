@@ -41,6 +41,7 @@ pub mod cancel;
 pub mod compact;
 pub mod context;
 pub mod custom_agents;
+pub mod dead_loop;
 pub mod debug;
 pub mod decision_audit;
 pub mod dynamic_subagent;
@@ -114,6 +115,8 @@ use runtime_hints::{
 };
 // 第 120 轮 ReAct 循环守卫:无进展检测(doom_loop)+ 双阈值止损
 use loop_guard::{abort_fallback_text, LoopGuard, LoopVerdict};
+// LLM 交互级死循环守卫:小循环/大循环指纹检测(补齐 LoopGuard 的换序/换工具/上下文自锁盲区)
+use dead_loop::{abort_fallback_text as dead_loop_abort_text, DeadLoopGuard, DeadLoopVerdict};
 
 use std::sync::Arc;
 

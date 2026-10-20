@@ -241,6 +241,90 @@ impl crate::llm::LlmClient for SameReadLlm {
     }
 }
 
+/// 换序打转 LLM:每轮读**不同**文件,按 A→B→A→B 固定周期轮转,永远不给终答。
+///
+/// 这正是工具级 `LoopGuard` 的结构性盲区 —— 相邻两轮动作永远不同,
+/// `last_key` 每次都被重置,`max_repeats` 恒为 1。
+struct RotatingReadLlm {
+    calls: std::sync::atomic::AtomicUsize,
+    paths: Vec<String>,
+}
+#[async_trait::async_trait]
+impl crate::llm::LlmClient for RotatingReadLlm {
+    async fn complete(
+        &self,
+        _system: &str,
+        _messages: &[ChatMessage],
+        _tools: &[crate::llm::ToolDef],
+        _meta: &RequestMeta,
+    ) -> Result<Completion> {
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = self.paths[n % self.paths.len()].clone();
+        Ok(Completion {
+            text: format!("读取 {path}"),
+            tool_calls: vec![crate::llm::ToolCallReq {
+                id: format!("call-rot-{n}"),
+                name: "Read".into(),
+                arguments: json!({"file_path": path}),
+            }],
+            usage: Usage::default(),
+            stop_reason: None,
+            thinking: Default::default(),
+        })
+    }
+    fn protocol(&self) -> crate::config::Protocol {
+        crate::config::Protocol::Anthropic
+    }
+}
+
+/// 换序打转(`A→B→A→B`)必须被 LLM 交互级死循环守卫拦住。
+///
+/// 这是 `LoopGuard` 抓不到的三类盲区之一,也是本守卫存在的核心理由。
+#[tokio::test]
+async fn dead_loop_stops_rotating_read_cycle() {
+    let paths = scratch_files("rot", &["AAA", "BBB"]);
+    let agent = Agent::new(
+        std::sync::Arc::new(RotatingReadLlm {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            paths,
+        }),
+        AgentProfile::sub_agent_work_profile(),
+    )
+    .with_max_iterations(16);
+    let mut session = Session::new();
+    session.context_mut().push(ChatMessage::user("在两个文件之间反复横跳"));
+    let (_text, _usage, trace) = agent.run_session(&mut session).await.unwrap();
+
+    assert!(
+        trace.early_terminated,
+        "换序打转应被判早终止,实际 trace: iterations={}",
+        trace.iterations
+    );
+    assert!(
+        trace.early_terminate_reason.starts_with("dead_loop"),
+        "早终止原因应为 dead_loop,实际 {}",
+        trace.early_terminate_reason
+    );
+    let diag = trace
+        .dead_loop
+        .as_ref()
+        .expect("死循环诊断必须写进 trace 供 QC 裁决");
+    assert_eq!(diag.period, Some(2), "应识别为二周期循环");
+    assert!(
+        trace
+            .failure_signals
+            .iter()
+            .any(|s| s.starts_with("dead_loop:")),
+        "应留 failure_signals,实际 {:?}",
+        trace.failure_signals
+    );
+    assert!(
+        trace.iterations < 16,
+        "应在跑满预算前止损,实际 {} 轮",
+        trace.iterations
+    );
+}
+
 #[tokio::test]
 async fn doom_loop_stops_before_burning_budget() {
     let paths = scratch_files("doom", &["SAME"]);
