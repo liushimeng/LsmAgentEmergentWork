@@ -259,3 +259,29 @@ fn grid_计算样式可见_template与放置() {
     let c = style_of(&doc, &engine, "#c");
     assert_eq!(c.grid_item.row_start, super::values::GridLine::Span(2));
 }
+
+#[test]
+fn object_fit_与_背景图_可见于计算样式() {
+    let (doc, engine) = doc_engine(
+        "<head><style>#t{object-fit:cover;background-image:url(/a.png)}</style></head>\
+         <body><div id=t>x</div></body>",
+        1280.0,
+    );
+    let t = style_of(&doc, &engine, "#t");
+    assert_eq!(t.object_fit, "cover");
+    assert_eq!(t.background_image.as_deref(), Some("/a.png"));
+    let map = t.to_map();
+    assert_eq!(map.get("object-fit").unwrap(), "cover");
+    assert_eq!(map.get("background-image").unwrap(), "url(/a.png)");
+}
+
+#[test]
+fn 背景图_none_与_非法_object_fit_回落默认值() {
+    let (doc, engine) = doc_engine(
+        "<body><div id=t style='background-image:none;object-fit:bogus'>x</div></body>",
+        1280.0,
+    );
+    let t = style_of(&doc, &engine, "#t");
+    assert!(t.background_image.is_none());
+    assert_eq!(t.object_fit, "fill");
+}

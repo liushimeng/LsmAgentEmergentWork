@@ -7,6 +7,7 @@
 
 pub mod api;
 pub mod document;
+pub mod images;
 pub mod inspect;
 pub mod js;
 pub mod layout;
@@ -160,6 +161,8 @@ pub struct TabState {
     pub auto_follow: bool,
     /// 页面 JS 线程句柄(阶段二:持久 Boa Context,导航换页时重建)。
     pub js: Option<script::JsHandle>,
+    /// 已解码图片缓存(阶段三第三步:URL → RGBA8,全内存)。
+    pub images: images::ImageStore,
 }
 
 #[derive(Debug, Clone)]
@@ -484,9 +487,27 @@ impl LsmBrowserManager {
         )
         .await;
         let html = pipeline.html;
+        // 阶段三第三步:预取图片(替换元素固有尺寸参与布局)。
+        let images_out = images::load_images(
+            &mut inner,
+            &self.http,
+            &html,
+            &resp.final_url,
+            &ua,
+            timeout_ms,
+            &images::ImageStore::new(),
+        )
+        .await;
         let doc = document::Document::parse(&html, &resp.final_url);
         let title = pipeline.title.clone().unwrap_or_else(|| doc.title());
-        let layout = layout::compute(&doc, viewport.width as f64, &self.font);
+        let media = style::MediaCtx::new(viewport.width as f64, 720.0);
+        let layout = layout::compute_full(
+            &doc,
+            viewport.width as f64,
+            &self.font,
+            &media,
+            &images_out.sizes,
+        );
         let page_id = format!("p_{:08x}", inner.seq + 1);
         inner.seq += 1;
         let window_id = if new_window || inner.windows.is_empty() {
@@ -551,11 +572,13 @@ impl LsmBrowserManager {
                 }];
                 recs.extend(resources_out.network.clone());
                 recs.extend(pipeline.network.clone());
+                recs.extend(images_out.network.clone());
                 recs
             },
             console: {
                 let mut logs = resources_out.console.clone();
                 logs.extend(pipeline.console.clone());
+                logs.extend(images_out.console.clone());
                 logs
             },
             form_values: pipeline.form_values.clone(),
@@ -574,6 +597,7 @@ impl LsmBrowserManager {
             highlight: false,
             auto_follow: false,
             js: pipeline.js,
+            images: images_out.store,
         };
         inner.tabs.insert(page_id.clone(), tab);
         if let Some(w) = inner.windows.iter_mut().find(|w| w.id == window_id) {
@@ -725,9 +749,21 @@ impl LsmBrowserManager {
         )
         .await;
         let html = pipeline.html;
+        // 阶段三第三步:预取图片(替换元素固有尺寸参与布局)。
+        let images_out = images::load_images(
+            inner,
+            &self.http,
+            &html,
+            &resp.final_url,
+            ua,
+            timeout_ms,
+            &images::ImageStore::new(),
+        )
+        .await;
         let doc = document::Document::parse(&html, &resp.final_url);
         let title = pipeline.title.clone().unwrap_or_else(|| doc.title());
-        let layout = layout::compute(&doc, viewport_w as f64, &self.font);
+        let media = style::MediaCtx::new(viewport_w as f64, 720.0);
+        let layout = layout::compute_full(&doc, viewport_w as f64, &self.font, &media, &images_out.sizes);
         let Some(tab) = inner.tabs.get_mut(page_id) else {
             return Err(EngineError::page_not_found(page_id));
         };
@@ -745,12 +781,17 @@ impl LsmBrowserManager {
         tab.focused = None;
         tab.last_active_ms = now_ms();
         tab.console = resources_out.console.clone();
-        tab.console.extend(pipeline.console);
+        tab.console.extend(pipeline.console.clone());
+        tab.console.extend(images_out.console.clone());
         for rec in resources_out.network {
             record_network(tab, rec);
         }
         tab.js = pipeline.js;
+        tab.images = images_out.store;
         for rec in pipeline.network {
+            record_network(tab, rec);
+        }
+        for rec in images_out.network {
             record_network(tab, rec);
         }
         if push_history {
@@ -990,7 +1031,9 @@ impl LsmBrowserManager {
         tab.viewport.width = width.clamp(320, 7680);
         tab.viewport.height = height.clamp(240, 4320);
         let doc = document::Document::parse(&tab.html, &tab.url);
-        tab.layout = layout::compute(&doc, tab.viewport.width as f64, &self.font);
+        let media = style::MediaCtx::new(tab.viewport.width as f64, 720.0);
+        let sizes = images::ImageSizes::from_store(&tab.images);
+        tab.layout = layout::compute_full(&doc, tab.viewport.width as f64, &self.font, &media, &sizes);
         Ok(json!({
             "width": tab.viewport.width,
             "height": tab.viewport.height,
@@ -1149,6 +1192,7 @@ impl LsmBrowserManager {
             tab.viewport.height,
             tab.scroll_y,
             full_page,
+            &tab.images,
         );
         if png.is_empty() {
             return Err(EngineError::new(3001, "渲染失败(无法创建像素缓冲区)"));

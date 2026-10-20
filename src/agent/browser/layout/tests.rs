@@ -527,3 +527,134 @@ fn grid_嵌套在_flex_内仍布局() {
     assert!((g.2 - 200.0).abs() < 2.0, "g.w={}", g.2);
     assert!((a.2 - 100.0).abs() < 1.0 && (b.0 - (a.0 + 100.0)).abs() < 1.0);
 }
+
+// ===================== 替换元素(图片,阶段三第三步) =====================
+
+/// 构造图片固有尺寸索引(URL → 自然宽高)。
+fn image_sizes(pairs: &[(&str, f64, f64)]) -> super::super::images::ImageSizes {
+    let mut sizes = super::super::images::ImageSizes::default();
+    for (url, w, h) in pairs {
+        sizes.sizes.insert(url.to_string(), (*w, *h));
+    }
+    sizes
+}
+
+#[test]
+fn 图片按固有尺寸成盒() {
+    let doc = Document::parse("<body><img src='a.png'></body>", "https://a.test/");
+    let sizes = image_sizes(&[("https://a.test/a.png", 120.0, 60.0)]);
+    let layout = super::compute_full(
+        &doc,
+        800.0,
+        &font(),
+        &super::super::style::MediaCtx::new(800.0, 720.0),
+        &sizes,
+    );
+    let img = layout.boxes.iter().find(|b| b.tag == "img").unwrap();
+    assert!((img.w - 120.0).abs() < 1.0, "img.w={}", img.w);
+    assert!((img.h - 60.0).abs() < 1.0, "img.h={}", img.h);
+    assert_eq!(layout.paints.len(), 1);
+    assert_eq!(layout.paints[0].src, "https://a.test/a.png");
+}
+
+#[test]
+fn 图片_css_宽度按比例推导高度() {
+    let doc = Document::parse(
+        "<body><img src='a.png' style='width:200px'></body>",
+        "https://a.test/",
+    );
+    let sizes = image_sizes(&[("https://a.test/a.png", 120.0, 60.0)]);
+    let layout = super::compute_full(
+        &doc,
+        800.0,
+        &font(),
+        &super::super::style::MediaCtx::new(800.0, 720.0),
+        &sizes,
+    );
+    let img = layout.boxes.iter().find(|b| b.tag == "img").unwrap();
+    assert!((img.w - 200.0).abs() < 1.0, "img.w={}", img.w);
+    assert!((img.h - 100.0).abs() < 1.0, "img.h={}", img.h);
+}
+
+#[test]
+fn 图片_html_属性尺寸生效() {
+    let doc = Document::parse(
+        "<body><img src='a.png' width='50' height='20'></body>",
+        "https://a.test/",
+    );
+    let sizes = image_sizes(&[("https://a.test/a.png", 120.0, 60.0)]);
+    let layout = super::compute_full(
+        &doc,
+        800.0,
+        &font(),
+        &super::super::style::MediaCtx::new(800.0, 720.0),
+        &sizes,
+    );
+    let img = layout.boxes.iter().find(|b| b.tag == "img").unwrap();
+    assert!((img.w - 50.0).abs() < 1.0 && (img.h - 20.0).abs() < 1.0);
+}
+
+#[test]
+fn 未加载图片不占位() {
+    let doc = Document::parse("<body><img src='missing.png'></body>", "https://a.test/");
+    let layout = super::compute_full(
+        &doc,
+        800.0,
+        &font(),
+        &super::super::style::MediaCtx::new(800.0, 720.0),
+        &super::super::images::ImageSizes::default(),
+    );
+    let img = layout.boxes.iter().find(|b| b.tag == "img").unwrap();
+    assert_eq!(img.w, 0.0);
+    assert!(layout.paints.is_empty());
+}
+
+#[test]
+fn 背景图生成绘制指令() {
+    let doc = Document::parse(
+        "<body><div id=d style='width:200px;height:100px;background-image:url(/bg.png)'></div></body>",
+        "https://a.test/",
+    );
+    let layout = super::compute_full(
+        &doc,
+        800.0,
+        &font(),
+        &super::super::style::MediaCtx::new(800.0, 720.0),
+        &super::super::images::ImageSizes::default(),
+    );
+    assert_eq!(layout.paints.len(), 1);
+    assert_eq!(layout.paints[0].src, "https://a.test/bg.png");
+    assert_eq!(layout.paints[0].kind, super::PaintKind::Background);
+    assert!((layout.paints[0].w - 200.0).abs() < 1.0);
+}
+
+#[test]
+fn flex_图片条目按固有宽度排布() {
+    let doc = Document::parse(
+        "<body><div style='display:flex;width:400px'>\
+         <img src='a.png'><img src='b.png'></div></body>",
+        "https://a.test/",
+    );
+    let sizes = image_sizes(&[
+        ("https://a.test/a.png", 100.0, 50.0),
+        ("https://a.test/b.png", 80.0, 40.0),
+    ]);
+    let layout = super::compute_full(
+        &doc,
+        800.0,
+        &font(),
+        &super::super::style::MediaCtx::new(800.0, 720.0),
+        &sizes,
+    );
+    let contents: Vec<&super::PaintBox> = layout
+        .paints
+        .iter()
+        .filter(|p| p.kind == super::PaintKind::Content)
+        .collect();
+    assert_eq!(contents.len(), 2);
+    let a = contents.iter().find(|p| p.src.ends_with("a.png")).unwrap();
+    let b = contents.iter().find(|p| p.src.ends_with("b.png")).unwrap();
+    assert!((a.w - 100.0).abs() < 1.0, "a.w={}", a.w);
+    assert!((b.w - 80.0).abs() < 1.0, "b.w={}", b.w);
+    assert!((b.x - (a.x + 100.0)).abs() < 1.0);
+}

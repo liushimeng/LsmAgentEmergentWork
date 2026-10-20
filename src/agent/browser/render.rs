@@ -8,6 +8,7 @@ use std::path::Path;
 use fontdue::{Font, FontSettings};
 use tiny_skia::{Color, Pixmap, PremultipliedColorU8};
 
+use super::images::{DecodedImage, ImageStore};
 use super::layout::{Layout, TextLine};
 
 pub struct FontSet {
@@ -56,6 +57,8 @@ impl FontSet {
     }
 
     /// 渲染一页。`scroll_y` 为垂直滚动偏移;`full_page=true` 时高度取整页。
+    ///
+    /// `images` 为已解码图片缓存(阶段三第三步);缺失的图片跳过绘制。
     pub fn render(
         &self,
         layout: &Layout,
@@ -63,6 +66,7 @@ impl FontSet {
         viewport_h: u32,
         scroll_y: f64,
         full_page: bool,
+        images: &ImageStore,
     ) -> Vec<u8> {
         let width = viewport_w.clamp(64, 7680);
         let mut height = if full_page {
@@ -97,6 +101,17 @@ impl FontSet {
                     pixmap.fill_rect(rect, &paint, tiny_skia::Transform::identity(), None);
                 }
             }
+        }
+
+        // 阶段三第三步:图像(背景图与内容图)先于文字绘制。
+        for paint in &layout.paints {
+            if !paint.visible {
+                continue;
+            }
+            let Some(img) = images.get(&paint.src) else {
+                continue;
+            };
+            draw_image(&mut pixmap, img, paint.x, paint.y, paint.w, paint.h, &paint.fit, scroll_y);
         }
 
         for line in &layout.lines {
@@ -151,6 +166,126 @@ impl FontSet {
                 }
             }
             pen_x += metrics.advance_width;
+        }
+    }
+}
+
+/// 目标盒内的绘制矩形(偏移 + 尺寸),由 `object-fit` 决定。
+///
+/// `fill` 拉伸铺满;`contain` 等比内缩居中;`cover` 等比放大后由目标盒裁剪;
+/// `none` 按原始尺寸左上对齐;`scale-down` 取 `none` 与 `contain` 的较小者。
+fn fit_rect(fit: &str, nw: f64, nh: f64, w: f64, h: f64) -> (f64, f64, f64, f64) {
+    let contain = |w: f64, h: f64| -> (f64, f64, f64, f64) {
+        let s = (w / nw).min(h / nh);
+        let dw = nw * s;
+        let dh = nh * s;
+        ((w - dw) / 2.0, (h - dh) / 2.0, dw, dh)
+    };
+    match fit {
+        "contain" => contain(w, h),
+        "cover" => {
+            let s = (w / nw).max(h / nh);
+            let dw = nw * s;
+            let dh = nh * s;
+            ((w - dw) / 2.0, (h - dh) / 2.0, dw, dh)
+        }
+        "none" => (0.0, 0.0, nw, nh),
+        "scale-down" => {
+            if nw <= w && nh <= h {
+                (0.0, 0.0, nw, nh)
+            } else {
+                contain(w, h)
+            }
+        }
+        _ => (0.0, 0.0, w, h),
+    }
+}
+
+/// 双线性采样(源坐标为像素中心偏移前的连续坐标)。
+fn sample_bilinear(img: &DecodedImage, x: f64, y: f64) -> [u8; 4] {
+    let nw = img.width as f64;
+    let nh = img.height as f64;
+    let x = x.clamp(0.0, (nw - 1.0).max(0.0));
+    let y = y.clamp(0.0, (nh - 1.0).max(0.0));
+    let x0 = x.floor().min((nw - 1.0).max(0.0)) as u32;
+    let y0 = y.floor().min((nh - 1.0).max(0.0)) as u32;
+    let x1 = (x0 + 1).min(img.width.saturating_sub(1));
+    let y1 = (y0 + 1).min(img.height.saturating_sub(1));
+    let fx = x - x0 as f64;
+    let fy = y - y0 as f64;
+    let c00 = img.pixel(x0, y0);
+    let c10 = img.pixel(x1, y0);
+    let c01 = img.pixel(x0, y1);
+    let c11 = img.pixel(x1, y1);
+    let mut out = [0u8; 4];
+    for ch in 0..4 {
+        let top = c00[ch] as f64 * (1.0 - fx) + c10[ch] as f64 * fx;
+        let bottom = c01[ch] as f64 * (1.0 - fx) + c11[ch] as f64 * fx;
+        out[ch] = (top * (1.0 - fy) + bottom * fy).round().clamp(0.0, 255.0) as u8;
+    }
+    out
+}
+
+/// 绘制一张图片(阶段三第三步)。
+///
+/// `x/y` 为页坐标,`w/h` 为目标盒(内容盒)尺寸;绘制矩形由 `fit` 决定,
+/// 超出目标盒的部分被裁剪(与 `cover` / `none` 语义一致)。
+fn draw_image(
+    pixmap: &mut Pixmap,
+    img: &DecodedImage,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    fit: &str,
+    scroll_y: f64,
+) {
+    let nw = img.width as f64;
+    let nh = img.height as f64;
+    if nw <= 0.0 || nh <= 0.0 || w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    let top = y - scroll_y;
+    let (ox, oy, dw, dh) = fit_rect(fit, nw, nh, w, h);
+    let dx = x + ox;
+    let dy = top + oy;
+    let pw = pixmap.width() as f64;
+    let ph = pixmap.height() as f64;
+    // 绘制区与目标盒求交(目标盒即裁剪区)。
+    let px0 = dx.max(x).max(0.0);
+    let py0 = dy.max(top).max(0.0);
+    let px1 = (dx + dw).min(x + w).min(pw);
+    let py1 = (dy + dh).min(top + h).min(ph);
+    if px1 <= px0 || py1 <= py0 {
+        return;
+    }
+    let width = pixmap.width() as i64;
+    let height = pixmap.height() as i64;
+    let pixels = pixmap.pixels_mut();
+    for py in py0.floor() as i64..py1.ceil() as i64 {
+        if py < 0 || py >= height {
+            continue;
+        }
+        for pxi in px0.floor() as i64..px1.ceil() as i64 {
+            if pxi < 0 || pxi >= width {
+                continue;
+            }
+            let u = (pxi as f64 + 0.5 - dx) / dw;
+            let v = (py as f64 + 0.5 - dy) / dh;
+            let c = sample_bilinear(img, u * nw - 0.5, v * nh - 0.5);
+            let a = c[3] as u32;
+            if a == 0 {
+                continue;
+            }
+            let idx = (py * width + pxi) as usize;
+            let old = pixels[idx].demultiply();
+            let ia = 255 - a;
+            let r = ((c[0] as u32 * a + old.red() as u32 * ia) / 255) as u8;
+            let g = ((c[1] as u32 * a + old.green() as u32 * ia) / 255) as u8;
+            let b = ((c[2] as u32 * a + old.blue() as u32 * ia) / 255) as u8;
+            if let Some(px) = PremultipliedColorU8::from_rgba(r, g, b, 255) {
+                pixels[idx] = px;
+            }
         }
     }
 }
@@ -263,9 +398,45 @@ mod tests {
         let doc = Document::parse("<body><h1>Hello</h1><p>World</p></body>", "https://a.test/");
         let font = FontSet::fallback();
         let l = layout::compute(&doc, 640.0, &font);
-        let png = font.render(&l, 640, 480, 0.0, false);
+        let png = font.render(&l, 640, 480, 0.0, false, &ImageStore::new());
         assert!(png.len() > 8);
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[test]
+    fn 渲染绘制图片() {
+        let font = FontSet::fallback();
+        let layout = Layout {
+            paints: vec![layout::PaintBox {
+                src: "u".to_string(),
+                x: 10.0,
+                y: 10.0,
+                w: 20.0,
+                h: 20.0,
+                fit: "fill".to_string(),
+                kind: layout::PaintKind::Content,
+                visible: true,
+                z_index: 0,
+            }],
+            width: 100.0,
+            height: 100.0,
+            ..Default::default()
+        };
+        let mut store = ImageStore::new();
+        store.insert(
+            "u".to_string(),
+            std::sync::Arc::new(DecodedImage {
+                width: 4,
+                height: 4,
+                rgba: (0..16).flat_map(|_| [255u8, 0, 0, 255]).collect(),
+            }),
+        );
+        let png = font.render(&layout, 100, 100, 0.0, false, &store);
+        let decoded = image::load_from_memory(&png).unwrap().to_rgba8();
+        let inside = decoded.get_pixel(20, 20).0;
+        assert_eq!(&inside[..3], &[255, 0, 0], "图片区域应为红色");
+        let outside = decoded.get_pixel(5, 5).0;
+        assert_eq!(&outside[..3], &[255, 255, 255], "图片外应为白底");
     }
 
     #[test]

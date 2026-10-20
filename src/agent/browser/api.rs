@@ -114,8 +114,9 @@ async fn apply_js_reply(
         };
         (tab.url.clone(), tab.html.clone())
     };
-    let doc = Document::parse(&tab_html, &tab_url);
-    let summary = script::dom_ops::apply(&doc, &reply.outcome.actions, &tab_url);
+    // DOM 句柄不可跨 await(非 Send):DOM 应用与序列化放在同步辅助函数内完成。
+    let (final_html, summary) =
+        apply_dom_actions(&tab_html, &tab_url, &reply.outcome.actions);
     for line in &summary.cookies {
         inner
             .cookies
@@ -152,10 +153,7 @@ async fn apply_js_reply(
     if summary.storage_session_clear {
         t.session_storage.clear();
     }
-    let final_html = doc.serialize_full();
-    let final_doc = Document::parse(&final_html, &t.url);
     t.html = final_html.clone();
-    t.layout = super::layout::compute(&final_doc, t.viewport.width as f64, mgr.font());
     if let Some(title) = &summary.title {
         t.title = title.clone();
     }
@@ -203,6 +201,61 @@ async fn apply_js_reply(
             at_ms: super::now_ms(),
         });
     }
+    // 阶段三第三步:补齐脚本新增的图片并重排(JS 动态插入 <img> 也能出图)。
+    let (page_url, user_agent, existing_images) = {
+        let Some(tab) = inner.tabs.get(pid) else {
+            return Vec::new();
+        };
+        (tab.url.clone(), tab.user_agent.clone(), tab.images.clone())
+    };
+    let images_out = super::images::load_images(
+        &mut inner,
+        &mgr.http,
+        &final_html,
+        &page_url,
+        &user_agent,
+        15_000,
+        &existing_images,
+    )
+    .await;
+    if let Some(tab) = inner.tabs.get_mut(pid) {
+        tab.images = images_out.store;
+        let dom = Document::parse(&tab.html, &tab.url);
+        let media = super::style::MediaCtx::new(tab.viewport.width as f64, 720.0);
+        let sizes = super::images::ImageSizes::from_store(&tab.images);
+        tab.layout = super::layout::compute_full(
+            &dom,
+            tab.viewport.width as f64,
+            mgr.font(),
+            &media,
+            &sizes,
+        );
+        for rec in images_out.network {
+            if tab.network.len() > 200 {
+                tab.network.remove(0);
+            }
+            tab.network.push(super::NetworkRecord {
+                url: rec.url,
+                method: rec.method,
+                status: rec.status,
+                content_type: rec.content_type,
+                bytes: rec.bytes,
+                elapsed_ms: rec.elapsed_ms,
+                redirect: rec.redirect,
+                at_ms: super::now_ms(),
+            });
+        }
+        for log in images_out.console {
+            if tab.console.len() > 400 {
+                tab.console.remove(0);
+            }
+            tab.console.push(super::ConsoleRecord {
+                level: log.level,
+                text: log.text,
+                at_ms: super::now_ms(),
+            });
+        }
+    }
     reply
         .outcome
         .actions
@@ -215,6 +268,21 @@ async fn apply_js_reply(
         })
         .cloned()
         .collect()
+}
+
+/// 应用 DOM 动作并序列化(同步辅助函数)。
+///
+/// DOM 句柄(`Rc` 树)不可跨 await 存活,故把"解析 → 应用 → 序列化"整体收在
+/// 同步函数内,调用方只拿纯数据(`String` + `ApplySummary`)。
+fn apply_dom_actions(
+    html: &str,
+    base_url: &str,
+    actions: &[script::JsAction],
+) -> (String, script::dom_ops::ApplySummary) {
+    let doc = Document::parse(html, base_url);
+    let summary = script::dom_ops::apply(&doc, actions, base_url);
+    let final_html = doc.serialize_full();
+    (final_html, summary)
 }
 
 /// eval_js 走页面 JS 线程(持久全局)。线程不可用时返回 None,由调用方回退快照桥。
@@ -418,7 +486,16 @@ pub async fn control(
                 tab.viewport.height = (h as u32).clamp(240, 4320);
             }
             let doc = Document::parse(&tab.html, &tab.url);
-            tab.layout = super::layout::compute(&doc, tab.viewport.width as f64, mgr.font());
+            // 阶段三第三步:视口变化复用已解码图片的固有尺寸重排。
+            let media = super::style::MediaCtx::new(tab.viewport.width as f64, 720.0);
+            let sizes = super::images::ImageSizes::from_store(&tab.images);
+            tab.layout = super::layout::compute_full(
+                &doc,
+                tab.viewport.width as f64,
+                mgr.font(),
+                &media,
+                &sizes,
+            );
             Ok(json!({
                 "width": tab.viewport.width,
                 "height": tab.viewport.height,

@@ -12,7 +12,8 @@ use super::super::document::{self, Document};
 use super::super::style::{ComputedStyle, GridFlow, GridLine, TrackSize};
 use super::flex::text_fragment;
 use super::{
-    append, style_visible, translate, ElementBox, Fragment, LayoutCtx, MAX_CONTENT_WIDTH,
+    append, style_visible, translate, ElementBox, Fragment, LayoutCtx, PaintBox, PaintKind,
+    MAX_CONTENT_WIDTH,
 };
 
 /// Grid 条目:元素子节点或匿名文本段。
@@ -27,6 +28,8 @@ struct Item {
     row: usize,
     col_span: usize,
     row_span: usize,
+    /// 替换元素图片地址(阶段三第三步;仅 `<img>` 条目非空)。
+    image: Option<String>,
     /// 内容片段(列宽确定后测量;定位时平移注入)。
     frag: Option<Fragment>,
 }
@@ -42,13 +45,14 @@ impl Item {
     }
 }
 
-fn element_item(node: &NodeRef, cs: ComputedStyle) -> Item {
+fn element_item(node: &NodeRef, cs: ComputedStyle, image: Option<String>) -> Item {
     Item {
         selector: Document::stable_selector(node),
         tag: document::tag_name(node),
         node: Some(node.clone()),
         style: cs,
         text: None,
+        image,
         col: 0,
         row: 0,
         col_span: 1,
@@ -65,6 +69,7 @@ fn anon_item(text: &str, parent: &ComputedStyle) -> Item {
         text: Some(text.to_string()),
         selector: String::new(),
         tag: String::new(),
+        image: None,
         col: 0,
         row: 0,
         col_span: 1,
@@ -117,7 +122,12 @@ pub(crate) fn layout_container(
     });
     let box_idx = ctx.boxes_len() - 1;
     let content_h = layout_content(ctx, node, content_x, inner_w, style, depth + 1, cb);
-    ctx.set_box_height(box_idx, (ctx.cursor_y() - start_y + content_h).max(1.0));
+    let box_h = (ctx.cursor_y() - start_y + content_h).max(1.0);
+    ctx.set_box_height(box_idx, box_h);
+    // 阶段三第三步:容器背景图。
+    if let Some(paint) = ctx.background_paint(style, bx, start_y, bw, box_h) {
+        ctx.push_paint(paint);
+    }
     ctx.advance_y(content_h + style.padding_bottom + style.margin_bottom.max(2.0));
 }
 
@@ -287,7 +297,13 @@ fn collect_items(
             items.push(anon_item(&pending_text, style));
             pending_text.clear();
         }
-        items.push(element_item(&child, cs));
+        // 阶段三第三步:`<img>` 条目记录图片地址(按固有尺寸参与轨道度量)。
+        let image = if document::tag_name(&child).eq_ignore_ascii_case("img") {
+            ctx.image_src(&child)
+        } else {
+            None
+        };
+        items.push(element_item(&child, cs, image));
     }
     if !pending_text.is_empty() {
         items.push(anon_item(&pending_text, style));
@@ -543,6 +559,10 @@ fn max_content_width(ctx: &mut LayoutCtx, item: &Item) -> f64 {
 
 /// min-content 主尺寸:最长单词宽(嵌套盒不递归,见设计文档边界)。
 fn min_content_width(ctx: &mut LayoutCtx, item: &Item) -> f64 {
+    // 阶段三第三步:图片条目的 min-content 即固有宽度。
+    if let Some(src) = &item.image {
+        return ctx.images().natural(src).map(|(w, _)| w).unwrap_or(0.0);
+    }
     let size = item.style.font_size;
     let text_owned;
     let text: &str = match &item.text {
@@ -810,6 +830,23 @@ fn emit_item(
         visible: style_visible(&cs),
         z_index: cs.pos.z_index,
     });
+    // 阶段三第三步:图片条目按最终尺寸绘制(object-fit 决定填充方式)。
+    if let Some(src) = item.image.clone().filter(|s| ctx.image_loaded(s)) {
+        let cw = (used_w - pl - item.style.padding_right).max(0.0);
+        let ch = (used_h - pt - pb).max(0.0);
+        ctx.push_paint(PaintBox {
+            src,
+            x: x + pl,
+            y: y + pt,
+            w: cw,
+            h: ch,
+            fit: cs.object_fit.clone(),
+            kind: PaintKind::Content,
+            visible: style_visible(&cs),
+            z_index: cs.pos.z_index,
+        });
+        return;
+    }
     let mut frag = item.frag.take().unwrap_or_default();
     translate(&mut frag, x + pl, y + pt);
     append(ctx, frag);

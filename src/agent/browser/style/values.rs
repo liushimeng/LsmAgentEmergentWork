@@ -41,6 +41,10 @@ pub struct ComputedStyle {
     pub grid: GridContainerStyle,
     /// Grid 条目属性(阶段三第二步),全部非继承。
     pub grid_item: GridItemStyle,
+    /// `object-fit`(阶段三第三步):替换元素内容在盒内的填充方式。
+    pub object_fit: String,
+    /// `background-image` 的 URL 原文(阶段三第三步;未解析为绝对地址)。
+    pub background_image: Option<String>,
     /// 未建模属性的计算值文本(如 border-radius)。
     pub extra: BTreeMap<String, String>,
     /// 自定义属性表(继承用,不进入 `to_map`)。
@@ -284,6 +288,8 @@ impl Default for ComputedStyle {
             flex_item: FlexItemStyle::default(),
             grid: GridContainerStyle::default(),
             grid_item: GridItemStyle::default(),
+            object_fit: "fill".to_string(),
+            background_image: None,
             extra: BTreeMap::new(),
             custom: BTreeMap::new(),
         }
@@ -412,6 +418,14 @@ impl ComputedStyle {
         out.insert(
             "justify-self".into(),
             self.grid_item.justify_self.clone(),
+        );
+        out.insert("object-fit".into(), self.object_fit.clone());
+        out.insert(
+            "background-image".into(),
+            self.background_image
+                .clone()
+                .map(|u| format!("url({u})"))
+                .unwrap_or_else(|| "none".to_string()),
         );
         for (k, v) in &self.extra {
             out.entry(k.clone()).or_insert_with(|| v.clone());
@@ -937,8 +951,19 @@ pub fn apply_declaration(
         "grid-column-end" => st.grid_item.col_end = parse_grid_line(value),
         "grid-row-start" => st.grid_item.row_start = parse_grid_line(value),
         "grid-row-end" => st.grid_item.row_end = parse_grid_line(value),
-        "background-image"
-        | "border-radius"
+        "background-image" => {
+            st.background_image = parse_css_url(value);
+        }
+        "object-fit" => {
+            let v = value.trim().to_ascii_lowercase();
+            if matches!(
+                v.as_str(),
+                "fill" | "contain" | "cover" | "none" | "scale-down"
+            ) {
+                st.object_fit = v;
+            }
+        }
+        "border-radius"
         | "border"
         | "border-color"
         | "box-shadow"
@@ -1039,8 +1064,26 @@ fn apply_initial(st: &mut ComputedStyle, key: &str, root: &ComputedStyle) {
             _ => st.max_width = None,
         },
         "background" | "background-color" => st.background = None,
+        "object-fit" => st.object_fit = "fill".to_string(),
+        "background-image" => st.background_image = None,
         "opacity" => st.opacity = 1.0,
         _ => {}
+    }
+}
+
+/// 解析 `url(...)` 形式的资源地址(阶段三第三步:背景图)。
+///
+/// 只取单个 `url()`;`none`/多背景/渐变返回 `None`。
+pub fn parse_css_url(value: &str) -> Option<String> {
+    let lower = value.to_ascii_lowercase();
+    let pos = lower.find("url(")?;
+    let start = pos + 4;
+    let end = lower[start..].find(')')? + start;
+    let raw = value[start..end].trim().trim_matches(|c| c == '"' || c == '\'').trim();
+    if raw.is_empty() {
+        None
+    } else {
+        Some(raw.to_string())
     }
 }
 

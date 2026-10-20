@@ -39,17 +39,37 @@ async fn start_site() -> String {
                 let head = String::from_utf8_lossy(&buf).to_string();
                 let first = head.lines().next().unwrap_or("");
                 let path = first.split_whitespace().nth(1).unwrap_or("/");
-                let (status, body) = route(path);
-                let resp = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                let (status, ctype, body) = if path == "/logo.png" {
+                    ("200 OK", "image/png", png_bytes())
+                } else {
+                    let (s, b) = route(path);
+                    (s, "text/html; charset=utf-8", b.into_bytes())
+                };
+                let mut resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
-                );
-                let _ = socket.write_all(resp.as_bytes()).await;
+                )
+                .into_bytes();
+                resp.extend_from_slice(&body);
+                let _ = socket.write_all(&resp).await;
                 let _ = socket.shutdown().await;
             });
         }
     });
     format!("http://{}", addr)
+}
+
+/// 生成 4x4 纯红 PNG(图片子资源测试用)。
+fn png_bytes() -> Vec<u8> {
+    let mut img = image::RgbaImage::new(4, 4);
+    for px in img.pixels_mut() {
+        *px = image::Rgba([255, 0, 0, 255]);
+    }
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(img)
+        .write_to(&mut out, image::ImageFormat::Png)
+        .unwrap();
+    out.into_inner()
 }
 
 fn route(path: &str) -> (&'static str, String) {
@@ -64,6 +84,14 @@ fn route(path: &str) -> (&'static str, String) {
              <select name=\"lang\"><option value=\"zh\">中文</option><option value=\"en\" selected>English</option></select>\
              <button id=\"go\" type=\"submit\">搜索</button>\
              </form></body></html>"
+                .to_string(),
+        )
+    } else if path == "/image-page" {
+        (
+            "200 OK",
+            "<html><head><title>图片页</title></head><body>\
+             <img id=\"logo\" src=\"/logo.png\" width=\"40\" height=\"20\">\
+             <p>图片下方文本</p></body></html>"
                 .to_string(),
         )
     } else if path == "/next" {
@@ -621,6 +649,77 @@ async fn eval_js_全局跨调用保留() {
     )
     .await;
     assert_eq!(second["data"]["result"], "42", "全局变量应跨 eval_js 保留:{second}");
+
+    exec(&tool, json!({"action": "close", "page_id": page_id})).await;
+}
+
+// ============ 阶段三第三步:图片子资源 ============
+
+#[tokio::test]
+async fn 图片子资源加载_解码_参与布局与渲染() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebUseTool;
+    let open = exec(
+        &tool,
+        json!({"action": "open", "url": format!("{base}/image-page"), "mode": "hidden", "reuse": false}),
+    )
+    .await;
+    assert_eq!(open["code"], 0, "{open}");
+    let page_id = open["data"]["page_id"].as_str().unwrap().to_string();
+
+    // 图片已解码:固有尺寸可见。
+    let images = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": page_id, "info": "image_urls"}),
+    )
+    .await;
+    assert_eq!(images["code"], 0, "{images}");
+    assert_eq!(images["data"]["decoded_count"], 1, "应解码 1 张图片:{images}");
+    let first = &images["data"]["images"][0];
+    assert_eq!(first["loaded"], true, "{images}");
+    assert_eq!(first["natural_width"], 4, "{images}");
+    assert_eq!(first["natural_height"], 4, "{images}");
+
+    // 图片请求进入网络台账。
+    let net = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": page_id, "info": "network"}),
+    )
+    .await;
+    let events = net["data"]["events"].as_array().cloned().unwrap_or_default();
+    assert!(
+        events
+            .iter()
+            .any(|e| e["url"].as_str().unwrap_or("").ends_with("/logo.png")),
+        "图片请求应记录在台账:{net}"
+    );
+
+    // 图片按 HTML 属性尺寸(40x20)排版,坐标可用于点击。
+    let el = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": page_id, "info": "elements",
+                "params": {"selector": "#logo"}}),
+    )
+    .await;
+    assert_eq!(el["code"], 0, "{el}");
+    assert_eq!(el["data"]["rect"]["width"], 40.0, "{el}");
+    assert_eq!(el["data"]["rect"]["height"], 20.0, "{el}");
+
+    // 截图中图片区域为红色(真实像素验证渲染链路)。
+    let shot = exec(
+        &tool,
+        json!({"action": "control", "page_id": page_id, "control_action": "screenshot",
+                "params": {"save_path": std::env::temp_dir().join("laew_image_test.png").to_string_lossy()}}),
+    )
+    .await;
+    assert_eq!(shot["code"], 0, "{shot}");
+    let path = shot["data"]["save_path"].as_str().unwrap().to_string();
+    let bytes = std::fs::read(&path).expect("截图应落盘");
+    let decoded = image::load_from_memory(&bytes).unwrap().to_rgba8();
+    let px = decoded.get_pixel(12, 12).0;
+    assert_eq!(&px[..3], &[255, 0, 0], "图片区域应渲染为红色");
+    let _ = std::fs::remove_file(&path);
 
     exec(&tool, json!({"action": "close", "page_id": page_id})).await;
 }

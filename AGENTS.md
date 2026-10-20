@@ -84,6 +84,10 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 | `LAEW_WEB_STYLES` | `off`/`0`/`false`/`no` | 关闭外链样式表加载(内联 `<style>` 仍生效)。见 `src/agent/browser/resources.rs` |
 | `LAEW_WEB_MAX_STYLESHEETS` | 正整数(默认 `16`) | 单页外链样式表数量上限 |
 | `LAEW_WEB_MAX_CSS_BYTES` | 正整数(默认 `2097152`) | 单个外链样式表字节上限(总量 4MB) |
+| `LAEW_WEB_IMAGES` | `off`/`0`/`false`/`no` | 关闭图片子资源加载(页面照常打开,只是没有图)。见 `src/agent/browser/images.rs` |
+| `LAEW_WEB_MAX_IMAGES` | 正整数(默认 `48`) | 单页图片数量上限 |
+| `LAEW_WEB_MAX_IMAGE_BYTES` | 正整数(默认 `12582912`) | 单张图片字节上限(默认 12MB) |
+| `LAEW_WEB_IMAGE_BUDGET_MS` | 正整数(默认 `20000`) | 单页图片加载总预算(毫秒),超限跳过剩余图片 |
 | `LAEW_WEB_PREFERS_DARK` | `1`/`true`/`yes`/`on` | `prefers-color-scheme: dark` 求值为真(样式引擎与 `matchMedia` 共用) |
 | `LAEW_WEB_EVIDENCE` | `off`/`0`/`false`/`no` | 关闭网页取证纪律硬闸门。见 `src/agent/safety/web_evidence.rs` |
 | `LAEW_READ_IMAGE_B64` | `1`/`true`/`yes`/`on` | 恢复 Read 工具图片 base64 全文返回（缺省为存根）。见 `src/agent/tools/read.rs` |
@@ -116,6 +120,7 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 - **死循环守卫(两级)**：`src/agent/loop_guard.rs` 是**工具级**守卫(判定键 = 相邻两轮的 工具+参数+结果,抓「同动作同结果」);`src/agent/dead_loop/` 是**LLM 交互级**守卫(判定键 = 「模型已见信息集合」指纹 + 输出全量指纹,跨轮次做尾部周期扫描 + 低新颖度检测),补齐前者的三条盲区:换序打转 `A→B→A→B`、换工具打转、上下文自锁。两级同轮命中时**工具级优先**(证据更硬、可逐项复算)。止损后的根因归类与换路径裁决由 Quality-Check Agent 承担(`quality/dead_loop.rs::check_dead_loop`)。设计见 `docs/LLM交互死循环指纹检测与质检裁决/01-设计与解决方案.md`。
 - **终端守卫**：`src/tui/term_guard.rs`。终端窗口关闭后 crossterm `event::read` 永久 hang，通过独立看门狗线程轮询 `POLLHUP` + 0 超时挂断探测根治。
 - **LsmAgentBrowser 内核**：`src/agent/browser/` 是进程内自研浏览器——窗口/标签页、HTTP(S) 网络栈、DOM、布局、软件渲染、JS 执行全部在本进程，**不存在外部浏览器进程、调试端口或 CDP 协议**。设计见 `docs/自定义浏览器和V8引擎/`。阶段一 `mode=headed` 回退为无头内核并在 `data.mode_hint` 说明；原生窗口在阶段三实现。
+- **图片子资源（`browser/images.rs`）**：宿主预取 `<img src>` 与 CSS `url(...)` 背景图并解码为 RGBA8 **全内存**缓存（随标签页生命周期，进程退出即销毁）；布局层按固有尺寸排版替换元素（`<img>`），渲染层按 `object-fit` 贴图；开关/限额见 `LAEW_WEB_IMAGES` / `LAEW_WEB_MAX_IMAGES` / `LAEW_WEB_MAX_IMAGE_BYTES`。设计见 `docs/自定义浏览器和V8引擎/10-阶段三第三步图片渲染与替换元素设计.md`
 - **样式引擎（`browser/style/`）**：CSS 解析/级联/继承/单位/媒体查询/自定义属性唯一真源；外链 `<link rel=stylesheet>` 由 `browser/resources.rs` 宿主预取并**原位内联**为 `<style data-lsm-href=...>`（保持级联顺序），布局、渲染、JS `getComputedStyle`、`inspect(stylesheets)` 共用同一份 `ComputedStyle`。
 - **页面模型**：`page_id` 格式 `p_` + 8 位十六进制；窗口/标签页、历史栈、Cookie Jar、localStorage/sessionStorage 全部内存驻留，`close(page_id="all")` 或进程退出即销毁。`open` 支持同 URL/同站复用，`new_tab`/`_blank` 返回 `spawned_page_id`。
 - **JS 引擎**：`JsRuntime` 抽象；阶段一默认 `boa_engine`（纯 Rust，离线可编译），DOM 通过快照桥暴露 `document/window/location/storage`；`rusty_v8` 作为可选目标后端（`v8-backend` 特性），上层接口不变。
@@ -303,6 +308,7 @@ agent/
     mod.rs         单例 / 窗口 / 标签页 / page_id / 导航 / 关闭 / 截图 / 下载 / 存储
     api.rs         control_action 实现(点击/输入/选择/按键/滚动/JS/视口)
     inspect.rs     inspect info 实现(elements/dom/text/network/extract 等)
+    images.rs      图片子资源加载/解码/全内存缓存(阶段三第三步)
     net.rs         HTTP(S) 网络栈 / 重定向 / Cookie / 字符集 / SSRF / TLS
     document.rs    DOM / 选择器 / 稳定选择器 / 文本抽取 / 表单序列化
     style/         CSS 解析 / 级联 / 继承 / 单位 / 媒体查询 / 自定义属性

@@ -192,6 +192,20 @@ pub async fn inspect(
         "image_urls" => {
             let max = p_u64(params, "max").unwrap_or(20).min(100) as usize;
             let urls = doc.image_urls();
+            // 阶段三第三步:附带解码状态与固有尺寸。
+            let items: Vec<Value> = urls
+                .iter()
+                .take(max)
+                .map(|u| {
+                    let decoded = tab.images.get(u);
+                    json!({
+                        "url": u,
+                        "loaded": decoded.is_some(),
+                        "natural_width": decoded.map(|d| d.width),
+                        "natural_height": decoded.map(|d| d.height),
+                    })
+                })
+                .collect();
             Ok(json!({
                 "img_count": urls.len(),
                 "img_urls": urls.iter().take(max).cloned().collect::<Vec<_>>(),
@@ -199,6 +213,9 @@ pub async fn inspect(
                 "canvas_count": doc.select("canvas").map(|v| v.len()).unwrap_or(0),
                 "svg_count": doc.select("svg").map(|v| v.len()).unwrap_or(0),
                 "picture_count": doc.select("picture").map(|v| v.len()).unwrap_or(0),
+                "decoded_count": tab.images.len(),
+                "images": items,
+                "note": "阶段三第三步:宿主预取并解码 <img>/背景图,解码结果仅存内存",
             }))
         }
         "blockers" => Ok(inspect_blockers(tab, &doc)),

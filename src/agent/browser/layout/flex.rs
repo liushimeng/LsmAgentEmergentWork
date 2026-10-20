@@ -10,7 +10,8 @@ use kuchikiki::NodeRef;
 use super::super::document::{self, Document};
 use super::super::style::{ComputedStyle, FlexWrap};
 use super::{
-    append, style_visible, translate, ElementBox, Fragment, LayoutCtx, MAX_CONTENT_WIDTH,
+    append, style_visible, translate, ElementBox, Fragment, LayoutCtx, PaintBox, PaintKind,
+    MAX_CONTENT_WIDTH,
 };
 
 /// Flex 条目:元素子节点或匿名文本段。
@@ -20,6 +21,8 @@ struct Item {
     text: Option<String>,
     selector: String,
     tag: String,
+    /// 替换元素图片地址(阶段三第三步;仅 `<img>` 条目非空)。
+    image: Option<String>,
     /// 弹性前 border-box 主尺寸。
     base_main: f64,
     /// 弹性后 border-box 主尺寸。
@@ -69,13 +72,14 @@ impl Item {
     }
 }
 
-fn element_item(node: &NodeRef, cs: ComputedStyle) -> Item {
+fn element_item(node: &NodeRef, cs: ComputedStyle, image: Option<String>) -> Item {
     Item {
         selector: Document::stable_selector(node),
         tag: document::tag_name(node),
         node: Some(node.clone()),
         style: cs,
         text: None,
+        image,
         base_main: 0.0,
         final_main: 0.0,
         final_cross: 0.0,
@@ -91,6 +95,7 @@ fn anon_item(text: &str, parent: &ComputedStyle) -> Item {
         text: Some(text.to_string()),
         selector: String::new(),
         tag: String::new(),
+        image: None,
         base_main: 0.0,
         final_main: 0.0,
         final_cross: 0.0,
@@ -143,7 +148,12 @@ pub(crate) fn layout_container(
     let box_idx = ctx.boxes_len() - 1;
     let content_h =
         layout_content(ctx, node, content_x, inner_w, style, depth + 1, cb);
-    ctx.set_box_height(box_idx, (ctx.cursor_y() - start_y + content_h).max(1.0));
+    let box_h = (ctx.cursor_y() - start_y + content_h).max(1.0);
+    ctx.set_box_height(box_idx, box_h);
+    // 阶段三第三步:容器背景图。
+    if let Some(paint) = ctx.background_paint(style, bx, start_y, bw, box_h) {
+        ctx.push_paint(paint);
+    }
     ctx.advance_y(content_h + style.padding_bottom + style.margin_bottom.max(2.0));
 }
 
@@ -360,7 +370,13 @@ fn collect_items(
             items.push(anon_item(&pending_text, style));
             pending_text.clear();
         }
-        items.push(element_item(&child, cs));
+        // 阶段三第三步:`<img>` 条目记录图片地址(按固有宽度参与弹性分配)。
+        let image = if document::tag_name(&child).eq_ignore_ascii_case("img") {
+            ctx.image_src(&child)
+        } else {
+            None
+        };
+        items.push(element_item(&child, cs, image));
     }
     if !pending_text.is_empty() {
         items.push(anon_item(&pending_text, style));
@@ -388,17 +404,27 @@ fn resolve_base(
         let mut base = explicit.unwrap_or_else(|| match &item.text {
             Some(text) => ctx.font().text_width(text, cs.font_size),
             None => {
-                let frag =
-                    ctx.measure_content(item.node.as_ref().unwrap(), MAX_CONTENT_WIDTH, cs, depth);
-                let mut max_main = 0.0f64;
-                for l in &frag.lines {
-                    let w = ctx.font().text_width(&l.text, l.size);
-                    max_main = max_main.max(l.x + w);
+                // 阶段三第三步:图片条目按固有宽度参与弹性分配。
+                if let Some(src) = &item.image {
+                    let natural = ctx.images().natural(src).map(|(w, _)| w).unwrap_or(0.0);
+                    natural + item.pads_main(row).0 + item.pads_main(row).1
+                } else {
+                    let frag = ctx.measure_content(
+                        item.node.as_ref().unwrap(),
+                        MAX_CONTENT_WIDTH,
+                        cs,
+                        depth,
+                    );
+                    let mut max_main = 0.0f64;
+                    for l in &frag.lines {
+                        let w = ctx.font().text_width(&l.text, l.size);
+                        max_main = max_main.max(l.x + w);
+                    }
+                    for b in &frag.boxes {
+                        max_main = max_main.max(b.x + b.w);
+                    }
+                    max_main + item.pads_main(row).0 + item.pads_main(row).1
                 }
-                for b in &frag.boxes {
-                    max_main = max_main.max(b.x + b.w);
-                }
-                max_main + item.pads_main(row).0 + item.pads_main(row).1
             }
         });
         if let Some(mw) = cs.max_width {
@@ -645,6 +671,29 @@ fn emit_item(ctx: &mut LayoutCtx, item: &mut Item, x: f64, y: f64, row: bool, de
         visible: style_visible(&cs),
         z_index: cs.pos.z_index,
     });
+    // 阶段三第三步:图片条目按最终尺寸绘制(object-fit 决定填充方式)。
+    if let Some(src) = item.image.clone().filter(|s| ctx.image_loaded(s)) {
+        let cw = (if row { item.final_main } else { item.final_cross }
+            - cs.padding_left
+            - cs.padding_right)
+            .max(0.0);
+        let ch = (if row { item.final_cross } else { item.final_main }
+            - cs.padding_top
+            - cs.padding_bottom)
+            .max(0.0);
+        ctx.push_paint(PaintBox {
+            src,
+            x: x + cs.padding_left,
+            y: y + cs.padding_top,
+            w: cw,
+            h: ch,
+            fit: cs.object_fit.clone(),
+            kind: PaintKind::Content,
+            visible: style_visible(&cs),
+            z_index: cs.pos.z_index,
+        });
+        return;
+    }
     let mut frag = item.frag.take().unwrap_or_default();
     let (pb, _) = item.pads_main(row);
     let (cb, _) = item.pads_cross(row);
@@ -700,5 +749,6 @@ pub(crate) fn text_fragment(ctx: &mut LayoutCtx, text: &str, cs: &ComputedStyle,
         height: y,
         lines,
         boxes: Vec::new(),
+        paints: Vec::new(),
     }
 }
