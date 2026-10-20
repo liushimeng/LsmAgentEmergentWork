@@ -37,6 +37,10 @@ pub struct ComputedStyle {
     pub flex: FlexContainerStyle,
     /// Flex 条目属性(阶段三),全部非继承。
     pub flex_item: FlexItemStyle,
+    /// Grid 容器属性(阶段三第二步),全部非继承。
+    pub grid: GridContainerStyle,
+    /// Grid 条目属性(阶段三第二步),全部非继承。
+    pub grid_item: GridItemStyle,
     /// 未建模属性的计算值文本(如 border-radius)。
     pub extra: BTreeMap<String, String>,
     /// 自定义属性表(继承用,不进入 `to_map`)。
@@ -147,6 +151,109 @@ impl Default for FlexItemStyle {
     }
 }
 
+/// Grid 轨道尺寸(声明期解析,布局期只读)。
+#[derive(Debug, Clone, PartialEq)]
+pub enum TrackSize {
+    Px(f64),
+    /// 列按内容宽;行按容器高(高度不定时退化 auto)。
+    Percent(f64),
+    Fr(f64),
+    Auto,
+    MinContent,
+    MaxContent,
+    /// `minmax(min, max)`;分量不再嵌套 minmax。
+    MinMax(Box<TrackSize>, Box<TrackSize>),
+}
+
+impl TrackSize {
+    /// 分量序列化文本(`to_map` 与 `grid-template-*` 回显用)。
+    pub fn text(&self) -> String {
+        match self {
+            TrackSize::Px(v) => format!("{}px", num(*v)),
+            TrackSize::Percent(v) => format!("{}%", num(*v)),
+            TrackSize::Fr(v) => format!("{}fr", num(*v)),
+            TrackSize::Auto => "auto".into(),
+            TrackSize::MinContent => "min-content".into(),
+            TrackSize::MaxContent => "max-content".into(),
+            TrackSize::MinMax(a, b) => format!("minmax({}, {})", a.text(), b.text()),
+        }
+    }
+}
+
+/// 网格线(条目放置)。负线号与命名线不支持(见设计文档边界)。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GridLine {
+    Auto,
+    /// 1 基线号。
+    Int(i64),
+    Span(u32),
+}
+
+/// 自动放置方向。`dense` 后缀接受但按 sparse 处理(见设计文档边界)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GridFlow {
+    Row,
+    Column,
+}
+
+/// Grid 容器计算值。
+#[derive(Debug, Clone)]
+pub struct GridContainerStyle {
+    pub template_cols: Vec<TrackSize>,
+    pub template_rows: Vec<TrackSize>,
+    pub auto_flow: GridFlow,
+    pub auto_cols: TrackSize,
+    pub auto_rows: TrackSize,
+    pub justify_items: String,
+    pub align_items: String,
+    pub justify_content: String,
+    pub align_content: String,
+    pub row_gap: f64,
+    pub col_gap: f64,
+}
+
+impl Default for GridContainerStyle {
+    fn default() -> Self {
+        Self {
+            template_cols: Vec::new(),
+            template_rows: Vec::new(),
+            auto_flow: GridFlow::Row,
+            auto_cols: TrackSize::Auto,
+            auto_rows: TrackSize::Auto,
+            justify_items: "stretch".to_string(),
+            align_items: "stretch".to_string(),
+            justify_content: "stretch".to_string(),
+            align_content: "stretch".to_string(),
+            row_gap: 0.0,
+            col_gap: 0.0,
+        }
+    }
+}
+
+/// Grid 条目计算值。
+#[derive(Debug, Clone)]
+pub struct GridItemStyle {
+    pub col_start: GridLine,
+    pub col_end: GridLine,
+    pub row_start: GridLine,
+    pub row_end: GridLine,
+    pub justify_self: String,
+    pub align_self: String,
+}
+
+impl Default for GridItemStyle {
+    fn default() -> Self {
+        Self {
+            col_start: GridLine::Auto,
+            col_end: GridLine::Auto,
+            row_start: GridLine::Auto,
+            row_end: GridLine::Auto,
+            justify_self: "auto".to_string(),
+            align_self: "auto".to_string(),
+        }
+    }
+}
+
 impl Default for ComputedStyle {
     fn default() -> Self {
         Self {
@@ -175,6 +282,8 @@ impl Default for ComputedStyle {
             pos: PositionStyle::default(),
             flex: FlexContainerStyle::default(),
             flex_item: FlexItemStyle::default(),
+            grid: GridContainerStyle::default(),
+            grid_item: GridItemStyle::default(),
             extra: BTreeMap::new(),
             custom: BTreeMap::new(),
         }
@@ -281,6 +390,29 @@ impl ComputedStyle {
         out.insert("flex-basis".into(), length_text(self.flex_item.basis));
         out.insert("align-self".into(), self.flex_item.align_self.clone());
         out.insert("order".into(), self.flex_item.order.to_string());
+        // Grid(阶段三第二步)
+        out.insert(
+            "grid-template-columns".into(),
+            track_list_text(&self.grid.template_cols),
+        );
+        out.insert(
+            "grid-template-rows".into(),
+            track_list_text(&self.grid.template_rows),
+        );
+        out.insert(
+            "grid-auto-flow".into(),
+            match self.grid.auto_flow {
+                GridFlow::Row => "row".to_string(),
+                GridFlow::Column => "column".to_string(),
+            },
+        );
+        out.insert("grid-auto-columns".into(), self.grid.auto_cols.text());
+        out.insert("grid-auto-rows".into(), self.grid.auto_rows.text());
+        out.insert("justify-items".into(), self.grid.justify_items.clone());
+        out.insert(
+            "justify-self".into(),
+            self.grid_item.justify_self.clone(),
+        );
         for (k, v) in &self.extra {
             out.entry(k.clone()).or_insert_with(|| v.clone());
         }
@@ -299,6 +431,18 @@ fn num(v: f64) -> String {
 fn length_text(v: Option<f64>) -> String {
     v.map(|v| format!("{}px", num(v)))
         .unwrap_or_else(|| "auto".into())
+}
+
+/// 轨道列表序列化(空表回显 `none`)。
+fn track_list_text(tracks: &[TrackSize]) -> String {
+    if tracks.is_empty() {
+        return "none".into();
+    }
+    tracks
+        .iter()
+        .map(|t| t.text())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn rgb_text(c: Rgb) -> String {
@@ -646,19 +790,24 @@ pub fn apply_declaration(
         }
         "justify-content" => {
             if let Some(v) = normalize_flex_align(value) {
-                st.flex.justify = v;
+                // Flex/Grid 共享关键字:双写,容器只读自己那侧。
+                st.flex.justify = v.clone();
+                st.grid.justify_content = to_grid_align(&v);
             }
         }
         "align-items" => {
             if let Some(v) = normalize_cross_align(value) {
-                st.flex.align_items = v;
+                st.flex.align_items = v.clone();
+                st.grid.align_items = to_grid_align(&v);
             }
         }
         "align-content" => {
             if let Some(v) = normalize_flex_align(value) {
-                st.flex.align_content = v;
+                st.flex.align_content = v.clone();
+                st.grid.align_content = to_grid_align(&v);
             } else if value.eq_ignore_ascii_case("stretch") {
                 st.flex.align_content = "stretch".to_string();
+                st.grid.align_content = "stretch".to_string();
             }
         }
         "gap" | "row-gap" | "column-gap" => {
@@ -669,23 +818,32 @@ pub fn apply_declaration(
             match key.as_str() {
                 "gap" => {
                     if let Some(first) = parts.first().copied().flatten() {
-                        st.flex.row_gap = first.max(0.0);
-                        st.flex.col_gap = parts
+                        let col = parts
                             .get(1)
                             .copied()
                             .flatten()
                             .unwrap_or(first)
                             .max(0.0);
+                        let row = first.max(0.0);
+                        // Flex/Grid 共享关键字:双写。
+                        st.flex.row_gap = row;
+                        st.flex.col_gap = col;
+                        st.grid.row_gap = row;
+                        st.grid.col_gap = col;
                     }
                 }
                 "row-gap" => {
                     if let Some(v) = parts.first().copied().flatten() {
-                        st.flex.row_gap = v.max(0.0);
+                        let v = v.max(0.0);
+                        st.flex.row_gap = v;
+                        st.grid.row_gap = v;
                     }
                 }
                 _ => {
                     if let Some(v) = parts.first().copied().flatten() {
-                        st.flex.col_gap = v.max(0.0);
+                        let v = v.max(0.0);
+                        st.flex.col_gap = v;
+                        st.grid.col_gap = v;
                     }
                 }
             }
@@ -715,7 +873,9 @@ pub fn apply_declaration(
                 v.as_str(),
                 "auto" | "stretch" | "flex-start" | "flex-end" | "center" | "baseline"
             ) {
-                st.flex_item.align_self = v;
+                // Flex/Grid 共享关键字:双写(start/end 归一到 flex-* 域)。
+                st.flex_item.align_self = v.clone();
+                st.grid_item.align_self = to_grid_align(&v);
             }
         }
         "order" => {
@@ -724,6 +884,59 @@ pub fn apply_declaration(
             }
         }
         "flex" => apply_flex_shorthand(st, value, ctx),
+        // ============ Grid 容器(阶段三第二步) ============
+        "grid-template-columns" => {
+            st.grid.template_cols = parse_track_list(value, st.font_size, ctx);
+        }
+        "grid-template-rows" => {
+            st.grid.template_rows = parse_track_list(value, st.font_size, ctx);
+        }
+        "grid-auto-columns" => {
+            if let Some(t) = parse_track_size(value, st.font_size, ctx) {
+                st.grid.auto_cols = t;
+            }
+        }
+        "grid-auto-rows" => {
+            if let Some(t) = parse_track_size(value, st.font_size, ctx) {
+                st.grid.auto_rows = t;
+            }
+        }
+        "grid-auto-flow" => {
+            let v = value.to_ascii_lowercase();
+            st.grid.auto_flow = if v.contains("column") {
+                GridFlow::Column
+            } else {
+                GridFlow::Row
+            };
+        }
+        "justify-items" => {
+            if let Some(v) = normalize_grid_align(value) {
+                st.grid.justify_items = v;
+            }
+        }
+        "justify-self" => {
+            if let Some(v) = normalize_grid_align(value) {
+                st.grid_item.justify_self = v;
+            }
+        }
+        // ============ Grid 条目放置(阶段三第二步) ============
+        "grid-column" | "grid-row" => {
+            let (start, end) = parse_grid_line_shorthand(value);
+            match key.as_str() {
+                "grid-column" => {
+                    st.grid_item.col_start = start;
+                    st.grid_item.col_end = end;
+                }
+                _ => {
+                    st.grid_item.row_start = start;
+                    st.grid_item.row_end = end;
+                }
+            }
+        }
+        "grid-column-start" => st.grid_item.col_start = parse_grid_line(value),
+        "grid-column-end" => st.grid_item.col_end = parse_grid_line(value),
+        "grid-row-start" => st.grid_item.row_start = parse_grid_line(value),
+        "grid-row-end" => st.grid_item.row_end = parse_grid_line(value),
         "background-image"
         | "border-radius"
         | "border"
@@ -740,8 +953,6 @@ pub fn apply_declaration(
         | "word-spacing"
         | "list-style"
         | "list-style-type"
-        | "grid-template-columns"
-        | "grid-template-rows"
         | "transform"
         | "transition" => {
             st.extra.insert(key, value.to_string());
@@ -994,6 +1205,186 @@ fn normalize_cross_align(value: &str) -> Option<String> {
         _ => return None,
     };
     Some(v.to_string())
+}
+
+/// Flex 域对齐关键字 → Grid 域(`flex-start`→`start`,`baseline` 按 `start`)。
+fn to_grid_align(v: &str) -> String {
+    match v {
+        "flex-start" => "start".into(),
+        "flex-end" => "end".into(),
+        "baseline" => "start".into(),
+        other => other.to_string(),
+    }
+}
+
+/// Grid 对齐关键字(容器/条目通用;`normal` 归一为 `stretch`)。
+fn normalize_grid_align(value: &str) -> Option<String> {
+    let v = match value.trim().to_ascii_lowercase().as_str() {
+        "normal" | "stretch" => "stretch",
+        "start" | "flex-start" | "left" | "self-start" => "start",
+        "end" | "flex-end" | "right" | "self-end" => "end",
+        "center" => "center",
+        _ => return None,
+    };
+    Some(v.to_string())
+}
+
+// ===================== Grid 轨道词法(阶段三第二步) =====================
+
+/// 轨道列表:顶层按空白/逗号切分;`repeat(n, …)` 展开;无法识别的词丢弃。
+pub fn parse_track_list(value: &str, font_size: f64, ctx: &ValueCtx) -> Vec<TrackSize> {
+    let v = value.trim();
+    if v.is_empty() || v.eq_ignore_ascii_case("none") {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for part in split_top_level(v) {
+        expand_track_part(&part, font_size, ctx, &mut out);
+    }
+    out
+}
+
+/// 顶层切分:空白与逗号均可分隔;括号内递归不切。
+fn split_top_level(s: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0usize;
+    for ch in s.chars() {
+        if ch == '(' {
+            depth += 1;
+            cur.push(ch);
+        } else if ch == ')' {
+            depth = depth.saturating_sub(1);
+            cur.push(ch);
+        } else if depth == 0 && (ch == ',' || ch.is_whitespace()) {
+            let t = cur.trim().to_string();
+            if !t.is_empty() {
+                parts.push(t);
+            }
+            cur.clear();
+        } else {
+            cur.push(ch);
+        }
+    }
+    let t = cur.trim().to_string();
+    if !t.is_empty() {
+        parts.push(t);
+    }
+    parts
+}
+
+/// 展开单个列表项(`repeat` 递归展开;其余按单轨道尺寸解析)。
+fn expand_track_part(part: &str, font_size: f64, ctx: &ValueCtx, out: &mut Vec<TrackSize>) {
+    let lower = part.to_ascii_lowercase();
+    if let Some(body) = lower
+        .strip_prefix("repeat(")
+        .and_then(|b| b.strip_suffix(')'))
+    {
+        let mut it = split_top_level(body).into_iter();
+        // 次数整数;auto-fill/auto-fit 不支持(整段丢弃,见设计文档边界)。
+        let count: usize = it
+            .next()
+            .and_then(|p| p.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        let mut inner = Vec::new();
+        for p in it {
+            expand_track_part(p.trim(), font_size, ctx, &mut inner);
+        }
+        if count > 0 && count <= 64 && !inner.is_empty() {
+            for _ in 0..count {
+                out.extend(inner.iter().cloned());
+            }
+        }
+        return;
+    }
+    if let Some(t) = parse_track_size(part, font_size, ctx) {
+        out.push(t);
+    }
+}
+
+/// 单个轨道尺寸。无法识别返回 `None`(宁缺勿错)。
+pub fn parse_track_size(value: &str, font_size: f64, ctx: &ValueCtx) -> Option<TrackSize> {
+    let v = value.trim();
+    if v.is_empty() {
+        return None;
+    }
+    let lower = v.to_ascii_lowercase();
+    match lower.as_str() {
+        "none" => return None,
+        "auto" | "fit-content" => return Some(TrackSize::Auto),
+        "min-content" => return Some(TrackSize::MinContent),
+        "max-content" => return Some(TrackSize::MaxContent),
+        _ => {}
+    }
+    if let Some(body) = lower
+        .strip_prefix("minmax(")
+        .and_then(|b| b.strip_suffix(')'))
+    {
+        let mut it = split_top_level(body).into_iter();
+        let min = it.next().and_then(|p| parse_track_size(&p, font_size, ctx));
+        let max = it.next().and_then(|p| parse_track_size(&p, font_size, ctx));
+        if let (Some(min), Some(max)) = (min, max) {
+            // 分量 fr 按 auto 处理(见设计文档边界)。
+            let min = if matches!(min, TrackSize::Fr(_)) {
+                TrackSize::Auto
+            } else {
+                min
+            };
+            let max = if matches!(max, TrackSize::Fr(_)) {
+                TrackSize::Auto
+            } else {
+                max
+            };
+            return Some(TrackSize::MinMax(Box::new(min), Box::new(max)));
+        }
+        return None;
+    }
+    if lower.starts_with("fit-content(") {
+        return Some(TrackSize::Auto);
+    }
+    if let Some(n) = lower.strip_suffix("fr") {
+        return n
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|v| *v >= 0.0)
+            .map(TrackSize::Fr);
+    }
+    if let Some(n) = lower.strip_suffix('%') {
+        return n.trim().parse::<f64>().ok().map(TrackSize::Percent);
+    }
+    parse_length(v, font_size, ctx).map(TrackSize::Px)
+}
+
+/// 网格线值:`auto` / 整数(1 基) / `span N`;命名线等不支持。
+fn parse_grid_line(value: &str) -> GridLine {
+    let v = value.trim().to_ascii_lowercase();
+    if v.is_empty() || v == "auto" {
+        return GridLine::Auto;
+    }
+    if let Some(rest) = v.strip_prefix("span") {
+        let n = rest.trim().parse::<u32>().ok().unwrap_or(1);
+        return GridLine::Span(n.max(1));
+    }
+    if let Ok(n) = v.parse::<i64>() {
+        return GridLine::Int(n);
+    }
+    GridLine::Auto
+}
+
+/// `grid-column`/`grid-row` 简写 `start / end`;省略 end 时 Int→+1、Span 保持。
+fn parse_grid_line_shorthand(value: &str) -> (GridLine, GridLine) {
+    let parts: Vec<&str> = value.split('/').collect();
+    let start = parse_grid_line(parts.first().copied().unwrap_or("auto"));
+    let end = match parts.get(1) {
+        Some(s) => parse_grid_line(s),
+        None => match start {
+            GridLine::Int(n) => GridLine::Int(n + 1),
+            GridLine::Span(n) => GridLine::Span(n),
+            GridLine::Auto => GridLine::Auto,
+        },
+    };
+    (start, end)
 }
 
 /// `flex` 简写解析:`none` → 0 0 auto;`auto`/`initial` → 1 1 auto;

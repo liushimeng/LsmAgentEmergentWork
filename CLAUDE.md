@@ -311,8 +311,8 @@ agent/
       values.rs     ComputedStyle、长度/颜色/关键字、var() 替换
       tests.rs      样式引擎单元测试
     resources.rs   外链样式表收集 / 宿主预取 / 原位内联 / 网络台账
-    layout/        布局引擎目录:块级流 + 文本换行(mod.rs)、Flex 容器(flex.rs,
-                   阶段三)、定位体系(position.rs,阶段三)、布局单测(tests.rs)
+    layout/        布局引擎目录:块级流 + 文本换行(mod.rs)、Flex 容器(flex.rs)、
+                   Grid 网格(grid.rs)、定位体系(position.rs)、布局单测(tests.rs)
     render.rs      fontdue + tiny-skia 软件渲染 + PNG
     js.rs          Boa 引导后端 + DOM 快照桥(阶段一回退路径)
     script/        阶段二页面脚本与动态 DOM(每 Tab 持久 JS 线程)

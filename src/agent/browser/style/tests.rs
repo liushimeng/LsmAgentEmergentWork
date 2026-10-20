@@ -194,3 +194,68 @@ fn 选择器特异性与组合符解析() {
     assert!(parse_selector("a:hover").is_some());
     assert!(parse_selector("a::before").is_none());
 }
+
+// ===================== Grid 样式(阶段三第二步) =====================
+
+#[test]
+fn 轨道列表解析_fr_minmax_repeat() {
+    use super::values::{parse_track_list, TrackSize, ValueCtx};
+    let ctx = ValueCtx::default();
+    let tracks = parse_track_list("repeat(3, 1fr) minmax(10px, 20px) 100px 20%", 16.0, &ctx);
+    assert_eq!(tracks.len(), 6, "tracks={:?}", tracks);
+    assert_eq!(tracks[0], TrackSize::Fr(1.0));
+    assert_eq!(tracks[2], TrackSize::Fr(1.0));
+    assert!(matches!(tracks[3], TrackSize::MinMax(_, _)));
+    assert_eq!(tracks[4], TrackSize::Px(100.0));
+    assert_eq!(tracks[5], TrackSize::Percent(20.0));
+}
+
+#[test]
+fn 轨道列表非法词与_repeat_auto_fill_丢弃() {
+    use super::values::{parse_track_list, TrackSize, ValueCtx};
+    let ctx = ValueCtx::default();
+    let tracks = parse_track_list("foo 1fr auto-fill repeat(auto-fill, 2)", 16.0, &ctx);
+    assert_eq!(tracks, vec![TrackSize::Fr(1.0)]);
+    assert!(parse_track_list("none", 16.0, &ctx).is_empty());
+}
+
+#[test]
+fn grid_共享关键字双写与专属属性() {
+    let (doc, engine) = doc_engine(
+        "<head><style>
+            #t { display:grid; gap:8px; align-items:center; justify-content:flex-end;
+                 grid-template-columns:1fr 2fr; grid-auto-flow:column;
+                 justify-items:center; }
+            #c { grid-column:1 / 3; }
+         </style></head><body><div id=t><span id=c>x</span></div></body>",
+        1280.0,
+    );
+    let t = style_of(&doc, &engine, "#t");
+    // 共享关键字双写到 grid 侧,并归一到 start/end 词表。
+    assert_eq!(t.grid.row_gap, 8.0);
+    assert_eq!(t.grid.col_gap, 8.0);
+    assert_eq!(t.grid.align_items, "center");
+    assert_eq!(t.grid.justify_content, "end");
+    assert_eq!(t.grid.template_cols.len(), 2);
+    assert_eq!(t.grid.auto_flow, super::values::GridFlow::Column);
+    assert_eq!(t.grid.justify_items, "center");
+    let c = style_of(&doc, &engine, "#c");
+    use super::values::GridLine;
+    assert_eq!(c.grid_item.col_start, GridLine::Int(1));
+    assert_eq!(c.grid_item.col_end, GridLine::Int(3));
+}
+
+#[test]
+fn grid_计算样式可见_template与放置() {
+    let (doc, engine) = doc_engine(
+        "<head><style>#t{display:grid;grid-template-columns:100px 1fr}</style></head>\
+         <body><div id=t><b id=c style='grid-row:span 2'>x</b></div></body>",
+        1280.0,
+    );
+    let t = style_of(&doc, &engine, "#t");
+    let map = t.to_map();
+    assert_eq!(map.get("grid-template-columns").unwrap(), "100px 1fr");
+    assert_eq!(map.get("grid-auto-flow").unwrap(), "row");
+    let c = style_of(&doc, &engine, "#c");
+    assert_eq!(c.grid_item.row_start, super::values::GridLine::Span(2));
+}

@@ -316,3 +316,214 @@ fn z_index_绘制序排序() {
     let high = layout.boxes.iter().position(|b| b.selector == "#high").unwrap();
     assert!(low < high);
 }
+
+// ===================== Grid(阶段三第二步) =====================
+
+#[test]
+fn grid_无模板单列堆叠() {
+    let doc = Document::parse(
+        "<body><div style='display:grid;width:300px'>\
+         <div id=a>A</div><div id=b>B</div><div id=c>C</div></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let a = layout.rect_for("#a").unwrap();
+    let b = layout.rect_for("#b").unwrap();
+    let c = layout.rect_for("#c").unwrap();
+    // 浏览器一致:无模板单列堆叠,条目 stretch 满宽。
+    assert!((a.0 - b.0).abs() < 1.0 && (b.0 - c.0).abs() < 1.0, "x: {} {} {}", a.0, b.0, c.0);
+    assert!((a.2 - 300.0).abs() < 2.0, "a.w={}", a.2);
+    assert!(a.1 < b.1 && b.1 < c.1, "y: {} {} {}", a.1, b.1, c.1);
+}
+
+#[test]
+fn grid_固定列宽_px轨道() {
+    let doc = Document::parse(
+        "<body><div style='display:grid;width:300px;grid-template-columns:100px 200px'>\
+         <div id=a>A</div><div id=b>B</div></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let a = layout.rect_for("#a").unwrap();
+    let b = layout.rect_for("#b").unwrap();
+    assert!((a.2 - 100.0).abs() < 1.0, "a.w={}", a.2);
+    assert!((b.2 - 200.0).abs() < 1.0, "b.w={}", b.2);
+    assert!((b.0 - (a.0 + 100.0)).abs() < 1.0, "b.x={} a.x={}", b.0, a.0);
+    // 同一行:y 一致。
+    assert!((a.1 - b.1).abs() < 1.0, "a.y={} b.y={}", a.1, b.1);
+}
+
+#[test]
+fn grid_fr轨道均分剩余() {
+    let doc = Document::parse(
+        "<body><div style='display:grid;width:600px;grid-template-columns:1fr 2fr'>\
+         <div id=a>A</div><div id=b>B</div></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let a = layout.rect_for("#a").unwrap();
+    let b = layout.rect_for("#b").unwrap();
+    // 1fr:2fr → 200:400。
+    assert!((a.2 - 200.0).abs() < 2.0, "a.w={}", a.2);
+    assert!((b.2 - 400.0).abs() < 2.0, "b.w={}", b.2);
+}
+
+#[test]
+fn grid_repeat_展开多列() {
+    let doc = Document::parse(
+        "<body><div style='display:grid;width:300px;grid-template-columns:repeat(3, 1fr)'>\
+         <div id=a>A</div><div id=b>B</div><div id=c>C</div></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let a = layout.rect_for("#a").unwrap();
+    let b = layout.rect_for("#b").unwrap();
+    let c = layout.rect_for("#c").unwrap();
+    assert!((a.2 - 100.0).abs() < 2.0, "a.w={}", a.2);
+    assert!((b.0 - (a.0 + 100.0)).abs() < 2.0, "b.x={}", b.0);
+    assert!((c.0 - (a.0 + 200.0)).abs() < 2.0, "c.x={}", c.0);
+    assert!((a.1 - c.1).abs() < 1.0, "同行: a.y={} c.y={}", a.1, c.1);
+}
+
+#[test]
+fn grid_minmax_钳制轨道() {
+    let doc = Document::parse(
+        "<body><div style='display:grid;width:420px;grid-template-columns:minmax(80px, 120px) 1fr'>\
+         <div id=a>hi</div><div id=b>B</div></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let a = layout.rect_for("#a").unwrap();
+    let b = layout.rect_for("#b").unwrap();
+    // 内容极窄时 min 下限 80 兜底;1fr 吃掉剩余。
+    assert!(a.2 >= 79.0 && a.2 <= 121.0, "a.w={}", a.2);
+    assert!((b.0 + b.2 - (a.0 + 420.0)).abs() < 2.0, "b 右缘贴容器: {}", b.0 + b.2);
+}
+
+#[test]
+fn grid_gap_行列间隔() {
+    let doc = Document::parse(
+        "<body><div style='display:grid;width:220px;gap:20px;grid-template-columns:100px 100px'>\
+         <div id=a>A</div><div id=b>B</div></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let a = layout.rect_for("#a").unwrap();
+    let b = layout.rect_for("#b").unwrap();
+    assert!((b.0 - (a.0 + 120.0)).abs() < 1.0, "gap 列间距: b.x={} a.x={}", b.0, a.0);
+}
+
+#[test]
+fn grid_span_跨列() {
+    let doc = Document::parse(
+        "<body><div style='display:grid;width:200px;grid-template-columns:100px 100px'>\
+         <div id=a style='grid-column:span 2'>A</div>\
+         <div id=b>B</div><div id=c>C</div></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let a = layout.rect_for("#a").unwrap();
+    let b = layout.rect_for("#b").unwrap();
+    let c = layout.rect_for("#c").unwrap();
+    assert!((a.2 - 200.0).abs() < 2.0, "a.w={}", a.2);
+    // 后两个条目进入第二行。
+    assert!(b.1 > a.1, "b.y={} a.y={}", b.1, a.1);
+    assert!((b.0 - a.0).abs() < 1.0 && (c.0 - (a.0 + 100.0)).abs() < 1.0);
+}
+
+#[test]
+fn grid_显式放置行列线() {
+    let doc = Document::parse(
+        "<body><div style='display:grid;width:300px;grid-template-columns:100px 100px 100px;\
+         grid-template-rows:50px 50px'>\
+         <div id=a style='grid-column:3;grid-row:2'>A</div>\
+         <div id=b>B</div></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let a = layout.rect_for("#a").unwrap();
+    let b = layout.rect_for("#b").unwrap();
+    // a 落在第 3 列第 2 行(1 基线号 → 0 基 2,1);容器 x=8(body 边距)。
+    assert!((a.0 - 208.0).abs() < 2.0, "a.x={}", a.0);
+    assert!(a.1 >= 50.0, "a.y={}", a.1);
+    // b 自动放置避开 a,落第一行第一列。
+    assert!((b.0 - 0.0).abs() < 2.0 || b.0 < a.0, "b.x={}", b.0);
+    assert!(b.1 < a.1, "b.y={} a.y={}", b.1, a.1);
+}
+
+#[test]
+fn grid_auto_flow_column_列优先() {
+    let doc = Document::parse(
+        "<body><div style='display:grid;grid-auto-flow:column;width:300px'>\
+         <div id=a>A</div><div id=b>B</div><div id=c>C</div></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let a = layout.rect_for("#a").unwrap();
+    let b = layout.rect_for("#b").unwrap();
+    let c = layout.rect_for("#c").unwrap();
+    // 无显式行模板:单行横排,列优先。
+    assert!((a.1 - b.1).abs() < 1.0 && (b.1 - c.1).abs() < 1.0);
+    assert!(a.0 < b.0 && b.0 < c.0, "x: {} {} {}", a.0, b.0, c.0);
+}
+
+#[test]
+fn grid_隐式行高由内容决定() {
+    let doc = Document::parse(
+        "<body><div style='display:grid;width:200px;grid-template-columns:200px'>\
+         <div id=a>x</div>\
+         <div id=b>one two three four five six seven eight nine ten</div></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let a = layout.rect_for("#a").unwrap();
+    let b = layout.rect_for("#b").unwrap();
+    // b 多行文本,行高 > a 单行;b 从第二行起。
+    assert!(b.1 > a.1, "b.y={} a.y={}", b.1, a.1);
+    assert!(b.3 > a.3, "b.h={} a.h={}", b.3, a.3);
+}
+
+#[test]
+fn grid_justify_items_center_条目居中() {
+    let doc = Document::parse(
+        "<body><div style='display:grid;width:300px;justify-items:center;\
+         grid-template-columns:300px'>\
+         <div id=a style='width:100px'>A</div></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let a = layout.rect_for("#a").unwrap();
+    // (300-100)/2 = 100 偏移。
+    assert!((a.2 - 100.0).abs() < 1.0, "a.w={}", a.2);
+    assert!((a.0 - 108.0).abs() < 2.0, "a.x={}", a.0);
+}
+
+#[test]
+fn grid_容器高度等于行高和() {
+    let doc = Document::parse(
+        "<body><div id=g style='display:grid;width:200px;gap:10px;\
+         grid-template-columns:200px;grid-template-rows:50px 50px'>\
+         <div>A</div><div>B</div></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let g = layout.rect_for("#g").unwrap();
+    // 50+10+50 = 110。
+    assert!((g.3 - 110.0).abs() < 2.0, "g.h={}", g.3);
+}
+
+#[test]
+fn grid_嵌套在_flex_内仍布局() {
+    let doc = Document::parse(
+        "<body><div style='display:flex;width:400px'>\
+         <div id=g style='display:grid;width:200px;grid-template-columns:100px 100px'>\
+         <div id=a>A</div><div id=b>B</div></div></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let g = layout.rect_for("#g").unwrap();
+    let a = layout.rect_for("#a").unwrap();
+    let b = layout.rect_for("#b").unwrap();
+    assert!((g.2 - 200.0).abs() < 2.0, "g.w={}", g.2);
+    assert!((a.2 - 100.0).abs() < 1.0 && (b.0 - (a.0 + 100.0)).abs() < 1.0);
+}

@@ -1,11 +1,12 @@
-//! 布局引擎:块级流式布局 + 文本换行 + Flex 容器 + 定位体系(阶段三)。
+//! 布局引擎:块级流式布局 + 文本换行 + Flex 容器 + Grid 网格 + 定位体系(阶段三)。
 //!
 //! 样式全部来自 `style::StyleEngine` 的计算样式;本模块只负责几何计算。
 //! 产出纯数据(`TextLine`/`ElementBox`),不持有 DOM 句柄,可跨 await 保存。
 //! 目录分工:`mod.rs` 块级/行内主流,`flex.rs` Flex 格式化上下文,
-//! `position.rs` 定位体系,`tests.rs` 布局单测。
+//! `grid.rs` Grid 网格布局,`position.rs` 定位体系,`tests.rs` 布局单测。
 
 mod flex;
+mod grid;
 mod position;
 #[cfg(test)]
 mod tests;
@@ -208,6 +209,7 @@ impl<'a> LayoutCtx<'a> {
 
     /// 在局部坐标(原点 0,0)下测量节点内容,返回片段;全局游标与已产出
     /// 几何零副作用。`content_width` 为内容盒宽度(调用方已扣除 padding)。
+    /// 节点自身是 flex/grid 容器时走对应格式化上下文(嵌套容器的子树几何正确)。
     pub(crate) fn measure_content(
         &mut self,
         node: &NodeRef,
@@ -221,11 +223,34 @@ impl<'a> LayoutCtx<'a> {
         let base0 = self.text_base;
         self.y = 0.0;
         self.text_base = 0.0;
-        let mut buf = InlineBuf::default();
-        let cb = (0.0, 0.0, content_width.max(1.0), UNKNOWN_CB_H);
-        self.layout_children(node, 0.0, content_width, &mut buf, depth, style, cb);
-        self.flush_inline(&mut buf, content_width);
-        let height = self.y;
+        let height = if style.display == "flex" {
+            // flex/grid 格式化上下文不推进全局游标,高度取返回值。
+            flex::layout_content(
+                self,
+                node,
+                0.0,
+                content_width.max(1.0),
+                style,
+                depth,
+                (0.0, 0.0, content_width.max(1.0), UNKNOWN_CB_H),
+            )
+        } else if style.display == "grid" {
+            grid::layout_content(
+                self,
+                node,
+                0.0,
+                content_width.max(1.0),
+                style,
+                depth,
+                (0.0, 0.0, content_width.max(1.0), UNKNOWN_CB_H),
+            )
+        } else {
+            let mut buf = InlineBuf::default();
+            let cb = (0.0, 0.0, content_width.max(1.0), UNKNOWN_CB_H);
+            self.layout_children(node, 0.0, content_width, &mut buf, depth, style, cb);
+            self.flush_inline(&mut buf, content_width);
+            self.y
+        };
         let lines = self.lines.split_off(lines0);
         let boxes = self.boxes.split_off(boxes0);
         self.y = y0;
@@ -276,6 +301,12 @@ impl<'a> LayoutCtx<'a> {
             if style.display == "flex" {
                 self.flush_inline(buf, width);
                 flex::layout_container(self, &child, x, width, depth, &style, cb);
+                continue;
+            }
+            // 阶段三第二步:Grid 格式化上下文。
+            if style.display == "grid" {
+                self.flush_inline(buf, width);
+                grid::layout_container(self, &child, x, width, depth, &style, cb);
                 continue;
             }
             if style.is_block() {

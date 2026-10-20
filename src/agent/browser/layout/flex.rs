@@ -148,8 +148,9 @@ pub(crate) fn layout_container(
 }
 
 /// Flex 内容区布局:布置全部条目并注入几何,返回内容高度。
+/// `measure_content` 对 flex 容器条目复用本入口(嵌套格式化上下文)。
 #[allow(clippy::too_many_arguments)]
-fn layout_content(
+pub(crate) fn layout_content(
     ctx: &mut LayoutCtx,
     node: &NodeRef,
     content_x: f64,
@@ -654,7 +655,8 @@ fn emit_item(ctx: &mut LayoutCtx, item: &mut Item, x: f64, y: f64, row: bool, de
 }
 
 /// 匿名文本条目片段:按给定宽度贪心换行,行高取样式 line-height。
-fn text_fragment(ctx: &mut LayoutCtx, text: &str, cs: &ComputedStyle, width: f64) -> Fragment {
+/// Grid 匿名文本条目共用(阶段三第二步)。
+pub(crate) fn text_fragment(ctx: &mut LayoutCtx, text: &str, cs: &ComputedStyle, width: f64) -> Fragment {
     let size = cs.font_size.max(8.0);
     let line_height = cs.line_height.max(size * 1.35);
     let max_w = width.max(1.0);

@@ -16,6 +16,9 @@ use kuchikiki::NodeRef;
 
 pub use values::ComputedStyle;
 pub use values::FlexWrap;
+pub use values::GridFlow;
+pub use values::GridLine;
+pub use values::TrackSize;
 use values::ValueCtx;
 
 use super::document::{self, Document};
