@@ -173,8 +173,34 @@ function __lsmFireScriptLoad(url) {
 }
 
 // ---------- 元素工厂 ----------
+// 从快照节点求几何属性组:rect 缺失时 html 兜底视口、其余取 0。
+// BMap 等地图/组件库初始化读容器 clientWidth/Height,undefined 会让 NaN
+// 在初始化链深处传播并炸出 ToObject TypeError(实测百度地图 widget 层即断于此)。
+function __lsmGeom(n) {
+  var r = n && n.rect;
+  if (r && typeof r.length === "number" && r.length >= 4) {
+    var x = Number(r[0]) || 0, y = Number(r[1]) || 0;
+    var w = Math.max(0, Math.round(Number(r[2]) || 0));
+    var h = Math.max(0, Math.round(Number(r[3]) || 0));
+    return { x: Math.round(x), y: Math.round(y), w: w, h: h,
+      rect: { x: x, y: y, top: y, left: x, right: x + w, bottom: y + h, width: w, height: h } };
+  }
+  var tag = String((n && n.tag) || "").toLowerCase();
+  if (tag === "html") {
+    var vw = Math.round(Number(__lsmMeta.width) || 1280);
+    var vh = Math.round(Number(__lsmMeta.height) || 720);
+    return { x: 0, y: 0, w: vw, h: vh,
+      rect: { x: 0, y: 0, top: 0, left: 0, right: vw, bottom: vh, width: vw, height: vh } };
+  }
+  return { x: 0, y: 0, w: 0, h: 0,
+    rect: { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 } };
+}
 function __mk(n) {
   var attrs = n.attrs || {};
+  // 布局几何:快照 rect [x,y,w,h] → clientWidth/offsetWidth 等属性。
+  // 缺 rect 的元素取 0;html 兜底视口宽高(真实浏览器 documentElement.clientWidth 语义);
+  // 动态创建元素(__newEl,未挂载)全 0——与 display:none 语义一致。
+  var __geo = __lsmGeom(n);
   var el = {
     __lsm_node: n,
     __lsm_idx: n.i,
@@ -211,6 +237,16 @@ function __mk(n) {
     options: [],
     selectedIndex: -1,
     files: [],
+    clientWidth: __geo.w,
+    clientHeight: __geo.h,
+    offsetWidth: __geo.w,
+    offsetHeight: __geo.h,
+    scrollWidth: __geo.w,
+    scrollHeight: __geo.h,
+    offsetLeft: __geo.x,
+    offsetTop: __geo.y,
+    clientLeft: 0,
+    clientTop: 0,
     getAttribute: function (k) {
       k = String(k);
       return Object.prototype.hasOwnProperty.call(attrs, k) ? attrs[k] : null;
@@ -242,7 +278,7 @@ function __mk(n) {
     },
     removeEventListener: function () {},
     getBoundingClientRect: function () {
-      return { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 };
+      return __geo.rect;
     },
     scrollIntoView: function () { __push({ type: "scroll_to", selector: n.sel }); },
     scrollTo: function (x, y) { __push({ type: "scroll", value: String(y || 0) }); },
@@ -438,6 +474,12 @@ function __newEl(tag) {
     id: "",
     style: __mkStyle(function () { return el.__attrs.style || ""; }, function (css) { el.__attrs.style = css; }),
     dataset: {},
+    // 未挂载元素几何全 0(真实浏览器 display:none 语义)。
+    clientWidth: 0, clientHeight: 0,
+    offsetWidth: 0, offsetHeight: 0,
+    scrollWidth: 0, scrollHeight: 0,
+    offsetLeft: 0, offsetTop: 0,
+    clientLeft: 0, clientTop: 0,
     children: [],
     childNodes: [],
     setAttribute: function (k, v) { this.__attrs[String(k)] = String(v); if (k === "id") this.id = String(v); if (k === "class") this.className = String(v); },

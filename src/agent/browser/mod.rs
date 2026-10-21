@@ -563,6 +563,15 @@ impl LsmBrowserManager {
             timeout_ms,
         )
         .await;
+        // 脚本前预布局(空图片尺寸):JS 桥的 clientWidth 等几何属性需要真实矩形,
+        // 容器 CSS 定宽场景(BMap 初始化读 #MapHolder 尺寸)不依赖图片固有尺寸。
+        let pre_rects = {
+            let pre_doc = document::Document::parse(&resources_out.html, &resp.final_url);
+            let pre_media = style::MediaCtx::new(viewport.width as f64, 720.0);
+            let pre_sizes = images::ImageSizes::default();
+            layout::compute_full(&pre_doc, viewport.width as f64, &self.font, &pre_media, &pre_sizes)
+                .rect_map()
+        };
         let pipeline = script::run_pipeline(
             &mut inner,
             &self.http,
@@ -572,6 +581,7 @@ impl LsmBrowserManager {
             (viewport.width, viewport.height),
             &empty_session,
             csp_policy.as_ref(),
+            &pre_rects,
         )
         .await;
         let html = pipeline.html;
@@ -848,6 +858,14 @@ impl LsmBrowserManager {
             .get(page_id)
             .map(|t| (t.viewport.width, t.viewport.height, t.session_storage.clone()))
             .unwrap_or((DEFAULT_VIEWPORT_W, DEFAULT_VIEWPORT_H, HashMap::new()));
+        // 脚本前预布局(空图片尺寸):与 open 同理,给 JS 桥喂元素几何。
+        let pre_rects = {
+            let pre_doc = document::Document::parse(&resources_out.html, &resp.final_url);
+            let pre_media = style::MediaCtx::new(viewport_w as f64, 720.0);
+            let pre_sizes = images::ImageSizes::default();
+            layout::compute_full(&pre_doc, viewport_w as f64, &self.font, &pre_media, &pre_sizes)
+                .rect_map()
+        };
         let pipeline = script::run_pipeline(
             inner,
             &self.http,
@@ -857,6 +875,7 @@ impl LsmBrowserManager {
             (viewport_w, viewport_h),
             &session_snapshot,
             csp_policy.as_ref(),
+            &pre_rects,
         )
         .await;
         let html = pipeline.html;

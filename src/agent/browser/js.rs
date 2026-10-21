@@ -653,6 +653,7 @@ mod tests {
             visible: true,
             attrs: Default::default(),
             css: Default::default(),
+            rect: None,
         }
     }
 

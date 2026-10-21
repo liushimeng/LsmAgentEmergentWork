@@ -74,6 +74,10 @@ impl FontSet {
     }
 
     /// 渲染一页为 pixmap（阶段四第二步：供 clip 区域截图裁剪）。
+    ///
+    /// 所有 `fill_rect` 输入先整像素对齐(`fill_snap`):亚像素定位的细条带
+    /// (如 1px 边框落在 x=91.476)经 tiny-skia 抗锯齿 FDot16 取整后宽度可为 0,
+    /// debug 构建下触发 hairline_aa 的 `debug_assert!` 断言(release 则静默丢绘)。
     pub fn render_pixmap(
         &self,
         layout: &Layout,
@@ -103,10 +107,10 @@ impl FontSet {
                 continue;
             }
             let rect = tiny_skia::Rect::from_xywh(
-                (s.x + s.dx - s.spread) as f32,
-                (s.y + s.dy - s.spread - scroll_y) as f32,
-                (s.w + s.spread * 2.0).max(1.0) as f32,
-                (s.h + s.spread * 2.0).max(1.0) as f32,
+                fill_snap(s.x + s.dx - s.spread),
+                fill_snap(s.y + s.dy - s.spread - scroll_y),
+                fill_snap((s.w + s.spread * 2.0).max(1.0)),
+                fill_snap((s.h + s.spread * 2.0).max(1.0)),
             );
             if let Some(rect) = rect {
                 let mut paint = tiny_skia::Paint::default();
@@ -121,10 +125,10 @@ impl FontSet {
             }
             if let Some(bg) = b.background {
                 if let Some(rect) = tiny_skia::Rect::from_xywh(
-                    b.x as f32,
-                    (b.y - scroll_y) as f32,
-                    b.w.max(1.0) as f32,
-                    b.h.max(1.0) as f32,
+                    fill_snap(b.x),
+                    fill_snap(b.y - scroll_y),
+                    fill_snap(b.w.max(1.0)),
+                    fill_snap(b.h.max(1.0)),
                 ) {
                     let mut paint = tiny_skia::Paint::default();
                     paint.set_color_rgba8(bg[0], bg[1], bg[2], 255);
@@ -151,7 +155,7 @@ impl FontSet {
                 }
                 let c = bd.colors[i];
                 if let Some(rect) =
-                    tiny_skia::Rect::from_xywh(*sx as f32, *sy as f32, *sw as f32, *sh as f32)
+                    tiny_skia::Rect::from_xywh(fill_snap(*sx), fill_snap(*sy), fill_snap(*sw), fill_snap(*sh))
                 {
                     let mut paint = tiny_skia::Paint::default();
                     paint.set_color_rgba8(c.0[0], c.0[1], c.0[2], c.1);
@@ -430,6 +434,13 @@ fn candidate_fonts() -> Vec<String> {
         }
     }
     out
+}
+
+/// fill_rect 输入整像素对齐:f64 坐标四舍五入到整数像素。
+/// 亚像素细条带(1px 边框落在 x=91.476 之类)经 tiny-skia FDot16 抗锯齿取整后
+/// 宽/高可为 0,debug 构建触发 hairline_aa 断言、release 静默丢绘;对齐后规避。
+fn fill_snap(v: f64) -> f32 {
+    v.round() as f32
 }
 
 /// 把 `data:`/绝对/相对路径的图片读取为 PNG/JPEG 原始字节(阶段一只用于下载与展示)。

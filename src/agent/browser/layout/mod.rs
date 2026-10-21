@@ -11,6 +11,8 @@ mod position;
 #[cfg(test)]
 mod tests;
 
+use std::collections::HashMap;
+
 use kuchikiki::NodeRef;
 
 use super::document::{self, Document};
@@ -146,6 +148,15 @@ impl Layout {
             .iter()
             .find(|b| b.selector == selector)
             .map(|b| (b.x, b.y, b.w, b.h))
+    }
+
+    /// 全量矩形映射(稳定选择器 → (x, y, w, h)):JS 桥几何属性注入用,
+    /// 与 `rect_for` 同源。同选择器多实例时后者覆盖前者(快照按选择器匹配,语义一致)。
+    pub fn rect_map(&self) -> HashMap<String, (f64, f64, f64, f64)> {
+        self.boxes
+            .iter()
+            .map(|b| (b.selector.clone(), (b.x, b.y, b.w, b.h)))
+            .collect()
     }
 
     pub fn page_height(&self) -> f64 {

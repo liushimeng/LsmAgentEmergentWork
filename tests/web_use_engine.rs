@@ -132,6 +132,23 @@ fn route(path: &str, with_headers: bool) -> (&'static str, String, Vec<(String, 
             "document.getElementById('app').textContent = '外链脚本已执行';".to_string(),
             vec![],
         )
+    } else if path == "/js-geometry" {
+        (
+            "200 OK",
+            "<html><head><title>JS几何页</title><style>\
+             #box{width:300px;height:200px;}\
+             #right{position:absolute;left:120px;top:40px;width:50px;height:30px;}\
+             </style></head><body>\
+             <div id=\"box\"></div><div id=\"right\"></div>\
+             <script>var b = document.getElementById('box');\
+             b.setAttribute('data-w', b.clientWidth); b.setAttribute('data-h', b.clientHeight);\
+             var c = document.getElementById('right');\
+             var r = c.getBoundingClientRect();\
+             c.setAttribute('data-left', r.left); c.setAttribute('data-top', r.top);</script>\
+             </body></html>"
+                .to_string(),
+            vec![],
+        )
     } else if path == "/js-external" {
         (
             "200 OK",
@@ -679,6 +696,38 @@ async fn 外链样式加载与计算样式可观测() {
             .any(|e| e["url"].as_str().unwrap_or("").ends_with("/site.css")),
         "样式表请求应记录在台账:{net}"
     );
+
+    exec(&tool, json!({"action": "close", "page_id": page_id})).await;
+}
+
+#[tokio::test]
+async fn js渲染_元素几何属性可读_定宽容器() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebUseTool;
+    let open = exec(
+        &tool,
+        json!({"action": "open", "url": format!("{base}/js-geometry"), "mode": "hidden", "reuse": false}),
+    )
+    .await;
+    assert_eq!(open["code"], 0, "{open}");
+    let page_id = open["data"]["page_id"].as_str().unwrap().to_string();
+
+    // 脚本在页面加载期读 clientWidth/clientHeight 写入 dataset:
+    // JS 桥必须拿到预布局矩形(而非 undefined/0),widget 层(如 BMap 容器)才可初始化。
+    let probe = exec(
+        &tool,
+        json!({"action": "control", "page_id": page_id, "control_action": "eval_js",
+                "params": {"expression": "JSON.stringify({w:document.getElementById('box').getAttribute('data-w'), h:document.getElementById('box').getAttribute('data-h'), left:document.getElementById('right').getAttribute('data-left'), top:document.getElementById('right').getAttribute('data-top'), cw:document.getElementById('box').clientWidth})"}}),
+    )
+    .await;
+    let result = probe["data"]["result"].as_str().unwrap_or("");
+    let v: Value = serde_json::from_str(result).unwrap_or(json!({}));
+    assert_eq!(v["w"], "300", "clientWidth 应为布局宽度 300:{probe}");
+    assert_eq!(v["h"], "200", "clientHeight 应为布局高度 200:{probe}");
+    assert_eq!(v["cw"], 300, "交互期 eval_js 读 clientWidth 也应命中矩形:{probe}");
+    assert_eq!(v["left"], "120", "getBoundingClientRect().left 应为 120:{probe}");
+    assert_eq!(v["top"], "40", "getBoundingClientRect().top 应为 40:{probe}");
 
     exec(&tool, json!({"action": "close", "page_id": page_id})).await;
 }

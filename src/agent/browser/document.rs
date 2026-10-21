@@ -339,17 +339,33 @@ impl Document {
     ///
     /// 阶段二起改为文档序(先根后子)递归遍历,并记录 `parent` 索引供 JS 侧事件冒泡使用。
     pub fn snapshot_nodes(&self) -> Vec<SnapshotNode> {
-        self.snapshot_nodes_inner(None)
+        self.snapshot_nodes_inner(None, None)
     }
 
     /// 带计算样式的快照:每个节点附 `css`(供 JS `getComputedStyle`)。
     pub fn snapshot_nodes_styled(&self, viewport: (u32, u32)) -> Vec<SnapshotNode> {
         let media = super::style::MediaCtx::new(viewport.0 as f64, viewport.1 as f64);
         let engine = StyleEngine::from_document(self, media);
-        self.snapshot_nodes_inner(Some(&engine))
+        self.snapshot_nodes_inner(Some(&engine), None)
     }
 
-    fn snapshot_nodes_inner(&self, engine: Option<&StyleEngine>) -> Vec<SnapshotNode> {
+    /// 带布局矩形的样式快照:rects 由 `layout::Layout::rect_map()` 生成,
+    /// 按稳定选择器匹配注入,供 JS 桥暴露 clientWidth/offsetWidth 等几何属性。
+    pub fn snapshot_nodes_with_rects(
+        &self,
+        viewport: (u32, u32),
+        rects: &HashMap<String, (f64, f64, f64, f64)>,
+    ) -> Vec<SnapshotNode> {
+        let media = super::style::MediaCtx::new(viewport.0 as f64, viewport.1 as f64);
+        let engine = StyleEngine::from_document(self, media);
+        self.snapshot_nodes_inner(Some(&engine), Some(rects))
+    }
+
+    fn snapshot_nodes_inner(
+        &self,
+        engine: Option<&StyleEngine>,
+        rects: Option<&HashMap<String, (f64, f64, f64, f64)>>,
+    ) -> Vec<SnapshotNode> {
         let mut out = Vec::new();
         // 起点用 `html` 而非 `body`:`document.documentElement` / `document.head`
         // 必须是真实节点,站点脚本常直接往 head 里插脚本/样式,拿不到就抛异常。
@@ -377,6 +393,7 @@ impl Document {
             &mut out,
             engine,
             &root_style,
+            rects,
         );
         out
     }
@@ -391,6 +408,7 @@ fn snapshot_walk(
     out: &mut Vec<SnapshotNode>,
     engine: Option<&StyleEngine>,
     parent_style: &ComputedStyle,
+    rects: Option<&HashMap<String, (f64, f64, f64, f64)>>,
 ) {
     if depth > 40 || out.len() >= 5000 {
         return;
@@ -413,10 +431,12 @@ fn snapshot_walk(
             let attrs = common_attrs(node);
             let idx = out.len();
             child_parent = idx;
+            let selector = Document::stable_selector(node);
             out.push(SnapshotNode {
                 index: idx,
                 parent,
-                selector: Document::stable_selector(node),
+                rect: rects.and_then(|m| m.get(&selector).copied()),
+                selector,
                 tag: tag.clone(),
                 id: attrs.get("id").cloned().unwrap_or_default(),
                 class: attrs.get("class").cloned().unwrap_or_default(),
@@ -454,6 +474,7 @@ fn snapshot_walk(
                 out,
                 engine,
                 &child_style,
+                rects,
             );
         }
     }
@@ -478,6 +499,9 @@ pub struct SnapshotNode {
     pub attrs: HashMap<String, String>,
     /// 计算样式(kebab-case);无样式引擎时为空。
     pub css: HashMap<String, String>,
+    /// 布局矩形 `(x, y, w, h)`:JS 桥的 clientWidth/offsetWidth 等几何属性数据源。
+    /// 快照时无布局(如纯样式快照)则为 None。
+    pub rect: Option<(f64, f64, f64, f64)>,
 }
 
 impl SnapshotNode {
@@ -498,6 +522,7 @@ impl SnapshotNode {
             "visible": self.visible,
             "attrs": self.attrs,
             "css": self.css,
+            "rect": self.rect.map(|r| json!([r.0, r.1, r.2, r.3])),
         })
     }
 }
