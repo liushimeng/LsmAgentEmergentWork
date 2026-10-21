@@ -163,6 +163,11 @@ impl tracing_subscriber::fmt::time::FormatTime for LocalTimer {
 ///
 /// 级别由调用方传入(`--debug` → DEBUG,`--info` → INFO),确定性输出,
 /// 不受 `RUST_LOG` 影响。泛型 `S` 使本层可叠加在任意 registry/Layered 栈上。
+///
+/// 噪声闸门:html5ever 等第三方 crate 在 DEBUG 级会逐 token 刷解析日志
+/// (实测百度地图任务 3 分钟 19MB,工程事件被淹没),故 DEBUG 级只放行本工程
+/// target(`lsm_agent` lib / `laew` bin);第三方一律 WARN+ 才落盘。
+/// INFO 及以上各级行为与原先一致(全 target)。
 pub fn file_fmt_layer<S>(
     maker: AgentLogMaker,
     level: LevelFilter,
@@ -177,7 +182,14 @@ where
         .with_writer(maker)
         .with_filter(tracing_subscriber::filter::filter_fn(
             move |meta: &tracing::Metadata<'_>| {
-                level >= *meta.level()
+                if level < *meta.level() {
+                    return false;
+                }
+                if *meta.level() <= tracing::Level::DEBUG {
+                    let t = meta.target();
+                    return t.starts_with("lsm_agent") || t.starts_with("laew");
+                }
+                true
             },
         ))
 }

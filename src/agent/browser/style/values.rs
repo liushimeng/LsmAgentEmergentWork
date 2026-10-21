@@ -53,10 +53,46 @@ pub struct ComputedStyle {
     pub object_fit: String,
     /// `background-image` 的 URL 原文(阶段三第三步;未解析为绝对地址)。
     pub background_image: Option<String>,
+    /// 边框线宽(top/right/bottom/left)。默认 0;样式 `none` 侧不参与绘制。
+    pub border_widths: [f64; 4],
+    /// 边框绘制开关(top/right/bottom/left):`border-style:none/hidden` 为 false。
+    pub border_drawn: [bool; 4],
+    /// 边框颜色(top/right/bottom/left)。`CurrentColor` 在布局期解析为文字色;
+    /// `transparent` 归一为 alpha=0 的 `Rgba`。
+    pub border_colors: [BorderColor; 4],
+    /// `box-shadow` 外阴影层(内阴影/inset 不在此列,解析期丢弃)。
+    /// `blur` 渲染层近似为 0(不实现高斯模糊),仅绘制偏移+扩散实心矩形。
+    pub box_shadow: Vec<BoxShadow>,
     /// 未建模属性的计算值文本(如 border-radius)。
     pub extra: BTreeMap<String, String>,
     /// 自定义属性表(继承用,不进入 `to_map`)。
     pub custom: BTreeMap<String, String>,
+}
+
+/// 边框颜色计算值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BorderColor {
+    /// CSS 默认:边框颜色取元素文字色(currentColor),布局期代入。
+    CurrentColor,
+    Rgba([u8; 3], u8),
+}
+
+impl Default for BorderColor {
+    fn default() -> Self {
+        BorderColor::CurrentColor
+    }
+}
+
+/// `box-shadow` 单层(仅外阴影)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoxShadow {
+    pub dx: f64,
+    pub dy: f64,
+    /// 高斯模糊半径。渲染层近似为 0(实心偏移矩形),保留字段供后续升级。
+    pub blur: f64,
+    pub spread: f64,
+    /// `None` = currentColor(布局期代入文字色)。
+    pub color: Option<([u8; 3], u8)>,
 }
 
 /// 定位体系计算值。`sticky` 布局层按 `relative` 处理(见阶段三设计文档边界)。
@@ -300,6 +336,10 @@ impl Default for ComputedStyle {
             grid_item: GridItemStyle::default(),
             object_fit: "fill".to_string(),
             background_image: None,
+            border_widths: [0.0; 4],
+            border_drawn: [false; 4],
+            border_colors: [BorderColor::CurrentColor; 4],
+            box_shadow: Vec::new(),
             extra: BTreeMap::new(),
             custom: BTreeMap::new(),
         }
@@ -600,6 +640,15 @@ pub fn ua_default(tag: &str, parent: &ComputedStyle) -> ComputedStyle {
             st.white_space = "pre".to_string();
         }
         "center" | "caption" => st.text_align = "center".to_string(),
+        // 表单控件 UA 默认描边:真实浏览器给 input/textarea/select/button
+        // 默认 1px 灰边框 + 白底;缺它时裸表单控件在渲染输出中完全不可见
+        // (页面未自定义控件样式时截图/视觉核验拿不到输入框几何)。
+        "input" | "textarea" | "select" | "button" => {
+            st.border_widths = [1.0; 4];
+            st.border_drawn = [true; 4];
+            st.border_colors = [BorderColor::Rgba([118, 118, 118], 255); 4];
+            st.background = Some([255, 255, 255]);
+        }
         _ => {}
     }
     let margin = match tag.as_str() {
@@ -985,10 +1034,90 @@ pub fn apply_declaration(
                 st.object_fit = v;
             }
         }
+        // ---- 边框(绘制用结构化解析;top/right/bottom/left = 0/1/2/3)----
+        "border" => {
+            let (w, drawn, color) = parse_border_shorthand(value);
+            for side in 0..4 {
+                if let Some(w) = w {
+                    st.border_widths[side] = w;
+                }
+                if let Some(d) = drawn {
+                    st.border_drawn[side] = d;
+                }
+                if let Some(c) = color {
+                    st.border_colors[side] = c;
+                }
+            }
+        }
+        "border-width" => {
+            let ws = parse_border_width_list(value, st.font_size, ctx);
+            apply_quad(&mut st.border_widths, ws);
+        }
+        "border-color" => {
+            let cs = parse_border_color_list(value);
+            apply_quad(&mut st.border_colors, cs);
+        }
+        "border-style" => {
+            let ds = parse_border_style_list(value);
+            apply_quad(&mut st.border_drawn, ds);
+        }
+        "border-top" | "border-right" | "border-bottom" | "border-left" => {
+            let side = match key.as_str() {
+                "border-top" => 0,
+                "border-right" => 1,
+                "border-bottom" => 2,
+                _ => 3,
+            };
+            let (w, drawn, color) = parse_border_shorthand(value);
+            if let Some(w) = w {
+                st.border_widths[side] = w;
+            }
+            if let Some(d) = drawn {
+                st.border_drawn[side] = d;
+            }
+            if let Some(c) = color {
+                st.border_colors[side] = c;
+            }
+        }
+        "border-top-width" | "border-right-width" | "border-bottom-width" | "border-left-width" => {
+            let side = match key.as_str() {
+                "border-top-width" => 0,
+                "border-right-width" => 1,
+                "border-bottom-width" => 2,
+                _ => 3,
+            };
+            if let Some(w) = parse_length(value.trim(), st.font_size, ctx) {
+                st.border_widths[side] = w;
+            }
+        }
+        "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color" => {
+            let side = match key.as_str() {
+                "border-top-color" => 0,
+                "border-right-color" => 1,
+                "border-bottom-color" => 2,
+                _ => 3,
+            };
+            if let Some(c) = parse_color(value) {
+                st.border_colors[side] = match c {
+                    Some(rgba) => BorderColor::Rgba(rgba.0, rgba.1),
+                    None => BorderColor::Rgba([0, 0, 0], 0),
+                };
+            }
+        }
+        "border-top-style" | "border-right-style" | "border-bottom-style" | "border-left-style" => {
+            let side = match key.as_str() {
+                "border-top-style" => 0,
+                "border-right-style" => 1,
+                "border-bottom-style" => 2,
+                _ => 3,
+            };
+            let v = value.trim().to_ascii_lowercase();
+            st.border_drawn[side] = !matches!(v.as_str(), "none" | "hidden" | "");
+        }
+        "box-shadow" => {
+            st.box_shadow = parse_box_shadow(value);
+        }
         "border-radius"
-        | "border"
-        | "border-color"
-        | "box-shadow"
         | "overflow"
         | "overflow-x"
         | "overflow-y"
@@ -1131,6 +1260,183 @@ fn normalize_display(value: &str) -> String {
 /// 解析百分比原值(`50%` → 50.0);非百分比/无法识别返回 `None`。
 ///
 /// 百分比长度的最终值依赖包含块尺寸,样式层无从得知,故单独留痕交布局层求解。
+/// 按空白切分 CSS 分量,括号内(`rgba(...)`/`var(...)`)不切开。
+fn split_ws_tokens(value: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0i32;
+    for ch in value.chars() {
+        match ch {
+            '(' => {
+                depth += 1;
+                cur.push(ch);
+            }
+            ')' => {
+                depth -= 1;
+                cur.push(ch);
+            }
+            c if c.is_whitespace() && depth <= 0 => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// `border` 单边/四边速写解析:`<width> || <style> || <color>` 任意顺序。
+/// 返回(线宽, 是否绘制, 颜色);未出现的分量为 `None`。
+/// 速写给出可绘制样式而未给线宽时按 CSS 默认 `medium`(3px)。
+pub fn parse_border_shorthand(value: &str) -> (Option<f64>, Option<bool>, Option<BorderColor>) {
+    let mut width: Option<f64> = None;
+    let mut style_drawn: Option<bool> = None;
+    let mut color: Option<BorderColor> = None;
+    for tok in split_ws_tokens(value) {
+        let t = tok.trim().to_ascii_lowercase();
+        if t.is_empty() {
+            continue;
+        }
+        match t.as_str() {
+            "none" | "hidden" => {
+                style_drawn = Some(false);
+                continue;
+            }
+            "solid" | "dashed" | "dotted" | "double" | "groove" | "ridge" | "inset" | "outset" => {
+                style_drawn = Some(true);
+                continue;
+            }
+            _ => {}
+        }
+        if let Some(c) = parse_color(&t) {
+            color = Some(match c {
+                Some(rgba) => BorderColor::Rgba(rgba.0, rgba.1),
+                None => BorderColor::Rgba([0, 0, 0], 0),
+            });
+            continue;
+        }
+        if let Some(w) = parse_length(&t, 16.0, &ValueCtx::default()) {
+            width = Some(w);
+        }
+    }
+    if style_drawn == Some(true) && width.is_none() {
+        width = Some(3.0);
+    }
+    (width, style_drawn, color)
+}
+
+/// `border-width` 速写:1~4 个长度按 CSS 四值规则铺到 [top,right,bottom,left]。
+fn parse_border_width_list(value: &str, font_size: f64, ctx: &ValueCtx) -> Vec<f64> {
+    split_ws_tokens(value)
+        .iter()
+        .filter_map(|t| parse_length(t, font_size, ctx))
+        .collect()
+}
+
+/// `border-color` 速写:1~4 个颜色按四值规则展开。
+fn parse_border_color_list(value: &str) -> Vec<BorderColor> {
+    let mut out = Vec::new();
+    for tok in split_ws_tokens(value) {
+        if let Some(c) = parse_color(&tok) {
+            out.push(match c {
+                Some(rgba) => BorderColor::Rgba(rgba.0, rgba.1),
+                None => BorderColor::Rgba([0, 0, 0], 0),
+            });
+        }
+    }
+    out
+}
+
+/// `border-style` 速写:可绘制性(非 none/hidden)按四值规则展开。
+fn parse_border_style_list(value: &str) -> Vec<bool> {
+    split_ws_tokens(value)
+        .iter()
+        .map(|t| !matches!(t.trim().to_ascii_lowercase().as_str(), "none" | "hidden"))
+        .collect()
+}
+
+/// CSS 四值铺填:1 值=全边,2 值=上下/左右,3 值=上/左右/下,4 值=上右下左。
+fn apply_quad<T: Copy>(slot: &mut [T; 4], values: Vec<T>) {
+    match values.len() {
+        1 => *slot = [values[0]; 4],
+        2 => *slot = [values[0], values[1], values[0], values[1]],
+        3 => *slot = [values[0], values[1], values[2], values[1]],
+        4 => *slot = [values[0], values[1], values[2], values[3]],
+        _ => {}
+    }
+}
+
+/// `box-shadow` 解析:逐层取外阴影(`inset` 层丢弃),长度分量按
+/// dx/dy/[blur]/[spread] 顺序,颜色缺省为 currentColor(`None`)。
+/// 颜色经 `parse_color`:transparent 层直接丢弃(不可见)。
+/// 层间按**括号外**逗号切分(`rgba(...)` 内的逗号不拆层)。
+pub fn parse_box_shadow(value: &str) -> Vec<BoxShadow> {
+    let mut out = Vec::new();
+    // 括号外逗号切层。
+    let mut layers: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0i32;
+    for ch in value.chars() {
+        match ch {
+            '(' => {
+                depth += 1;
+                cur.push(ch);
+            }
+            ')' => {
+                depth -= 1;
+                cur.push(ch);
+            }
+            ',' if depth <= 0 => {
+                layers.push(std::mem::take(&mut cur));
+            }
+            c => cur.push(c),
+        }
+    }
+    layers.push(cur);
+    for layer in &layers {
+        let toks = split_ws_tokens(layer);
+        if toks.iter().any(|t| t.trim().eq_ignore_ascii_case("inset")) {
+            continue;
+        }
+        let mut lens = Vec::new();
+        let mut color: Option<([u8; 3], u8)> = None;
+        let mut color_seen = false;
+        for tok in &toks {
+            if !color_seen {
+                if let Some(c) = parse_color(tok) {
+                    match c {
+                        Some(rgba) => color = Some(rgba),
+                        None => color = None, // transparent 层
+                    }
+                    color_seen = true;
+                    continue;
+                }
+            }
+            if let Some(l) = parse_length(tok, 16.0, &ValueCtx::default()) {
+                lens.push(l);
+            }
+        }
+        if color_seen && color.is_none() {
+            continue; // transparent 阴影不可见
+        }
+        if lens.len() < 2 {
+            continue; // 少于 dx/dy,非法层
+        }
+        out.push(BoxShadow {
+            dx: lens[0],
+            dy: lens[1],
+            blur: lens.get(2).copied().unwrap_or(0.0),
+            spread: lens.get(3).copied().unwrap_or(0.0),
+            color,
+        });
+    }
+    out
+}
+
 pub fn parse_percent(value: &str) -> Option<f64> {
     let v = value.trim();
     v.strip_suffix('%')

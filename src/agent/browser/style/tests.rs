@@ -285,3 +285,96 @@ fn 背景图_none_与_非法_object_fit_回落默认值() {
     assert!(t.background_image.is_none());
     assert_eq!(t.object_fit, "fill");
 }
+
+#[test]
+fn border_速写解析_宽度样式颜色() {
+    let (doc, engine) = doc_engine(
+        "<body><div id=t style='border:2px solid #ff0000'>x</div></body>",
+        1280.0,
+    );
+    let t = style_of(&doc, &engine, "#t");
+    assert_eq!(t.border_widths, [2.0; 4]);
+    assert_eq!(t.border_drawn, [true; 4]);
+    assert_eq!(
+        t.border_colors,
+        [super::values::BorderColor::Rgba([255, 0, 0], 255); 4]
+    );
+}
+
+#[test]
+fn border_速写_仅样式时线宽回落medium() {
+    let (doc, engine) = doc_engine(
+        "<body><div id=t style='border:solid'>x</div></body>",
+        1280.0,
+    );
+    let t = style_of(&doc, &engine, "#t");
+    assert_eq!(t.border_widths, [3.0; 4], "CSS 默认 medium=3px");
+    assert_eq!(t.border_drawn, [true; 4]);
+}
+
+#[test]
+fn border_none_不绘制且四值铺开正确() {
+    let (doc, engine) = doc_engine(
+        "<body><div id=t style='border:0;border-top:5px solid transparent;border-right:1px dashed rgb(0,0,255)'>x</div></body>",
+        1280.0,
+    );
+    let t = style_of(&doc, &engine, "#t");
+    // border:0 先把四边清零,再按边覆盖:上 5px 透明可绘制,右 1px 蓝,下/左 0。
+    assert_eq!(t.border_widths, [5.0, 1.0, 0.0, 0.0]);
+    assert_eq!(t.border_drawn, [true, true, false, false]);
+    assert_eq!(t.border_colors[0], super::values::BorderColor::Rgba([0, 0, 0], 0));
+    assert_eq!(
+        t.border_colors[1],
+        super::values::BorderColor::Rgba([0, 0, 255], 255)
+    );
+}
+
+#[test]
+fn border_width_颜色四值速写() {
+    let (doc, engine) = doc_engine(
+        "<body><div id=t style='border-style:solid;border-width:1px 2px;border-color:#00ff00'>x</div></body>",
+        1280.0,
+    );
+    let t = style_of(&doc, &engine, "#t");
+    assert_eq!(t.border_widths, [1.0, 2.0, 1.0, 2.0]);
+    assert_eq!(
+        t.border_colors,
+        [super::values::BorderColor::Rgba([0, 255, 0], 255); 4]
+    );
+}
+
+#[test]
+fn box_shadow_解析_长度与颜色() {
+    let (doc, engine) = doc_engine(
+        "<body><div id=t style='box-shadow:1px 2px 1px rgba(0,0,0,.15)'>x</div></body>",
+        1280.0,
+    );
+    let t = style_of(&doc, &engine, "#t");
+    assert_eq!(t.box_shadow.len(), 1);
+    let s = &t.box_shadow[0];
+    assert_eq!(s.dx, 1.0);
+    assert_eq!(s.dy, 2.0);
+    assert_eq!(s.blur, 1.0);
+    assert_eq!(s.color, Some(([0, 0, 0], 38)), "0.15×255≈38");
+}
+
+#[test]
+fn box_shadow_透明层与inset丢弃() {
+    let (doc, engine) = doc_engine(
+        "<body><div id=t style='box-shadow:inset 1px 1px #000, 2px 2px transparent, 3px 4px #ff0000'>x</div></body>",
+        1280.0,
+    );
+    let t = style_of(&doc, &engine, "#t");
+    assert_eq!(t.box_shadow.len(), 1, "inset 与 transparent 层丢弃");
+    assert_eq!(t.box_shadow[0].dx, 3.0);
+    assert_eq!(t.box_shadow[0].color, Some(([255, 0, 0], 255)));
+}
+
+#[test]
+fn 表单控件_ua_默认描边() {
+    let (doc, engine) = doc_engine("<body><input id=t></body>", 1280.0);
+    let t = style_of(&doc, &engine, "#t");
+    assert_eq!(t.border_widths, [1.0; 4]);
+    assert!(t.border_drawn[0], "input 默认边框可绘制");
+    assert_eq!(t.background, Some([255, 255, 255]));
+}

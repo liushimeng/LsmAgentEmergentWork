@@ -16,7 +16,7 @@ use kuchikiki::NodeRef;
 use super::document::{self, Document};
 use super::images::ImageSizes;
 use super::render::FontSet;
-use super::style::{ComputedStyle, MediaCtx, StyleEngine};
+use super::style::{BorderColor, ComputedStyle, MediaCtx, StyleEngine};
 use super::urlutil;
 
 /// 测量宽度的"无穷大":超过任何真实换行阈值,用于 max-content 度量。
@@ -25,6 +25,23 @@ pub(crate) const MAX_CONTENT_WIDTH: f64 = 100_000.0;
 /// 包含块高度未知标记:布局期父盒高度未定时使用;此时 `bottom` 锚定退化
 /// 为 `top` 语义(见设计文档"已知边界")。
 pub(crate) const UNKNOWN_CB_H: f64 = f64::MAX / 2.0;
+
+/// 元素自身的「确定高度」:显式长度,或包含块高度确定时的百分比高度。
+///
+/// CSS 语义:百分比高度仅在包含块高度确定(非 auto、不依赖内容)时生效,
+/// 否则按 auto 处理。根元素(html)的包含块是视口,调用方传 `Some(视口高)`。
+pub(crate) fn definite_height(
+    style: &ComputedStyle,
+    parent_definite: Option<f64>,
+) -> Option<f64> {
+    if let Some(h) = style.height {
+        return Some(h);
+    }
+    if let (Some(p), Some(ph)) = (style.height_percent, parent_definite) {
+        return Some((p / 100.0 * ph).max(0.0));
+    }
+    None
+}
 
 #[derive(Debug, Clone)]
 pub struct TextLine {
@@ -58,8 +75,45 @@ pub struct Layout {
     pub boxes: Vec<ElementBox>,
     /// 图像绘制指令(阶段三第三步):按绘制序存放,渲染层据此贴图。
     pub paints: Vec<PaintBox>,
+    /// 边框绘制指令:绘制在元素背景之上、文字之下;不占布局几何。
+    pub borders: Vec<BorderDraw>,
+    /// 外阴影绘制指令(`box-shadow` 近似):绘制在元素背景之下。
+    pub shadows: Vec<ShadowDraw>,
     pub width: f64,
     pub height: f64,
+}
+
+/// 边框绘制指令。`colors` 已在布局期把 currentColor 解析为文字色,
+/// `transparent` 归一为 alpha=0。渲染层按四边实心矩形绘制(圆角不实现)。
+#[derive(Debug, Clone)]
+pub struct BorderDraw {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+    /// top/right/bottom/left 线宽(px)。
+    pub widths: [f64; 4],
+    /// top/right/bottom/left 颜色(已解析)。
+    pub colors: [([u8; 3], u8); 4],
+    pub visible: bool,
+    pub z_index: i64,
+}
+
+/// 外阴影绘制指令。`blur` 不实现高斯模糊,渲染为偏移+扩散的实心矩形
+/// (现代页面卡片/输入框普遍以阴影描边,近似后视觉可辨)。
+#[derive(Debug, Clone)]
+pub struct ShadowDraw {
+    /// 元素盒矩形(页坐标)。
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+    pub dx: f64,
+    pub dy: f64,
+    pub spread: f64,
+    pub color: ([u8; 3], u8),
+    pub visible: bool,
+    pub z_index: i64,
 }
 
 /// 图像绘制指令(阶段三第三步)。
@@ -135,6 +189,8 @@ pub fn compute_full(
         lines: Vec::new(),
         boxes: Vec::new(),
         paints: Vec::new(),
+        borders: Vec::new(),
+        shadows: Vec::new(),
         images,
         base_url: doc.base_url.clone(),
         y: 8.0,
@@ -146,17 +202,25 @@ pub fn compute_full(
         .map(|n| n.as_node().clone())
         .unwrap_or_else(|| doc.root().clone());
     let initial = engine.initial_style();
-    let parent_style = doc
+    let html_style = doc
         .first("html")
         .ok()
         .flatten()
         .map(|n| engine.computed(&n, &initial))
         .unwrap_or_else(|| initial.clone());
-    let body_style = engine.computed(&body, &parent_style);
+    let body_style = engine.computed(&body, &html_style);
     let mut buf = InlineBuf::default();
     let content_width = ctx.width - 16.0;
-    // 初始包含块:整页坐标,高度未知(bottom 锚定退化)。
-    let icb = (0.0, 0.0, ctx.width, UNKNOWN_CB_H);
+    // 初始包含块:整页坐标。高度传播链:视口 → html → body。
+    // 百分比高度仅在包含块高度确定时生效(CSS),故 html/body 的确定高
+    // 逐级解析后作为 ICB 高度;chain 任一环 auto 则 ICB 高度未知,
+    // 后代百分比高度全部按 auto 退化(如 height:100% 页面不再塌陷)。
+    let html_definite = definite_height(&html_style, Some(ctx.viewport_h));
+    let body_definite = definite_height(&body_style, html_definite);
+    let icb_h = body_definite
+        .map(|h| (h - body_style.padding_top - body_style.padding_bottom).max(0.0))
+        .unwrap_or(UNKNOWN_CB_H);
+    let icb = (0.0, 0.0, ctx.width, icb_h);
     ctx.layout_children(&body, 8.0, content_width, &mut buf, 0, &body_style, icb);
     ctx.flush_inline(&mut buf, content_width);
     let height = ctx.y + 8.0;
@@ -168,10 +232,15 @@ pub fn compute_full(
         PaintKind::Content => 1,
     });
     ctx.paints.sort_by_key(|p| p.z_index);
+    // 边框/阴影随盒序按 z-index 稳定排序,渲染层按序叠画。
+    ctx.borders.sort_by_key(|b| b.z_index);
+    ctx.shadows.sort_by_key(|s| s.z_index);
     Layout {
         lines: ctx.lines,
         boxes: ctx.boxes,
         paints: ctx.paints,
+        borders: ctx.borders,
+        shadows: ctx.shadows,
         width: ctx.width,
         height,
     }
@@ -184,6 +253,8 @@ pub(crate) struct Fragment {
     pub lines: Vec<TextLine>,
     pub boxes: Vec<ElementBox>,
     pub paints: Vec<PaintBox>,
+    pub borders: Vec<BorderDraw>,
+    pub shadows: Vec<ShadowDraw>,
 }
 
 /// 平移片段内全部几何。
@@ -200,6 +271,14 @@ pub(crate) fn translate(fragment: &mut Fragment, dx: f64, dy: f64) {
         p.x += dx;
         p.y += dy;
     }
+    for bd in &mut fragment.borders {
+        bd.x += dx;
+        bd.y += dy;
+    }
+    for s in &mut fragment.shadows {
+        s.x += dx;
+        s.y += dy;
+    }
 }
 
 /// 片段注入全局结果。
@@ -207,6 +286,63 @@ pub(crate) fn append(ctx: &mut LayoutCtx, fragment: Fragment) {
     ctx.lines.extend(fragment.lines);
     ctx.boxes.extend(fragment.boxes);
     ctx.paints.extend(fragment.paints);
+    ctx.borders.extend(fragment.borders);
+    ctx.shadows.extend(fragment.shadows);
+}
+
+/// 解析四边边框颜色:currentColor 代入文字色。
+fn resolved_border_colors(style: &ComputedStyle) -> [([u8; 3], u8); 4] {
+    let mut out = [([0u8; 3], 0u8); 4];
+    for (i, c) in style.border_colors.iter().enumerate() {
+        out[i] = match c {
+            BorderColor::CurrentColor => (style.color, 255),
+            BorderColor::Rgba(rgb, a) => (*rgb, *a),
+        };
+    }
+    out
+}
+
+/// 盒的边框/阴影绘制指令入队(四边均无线宽时零开销)。
+pub(crate) fn push_border_and_shadow(
+    ctx: &mut LayoutCtx,
+    style: &ComputedStyle,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+) {
+    let visible = style_visible(style);
+    if style
+        .border_widths
+        .iter()
+        .zip(style.border_drawn.iter())
+        .any(|(w, d)| *w > 0.0 && *d)
+    {
+        ctx.borders.push(BorderDraw {
+            x,
+            y,
+            w,
+            h,
+            widths: style.border_widths,
+            colors: resolved_border_colors(style),
+            visible,
+            z_index: style.pos.z_index,
+        });
+    }
+    for layer in &style.box_shadow {
+        ctx.shadows.push(ShadowDraw {
+            x,
+            y,
+            w,
+            h,
+            dx: layer.dx,
+            dy: layer.dy,
+            spread: layer.spread,
+            color: layer.color.unwrap_or((style.color, 255)),
+            visible,
+            z_index: style.pos.z_index,
+        });
+    }
 }
 
 /// 元素是否参与绘制(visibility/opacity)。
@@ -236,6 +372,8 @@ pub(crate) struct LayoutCtx<'a> {
     lines: Vec<TextLine>,
     boxes: Vec<ElementBox>,
     paints: Vec<PaintBox>,
+    borders: Vec<BorderDraw>,
+    shadows: Vec<ShadowDraw>,
     /// 图片固有尺寸索引(阶段三第三步)。
     images: &'a ImageSizes,
     /// 页面 URL(相对图片地址解析基准)。
@@ -416,12 +554,16 @@ impl<'a> LayoutCtx<'a> {
                     z_index: style.pos.z_index,
                 }],
                 paints: Vec::new(),
+                borders: Vec::new(),
+                shadows: Vec::new(),
             };
         }
         let y0 = self.y;
         let lines0 = self.lines.len();
         let boxes0 = self.boxes.len();
         let paints0 = self.paints.len();
+        let borders0 = self.borders.len();
+        let shadows0 = self.shadows.len();
         let base0 = self.text_base;
         self.y = 0.0;
         self.text_base = 0.0;
@@ -456,6 +598,8 @@ impl<'a> LayoutCtx<'a> {
         let lines = self.lines.split_off(lines0);
         let boxes = self.boxes.split_off(boxes0);
         let paints = self.paints.split_off(paints0);
+        let borders = self.borders.split_off(borders0);
+        let shadows = self.shadows.split_off(shadows0);
         self.y = y0;
         self.text_base = base0;
         Fragment {
@@ -463,6 +607,8 @@ impl<'a> LayoutCtx<'a> {
             lines,
             boxes,
             paints,
+            borders,
+            shadows,
         }
     }
 
@@ -560,6 +706,8 @@ impl<'a> LayoutCtx<'a> {
                 self.flush_inline(buf, width);
                 let mark_lines = self.lines.len();
                 let mark_boxes = self.boxes.len();
+                let mark_borders = self.borders.len();
+                let mark_shadows = self.shadows.len();
                 self.y += style.margin_top;
                 let bx = x + style.margin_left;
                 // 盒宽(border box,不含 margin):auto 时撑满父内容宽减 margin;
@@ -576,8 +724,22 @@ impl<'a> LayoutCtx<'a> {
                 let content_w = (bw - style.padding_left - style.padding_right).max(1.0);
                 let start_y = self.y;
                 self.y += style.padding_top;
-                // 定位元素为后代 absolute 建立新的包含块(padding 盒);
-                // 高度布局期未知,bottom 锚定退化(见 UNKNOWN_CB_H)。
+                // 盒高先于子代布局求出:显式/百分比高度不依赖子代内容;
+                // auto 高(占位 0)待子代布局完成后用内容高回填。
+                let own_definite_h = style.height.is_some()
+                    || (style.height_percent.is_some() && cb.3 != UNKNOWN_CB_H);
+                let box_h = match style.height {
+                    Some(h) => h.max(1.0),
+                    None => match style.height_percent {
+                        Some(p) if cb.3 != UNKNOWN_CB_H => ((p / 100.0) * cb.3).max(1.0),
+                        _ => 0.0, // auto:子代布局后回填
+                    },
+                };
+                // 子代包含块:定位元素为后代 absolute 建立新的包含块(padding 盒),
+                // 高度布局期未知,bottom 锚定退化(见 UNKNOWN_CB_H);
+                // 非定位子代的百分比高度以本盒内容高为包含块高 —— 仅当本盒高度
+                // 确定时成立,auto 高必须传 UNKNOWN_CB_H(不得把祖父确定高透传,
+                // 否则违背 CSS「百分比高度相对父内容高」的语义)。
                 let child_cb = if style.pos.is_positioned() {
                     (
                         bx + style.padding_left,
@@ -585,8 +747,15 @@ impl<'a> LayoutCtx<'a> {
                         (bw - style.padding_left - style.padding_right).max(0.0),
                         UNKNOWN_CB_H,
                     )
+                } else if own_definite_h {
+                    (
+                        bx + style.padding_left,
+                        start_y + style.padding_top,
+                        (bw - style.padding_left - style.padding_right).max(0.0),
+                        (box_h - style.padding_top - style.padding_bottom).max(0.0),
+                    )
                 } else {
-                    cb
+                    (cb.0, cb.1, cb.2, UNKNOWN_CB_H)
                 };
                 self.layout_children(
                     &child,
@@ -598,12 +767,11 @@ impl<'a> LayoutCtx<'a> {
                     child_cb,
                 );
                 self.flush_inline(buf, width);
-                // 内容高(不含 padding);显式高度优先(百分比高度在父高未知时按 auto
-                // 处理,见 style/values.rs)。用高即占位高,显式高度时按声明值推进流。
                 let content_h = (self.y - (start_y + style.padding_top)).max(1.0);
-                let box_h = match style.height {
-                    Some(h) => h.max(1.0),
-                    None => (content_h + style.padding_top + style.padding_bottom).max(1.0),
+                let box_h = if box_h > 0.0 {
+                    box_h
+                } else {
+                    (content_h + style.padding_top + style.padding_bottom).max(1.0)
                 };
                 self.y = start_y + box_h + style.margin_bottom.max(2.0);
                 self.boxes.push(ElementBox {
@@ -621,6 +789,8 @@ impl<'a> LayoutCtx<'a> {
                 if let Some(paint) = self.background_paint(&style, bx, start_y, bw, box_h) {
                     self.push_paint(paint);
                 }
+                // 边框/外阴影绘制指令(不占几何;relative 偏移需同步平移)。
+                push_border_and_shadow(self, &style, bx, start_y, bw, box_h);
                 // 阶段三:relative/sticky 整体偏移(不影响占位)。
                 if matches!(style.pos.position.as_str(), "relative" | "sticky") {
                     let dx = style.pos.left.unwrap_or(0.0) - style.pos.right.unwrap_or(0.0);
@@ -633,6 +803,14 @@ impl<'a> LayoutCtx<'a> {
                         for b in &mut self.boxes[mark_boxes..] {
                             b.x += dx;
                             b.y += dy;
+                        }
+                        for bd in &mut self.borders[mark_borders..] {
+                            bd.x += dx;
+                            bd.y += dy;
+                        }
+                        for s in &mut self.shadows[mark_shadows..] {
+                            s.x += dx;
+                            s.y += dy;
                         }
                     }
                 }
@@ -712,6 +890,15 @@ impl<'a> LayoutCtx<'a> {
                 visible: style_visible(style),
                 z_index: style.pos.z_index,
             });
+            // 输入框/按钮等交互元素的边框与外阴影(绘制不占几何)。
+            push_border_and_shadow(
+                self,
+                style,
+                line_x + style.margin_left + style.padding_left + dx,
+                self.y + dy,
+                w,
+                h,
+            );
         }
         for child in node.children() {
             if let Some(text) = child.as_text() {

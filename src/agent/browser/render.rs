@@ -97,6 +97,24 @@ impl FontSet {
         let mut pixmap = Pixmap::new(width, height)?;
         pixmap.fill(Color::WHITE);
 
+        // 外阴影绘制在元素背景之下(blur 不实现,按偏移+扩散实心矩形近似)。
+        for s in &layout.shadows {
+            if !s.visible {
+                continue;
+            }
+            let rect = tiny_skia::Rect::from_xywh(
+                (s.x + s.dx - s.spread) as f32,
+                (s.y + s.dy - s.spread - scroll_y) as f32,
+                (s.w + s.spread * 2.0).max(1.0) as f32,
+                (s.h + s.spread * 2.0).max(1.0) as f32,
+            );
+            if let Some(rect) = rect {
+                let mut paint = tiny_skia::Paint::default();
+                paint.set_color_rgba8(s.color.0[0], s.color.0[1], s.color.0[2], s.color.1);
+                pixmap.fill_rect(rect, &paint, tiny_skia::Transform::identity(), None);
+            }
+        }
+
         for b in &layout.boxes {
             if !b.visible {
                 continue;
@@ -110,6 +128,33 @@ impl FontSet {
                 ) {
                     let mut paint = tiny_skia::Paint::default();
                     paint.set_color_rgba8(bg[0], bg[1], bg[2], 255);
+                    pixmap.fill_rect(rect, &paint, tiny_skia::Transform::identity(), None);
+                }
+            }
+        }
+
+        // 边框绘制在背景之上、文字之下:四边实心矩形(alpha 含 transparent)。
+        for bd in &layout.borders {
+            if !bd.visible {
+                continue;
+            }
+            let (x, y, w, h) = (bd.x, bd.y - scroll_y, bd.w, bd.h);
+            let strips: [(f64, f64, f64, f64); 4] = [
+                (x, y, w, bd.widths[0]),                    // top
+                (x + w - bd.widths[1], y, bd.widths[1], h), // right
+                (x, y + h - bd.widths[2], w, bd.widths[2]), // bottom
+                (x, y, bd.widths[3], h),                    // left
+            ];
+            for (i, (sx, sy, sw, sh)) in strips.iter().enumerate() {
+                if *sw <= 0.0 || *sh <= 0.0 {
+                    continue;
+                }
+                let c = bd.colors[i];
+                if let Some(rect) =
+                    tiny_skia::Rect::from_xywh(*sx as f32, *sy as f32, *sw as f32, *sh as f32)
+                {
+                    let mut paint = tiny_skia::Paint::default();
+                    paint.set_color_rgba8(c.0[0], c.0[1], c.0[2], c.1);
                     pixmap.fill_rect(rect, &paint, tiny_skia::Transform::identity(), None);
                 }
             }
@@ -531,5 +576,68 @@ mod tests {
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
         assert_eq!(pm.width(), 320);
         assert_eq!(pm.height(), 240);
+    }
+}
+
+#[cfg(test)]
+mod border_shadow_tests {
+    use super::super::document::Document;
+    use super::super::layout;
+    use super::FontSet;
+
+    fn pixel(pm: &tiny_skia::Pixmap, x: u32, y: u32) -> [u8; 4] {
+        let w = pm.width();
+        let idx = ((y * w + x) * 4) as usize;
+        let d = pm.data();
+        [d[idx], d[idx + 1], d[idx + 2], d[idx + 3]]
+    }
+
+    #[test]
+    fn 边框绘制在盒沿() {
+        // 300×200 白底盒,2px 红边框:盒内白、盒沿红。
+        let doc = Document::parse(
+            "<body><div style='width:300px;height:200px;border:2px solid #ff0000;background:#ffffff'></div></body>",
+            "https://a.test/",
+        );
+        let font = FontSet::fallback();
+        let l = layout::compute(&doc, 800.0, &font);
+        assert_eq!(l.borders.len(), 1, "应产出一条边框绘制指令");
+        let pm = font.render_pixmap(&l, 800, 600, 0.0, false, &super::ImageStore::new()).unwrap();
+        // tiny_skia 数据字节序为 RGBA(实证);盒在 body margin 8 处,2px 红边框。
+        let edge = pixel(&pm, 8, 8);
+        assert!(edge[0] > 200 && edge[1] < 50 && edge[2] < 50, "左上角应为红:{edge:?}");
+        let inside = pixel(&pm, 30, 30);
+        assert!(inside[0] > 200 && inside[1] > 200, "盒内应为白:{inside:?}");
+    }
+
+    #[test]
+    fn 外阴影绘制在背景之下() {
+        // 100×100 白盒 + 1px 2px 纯黑阴影:盒外偏移处应出现黑色像素。
+        let doc = Document::parse(
+            "<body><div style='width:100px;height:100px;background:#ffffff;box-shadow:1px 2px 0 #000000'></div></body>",
+            "https://a.test/",
+        );
+        let font = FontSet::fallback();
+        let l = layout::compute(&doc, 800.0, &font);
+        assert_eq!(l.shadows.len(), 1, "应产出一条阴影绘制指令");
+        let pm = font.render_pixmap(&l, 800, 600, 0.0, false, &super::ImageStore::new()).unwrap();
+        // 盒 x∈[8,108]、阴影右移 1px 覆盖 x∈[9,109);背景绘制后仅 x=108 一列可见。
+        let sp = pixel(&pm, 108, 30);
+        assert!(sp[0] < 50 && sp[1] < 50 && sp[2] < 50, "盒外偏移处应为黑:{sp:?}");
+    }
+
+    #[test]
+    fn 输入框_ua_默认边框可见() {
+        // 裸 input(无页面样式):UA 1px 灰边框应出现在渲染输出里。
+        let doc = Document::parse("<body><input style='width:200px;height:30px'></body>", "https://a.test/");
+        let font = FontSet::fallback();
+        let l = layout::compute(&doc, 800.0, &font);
+        assert!(!l.borders.is_empty(), "输入框应有边框绘制指令");
+        let pm = font.render_pixmap(&l, 800, 600, 0.0, false, &super::ImageStore::new()).unwrap();
+        let edge = pixel(&pm, 8, 8);
+        assert!(
+            edge[0] < 200 && edge[1] < 200 && edge[2] < 200,
+            "输入框边缘应为灰边框而非纯白:{edge:?}"
+        );
     }
 }

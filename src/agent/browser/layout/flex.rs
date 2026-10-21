@@ -750,5 +750,7 @@ pub(crate) fn text_fragment(ctx: &mut LayoutCtx, text: &str, cs: &ComputedStyle,
         lines,
         boxes: Vec::new(),
         paints: Vec::new(),
+        borders: Vec::new(),
+        shadows: Vec::new(),
     }
 }

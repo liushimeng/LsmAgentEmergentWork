@@ -14,6 +14,8 @@ use std::collections::BTreeMap;
 
 use kuchikiki::NodeRef;
 
+pub use values::BorderColor;
+pub use values::BoxShadow;
 pub use values::ComputedStyle;
 pub use values::FlexWrap;
 pub use values::GridFlow;

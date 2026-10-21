@@ -736,3 +736,82 @@ fn 无盒元素不与零尺寸元素混淆() {
     let layout = compute(&doc, 800.0, &font());
     assert!(layout.rect_for("#a").is_none(), "被剪枝元素不应有布局盒");
 }
+
+// ===================== 百分比高度求解 + 视口传播(根高度链) =====================
+
+#[test]
+fn 百分比高度沿根链向视口传播() {
+    // html,body 100% 链:容器 100% 应解析为视口高(compute 默认视口高 720)。
+    // 百度地图类 height:100% 页面此前整链退化为 auto,页面塌陷为头部高度。
+    let doc = Document::parse(
+        "<head><style>html,body{height:100%;margin:0}#wrap{height:100%}</style></head>\
+         <body><div id='wrap'></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let wrap = layout.rect_for("#wrap").unwrap();
+    assert!(
+        (wrap.3 - 720.0).abs() < 2.0,
+        "100% 容器应撑满视口高(720),实际 {}",
+        wrap.3
+    );
+}
+
+#[test]
+fn 百分比高度遇auto父退化为内容高() {
+    // body 无显式高(auto)→ 子代 50% 高度无确定包含块,按 auto(内容高)处理。
+    let doc = Document::parse(
+        "<body><div style='height:50%'><p>hi</p></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let div = layout
+        .boxes
+        .iter()
+        .find(|b| b.tag == "div")
+        .expect("div 应有布局盒");
+    assert!(
+        div.h < 100.0,
+        "auto 父下的 50% 应退化为内容高,实际 {}",
+        div.h
+    );
+}
+
+#[test]
+fn 显式父高支撑多级百分比链() {
+    // 显式 400px 父 → 子 50% = 200 → 孙 50% = 100;逐代确定高逐代传播。
+    let doc = Document::parse(
+        "<body><div style='height:400px'>\
+            <div id='half' style='height:50%'>\
+                <div id='quarter' style='height:50%'></div>\
+            </div>\
+         </div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let half = layout.rect_for("#half").unwrap();
+    let quarter = layout.rect_for("#quarter").unwrap();
+    assert!((half.3 - 200.0).abs() < 2.0, "50% of 400 应为 200,实际 {}", half.3);
+    assert!(
+        (quarter.3 - 100.0).abs() < 2.0,
+        "50% of 200 应为 100,实际 {}",
+        quarter.3
+    );
+}
+
+#[test]
+fn auto高父不向上透传祖父确定高() {
+    // 祖父显式 400px → 父 auto → 子 50% 必须按 auto(内容高),
+    // 不得把祖父的 400px 透传成子的包含块高(CSS 百分比高度只相对父内容高)。
+    let doc = Document::parse(
+        "<body><div style='height:400px'><div><div id='inner' style='height:50%'><p>x</p></div></div></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let inner = layout.rect_for("#inner").unwrap();
+    assert!(
+        inner.3 < 100.0,
+        "auto 父的子代 50% 应退化为内容高,实际 {}",
+        inner.3
+    );
+}
