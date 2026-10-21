@@ -6,6 +6,7 @@
 
 pub mod dom_ops;
 pub mod env_js;
+pub mod for_in_guard;
 pub mod prelude;
 pub mod runtime;
 
@@ -178,11 +179,21 @@ pub struct PipelineOut {
 ///
 /// 每一轮把"上一轮注入的 `<script>`"取回并执行;AMD 装载器会连续注入多个模块
 /// 脚本(每个模块一轮),3 轮远远不够,页面 widget 层会卡在"等模块"状态。
-/// 轮次本身很便宜(`collect_scripts` 按内容指纹去重,已执行过的脚本不再取回),
-/// 配合墙钟预算即可。
-const MAX_ROUNDS: usize = 24;
-/// 整条脚本管线的墙钟预算(毫秒)。
-const PIPELINE_BUDGET_MS: u64 = 20_000;
+/// 轮次本身很便宜(`collect_scripts` 按内容指纹/URL 去重,已执行过的脚本不再取回),
+/// 配合墙钟预算即可。真实大站(百度地图)的 widget 层注入量实测超过 24 轮,
+/// 放宽到 64。
+const MAX_ROUNDS: usize = 64;
+/// 整条脚本管线的墙钟预算(毫秒),可用 `LAEW_WEB_SCRIPT_PIPELINE_MS` 覆盖。
+const PIPELINE_BUDGET_MS: u64 = 40_000;
+
+/// 管线墙钟预算(环境变量覆盖,下限 2000ms)。
+fn pipeline_budget_ms() -> u64 {
+    std::env::var("LAEW_WEB_SCRIPT_PIPELINE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v >= 2_000)
+        .unwrap_or(PIPELINE_BUDGET_MS)
+}
 const MAX_EXTERNAL_BYTES: usize = 2 * 1024 * 1024;
 const SCRIPT_FETCH_TIMEOUT_MS: u64 = 15_000;
 
@@ -209,7 +220,7 @@ pub(crate) async fn run_pipeline(
     }
     let mut executed = std::collections::HashSet::new();
     let mut handle: Option<JsHandle> = None;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(PIPELINE_BUDGET_MS);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(pipeline_budget_ms());
     let title_now = {
         let doc = super::document::Document::parse(raw_html, base_url);
         doc.title()
@@ -218,7 +229,7 @@ pub(crate) async fn run_pipeline(
         if std::time::Instant::now() >= deadline {
             out.console.push(super::ConsoleRecord {
                 level: "warn".to_string(),
-                text: format!("脚本管线达到墙钟预算({PIPELINE_BUDGET_MS}ms),已停止继续取回模块"),
+                text: format!("脚本管线达到墙钟预算({}ms),已停止继续取回模块", pipeline_budget_ms()),
                 at_ms: super::now_ms(),
             });
             break;
@@ -326,6 +337,13 @@ pub(crate) async fn run_pipeline(
         if handle.is_none() {
             handle = Some(JsHandle::spawn());
         }
+        // 本轮执行的外链 URL 先留底:执行完成后记账进 executed,
+        // 下一轮 collect_scripts 不再取回(真实浏览器语义:script 只执行一次)。
+        let executed_externals: Vec<String> = scripts
+            .iter()
+            .filter(|s| s.kind == "external")
+            .map(|s| s.src_url.clone())
+            .collect();
         let Some(h) = handle.clone() else { break };
         let env = build_env(inner, base_url, &title_now, ua, viewport, session_storage, csp);
         // 快照后立即销毁 Document(NodeRef 非 Send,不能跨 await 存活)。
@@ -361,6 +379,10 @@ pub(crate) async fn run_pipeline(
         let doc = super::document::Document::parse(&out.html, base_url);
         append_reply(&mut out, inner, base_url, &reply, &doc);
         out.html = doc.serialize_full();
+        // 外链执行记账(含执行抛错的:真实浏览器里抛错的 script 同样不会重跑)。
+        for url in &executed_externals {
+            executed.insert(dom_ops::fingerprint(url));
+        }
         if round + 1 < MAX_ROUNDS {
             // 下一轮 collect_scripts 会检测是否有新注入的脚本。
             continue;

@@ -21,6 +21,7 @@ pub mod security;
 pub mod storage;
 pub mod style;
 pub mod urlutil;
+pub mod view;
 
 #[cfg(test)]
 mod tests;
@@ -42,7 +43,8 @@ pub const DEFAULT_VIEWPORT_H: u32 = 720;
 pub const MAX_TABS_DEFAULT: usize = 8;
 pub const MAX_WINDOWS_DEFAULT: usize = 4;
 
-/// 浏览器模式。阶段一只有无头内核;`Headed` 会回退为 `Hidden` 并在响应中说明。
+/// 浏览器模式。`Headed` = 进程内无头内核 + 独立查看器子进程原生窗口显示渲染帧
+/// (引擎线程零 UI 依赖);查看器不可用时自动回退纯无头,页面能力不受影响。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrowserMode {
     Headed,
@@ -61,10 +63,24 @@ impl BrowserMode {
     }
 
     pub fn from_env_or_default() -> Self {
-        std::env::var("LAEW_BROWSER_MODE")
-            .ok()
-            .and_then(|v| Self::from_arg(&v))
-            .unwrap_or(Self::DEFAULT)
+        if let Ok(v) = std::env::var("LAEW_BROWSER_MODE") {
+            if let Some(m) = Self::from_arg(&v) {
+                return m;
+            }
+        }
+        Self::interactive_default()
+    }
+
+    /// 环境变量未设置时的默认档:**交互式终端(stdin/stdout 均为 TTY)默认有头**
+    /// —— 用户在终端跑 Agent 时能直接看到浏览器窗口;管道/cargo test/CI 无 TTY
+    /// 场景保持无头,既有测试与自动化路径零影响。显式 LAEW_BROWSER_MODE 仍精确覆盖。
+    fn interactive_default() -> Self {
+        use std::io::IsTerminal as _;
+        if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+            Self::Headed
+        } else {
+            Self::Hidden
+        }
     }
 
     pub fn as_str(self) -> &'static str {
@@ -282,6 +298,8 @@ pub struct LsmBrowserManager {
     inner: Mutex<Inner>,
     http: net::HttpClient,
     font: render::FontSet,
+    /// 有头帧查看器(惰性;headed 模式首个页面打开时启动,失败静默降级)。
+    view: std::sync::Mutex<Option<view::ViewSink>>,
 }
 
 /// 兼容旧调用点的类型名。
@@ -299,6 +317,64 @@ impl LsmBrowserManager {
             }),
             http: net::HttpClient::new(DEFAULT_UA),
             font: render::FontSet::load(),
+            view: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// 有头模式:确保查看器子进程在跑(幂等),并推首帧。
+    /// 任何失败(无桌面会话/spawn 失败/写管道失败)静默降级为纯无头,不影响工具行为。
+    fn ensure_view(&self, tab: &TabState) {
+        let title = format!("🌐 {} · {} — {}", tab.id, tab.title, tab.url);
+        let mut guard = self.view.lock().unwrap();
+        if guard.is_none() {
+            *guard = view::ViewSink::start(
+                tab.viewport.width,
+                tab.viewport.height,
+                &title,
+            );
+        }
+        drop(guard);
+        self.push_frame(tab);
+    }
+
+    /// 渲染当前布局为视口 PNG 并推给查看器(查看器不存在时 no-op)。
+    fn push_frame(&self, tab: &TabState) {
+        let alive = self
+            .view
+            .lock()
+            .map(|g| g.is_some())
+            .unwrap_or(false);
+        if !alive {
+            return;
+        }
+        let Some(pixmap) = self.font.render_pixmap(
+            &tab.layout,
+            tab.viewport.width,
+            tab.viewport.height,
+            tab.scroll_y,
+            false,
+            &tab.images,
+        ) else {
+            return;
+        };
+        let png = pixmap.encode_png().unwrap_or_default();
+        if png.is_empty() {
+            return;
+        }
+        if let Ok(guard) = self.view.lock() {
+            if let Some(sink) = guard.as_ref() {
+                sink.send_frame(&png);
+                sink.send_title(&format!("🌐 {} · {} — {}", tab.id, tab.title, tab.url));
+            }
+        }
+    }
+
+    /// 关闭查看器(所有页面关闭后)。
+    fn close_view(&self) {
+        if let Ok(mut guard) = self.view.lock() {
+            if let Some(sink) = guard.take() {
+                sink.send_close();
+            }
         }
     }
 
@@ -602,7 +678,7 @@ impl LsmBrowserManager {
             last_active_ms: now_ms(),
             foreground: true,
             user_agent: ua,
-            mode: BrowserMode::Hidden,
+            mode,
             guard: GuardState {
                 mode: "open".to_string(),
                 ..Default::default()
@@ -624,12 +700,18 @@ impl LsmBrowserManager {
         if let Some(w) = inner.windows.iter_mut().find(|w| w.id == window_id) {
             w.tabs.push(page_id.clone());
         }
+        // 有头:首个页面打开时启动查看器并推首帧(失败静默降级纯无头)。
+        if mode.is_headed() {
+            if let Some(tab) = inner.tabs.get(&page_id) {
+                self.ensure_view(tab);
+            }
+        }
         Ok(OpenOutcome {
             page_id,
             title,
             final_url: resp.final_url,
             request_url: requested,
-            mode: BrowserMode::Hidden.as_str().to_string(),
+            mode: mode.as_str().to_string(),
             mode_hint: mode_hint(mode),
             reused: false,
             status: resp.status,
@@ -836,6 +918,10 @@ impl LsmBrowserManager {
             });
             tab.history_index = tab.history.len().saturating_sub(1);
         }
+        // 有头:导航完成后推帧(查看器展示最新页面)。
+        if tab.mode.is_headed() {
+            self.push_frame(tab);
+        }
         record_network(
             tab,
             NetworkRecord {
@@ -968,6 +1054,8 @@ impl LsmBrowserManager {
                 inner.windows.clear();
                 inner.cookies.clear();
                 inner.local_storage.clear();
+                // 有头:所有页面关闭 → 查看器一并关闭。
+                self.close_view();
                 CloseOutcome {
                     closed: ids,
                     message: "closed".to_string(),
@@ -1000,6 +1088,10 @@ impl LsmBrowserManager {
                     inner.tabs.remove(id);
                     close_from_windows(&mut inner, &ids);
                     clear_session_if_empty(&mut inner);
+                    // 有头:最后一个页面关闭 → 查看器一并关闭。
+                    if inner.tabs.is_empty() {
+                        self.close_view();
+                    }
                     CloseOutcome {
                         closed: ids,
                         message: "closed".to_string(),
@@ -1092,6 +1184,10 @@ impl LsmBrowserManager {
         let media = style::MediaCtx::new(tab.viewport.width as f64, 720.0);
         let sizes = images::ImageSizes::from_store(&tab.images);
         tab.layout = layout::compute_full(&doc, tab.viewport.width as f64, &self.font, &media, &sizes);
+        // 有头:视口重排后推帧。
+        if tab.mode.is_headed() {
+            self.push_frame(tab);
+        }
         Ok(json!({
             "width": tab.viewport.width,
             "height": tab.viewport.height,
@@ -1302,6 +1398,14 @@ impl LsmBrowserManager {
         if png.is_empty() {
             return Err(EngineError::new(3001, "渲染失败(无法编码 PNG)"));
         }
+        // 有头:截到的视口帧同步推给查看器(所见即所得;全页截图仍推视口帧)。
+        if tab.mode.is_headed() && !full_page && applied_clip.is_none() {
+            if let Ok(guard) = self.view.lock() {
+                if let Some(sink) = guard.as_ref() {
+                    sink.send_frame(&png);
+                }
+            }
+        }
         // 落盘路径:`save_path` 为契约名,`output_path`/`path` 为常见别名
         // (LLM 常按直觉写别名,静默忽略会让 Agent 找不到自己要的截图)。
         let save_path = ["save_path", "output_path", "path"]
@@ -1439,7 +1543,11 @@ fn env_limit(key: &str, default: usize, min: usize) -> usize {
 
 fn mode_hint(requested: BrowserMode) -> Option<String> {
     if requested.is_headed() {
-        Some("LsmAgentBrowser 阶段一为进程内无头内核;原生窗口与可视化在阶段三实现。页面能力不受影响。".to_string())
+        Some(
+            "有头模式已启用:独立查看器子进程(`laew __browser-view`)以原生窗口显示软件渲染帧。\
+             查看器退出/不可用时自动回退纯无头,页面能力不受影响。"
+                .to_string(),
+        )
     } else {
         None
     }

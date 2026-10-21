@@ -266,16 +266,29 @@ impl ThreadRuntime {
             return JsReply::error(e);
         }
         for s in scripts {
-            // 直接在宿主侧求值(而不是把源码塞进 JS 里再 eval):
-            // Boa 的错误对象带行号/列号,失败脚本能定位到具体位置;
-            // 语义与 `(0,eval)` 一致(都在全局作用域求值)。
-            if let Err(e) = self.eval_src(&s.content) {
-                let origin = if s.src_url.is_empty() { "(inline)".to_string() } else { s.src_url.clone() };
-                let msg = format!("脚本执行失败:{e} @ {origin}");
-                self.eval_quiet(&format!(
-                    "__cerror({})",
-                    serde_json::to_string(&msg).unwrap_or_else(|_| "\"error\"".into())
-                ));
+            // 经 `__lsmRunScript` 间接求值(全局作用域,与浏览器 <script> 一致):
+            // 失败时 JS 侧捕获 e.stack 回传,压缩大脚本也能定位到行列;
+            // 此前直接 ctx.eval 只拿到 "TypeError: xxx" 一句,无从定位。
+            let origin = if s.src_url.is_empty() { "(inline)".to_string() } else { s.src_url.clone() };
+            // Boa 0.20 for-in 规范偏差守卫:遍历 null/undefined 会抛错(规范应零次迭代),
+            // `EXPR||{}` 改写在一切取值下与规范等价(见 for_in_guard.rs)。
+            let guarded = super::for_in_guard::guard_for_in(&s.content);
+            let payload = serde_json::to_string(&guarded).unwrap_or_else(|_| "\"\"".into());
+            let res = self.eval_string(&format!("__lsmRunScript({payload})"));
+            if let Ok(body) = res {
+                let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                if !parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    let stack = parsed
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(无栈)")
+                        .to_string();
+                    let msg = format!("脚本执行失败:{stack} @ {origin}");
+                    self.eval_quiet(&format!(
+                        "__cerror({})",
+                        serde_json::to_string(&msg).unwrap_or_else(|_| "\"error\"".into())
+                    ));
+                }
             }
             // 外链脚本执行完要触发脚本元素的 load 事件:AMD 装载器靠它推进
             // 模块解析,不触发就永远停在"等模块"状态(实测百度地图 widget 层)。
@@ -629,6 +642,13 @@ fn blocking_fetch(
         return json!({"error": err});
     }
     record_network(url, &method, status, &content_type, bytes.len(), started);
+    // JS 响应体套 for-in 守卫:AMD 装载器在线程内同步 eval 模块源码,
+    // 模块里的 `for(x in nullable)` 同样会被 Boa 规范偏差打断。
+    let body = if content_type.contains("javascript") || content_type.contains("ecmascript") {
+        super::for_in_guard::guard_for_in(&body)
+    } else {
+        body
+    };
     let mut header_map = serde_json::Map::new();
     for (k, v) in &headers {
         if k.eq_ignore_ascii_case("set-cookie") {

@@ -57,3 +57,6 @@ TestWorkSpace/
 # BashSpill(Bash 大输出落盘产物,D17 大对象溢出,自动落盘不入库)
 BashSpill/
 EvalSpill/
+
+# web_screenshots(浏览器任务截图产物,自动落盘,不入库)
+web_screenshots/

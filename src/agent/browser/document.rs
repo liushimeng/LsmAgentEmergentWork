@@ -165,7 +165,10 @@ impl Document {
     ) -> Value {
         let selector = Self::stable_selector(node);
         let tag = tag_name(node);
-        let text = truncate_chars(&collapse_ws(&node.text_contents()), 4000);
+        // 可见文本而非 text_contents():后者把 <script>/<style> 源码算进来,
+        // inspect elements 在 body 上会返回 4000 字符 JS 源码(实测百度地图)。
+        // visible_text_of 的 SKIP_TEXT_TAGS 与快照层同一套排除规则。
+        let text = truncate_chars(&collapse_ws(&visible_text_of(node)), 4000);
         let attrs = common_attrs(node);
         let value = self.runtime_value(node, &selector, &attrs, values);
         let (x, y, w, h) = rect.unwrap_or((0.0, 0.0, 0.0, 0.0));

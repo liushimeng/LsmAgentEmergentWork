@@ -150,6 +150,19 @@ enum Cmd {
         /// payload JSON 临时文件路径。
         payload: std::path::PathBuf,
     },
+
+    /// 内部隐藏子命令：LsmAgentBrowser 有头帧查看器子进程,由浏览器内核在
+    /// headed 模式首个页面打开时 spawn;stdin 长度前缀帧协议接收 PNG 帧。
+    /// macOS AppKit / Windows Win32。禁止手工调用。
+    #[command(name = "__browser-view", hide = true)]
+    BrowserView {
+        /// 视口宽(px)。
+        width: u32,
+        /// 视口高(px)。
+        height: u32,
+        /// 窗口初始标题。
+        title: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1081,6 +1094,12 @@ async fn main() -> Result<()> {
         std::process::exit(code);
     }
 
+    // 浏览器有头帧查看器子进程:同步阻塞(原生窗口事件循环),不走 tokio。
+    if let Some(Cmd::BrowserView { width, height, title }) = &cli.cmd {
+        let code = lsm_agent::agent::browser::view::run_viewer_main(*width, *height, title);
+        std::process::exit(code);
+    }
+
     // TUI 模式下 INFO 级日志会与对话内容交错打印,造成视觉混乱 + 闪烁。
     // 单轮 / -debug / provider 子命令场景不受影响,沿用 RUST_LOG 默认行为。
     // 关联报告: 2026-09-09_07 F-007-1
@@ -1192,6 +1211,7 @@ async fn main() -> Result<()> {
             Some(Cmd::Mcp(c)) => cmd_mcp(c).await,
             // 已在 main 初始化前返回；此分支仅为穷尽性匹配。
             Some(Cmd::HitlDialog { .. }) => unreachable!("hitl-dialog returned before setup"),
+            Some(Cmd::BrowserView { .. }) => unreachable!("browser-view returned before setup"),
             None => {
                 // 纯函数斜杠命令前置检测(/diff 等不依赖 LLM 的命令在 -p 模式也可直接执行)
                 if let Some(prompt) = &cli.prompt {

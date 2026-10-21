@@ -554,6 +554,7 @@ pub const GLOBALS_JS: &str = r##"
   if (G.define && G.define.amd) return; // 已有实现不覆盖
   var cfg = { baseUrl: "/", paths: {}, packages: {}, shim: {} };
   var resMap = {};
+  var pkgMap = {};
   var modules = {};
   var defs = {};
   var loadStack = [];
@@ -590,6 +591,11 @@ pub const GLOBALS_JS: &str = r##"
   function resolveUrl(id) {
     var r = resMap[id];
     if (r && r.url) return joinUrl(cfg.baseUrl, r.url);
+    // pkg 打包映射:模块捆绑在包文件里(resourceMap 的 res[].pkg → pkg[].url),
+    // 真实 requirejs 语义是加载包 URL(百度地图 439 个模块里大量走 pkg)。
+    if (r && r.pkg && pkgMap[r.pkg] && pkgMap[r.pkg].url) {
+      return joinUrl(cfg.baseUrl, pkgMap[r.pkg].url);
+    }
     var segs = String(id).split("/");
     var head = segs[0];
     var rest = String(id).slice(head.length);
@@ -600,6 +606,8 @@ pub const GLOBALS_JS: &str = r##"
       var pu = String(cfg.packages[head].url);
       return joinUrl(cfg.baseUrl, pu.replace(/\/$/, "") + rest + ".js");
     }
+    // id 本身常以 .js 结尾(common:widget/xxx.js),不能再拼一次。
+    if (/\.js(\?|$)/.test(String(id))) return joinUrl(cfg.baseUrl, String(id));
     return joinUrl(cfg.baseUrl, String(id) + ".js");
   }
   function fetchTextSync(url) {
@@ -649,12 +657,29 @@ pub const GLOBALS_JS: &str = r##"
     if (rec && typeof rec.factory === "function") {
       var args = [];
       var deps = rec.deps || [];
+      var moduleObj = { exports: exports };
       for (var i = 0; i < deps.length; i++) {
         var depId = normalizeId(deps[i], mid);
+        // AMD/CommonJS 特殊依赖:真实 requirejs 会注入这三个标识符,
+        // 站点模块普遍 `function(require, exports, module)` 三参工厂
+        // (百度 tangram/messageCenter 整层如此),不注入的话 exports 参数
+        // 是 undefined,`exports.foo = ...` 直接抛错或写进丢弃对象,全局永不导出。
+        if (depId === "require") { args.push(requireFn); continue; }
+        if (depId === "exports") { args.push(exports); continue; }
+        if (depId === "module") { args.push(moduleObj); continue; }
         args.push(loadModule(depId, mid));
       }
-      try { exports = rec.factory.apply(null, args); }
+      // deps 缺省的三参工厂(define(id, function(require, exports, module))):
+      // 按 AMD 约定补注入(CommonJS 风格模块没有依赖数组)。
+      if (!deps.length && rec.factory.length >= 1) {
+        args = [requireFn, exports, moduleObj];
+      }
+      var ret;
+      try { ret = rec.factory.apply(null, args); }
       catch (e) { amdLog("模块 " + mid + " 工厂执行失败: " + String((e && e.stack) || e)); }
+      // 导出合并优先级:工厂返回值 > module.exports 写入 > 预置空对象。
+      if (ret !== undefined && ret !== null) exports = ret;
+      else if (moduleObj.exports && moduleObj.exports !== exports) exports = moduleObj.exports;
     }
     modules[mid] = exports;
     return exports;
@@ -678,12 +703,18 @@ pub const GLOBALS_JS: &str = r##"
   };
   requireFn.resourceMap = function (m) {
     if (m && m.res) for (var k in m.res) if (Object.prototype.hasOwnProperty.call(m.res, k)) resMap[k] = m.res[k];
+    if (m && m.pkg) for (var p in m.pkg) if (Object.prototype.hasOwnProperty.call(m.pkg, p)) pkgMap[p] = m.pkg[p];
     return requireFn;
   };
   requireFn.defined = function (id) { return Object.prototype.hasOwnProperty.call(modules, id); };
   requireFn.specified = function (id) { return Object.prototype.hasOwnProperty.call(defs, id) || Object.prototype.hasOwnProperty.call(resMap, id); };
   requireFn.undef = function (id) { delete modules[id]; delete defs[id]; };
   requireFn.toUrl = function (id) { return resolveUrl(id); };
+  // `require.async(deps, cb)`:百度系(Tangram/FIS)普遍用它启动 widget 层
+  // (实测 initmap 的 require.async([...tangram, statCode, init]) —— 缺它直接
+  // "not a callable function",widget 层整层不启动)。真实浏览器里是异步装载,
+  // 这里同步执行同一装载路径,cb 立刻触发,时序差异由宿主轮次兜底。
+  requireFn.async = function (deps, cb, errCb) { return requireFn(deps, cb, errCb); };
 
   if (typeof G.require === "undefined") G.require = requireFn;
   // 刻意**不**定义 `requirejs`:站点自带的 requirejs 在初始化时有一句

@@ -232,6 +232,10 @@ async fn apply_js_reply(
             &media,
             &sizes,
         );
+        // 有头:JS 动作应用后重排完成,推帧给查看器。
+        if tab.mode.is_headed() {
+            mgr.push_frame(tab);
+        }
         for rec in images_out.network {
             if tab.network.len() > 200 {
                 tab.network.remove(0);
@@ -500,6 +504,10 @@ pub async fn control(
                 &media,
                 &sizes,
             );
+            // 有头:视口/窗口变更后重排完成,推帧给查看器。
+            if tab.mode.is_headed() {
+                mgr.push_frame(tab);
+            }
             Ok(json!({
                 "width": tab.viewport.width,
                 "height": tab.viewport.height,
@@ -1134,6 +1142,9 @@ async fn act_scroll(mgr: &LsmBrowserManager, pid: &str, params: &Value) -> Engin
         let stable = Document::stable_selector(node);
         if let Some((_, y, _, h)) = tab.layout.rect_for(&stable) {
             tab.scroll_y = (y - tab.viewport.height as f64 / 3.0 + h / 2.0).max(0.0);
+            if tab.mode.is_headed() {
+                mgr.push_frame(tab);
+            }
             return Ok(json!({"mode": "selector_into_view", "found": true, "selector": stable, "scrollY": tab.scroll_y}));
         }
         return Ok(json!({"mode": "selector_into_view", "found": false, "selector": stable}));
@@ -1144,6 +1155,9 @@ async fn act_scroll(mgr: &LsmBrowserManager, pid: &str, params: &Value) -> Engin
         .unwrap_or(0.0);
     tab.scroll_x = (tab.scroll_x + dx).max(0.0);
     tab.scroll_y = (tab.scroll_y + dy).max(0.0);
+    if tab.mode.is_headed() {
+        mgr.push_frame(tab);
+    }
     Ok(json!({"mode": "scrollBy", "delta_x": dx, "delta_y": dy, "scrollX": tab.scroll_x, "scrollY": tab.scroll_y}))
 }
 
@@ -1162,6 +1176,9 @@ async fn act_scroll_to(mgr: &LsmBrowserManager, pid: &str, params: &Value) -> En
     let rect = tab.layout.rect_for(&stable);
     if let Some(r) = rect {
         tab.scroll_y = (r.1 - tab.viewport.height as f64 / 3.0).max(0.0);
+    }
+    if tab.mode.is_headed() {
+        mgr.push_frame(tab);
     }
     Ok(json!({"selector": stable, "block": p_str(params, "block").unwrap_or("center"), "found": rect.is_some(), "scrollY": tab.scroll_y, "rect": rect.map(|r| json!({"x": r.0, "y": r.1, "width": r.2, "height": r.3}))}))
 }

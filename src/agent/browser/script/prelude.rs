@@ -56,7 +56,11 @@ function __lsmRefresh(nodes, meta) {
   window.pageYOffset = window.scrollY;
   __rebindDocNodes();
   __rebindLocation();
-  document.readyState = "loading";
+  // 注意:这里刻意**不**重置 document.readyState。refresh 只是注入最新 DOM 快照,
+  // 页面生命周期状态属于整个页面会话:管线尾部已依序置 interactive/complete,
+  // 若每次请求(eval_js/click/input 都会 refresh)都打回 "loading",页面按
+  // readyState 分支的初始化会全部误判「还在加载」(实测百度地图即如此)。
+  // 导航换页会重建 JS 线程,新 Context 天然从 "loading" 开始。
 }
 
 function __ancestorChain(idx) {
@@ -178,7 +182,14 @@ function __mk(n) {
     nodeName: String(n.tag || "").toUpperCase(),
     nodeType: 1,
     id: n.id || "",
+    // className 经 define() 反射到 class 属性并回传宿主(见下方),
+    // 此处占位避免字面量顺序问题。
     className: n.class || "",
+    // ownerDocument → document(defaultView → window):标准取样式路径
+    // `el.ownerDocument.defaultView.getComputedStyle(el, null)` 依赖它,
+    // 缺失时该路径返回 void 0,`...getComputedStyle(t).position` 直接抛错
+    // (实测百度地图 initmap._setStyle 即命中)。
+    ownerDocument: null,
     name: n.name || "",
     type: n.type || "",
     title: attrs.title || "",
@@ -236,15 +247,39 @@ function __mk(n) {
     scrollIntoView: function () { __push({ type: "scroll_to", selector: n.sel }); },
     scrollTo: function (x, y) { __push({ type: "scroll", value: String(y || 0) }); },
     querySelector: function (s) { return __lsmQueryOne(s, n.i); },
+    getElementsByTagName: function (t) {
+      var out = [];
+      var tag = String(t).toLowerCase();
+      // 快照子树(父索引)∪ 动态覆盖层,一起按标签收集。
+      for (var i = 0; i < __lsmNodes.length; i++) {
+        var nd = __lsmNodes[i];
+        var anc = __ancestorChain(nd.i);
+        if (anc.indexOf(n.i) >= 0 && (tag === "*" || String(nd.tag).toLowerCase() === tag)) out.push(__mk(nd));
+      }
+      for (var d = 0; d < dynKids.length; d++) {
+        (function walk(k) {
+          var kt = String((k.__tag || k.tagName || "")).toLowerCase();
+          if (tag === "*" || kt === tag) out.push(k);
+          var ks = k.__kids || [];
+          for (var q = 0; q < ks.length; q++) walk(ks[q]);
+        })(dynKids[d]);
+      }
+      return out;
+    },
     querySelectorAll: function (s) { return __lsmQuery(s, n.i); },
     appendChild: function (c) {
       try { __lsmRegisterScriptLoad(c); } catch (e) {}
+      if (c) dynKids.push(c);
       if (c && c.__detached) __push({ type: "append_html", selector: n.sel, value: __serEl(c) });
       else if (c && c.__lsm_node) __push({ type: "append_html", selector: n.sel, value: String((c.__lsm_node && c.__lsm_node.text) || "") });
       return c;
     },
     insertBefore: function (c, ref) {
       try { __lsmRegisterScriptLoad(c); } catch (e) {}
+      if (c) {
+        var at = dynKids.indexOf(ref);
+        if (at >= 0) dynKids.splice(at, 0, c); else dynKids.push(c);
+      }
       var html = "";
       try { html = (c && c.__detached) ? __serEl(c) : String((c && c.__lsm_node && c.__lsm_node.text) || ""); }
       catch (e) { html = ""; }
@@ -252,10 +287,27 @@ function __mk(n) {
       return c;
     },
     removeChild: function (c) {
+      var ri = dynKids.indexOf(c);
+      if (ri >= 0) dynKids.splice(ri, 1);
       if (c && c.__lsm_node) __push({ type: "remove_node", selector: c.__lsm_node.sel });
       return c;
     },
     remove: function () { __push({ type: "remove_node", selector: n.sel }); },
+    insertAdjacentHTML: function (pos, html) {
+      var p = String(pos || "beforeend").toLowerCase();
+      var h = String(html == null ? "" : html);
+      // 本地覆盖层同步记账:插入的 HTML 用伪元素占位,`t.lastChild` 等
+      // 立即可读可写(co 辅助函数 `insertAdjacentHTML + lastChild` 模式)。
+      var pseudo = __newEl("div");
+      pseudo.__text = h;
+      pseudo.__lsm_html = h;
+      if (p === "afterbegin") { dynKids.unshift(pseudo); __push({ type: "insert_html", selector: n.sel, value: h }); }
+      else { dynKids.push(pseudo); __push({ type: "append_html", selector: n.sel, value: h }); }
+    },
+    insertAdjacentElement: function (pos, c) { this.appendChild(c); return c; },
+    insertAdjacentText: function (pos, text) {
+      this.insertAdjacentHTML(pos, "<span>" + String(text == null ? "" : text) + "</span>");
+    },
     cloneNode: function () { return el; }
   };
   el.classList = {
@@ -276,6 +328,13 @@ function __mk(n) {
     try { Object.defineProperty(el, name, { get: getter, set: setter, configurable: true, enumerable: true }); } catch (e) {}
   }
   var key = n.sel || ("#idx_" + n.i);
+  // 动态子节点覆盖层:appendChild/insertBefore 的写入对页面脚本**立即可见**
+  // (真实浏览器语义)。宿主动作回写是轮间的,若 children 只从快照父索引推导,
+  // `container.appendChild(el); container.children[0]` 拿到 undefined,
+  // 整条初始化链当场断(实测百度地图 initmap 的 platform = t.children[0])。
+  // 元素包装器每次 refresh 重建,覆盖层随之自然重置(彼时宿主 DOM 已应用动作)。
+  var dynKids = [];
+  var htmlCleared = false;
   define("value", function () {
     return Object.prototype.hasOwnProperty.call(__lsmValues, key) ? __lsmValues[key] : (n.value || "");
   }, function (v) {
@@ -299,9 +358,12 @@ function __mk(n) {
   define("parentElement", function () { return el.parentNode; }, function (v) {});
   define("children", function () {
     var out = [];
-    for (var i = 0; i < __lsmNodes.length; i++) {
-      if (__lsmNodes[i].parent === n.i) out.push(__mk(__lsmNodes[i]));
+    if (!htmlCleared) {
+      for (var i = 0; i < __lsmNodes.length; i++) {
+        if (__lsmNodes[i].parent === n.i) out.push(__mk(__lsmNodes[i]));
+      }
     }
+    for (var d = 0; d < dynKids.length; d++) out.push(dynKids[d]);
     return out;
   }, function (v) {});
   define("childNodes", function () { return el.children; }, function (v) {});
@@ -317,11 +379,22 @@ function __mk(n) {
     __push({ type: "set_text", selector: n.sel, value: String(v) });
   });
   define("innerText", function () { return el.textContent; }, function (v) { el.textContent = v; });
+  // className 反射到 class 属性:站点普遍 `el.className = "x"` 改样式,
+  // 不回传宿主的话序列化 DOM 永远拿不到改后的类名(百度地图节日主题即如此)。
+  define("className", function () {
+    return Object.prototype.hasOwnProperty.call(attrs, "class") ? String(attrs["class"]) : String(n.class || "");
+  }, function (v) {
+    attrs["class"] = String(v);
+    __push({ type: "set_attr", selector: n.sel, key: "class", value: String(v) });
+  });
   define("innerHTML", function () {
     return Object.prototype.hasOwnProperty.call(__lsmText, key) ? __lsmText[key] : (n.attrs && n.attrs.outer_html ? n.attrs.outer_html : n.text || "");
   }, function (v) {
     var s = String(v);
     __lsmText[key] = s;
+    // 本地视角:清空既有子节点(innerHTML=""),覆盖层同步清空。
+    htmlCleared = true;
+    dynKids.length = 0;
     __push({ type: "set_html", selector: n.sel, value: s });
   });
   define("outerHTML", function () {
@@ -345,6 +418,8 @@ function __mk(n) {
     __push({ type: "set_attr", selector: n.sel, key: "style", value: css });
     attrs.style = css;
   });
+  // ownerDocument 指向 document(document.defaultView → window 在 window 创建后统一回填)。
+  el.ownerDocument = document;
   return el;
 }
 
@@ -384,6 +459,14 @@ function __newEl(tag) {
       if (i >= 0) this.__kids.splice(i, 1);
       return c;
     },
+    insertAdjacentHTML: function (pos, html) {
+      var p = String(pos || "beforeend").toLowerCase();
+      var pseudo = __newEl("div");
+      pseudo.__text = String(html == null ? "" : html);
+      if (p === "afterbegin" && this.__kids.length) this.insertBefore(pseudo, this.__kids[0]);
+      else this.appendChild(pseudo);
+    },
+    insertAdjacentElement: function (pos, c) { this.appendChild(c); return c; },
     remove: function () {},
     addEventListener: function () {},
     removeEventListener: function () {},
@@ -412,8 +495,45 @@ function __newEl(tag) {
       __push({ type: "set_html", selector: "@created:" + t + ":" + el.__attrs.id, value: String(v) });
     });
   def("textContent", function () { return el.__text; }, function (v) { el.__text = String(v); el.__kids = []; });
+  // 子树查找:detached 元素树上按标签/类收集(消息中心等 widget 对
+  // createElement 建出的子树直接 getElementsByTagName)。
+  el.getElementsByTagName = function (t) {
+    var out = [];
+    var tag = String(t).toLowerCase();
+    (function walk(node) {
+      var ks = node.__kids || [];
+      for (var i = 0; i < ks.length; i++) {
+        var k = ks[i];
+        var kt = String((k.__tag || k.tagName || "")).toLowerCase();
+        if (tag === "*" || kt === tag) out.push(k);
+        walk(k);
+      }
+    })(el);
+    return out;
+  };
+  el.getElementsByClassName = function (c) {
+    var out = [];
+    var cls = String(c);
+    (function walk(node) {
+      var ks = node.__kids || [];
+      for (var i = 0; i < ks.length; i++) {
+        var k = ks[i];
+        var kc = String((k.className != null ? k.className : (k.__attrs && k.__attrs["class"]) || ""));
+        if (cls === "*" || kc.split(/\s+/).indexOf(cls) >= 0) out.push(k);
+        walk(k);
+      }
+    })(el);
+    return out;
+  };
   def("innerText", function () { return el.__text; }, function (v) { el.__text = String(v); el.__kids = []; });
   def("value", function () { return el.__attrs.value || ""; }, function (v) { el.__attrs.value = String(v); });
+  // children 反射 __kids:createElement+appendChild 建出的子树立即被父节点可见
+  // (百度地图 render() 容器 → platform = t.children[0] 链路依赖此语义)。
+  def("children", function () { return el.__kids.slice(); }, function (v) {});
+  def("childNodes", function () { return el.__kids.slice(); }, function (v) {});
+  def("firstChild", function () { return el.__kids.length ? el.__kids[0] : null; }, function (v) {});
+  def("lastChild", function () { return el.__kids.length ? el.__kids[el.__kids.length - 1] : null; }, function (v) {});
+  el.ownerDocument = document;
   return el;
 }
 
@@ -892,6 +1012,9 @@ var getComputedStyle = function (el) { return window.getComputedStyle(el); };
 var matchMedia = function (q) { return window.matchMedia(q); };
 window.self = window; window.top = window; window.parent = window; window.frames = window;
 window.window = window;
+// document.defaultView → window:标准取样式路径 `el.ownerDocument.defaultView
+// .getComputedStyle(el, null)` 的关键一环(IE 的 currentStyle 分支之外的主流路径)。
+document.defaultView = window;
 try {
   Object.defineProperty(window, "location", {
     get: function () { return location; },
@@ -1018,6 +1141,15 @@ function __lsmDispatchDoc(type) {
   return JSON.stringify(res);
 }
 function __lsmReady(state) { document.readyState = String(state); }
+// 宿主侧脚本执行包装:间接 eval(全局作用域)失败时把 e.stack(含行列)回传,
+// 否则只拿到 "TypeError: xxx" 一句,几百 KB 的压缩脚本无从定位。
+function __lsmRunScript(code) {
+  try { (0, eval)(String(code)); return __lsmCollect({ ok: true, value: null }); }
+  catch (e) {
+    var msg = String((e && e.stack) || e);
+    return __lsmCollect({ ok: false, value: null, error: msg });
+  }
+}
 function __lsmBegin() {
   __lsmActions.length = 0;
   __lsmConsole.length = 0;

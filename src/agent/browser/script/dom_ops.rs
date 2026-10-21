@@ -250,6 +250,13 @@ pub fn collect_scripts(doc: &Document, base_url: &str, executed: &mut HashSet<u6
             }
             if let Some(abs) = crate::agent::browser::urlutil::resolve(base_url, &src) {
                 if abs.starts_with("http://") || abs.starts_with("https://") {
+                    // 已执行过的外链不再取回:真实浏览器语义是「每个 script 元素
+                    // 只执行一次」。此前外链从不进 executed,每轮(上限 24 轮)把
+                    // 全部静态外链重新取回重新执行,重复初始化破坏页面启动时序
+                    // (实测百度地图 widget 层因此整层停滞)。
+                    if executed.contains(&fingerprint(&abs)) {
+                        continue;
+                    }
                     if !out.external_urls.contains(&abs) {
                         out.external_urls.push(abs);
                     }
@@ -298,7 +305,8 @@ fn push_inline(
     });
 }
 
-fn fingerprint(s: &str) -> u64 {
+/// 内容/URL 指纹:内联脚本与外链 URL 共用的执行记账键。
+pub(super) fn fingerprint(s: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     s.hash(&mut h);
