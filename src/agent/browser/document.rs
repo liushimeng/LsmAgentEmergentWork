@@ -777,6 +777,16 @@ fn collect_text(node: &NodeRef, out: &mut String, depth: usize) {    if depth > 
     }
 }
 
+/// 元素级可见文本(块级换行 + 折叠空白):`wait` 的 `text` 条件与元素正文判定用。
+///
+/// 与 [`Document::text`] 的差别:只取该元素子树,不含 body 之外的内容;
+/// `script`/`style`/`head` 等跳过(见 `collect_text`)。
+pub fn node_text(node: &NodeRef) -> String {
+    let mut out = String::new();
+    collect_text(node, &mut out, 0);
+    collapse_ws(&out)
+}
+
 pub fn collapse_ws(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut space = false;

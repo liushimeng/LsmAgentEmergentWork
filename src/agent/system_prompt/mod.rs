@@ -1092,6 +1092,9 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
    2002 换 selector/路径重试;2001 网络不可达→确认 URL/重试一次后如实报告;
    3001 渲染/环境缺失→如实告知用户(确定性失败,不要循环重试,不要编造结果);
 5. 效率铁律:页面加载后需等动态内容先 control(control_action=wait, selector=目标元素);
+   wait 是就绪判定原语:state(visible/hidden/attached/detached)判状态、text 判文案是否出现、
+   network_idle 判网络是否静默、js 判页面标志位(如 window.__ready===1),多条件取「与」
+   (例:selector=列表项 + network_idle=800 = 「列表渲染完且无后续请求」);
    中文输入优先 params.use_js=true(React/Vue 受控组件兼容,sendkeys 模式中文可能乱码);
    复杂页面(公众号后台/电商后台)先 inspect(info=elements, selector="body") 探测真实 DOM,
    不要凭 selector 名字硬猜;AI 对话类网站回复等待用 wait(selector=[class*=response],

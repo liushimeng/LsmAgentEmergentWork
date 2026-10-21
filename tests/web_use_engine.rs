@@ -174,6 +174,19 @@ fn route(path: &str, with_headers: bool) -> (&'static str, String, Vec<(String, 
                 .to_string(),
             vec![],
         )
+    } else if path == "/wait-page" {
+        (
+            "200 OK",
+            "<html><head><title>等待页</title></head><body>\
+             <div id=\"result\">合计 42</div>\
+             <div id=\"hidden\" style=\"display:none\">藏起来了</div>\
+             <div id=\"late\">未就绪</div>\
+             <script>window.__ready = 1;\
+             setTimeout(function(){ document.getElementById('late').textContent = '延迟就绪'; }, 1500);</script>\
+             </body></html>"
+                .to_string(),
+            vec![],
+        )
     } else if path == "/js-timer" {
         (
             "200 OK",
@@ -969,6 +982,114 @@ async fn cors_跨域fetch_无头拒绝_有头放行() {
         r2["data"]["result"].as_str().unwrap_or("").starts_with("ok:"),
         "有 CORS 头应放行:{r2}"
     );
+
+    exec(&tool, json!({"action": "close", "page_id": page_id})).await;
+}
+
+// ============ 阶段五第一步:就绪判定原语 ============
+
+#[tokio::test]
+async fn wait_元素状态与文本条件() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebUseTool;
+    let open = exec(
+        &tool,
+        json!({"action": "open", "url": format!("{base}/wait-page"), "mode": "hidden", "reuse": false}),
+    )
+    .await;
+    assert_eq!(open["code"], 0, "{open}");
+    let page_id = open["data"]["page_id"].as_str().unwrap().to_string();
+
+    // 元素可见 + 文本命中 → 立即返回。
+    let ok = exec(
+        &tool,
+        json!({"action": "control", "page_id": page_id, "control_action": "wait",
+                "params": {"selector": "#result", "state": "visible", "text": "合计", "timeout_ms": 3000}}),
+    )
+    .await;
+    assert_eq!(ok["code"], 0, "可见且文本命中应返回:{ok}");
+
+    // hidden:元素存在但不可见。
+    let hid = exec(
+        &tool,
+        json!({"action": "control", "page_id": page_id, "control_action": "wait",
+                "params": {"selector": "#hidden", "state": "hidden", "timeout_ms": 3000}}),
+    )
+    .await;
+    assert_eq!(hid["code"], 0, "隐藏元素应判定为 hidden:{hid}");
+
+    // 修复前 state=hidden 对「不存在的元素」恒为真(元素还没出现就判已隐藏),
+    // 现在必须超时失败。
+    let miss = exec(
+        &tool,
+        json!({"action": "control", "page_id": page_id, "control_action": "wait",
+                "params": {"selector": "#nope", "state": "hidden", "timeout_ms": 800}}),
+    )
+    .await;
+    assert_eq!(miss["code"], 2002, "不存在的元素不应被判为 hidden:{miss}");
+
+    // detached:元素不存在 → 立即成立。
+    let det = exec(
+        &tool,
+        json!({"action": "control", "page_id": page_id, "control_action": "wait",
+                "params": {"selector": "#nope", "state": "detached", "timeout_ms": 800}}),
+    )
+    .await;
+    assert_eq!(det["code"], 0, "detached 应立即成立:{det}");
+
+    exec(&tool, json!({"action": "close", "page_id": page_id})).await;
+}
+
+#[tokio::test]
+async fn wait_js条件与网络静默() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebUseTool;
+    let open = exec(
+        &tool,
+        json!({"action": "open", "url": format!("{base}/wait-page"), "mode": "hidden", "reuse": false}),
+    )
+    .await;
+    assert_eq!(open["code"], 0, "{open}");
+    let page_id = open["data"]["page_id"].as_str().unwrap().to_string();
+
+    // 页面脚本置位的全局量:JS 条件成立。
+    let js = exec(
+        &tool,
+        json!({"action": "control", "page_id": page_id, "control_action": "wait",
+                "params": {"js": "window.__ready === 1", "timeout_ms": 3000}}),
+    )
+    .await;
+    assert_eq!(js["code"], 0, "JS 条件成立应返回:{js}");
+
+    // JS 条件不成立 → 超时失败。
+    let no = exec(
+        &tool,
+        json!({"action": "control", "page_id": page_id, "control_action": "wait",
+                "params": {"js": "window.__never === 1", "timeout_ms": 800}}),
+    )
+    .await;
+    assert_eq!(no["code"], 2002, "JS 条件不成立应超时:{no}");
+
+    // 网络静默:台账无新请求 → 立即返回。
+    let idle = exec(
+        &tool,
+        json!({"action": "control", "page_id": page_id, "control_action": "wait",
+                "params": {"network_idle": 200, "timeout_ms": 3000}}),
+    )
+    .await;
+    assert_eq!(idle["code"], 0, "网络静默应返回:{idle}");
+
+    // 组合条件:元素可见 且 JS 条件成立。
+    let both = exec(
+        &tool,
+        json!({"action": "control", "page_id": page_id, "control_action": "wait",
+                "params": {"selector": "#late", "state": "visible", "js": "window.__ready === 1",
+                            "network_idle": 200, "timeout_ms": 3000}}),
+    )
+    .await;
+    assert_eq!(both["code"], 0, "组合条件应返回:{both}");
 
     exec(&tool, json!({"action": "close", "page_id": page_id})).await;
 }

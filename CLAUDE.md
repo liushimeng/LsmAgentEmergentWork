@@ -127,6 +127,7 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 - **样式引擎（`browser/style/`）**：CSS 解析/级联/继承/单位/媒体查询/自定义属性唯一真源；外链 `<link rel=stylesheet>` 由 `browser/resources.rs` 宿主预取并**原位内联**为 `<style data-lsm-href=...>`（保持级联顺序），布局、渲染、JS `getComputedStyle`、`inspect(stylesheets)` 共用同一份 `ComputedStyle`。
 - **页面模型**：`page_id` 格式 `p_` + 8 位十六进制；窗口/标签页、历史栈、Cookie Jar、localStorage/sessionStorage 全部内存驻留，`close(page_id="all")` 或进程退出即销毁。`open` 支持同 URL/同站复用，`new_tab`/`_blank` 返回 `spawned_page_id`。
 - **JS 引擎**：`JsRuntime` 抽象；阶段一默认 `boa_engine`（纯 Rust，离线可编译），DOM 通过快照桥暴露 `document/window/location/storage`；`rusty_v8` 作为可选目标后端（`v8-backend` 特性），上层接口不变。
+- **页面观察与就绪判定**：`MutationObserver`/`IntersectionObserver`/`ResizeObserver` 在 PRELUDE 层**真实派发**（记账点/选项过滤/子树/旧值/阈值）；宿主侧变更经快照 diff 合成 mutation 记录（Agent 侧动作对页面脚本可见）。`control(wait)` 是就绪判定原语：`selector`+`state`(visible/hidden/attached/detached)、`text`、`js`、`network_idle` 可组合取「与」，超时返 2002。设计见 `docs/自定义浏览器和V8引擎/17-阶段五第一步页面观察与就绪判定设计.md`。
 - **页面能力与安全**：网络请求走本进程 `reqwest`（rustls），沿用 `LAEW_TLS_INSECURE` 与 SSRF 私网拦截；任务锚点 6001 继续在显式 URL 动作入口生效；页面脚本执行、原生窗口、资源加载器分别在阶段二/三/四补齐。
 - **人工介入**：`control(request_human)` 桥接 `human_assist`（桌面原生弹窗 / TUI），返回 0/4001/4002；取消任务同时置位进程级旗标。弹窗实现见 `src/agent/human_ui/`。
 

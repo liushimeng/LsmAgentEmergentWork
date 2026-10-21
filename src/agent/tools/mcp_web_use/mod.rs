@@ -113,7 +113,7 @@ fn open_next_steps() -> Value {
     json!([
         {"step": 1, "action": "control", "control_action": "input_text", "params": {"selector": "输入框选择器", "text": "关键词"}},
         {"step": 2, "action": "control", "control_action": "click", "params": {"selector": "搜索/提交按钮选择器"}},
-        {"step": 3, "action": "control", "control_action": "wait", "params": {"duration_ms": 800}},
+        {"step": 3, "action": "control", "control_action": "wait", "params": {"selector": "结果条目选择器", "state": "visible", "network_idle": 800}},
         {"step": 4, "action": "inspect", "info": "elements", "params": {"selector": "结果条目选择器"}},
     ])
 }
@@ -140,7 +140,10 @@ scroll/navigate/back/forward/reload/wait/eval_js/screenshot/download/set_cookie/
 new_tab/new_window/close_tab/bring_to_front/request_human 等);inspect 观测页面(title/url/text/\
 html/elements/links/forms/cookies/localstorage/network/console/viewport/extract/extract_links/\
 page_state/blockers/screenshot/ocr 等);close 释放页面;sequence/batch 连续执行 ≤24 步;\
-explore 一次做 ≤8 个观测。返回统一信封 {code,message,data}。"
+explore 一次做 ≤8 个观测。\
+wait 是就绪判定原语:可给 selector+state(visible/hidden/attached/detached)、text(元素文本包含)、\
+js(页面表达式为真)、network_idle(网络静默毫秒),多条件取「与」,超时返回 2002。\
+返回统一信封 {code,message,data}。"
     }
 
     fn parameters(&self) -> Value {

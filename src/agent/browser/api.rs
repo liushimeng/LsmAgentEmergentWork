@@ -1359,6 +1359,14 @@ async fn act_set_guard(mgr: &LsmBrowserManager, pid: &str, params: &Value) -> En
     }))
 }
 
+/// 就绪判定:元素状态/文本、页面 JS 表达式、网络静默(可组合,取 AND)。
+///
+/// 阶段五第一步。旧实现只支持 `selector` + `state`,且状态语义有 bug
+/// (`hidden`/`detached` 恒为真)。现在:
+/// - `state`:visible / hidden / attached / detached,语义按标准;
+/// - `text`:元素文本需包含该子串;
+/// - `js`:页面 JS 表达式求值为真(走页面 JS 线程,回退阶段一快照桥);
+/// - `network_idle`/`network_idle_ms`:网络台账静默窗口(毫秒)。
 async fn act_wait(
     mgr: &LsmBrowserManager,
     pid: &str,
@@ -1366,41 +1374,176 @@ async fn act_wait(
     top: &Value,
 ) -> EngineResult<Value> {
     require_page(pid)?;
-    if let Some(selector) = p_str(params, "selector") {
-        let total = timeout_ms(params, top, 30_000).min(120_000);
-        let state = p_str(params, "state").unwrap_or("visible");
-        let started = std::time::Instant::now();
-        loop {
-            let found = {
-                let inner = mgr.inner.lock().await;
-                let Some(tab) = inner.tabs.get(pid) else {
-                    return Err(EngineError::page_not_found(pid));
-                };
-                let doc = Document::parse(&tab.html, &tab.url);
-                match doc.select(selector) {
-                    Ok(nodes) => nodes.first().map(|n| {
-                        state != "visible" || state == "attached" || document::is_visible(n)
-                    }),
-                    Err(e) => return Err(EngineError::action_failed(e)),
-                }
-            };
-            if found == Some(true) {
-                return Ok(json!({"waited_for": selector, "state": state, "elapsed_ms": started.elapsed().as_millis() as u64}));
-            }
-            if started.elapsed().as_millis() as u64 >= total {
-                return Err(EngineError::action_failed(format!("等待元素超时:{selector}"))
-                    .with_data(json!({"elapsed_ms": started.elapsed().as_millis() as u64})));
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
+    let selector = p_str(params, "selector").map(str::to_string);
+    let state = p_str(params, "state")
+        .unwrap_or("visible")
+        .trim()
+        .to_ascii_lowercase();
+    let text_cond = p_str(params, "text").map(str::to_string);
+    let js_cond = p_str(params, "js")
+        .or_else(|| p_str(params, "expression"))
+        .map(str::to_string);
+    // `network_idle` 允许数字(毫秒)或布尔(true = 默认 800ms)。
+    let idle_ms = p_u64(params, "network_idle_ms")
+        .or_else(|| p_u64(params, "idle_ms"))
+        .or_else(|| p_u64(params, "network_idle"))
+        .or_else(|| match params.get("network_idle") {
+            Some(Value::Bool(true)) => Some(800),
+            _ => None,
+        });
+    let total = timeout_ms(params, top, 30_000).min(120_000);
+
+    // 无任何条件:纯等待(旧语义保持)。
+    if selector.is_none() && js_cond.is_none() && idle_ms.is_none() {
+        let ms = p_u64(params, "duration_ms")
+            .or_else(|| p_u64(params, "ms"))
+            .or_else(|| p_u64(params, "wait_ms"))
+            .unwrap_or(500)
+            .min(30_000);
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        return Ok(json!({"slept_ms": ms}));
     }
-    let ms = p_u64(params, "duration_ms")
-        .or_else(|| p_u64(params, "ms"))
-        .or_else(|| p_u64(params, "wait_ms"))
-        .unwrap_or(500)
-        .min(30_000);
-    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-    Ok(json!({"slept_ms": ms}))
+
+    let started = std::time::Instant::now();
+    let mut last = json!({});
+    loop {
+        let mut cond = serde_json::Map::new();
+        let mut ok = true;
+        if let Some(sel) = &selector {
+            let (hit, detail) = check_element_state(mgr, pid, sel, &state, text_cond.as_deref()).await;
+            cond.insert(
+                "element".to_string(),
+                json!({"selector": sel, "state": state, "ok": hit, "detail": detail}),
+            );
+            ok &= hit;
+        }
+        if let Some(expr) = &js_cond {
+            let hit = js_condition(mgr, pid, expr).await;
+            cond.insert("js".to_string(), json!({"expression": expr, "ok": hit}));
+            ok &= hit;
+        }
+        if let Some(idle) = idle_ms {
+            let (hit, ago) = network_idle_state(mgr, pid, idle).await;
+            cond.insert(
+                "network_idle".to_string(),
+                json!({"idle_ms": idle, "ok": hit, "last_request_ms_ago": ago}),
+            );
+            ok &= hit;
+        }
+        if ok {
+            return Ok(json!({
+                "waited_for": selector.clone().unwrap_or_default(),
+                "state": state,
+                "conditions": Value::Object(cond),
+                "elapsed_ms": started.elapsed().as_millis() as u64,
+            }));
+        }
+        last = Value::Object(cond);
+        if started.elapsed().as_millis() as u64 >= total {
+            return Err(
+                EngineError::action_failed(format!("等待超时({total}ms)")).with_data(last)
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// 元素状态 + 文本条件判定。
+///
+/// `attached`=存在;`detached`=不存在;`visible`=存在且可见;`hidden`=存在且不可见。
+async fn check_element_state(
+    mgr: &LsmBrowserManager,
+    pid: &str,
+    selector: &str,
+    state: &str,
+    text_cond: Option<&str>,
+) -> (bool, Value) {
+    let (html, url) = {
+        let inner = mgr.inner.lock().await;
+        let Some(tab) = inner.tabs.get(pid) else {
+            return (false, json!("页面不存在"));
+        };
+        (tab.html.clone(), tab.url.clone())
+    };
+    let doc = Document::parse(&html, &url);
+    let nodes = match doc.select(selector) {
+        Ok(n) => n,
+        Err(e) => return (false, json!(e)),
+    };
+    let first = nodes.first();
+    let exists = first.is_some();
+    let visible = first.map(|n| document::is_visible(n)).unwrap_or(false);
+    let matched = match state {
+        "attached" => exists,
+        "detached" => !exists,
+        "hidden" => exists && !visible,
+        "visible" => exists && visible,
+        // 未知状态按 attached 处理(不静默判真)。
+        _ => exists,
+    };
+    let text_ok = match (text_cond, first) {
+        (Some(needle), Some(node)) => document::node_text(node).contains(needle),
+        (Some(_), None) => false,
+        (None, _) => true,
+    };
+    (matched && text_ok, json!({"exists": exists, "visible": visible, "text_ok": text_ok}))
+}
+
+/// JS 条件判定:表达式包一层 `!!(...)` 取真值。
+///
+/// 优先走页面 JS 线程(持久上下文,能看到页面真实全局态);线程不可用
+/// (`LAEW_WEB_SCRIPT=off` / 超时)回退阶段一快照桥。
+async fn js_condition(mgr: &LsmBrowserManager, pid: &str, expr: &str) -> bool {
+    let script = format!("!!({expr})");
+    if let Some(reply) = js_eval_thread(mgr, pid, &script).await {
+        return reply.outcome.value.trim() == "true";
+    }
+    let inner = mgr.inner.lock().await;
+    let Some(tab) = inner.tabs.get(pid) else {
+        return false;
+    };
+    let doc = Document::parse(&tab.html, &tab.url);
+    let nodes = doc.snapshot_nodes();
+    let empty = empty_map();
+    let meta = JsPageMeta {
+        url: &tab.url,
+        title: &tab.title,
+        cookies: &inner.cookies.header_for(&tab.url).unwrap_or_default(),
+        local_storage: inner
+            .local_storage
+            .get(&urlutil::storage_origin(&tab.url))
+            .unwrap_or(&empty),
+        session_storage: &tab.session_storage,
+        viewport_width: tab.viewport.width,
+        viewport_height: tab.viewport.height,
+        scroll_x: tab.scroll_x,
+        scroll_y: tab.scroll_y,
+        user_agent: &tab.user_agent,
+    };
+    js::eval(&script, &nodes, &meta)
+        .map(|o| o.value.trim() == "true")
+        .unwrap_or(false)
+}
+
+/// 网络静默判定:台账末条请求距今是否已超过静默窗口。
+async fn network_idle_state(
+    mgr: &LsmBrowserManager,
+    pid: &str,
+    idle_ms: u64,
+) -> (bool, Option<u128>) {
+    let inner = mgr.inner.lock().await;
+    let Some(tab) = inner.tabs.get(pid) else {
+        return (false, None);
+    };
+    let now = super::now_ms();
+    match tab.network.last() {
+        Some(rec) => {
+            let ago = now.saturating_sub(rec.at_ms);
+            (ago >= idle_ms as u128, Some(ago))
+        }
+        // 从未发起过请求:无待完成网络,视为已静默。
+        None => (true, None),
+    }
 }
 
 async fn act_eval(

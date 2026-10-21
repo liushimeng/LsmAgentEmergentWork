@@ -27,6 +27,20 @@ var __lsmNow = 0;
 var __lsmTimerRan = 0;
 var __lsmFatal = null;
 var __lsmDispatchResult = { handled: false, defaultPrevented: false };
+// 阶段五第一步:观察者系列(MutationObserver/IntersectionObserver/ResizeObserver)。
+// 站点前端框架普遍靠 MutationObserver 驱动二次渲染,桩实现(回调永不触发)会让
+// 页面停在「等 DOM 变化」状态;这里按标准语义真实派发(见 17 号设计文档)。
+var __lsmMutObservers = [];
+var __lsmMutQueue = [];
+var __lsmIObservers = [];
+var __lsmRObservers = [];
+// 上一轮快照索引:宿主侧变更 diff 的基线(Agent 动作造成的 DOM 变化对页面脚本可见)。
+var __lsmPrevSnap = null;
+// 动态节点自增 uid:快照节点每轮重建包装器,对象同一性跨轮不可用,一律按键比较。
+var __lsmUidSeq = 0;
+var __lsmFlushDepth = 0;
+// 变更序号:观察者只应看到登记之后的变更(seq 守卫)。
+var __lsmMutSeq = 0;
 
 var MAX_ACTIONS = 4096;
 var MAX_CONSOLE = 2048;
@@ -38,7 +52,18 @@ function __clog(level, text) {
 function __cerror(text) { __clog("error", text); }
 
 function __lsmRefresh(nodes, meta) {
-  __lsmNodes = nodes || [];
+  // 宿主侧变更 diff:与上一轮快照比对,合成 mutation 记录。
+  // Agent 侧动作(input_text 写值、click 后 DOM 重建)只体现在快照里,
+  // 页面脚本若无通知就只能轮询;这里把差异翻译成标准 mutation 记录喂给观察者。
+  // 没有观察者时不算 diff(大页面每请求一次全量比对不划算)。
+  var next = nodes || [];
+  var diff = [];
+  if (__lsmActiveObservers() > 0 || __lsmPrevSnap) {
+    var nextIdx = __lsmSnapIndex(next);
+    diff = __lsmDiffSnap(__lsmPrevSnap, nextIdx);
+    __lsmPrevSnap = nextIdx;
+  }
+  __lsmNodes = next;
   __lsmMeta = meta || {};
   __lsmLocal = {};
   var src = __lsmMeta.local || {};
@@ -56,6 +81,7 @@ function __lsmRefresh(nodes, meta) {
   window.pageYOffset = window.scrollY;
   __rebindDocNodes();
   __rebindLocation();
+  __lsmApplyDiff(diff);
   // 注意:这里刻意**不**重置 document.readyState。refresh 只是注入最新 DOM 快照,
   // 页面生命周期状态属于整个页面会话:管线尾部已依序置 interactive/complete,
   // 若每次请求(eval_js/click/input 都会 refresh)都打回 "loading",页面按
@@ -257,10 +283,12 @@ function __mk(n) {
     },
     hasAttribute: function (k) { return Object.prototype.hasOwnProperty.call(attrs, String(k)); },
     setAttribute: function (k, v) {
+      __lsmRec("attributes", el, { attributeName: String(k), attributeOldValue: __lsmAttrOld(attrs, String(k)) });
       __push({ type: "set_attr", selector: n.sel, key: String(k), value: String(v) });
       attrs[String(k)] = String(v);
     },
     removeAttribute: function (k) {
+      __lsmRec("attributes", el, { attributeName: String(k), attributeOldValue: __lsmAttrOld(attrs, String(k)) });
       __push({ type: "remove_attr", selector: n.sel, key: String(k) });
       delete attrs[String(k)];
     },
@@ -310,6 +338,7 @@ function __mk(n) {
     appendChild: function (c) {
       try { __lsmRegisterScriptLoad(c); } catch (e) {}
       if (c) dynKids.push(c);
+      __lsmRec("childList", el, { addedNodes: c ? [c] : [] });
       if (c && c.__detached) __push({ type: "append_html", selector: n.sel, value: __serEl(c) });
       else if (c && c.__lsm_node) __push({ type: "append_html", selector: n.sel, value: String((c.__lsm_node && c.__lsm_node.text) || "") });
       return c;
@@ -320,6 +349,7 @@ function __mk(n) {
         var at = dynKids.indexOf(ref);
         if (at >= 0) dynKids.splice(at, 0, c); else dynKids.push(c);
       }
+      __lsmRec("childList", el, { addedNodes: c ? [c] : [] });
       var html = "";
       try { html = (c && c.__detached) ? __serEl(c) : String((c && c.__lsm_node && c.__lsm_node.text) || ""); }
       catch (e) { html = ""; }
@@ -329,10 +359,15 @@ function __mk(n) {
     removeChild: function (c) {
       var ri = dynKids.indexOf(c);
       if (ri >= 0) dynKids.splice(ri, 1);
+      __lsmRec("childList", el, { removedNodes: c ? [c] : [] });
       if (c && c.__lsm_node) __push({ type: "remove_node", selector: c.__lsm_node.sel });
       return c;
     },
-    remove: function () { __push({ type: "remove_node", selector: n.sel }); },
+    remove: function () {
+      var parent = el.parentNode;
+      __lsmRec("childList", parent || el, { removedNodes: [el] });
+      __push({ type: "remove_node", selector: n.sel });
+    },
     insertAdjacentHTML: function (pos, html) {
       var p = String(pos || "beforeend").toLowerCase();
       var h = String(html == null ? "" : html);
@@ -340,12 +375,36 @@ function __mk(n) {
       // 立即可读可写(co 辅助函数 `insertAdjacentHTML + lastChild` 模式)。
       var pseudo = __newEl("div");
       pseudo.__pendingHtml = h;
+      __lsmRec("childList", el, { addedNodes: [pseudo] });
       if (p === "afterbegin") { dynKids.unshift(pseudo); __push({ type: "insert_html", selector: n.sel, value: h }); }
       else { dynKids.push(pseudo); __push({ type: "append_html", selector: n.sel, value: h }); }
     },
     insertAdjacentElement: function (pos, c) { this.appendChild(c); return c; },
     insertAdjacentText: function (pos, text) {
       this.insertAdjacentHTML(pos, "<span>" + String(text == null ? "" : text) + "</span>");
+    },
+    // append/prepend:站点常用(缺了直接抛 "not a callable function" 打断整段脚本,
+    // 实测 example.com 的 s.js 就卡在 `B.prepend(p)`)。
+    append: function () {
+      var kids = Array.prototype.slice.call(arguments);
+      for (var i = 0; i < kids.length; i++) {
+        dynKids.push(kids[i]);
+        __lsmInsertChild(el, n.sel, kids[i], false);
+      }
+    },
+    prepend: function () {
+      var kids = Array.prototype.slice.call(arguments);
+      for (var i = kids.length - 1; i >= 0; i--) {
+        dynKids.unshift(kids[i]);
+        __lsmInsertChild(el, n.sel, kids[i], true);
+      }
+    },
+    replaceChildren: function () {
+      htmlCleared = true;
+      dynKids.length = 0;
+      __lsmRec("childList", el, {});
+      var kids = Array.prototype.slice.call(arguments);
+      for (var i = 0; i < kids.length; i++) __lsmInsertChild(el, n.sel, kids[i], false);
     },
     cloneNode: function () { return el; }
   };
@@ -378,12 +437,14 @@ function __mk(n) {
     return Object.prototype.hasOwnProperty.call(__lsmValues, key) ? __lsmValues[key] : (n.value || "");
   }, function (v) {
     __lsmValues[key] = String(v);
+    __lsmRec("attributes", el, { attributeName: "value", attributeOldValue: n.value || "" });
     __push({ type: "set_value", selector: n.sel, value: String(v) });
   });
   define("checked", function () {
     return Object.prototype.hasOwnProperty.call(__lsmChecked, key) ? __lsmChecked[key] : !!n.checked;
   }, function (v) {
     __lsmChecked[key] = !!v;
+    __lsmRec("attributes", el, { attributeName: "checked", attributeOldValue: n.checked ? "true" : "false" });
     __push({ type: "set_checked", selector: n.sel, value: v ? "true" : "false" });
   });
   // 真实的父子关系:站点脚本常走 `el.parentNode.insertBefore(...)` 这类路径,
@@ -415,6 +476,7 @@ function __mk(n) {
     return Object.prototype.hasOwnProperty.call(__lsmText, key) ? __lsmText[key] : (n.text || "");
   }, function (v) {
     __lsmText[key] = String(v);
+    __lsmRec("characterData", el, { oldValue: n.text || "" });
     __push({ type: "set_text", selector: n.sel, value: String(v) });
   });
   define("innerText", function () { return el.textContent; }, function (v) { el.textContent = v; });
@@ -423,6 +485,7 @@ function __mk(n) {
   define("className", function () {
     return Object.prototype.hasOwnProperty.call(attrs, "class") ? String(attrs["class"]) : String(n.class || "");
   }, function (v) {
+    __lsmRec("attributes", el, { attributeName: "class", attributeOldValue: __lsmAttrOld(attrs, "class") });
     attrs["class"] = String(v);
     __push({ type: "set_attr", selector: n.sel, key: "class", value: String(v) });
   });
@@ -434,6 +497,7 @@ function __mk(n) {
     // 本地视角:清空既有子节点(innerHTML=""),覆盖层同步清空。
     htmlCleared = true;
     dynKids.length = 0;
+    __lsmRec("childList", el, {});
     __push({ type: "set_html", selector: n.sel, value: s });
   });
   define("outerHTML", function () {
@@ -453,6 +517,7 @@ function __mk(n) {
   });
   var styleCss = attrs.style || "";
   el.style = __mkStyle(function () { return styleCss; }, function (css) {
+    __lsmRec("attributes", el, { attributeName: "style", attributeOldValue: styleCss });
     styleCss = css;
     __push({ type: "set_attr", selector: n.sel, key: "style", value: css });
     attrs.style = css;
@@ -466,6 +531,8 @@ function __newEl(tag) {
   var t = String(tag || "div").toLowerCase();
   var el = {
     __detached: true,
+    // 动态节点稳定键:快照节点用索引(s<i>),动态节点用自增 uid(d<uid>)。
+    __lsmUid: ++__lsmUidSeq,
     __tag: t,
     __attrs: {},
     __kids: [],
@@ -485,23 +552,32 @@ function __newEl(tag) {
     clientLeft: 0, clientTop: 0,
     children: [],
     childNodes: [],
-    setAttribute: function (k, v) { this.__attrs[String(k)] = String(v); if (k === "id") this.id = String(v); if (k === "class") this.className = String(v); },
+    setAttribute: function (k, v) {
+      __lsmRec("attributes", el, { attributeName: String(k), attributeOldValue: __lsmAttrOld(this.__attrs, String(k)) });
+      this.__attrs[String(k)] = String(v); if (k === "id") this.id = String(v); if (k === "class") this.className = String(v);
+    },
     getAttribute: function (k) { return Object.prototype.hasOwnProperty.call(this.__attrs, String(k)) ? this.__attrs[String(k)] : null; },
     hasAttribute: function (k) { return Object.prototype.hasOwnProperty.call(this.__attrs, String(k)); },
-    removeAttribute: function (k) { delete this.__attrs[String(k)]; },
+    removeAttribute: function (k) {
+      __lsmRec("attributes", el, { attributeName: String(k), attributeOldValue: __lsmAttrOld(this.__attrs, String(k)) });
+      delete this.__attrs[String(k)];
+    },
     appendChild: function (c) {
       this.__kids.push(c);
       try { __lsmRegisterScriptLoad(c); } catch (e) {}
+      __lsmRec("childList", el, { addedNodes: c ? [c] : [] });
       return c;
     },
     insertBefore: function (c) {
       this.__kids.push(c);
       try { __lsmRegisterScriptLoad(c); } catch (e) {}
+      __lsmRec("childList", el, { addedNodes: c ? [c] : [] });
       return c;
     },
     removeChild: function (c) {
       var i = this.__kids.indexOf(c);
       if (i >= 0) this.__kids.splice(i, 1);
+      __lsmRec("childList", el, { removedNodes: c ? [c] : [] });
       return c;
     },
     insertAdjacentHTML: function (pos, html) {
@@ -512,6 +588,32 @@ function __newEl(tag) {
       else this.appendChild(pseudo);
     },
     insertAdjacentElement: function (pos, c) { this.appendChild(c); return c; },
+    // 动态节点的 append/prepend:只进本地子树(未挂载,宿主无处落地)。
+    append: function () {
+      var kids = Array.prototype.slice.call(arguments);
+      for (var i = 0; i < kids.length; i++) {
+        this.__kids.push(kids[i]);
+        try { __lsmRegisterScriptLoad(kids[i]); } catch (e) {}
+        __lsmRec("childList", el, { addedNodes: [kids[i]] });
+      }
+    },
+    prepend: function () {
+      var kids = Array.prototype.slice.call(arguments);
+      for (var i = kids.length - 1; i >= 0; i--) {
+        this.__kids.unshift(kids[i]);
+        try { __lsmRegisterScriptLoad(kids[i]); } catch (e) {}
+        __lsmRec("childList", el, { addedNodes: [kids[i]] });
+      }
+    },
+    replaceChildren: function () {
+      el.__kids = [];
+      __lsmRec("childList", el, {});
+      var kids = Array.prototype.slice.call(arguments);
+      for (var i = 0; i < kids.length; i++) {
+        this.__kids.push(kids[i]);
+        __lsmRec("childList", el, { addedNodes: [kids[i]] });
+      }
+    },
     remove: function () {},
     addEventListener: function () {},
     removeEventListener: function () {},
@@ -542,10 +644,14 @@ function __newEl(tag) {
     // 元素未入树:宿主端 @created set_html 无处落地,内容存 __pendingHtml,
     // 挂载时随序列化原样带到宿主(见 __serEl)。
     el.__pendingHtml = String(v);
+    __lsmRec("childList", el, {});
     __push({ type: "set_html", selector: "@created:" + t + ":" + el.__attrs.id, value: String(v) });
   });
   def("textContent", function () { return el.__pendingHtml != null ? el.__pendingHtml : el.__text; },
-    function (v) { el.__text = String(v); el.__kids = []; el.__pendingHtml = null; });
+    function (v) {
+      __lsmRec("characterData", el, { oldValue: el.__text || "" });
+      el.__text = String(v); el.__kids = []; el.__pendingHtml = null;
+    });
   // 子树查找:detached 元素树上按标签/类收集(消息中心等 widget 对
   // createElement 建出的子树直接 getElementsByTagName)。
   el.getElementsByTagName = function (t) {
@@ -807,6 +913,8 @@ function __lsmTick() {
     }
     if (ran >= 64) break;
   }
+  // 定时器批次后派发观察者:rAF/定时器驱动的 SPA 靠 MutationObserver 推进状态。
+  __lsmFlushObservers();
   return JSON.stringify({ pending: __lsmTimers.length, ran: ran });
 }
 
@@ -1143,6 +1251,516 @@ function __fireDocument(type) {
   return { handled: handled, defaultPrevented: prevented };
 }
 
+// ---------- 观察者系列(阶段五第一步) ----------
+// 站点前端框架(Vue/React/Ant Design/Element)普遍用 MutationObserver 驱动
+// 二次渲染;此前 env_js 里的桩实现回调永不触发,页面会停在「等 DOM 变化」状态。
+// 这里按标准语义真实派发:节点稳定键 → 记账 → 选项过滤 → 微任务检查点投递。
+// 设计见 docs/自定义浏览器和V8引擎/17-阶段五第一步页面观察与就绪判定设计.md
+
+// 节点稳定键:快照节点按索引(s<i>),动态节点按自增 uid(d<uid>)。
+// 快照每轮 refresh 重建包装器,对象同一性跨轮不可用,一律按键比较。
+function __lsmKey(node) {
+  if (!node) return null;
+  if (node.__lsm_node && typeof node.__lsm_node.i === "number") return "s" + node.__lsm_node.i;
+  if (typeof node.__lsmUid === "number") return "d" + node.__lsmUid;
+  return null;
+}
+// 属性旧值(不存在时为 null,对齐标准 attributeOldValue 语义)。
+function __lsmAttrOld(attrs, key) {
+  if (!attrs) return null;
+  return Object.prototype.hasOwnProperty.call(attrs, key) ? attrs[key] : null;
+}
+// 动态节点子树包含(快照树用索引链上溯,动态树用 __kids 递归)。
+function __lsmDetachedHas(root, node) {
+  var kids = root.__kids || [];
+  for (var i = 0; i < kids.length; i++) {
+    if (kids[i] === node) return true;
+    if (__lsmDetachedHas(kids[i], node)) return true;
+  }
+  return false;
+}
+function __lsmIsDescendant(node, root) {
+  if (!node || !root) return false;
+  var nk = __lsmKey(node), rk = __lsmKey(root);
+  if (!nk || !rk) return node === root;
+  if (nk === rk) return true;
+  if (nk.charAt(0) === "s" && rk.charAt(0) === "s") {
+    var idx = Number(nk.slice(1));
+    var rid = Number(rk.slice(1));
+    var guard = 0;
+    while (idx >= 0 && idx < __lsmNodes.length && guard++ < 128) {
+      var p = __lsmNodes[idx].parent;
+      if (p == null || p < 0 || p >= __lsmNodes.length) break;
+      if (p === rid) return true;
+      idx = p;
+    }
+    return false;
+  }
+  if (nk.charAt(0) === "d" && rk.charAt(0) === "d") return __lsmDetachedHas(root, node);
+  return false;
+}
+// 快照节点的选择器(稳定选择器,如 "#box"):跨 refresh 稳定,索引会漂移。
+function __lsmNodeSel(node) {
+  if (node && node.__lsm_node && node.__lsm_node.sel) return String(node.__lsm_node.sel);
+  return null;
+}
+// 按选择器在当前快照里找活节点:观察者持有的是旧包装器(矩形已过期),
+// 每次判定都要重新解析,否则尺寸/相交永远停在首次观察的值。
+function __lsmResolve(node) {
+  var sel = __lsmNodeSel(node);
+  if (!sel) return node;
+  for (var i = 0; i < __lsmNodes.length; i++) {
+    if (String(__lsmNodes[i].sel || "") === sel) return __mk(__lsmNodes[i]);
+  }
+  return node;
+}
+// 祖先链里是否含指定选择器(子树判定,按选择器而非索引)。
+function __lsmHasAncestorSel(node, sel) {
+  var idx = node && node.__lsm_node ? node.__lsm_node.i : -1;
+  var guard = 0;
+  while (idx >= 0 && idx < __lsmNodes.length && guard++ < 128) {
+    if (String(__lsmNodes[idx].sel || "") === sel) return true;
+    var p = __lsmNodes[idx].parent;
+    if (p == null || p < 0 || p >= __lsmNodes.length) break;
+    idx = p;
+  }
+  return false;
+}
+// 快照节点的 HTML 近似(属性 + 文本):append/prepend 移动快照节点时用。
+function __lsmNodeHtml(n) {
+  if (!n) return "";
+  var tag = String(n.tag || "div").toLowerCase();
+  var attrs = n.attrs || {};
+  var out = "<" + tag;
+  for (var k in attrs) {
+    if (!Object.prototype.hasOwnProperty.call(attrs, k)) continue;
+    out += " " + k + '="' + String(attrs[k] == null ? "" : attrs[k]).replace(/"/g, "&quot;") + '"';
+  }
+  out += ">" + String(n.text || "") + "</" + tag + ">";
+  return out;
+}
+// 子节点插入统一记账:动态节点带序列化 HTML;快照节点按「移动」处理
+// (先摘除原节点再插副本),否则同一节点会在 DOM 里出现两次。
+function __lsmInsertChild(el, targetSel, child, first) {
+  if (!child) return;
+  try { __lsmRegisterScriptLoad(child); } catch (e) {}
+  var html = "";
+  if (child.__detached) {
+    html = __serEl(child);
+  } else if (child.__lsm_node) {
+    html = __lsmNodeHtml(child.__lsm_node);
+    __push({ type: "remove_node", selector: child.__lsm_node.sel });
+  }
+  __lsmRec("childList", el, { addedNodes: [child] });
+  if (first) __push({ type: "insert_html", selector: targetSel, value: html });
+  else __push({ type: "append_html", selector: targetSel, value: html });
+}
+// 变更记账:统一入口,队列上限 4096(超出丢最旧)。
+function __lsmRec(type, target, extra) {
+  extra = extra || {};
+  var rec = {
+    type: String(type),
+    target: target || null,
+    addedNodes: extra.addedNodes || [],
+    removedNodes: extra.removedNodes || [],
+    attributeName: extra.attributeName == null ? null : String(extra.attributeName),
+    attributeOldValue: extra.attributeOldValue == null ? null : extra.attributeOldValue,
+    oldValue: extra.oldValue == null ? null : extra.oldValue,
+    timeStamp: __lsmNow,
+    seq: ++__lsmMutSeq
+  };
+  __lsmMutQueue.push(rec);
+  if (__lsmMutQueue.length > 4096) __lsmMutQueue.shift();
+  return rec;
+}
+
+// ---- 宿主侧变更 diff:上一轮快照 ↔ 本轮快照 ----
+function __lsmSnapIndex(nodes) {
+  var counts = {};
+  var map = {};
+  for (var i = 0; i < nodes.length; i++) {
+    var p = nodes[i].parent;
+    if (p != null && p >= 0) counts[p] = (counts[p] || 0) + 1;
+  }
+  for (var j = 0; j < nodes.length; j++) {
+    var n = nodes[j];
+    map["s" + n.i] = {
+      i: n.i, parent: n.parent,
+      attrs: n.attrs || {},
+      text: n.text || "",
+      value: n.value || "",
+      checked: !!n.checked,
+      kids: counts[n.i] || 0
+    };
+  }
+  return map;
+}
+function __lsmDiffSnap(prev, next) {
+  var out = [];
+  if (!prev) return out;
+  for (var key in next) {
+    if (!Object.prototype.hasOwnProperty.call(next, key)) continue;
+    var cur = next[key], old = prev[key];
+    if (!old) {
+      // 新节点:挂到父节点上算一次 childList。
+      var pid = cur.parent;
+      if (pid != null && pid >= 0) out.push({ type: "childList", target: pid });
+      continue;
+    }
+    for (var ak in cur.attrs) {
+      if (!Object.prototype.hasOwnProperty.call(cur.attrs, ak)) continue;
+      var ov = __lsmAttrOld(old.attrs, ak);
+      if (ov !== cur.attrs[ak]) {
+        out.push({ type: "attributes", target: cur.i, attributeName: ak, oldValue: ov });
+      }
+    }
+    for (var bk in old.attrs) {
+      if (!Object.prototype.hasOwnProperty.call(old.attrs, bk)) continue;
+      if (!Object.prototype.hasOwnProperty.call(cur.attrs, bk)) {
+        out.push({ type: "attributes", target: cur.i, attributeName: bk, oldValue: old.attrs[bk] });
+      }
+    }
+    if (old.text !== cur.text) {
+      out.push({ type: "characterData", target: cur.i, oldValue: old.text });
+    }
+    if (old.kids !== cur.kids) {
+      out.push({ type: "childList", target: cur.i });
+    }
+  }
+  return out;
+}
+function __lsmApplyDiff(diff) {
+  for (var i = 0; i < diff.length; i++) {
+    var d = diff[i];
+    var node = __lsmNodes[d.target];
+    if (!node) continue;
+    var el = __mk(node);
+    if (d.type === "attributes") {
+      __lsmRec("attributes", el, { attributeName: d.attributeName, attributeOldValue: d.oldValue });
+    } else if (d.type === "characterData") {
+      __lsmRec("characterData", el, { oldValue: d.oldValue });
+    } else {
+      __lsmRec("childList", el, {});
+    }
+  }
+}
+
+// 活跃观察者计数(登记了目标且未 disconnect):决定是否维护快照 diff 基线。
+function __lsmActiveObservers() {
+  var n = 0;
+  for (var i = 0; i < __lsmMutObservers.length; i++) {
+    if (__lsmMutObservers[i]._targets.length > 0) n++;
+  }
+  return n;
+}
+
+// ---- MutationObserver ----
+function MutationObserver(cb) {
+  if (!(this instanceof MutationObserver)) throw new TypeError("MutationObserver 需要 new 构造");
+  this._cb = (typeof cb === "function") ? cb : function () {};
+  this._records = [];
+  this._targets = [];
+  __lsmMutObservers.push(this);
+}
+MutationObserver.prototype.observe = function (target, options) {
+  if (!target) throw new TypeError("observe 需要目标元素");
+  options = options || {};
+  // 首个观察者登记时建立 diff 基线:从此刻起的宿主侧变化才可见。
+  if (!__lsmPrevSnap) __lsmPrevSnap = __lsmSnapIndex(__lsmNodes);
+  var filter = options.attributeFilter || null;
+  if (filter && !filter.length) filter = null;
+  // 标准语义:attributes 仅在显式 true,或给出 attributeFilter/attributeOldValue 时开启。
+  var wantAttrs = (options.attributes === true) ||
+    (options.attributes !== false && (filter || options.attributeOldValue === true));
+  this._targets.push({
+    node: target,
+    key: __lsmKey(target),
+    sel: __lsmNodeSel(target),
+    sinceSeq: __lsmMutSeq,
+    childList: options.childList !== false,
+    attributes: wantAttrs,
+    characterData: options.characterData === true || options.characterDataOldValue === true,
+    subtree: options.subtree === true,
+    filter: filter,
+    attributeOldValue: options.attributeOldValue === true,
+    characterDataOldValue: options.characterDataOldValue === true
+  });
+};
+MutationObserver.prototype.disconnect = function () {
+  this._targets.length = 0;
+  this._records.length = 0;
+  // 没有观察者时不再维护 diff 基线(大页面每请求全量比对不划算)。
+  if (__lsmActiveObservers() === 0) __lsmPrevSnap = null;
+};
+MutationObserver.prototype.takeRecords = function () {
+  var r = this._records;
+  this._records = [];
+  return r;
+};
+function __lsmMutMatches(obs, rec) {  for (var t = 0; t < obs._targets.length; t++) {
+    var o = obs._targets[t];
+    if (!o.key) continue;
+    var rk = __lsmKey(rec.target);
+    if (!rk) continue;
+    // 观察者只应看到登记之后的变更。
+    if (rec.seq < o.sinceSeq) continue;
+    var hit = (o.key === rk);
+    // 索引会随 DOM 变化漂移,选择器才是稳定身份。
+    if (!hit && o.sel && o.sel === __lsmNodeSel(rec.target)) hit = true;
+    if (!hit && o.subtree) {
+      if (o.sel && __lsmHasAncestorSel(rec.target, o.sel)) hit = true;
+      else if (!o.sel && __lsmIsDescendant(rec.target, o.node)) hit = true;
+    }
+    if (!hit) continue;
+    if (rec.type === "attributes") {
+      if (!o.attributes) continue;
+      if (o.filter && o.filter.indexOf(rec.attributeName) < 0) continue;
+    } else if (rec.type === "characterData") {
+      if (!o.characterData) continue;
+    } else if (rec.type === "childList") {
+      if (!o.childList) continue;
+    } else {
+      continue;
+    }
+    return true;
+  }
+  return false;
+}
+// 微任务检查点:把队列里的记录按观察者选项过滤后投递。
+// 递归上限 8 轮 / 单轮 32 批:回调再改 DOM 也不许自激死循环。
+function __lsmFlushMutations() {
+  if (__lsmFlushDepth > 8) { __lsmMutQueue.length = 0; return 0; }
+  __lsmFlushDepth++;
+  var fired = 0;
+  try {
+    var guard = 0;
+    while (__lsmMutQueue.length > 0 && guard++ < 32) {
+      var batch = __lsmMutQueue;
+      __lsmMutQueue = [];
+      for (var o = 0; o < __lsmMutObservers.length; o++) {
+        var obs = __lsmMutObservers[o];
+        if (!obs._targets.length) continue;
+        var matched = [];
+        for (var r = 0; r < batch.length; r++) {
+          if (__lsmMutMatches(obs, batch[r])) matched.push(batch[r]);
+        }
+        if (!matched.length) continue;
+        for (var m = 0; m < matched.length; m++) obs._records.push(matched[m]);
+        var recs = obs._records;
+        obs._records = [];
+        fired++;
+        try { obs._cb(recs, obs); }
+        catch (e) { __cerror("MutationObserver 回调失败: " + String((e && e.stack) || e)); }
+      }
+    }
+  } finally { __lsmFlushDepth--; }
+  return fired;
+}
+
+// ---- IntersectionObserver / ResizeObserver 公共件 ----
+function __lsmThresholds(v) {
+  var out = [];
+  if (typeof v === "number" && isFinite(v)) out.push(v);
+  else if (v && v.length) {
+    for (var i = 0; i < v.length; i++) {
+      var n = Number(v[i]);
+      if (isFinite(n)) out.push(n);
+    }
+  }
+  if (!out.length) out.push(0);
+  out.sort(function (a, b) { return a - b; });
+  return out;
+}
+function __lsmCrossed(thresholds, prev, cur) {
+  for (var i = 0; i < thresholds.length; i++) {
+    var t = thresholds[i];
+    if ((prev < t && cur >= t) || (prev >= t && cur < t)) return true;
+  }
+  return false;
+}
+function __lsmRectOf(node) {
+  try {
+    if (node && typeof node.getBoundingClientRect === "function") return node.getBoundingClientRect();
+  } catch (e) {}
+  return null;
+}
+function __lsmIntersect(a, b) {
+  var l = Math.max(a.left, b.left), t = Math.max(a.top, b.top);
+  var r = Math.min(a.right, b.right), bo = Math.min(a.bottom, b.bottom);
+  if (r <= l || bo <= t) return null;
+  return { left: l, top: t, right: r, bottom: bo, width: r - l, height: bo - t };
+}
+
+// ---- IntersectionObserver ----
+function IntersectionObserver(cb, options) {
+  if (!(this instanceof IntersectionObserver)) throw new TypeError("IntersectionObserver 需要 new 构造");
+  this._cb = (typeof cb === "function") ? cb : function () {};
+  this._options = options || {};
+  this._targets = [];
+  this._records = [];
+  __lsmIObservers.push(this);
+}
+IntersectionObserver.prototype.observe = function (target) {
+  if (!target) return;
+  var key = __lsmKey(target);
+  for (var i = 0; i < this._targets.length; i++) {
+    if (this._targets[i].key === key) return;
+  }
+  this._targets.push({
+    node: target, key: key, sel: __lsmNodeSel(target),
+    thresholds: __lsmThresholds(this._options.threshold),
+    prevRatio: 0, prevIntersecting: false, hasPrev: false
+  });
+};
+IntersectionObserver.prototype.unobserve = function (target) {
+  var key = __lsmKey(target);
+  this._targets = this._targets.filter(function (t) { return t.key !== key; });
+};
+IntersectionObserver.prototype.disconnect = function () {
+  this._targets.length = 0;
+  this._records.length = 0;
+};
+IntersectionObserver.prototype.takeRecords = function () {
+  var r = this._records;
+  this._records = [];
+  return r;
+};
+function __lsmFlushIntersection() {
+  if (!__lsmIObservers.length) return 0;
+  var vw = Number(window.innerWidth) || 1280, vh = Number(window.innerHeight) || 720;
+  var sx = Number(__lsmMeta.scrollX) || 0, sy = Number(__lsmMeta.scrollY) || 0;
+  // 布局矩形是文档坐标,视口矩形按滚动偏移换算到文档坐标后再求交。
+  var rootRect = { left: sx, top: sy, right: sx + vw, bottom: sy + vh, width: vw, height: vh };
+  var fired = 0;
+  for (var o = 0; o < __lsmIObservers.length; o++) {
+    var obs = __lsmIObservers[o];
+    var entries = [];
+    for (var t = 0; t < obs._targets.length; t++) {
+      var tg = obs._targets[t];
+      // 解析活节点:观察者持有的是旧包装器,矩形会停在首次观察的值。
+      var live = __lsmResolve(tg.node);
+      var rect = __lsmRectOf(live);
+      if (!rect) continue;
+      var inter = __lsmIntersect(rect, rootRect);
+      var area = (rect.width || 0) * (rect.height || 0);
+      var ratio = 0;
+      if (inter) ratio = area > 0 ? ((inter.width * inter.height) / area) : 1;
+      var intersecting = inter != null;
+      var changed = !tg.hasPrev || tg.prevIntersecting !== intersecting ||
+        __lsmCrossed(tg.thresholds, tg.prevRatio, ratio);
+      if (!changed) continue;
+      tg.prevRatio = ratio;
+      tg.prevIntersecting = intersecting;
+      tg.hasPrev = true;
+      entries.push({
+        target: live,
+        isIntersecting: intersecting,
+        intersectionRatio: ratio,
+        boundingClientRect: rect,
+        intersectionRect: inter || { left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 },
+        rootBounds: rootRect,
+        time: __lsmNow
+      });
+    }
+    if (!entries.length) continue;
+    for (var e = 0; e < entries.length; e++) obs._records.push(entries[e]);
+    var recs = obs._records;
+    obs._records = [];
+    fired++;
+    try { obs._cb(recs, obs); }
+    catch (e2) { __cerror("IntersectionObserver 回调失败: " + String((e2 && e2.stack) || e2)); }
+  }
+  return fired;
+}
+
+// ---- ResizeObserver ----
+function ResizeObserver(cb) {
+  if (!(this instanceof ResizeObserver)) throw new TypeError("ResizeObserver 需要 new 构造");
+  this._cb = (typeof cb === "function") ? cb : function () {};
+  this._targets = [];
+  this._records = [];
+  __lsmRObservers.push(this);
+}
+ResizeObserver.prototype.observe = function (target) {
+  if (!target) return;
+  var key = __lsmKey(target);
+  for (var i = 0; i < this._targets.length; i++) {
+    if (this._targets[i].key === key) return;
+  }
+  this._targets.push({ node: target, key: key, sel: __lsmNodeSel(target), prevW: null, prevH: null });
+};
+ResizeObserver.prototype.unobserve = function (target) {
+  var key = __lsmKey(target);
+  this._targets = this._targets.filter(function (t) { return t.key !== key; });
+};
+ResizeObserver.prototype.disconnect = function () {
+  this._targets.length = 0;
+  this._records.length = 0;
+};
+ResizeObserver.prototype.takeRecords = function () {
+  var r = this._records;
+  this._records = [];
+  return r;
+};
+function __lsmFlushResize() {
+  if (!__lsmRObservers.length) return 0;
+  var fired = 0;
+  for (var o = 0; o < __lsmRObservers.length; o++) {
+    var obs = __lsmRObservers[o];
+    var entries = [];
+    for (var t = 0; t < obs._targets.length; t++) {
+      var tg = obs._targets[t];
+      // 解析活节点:尺寸判定必须用当前快照的矩形。
+      var live = __lsmResolve(tg.node);
+      var rect = __lsmRectOf(live);
+      if (!rect) continue;
+      var w = rect.width || 0, h = rect.height || 0;
+      if (tg.prevW === null) {
+        // 首次观察:与标准一致给一条初始尺寸记录。
+        tg.prevW = w; tg.prevH = h;
+        entries.push(__lsmResizeEntry(live, rect, w, h));
+        continue;
+      }
+      if (tg.prevW === w && tg.prevH === h) continue;
+      tg.prevW = w; tg.prevH = h;
+      entries.push(__lsmResizeEntry(live, rect, w, h));
+    }
+    if (!entries.length) continue;
+    for (var e = 0; e < entries.length; e++) obs._records.push(entries[e]);
+    var recs = obs._records;
+    obs._records = [];
+    fired++;
+    try { obs._cb(recs, obs); }
+    catch (e2) { __cerror("ResizeObserver 回调失败: " + String((e2 && e2.stack) || e2)); }
+  }
+  return fired;
+}
+function __lsmResizeEntry(target, rect, w, h) {
+  var contentRect = { x: rect.left || 0, y: rect.top || 0, width: w, height: h };
+  var box = [{ inlineSize: w, blockSize: h }];
+  return {
+    target: target,
+    contentRect: contentRect,
+    borderBoxSize: box,
+    contentBoxSize: box,
+    devicePixelContentBoxSize: [{ inlineSize: w, blockSize: h }]
+  };
+}
+
+// 组合入口:三类观察者一次派发(宿主请求收口与虚拟时钟批次共用)。
+function __lsmFlushObservers() {
+  try { __lsmFlushMutations(); } catch (e) { __cerror("观察者派发失败: " + String(e)); }
+  try { __lsmFlushIntersection(); } catch (e2) { __cerror("IntersectionObserver 派发失败: " + String(e2)); }
+  try { __lsmFlushResize(); } catch (e3) { __cerror("ResizeObserver 派发失败: " + String(e3)); }
+}
+
+// window 暴露:站点普遍写 `new window.MutationObserver(...)`。
+try {
+  __lsmWin.MutationObserver = MutationObserver;
+  __lsmWin.IntersectionObserver = IntersectionObserver;
+  __lsmWin.ResizeObserver = ResizeObserver;
+} catch (e) {}
+
 // ---------- 宿主驱动入口 ----------
 function __lsmErrText(e) {
   if (e === null || e === undefined) return "unknown error";
@@ -1222,6 +1840,8 @@ function __lsmSetViewport(w, h) {
 }
 function __lsmCollect(ov) {
   ov = ov || {};
+  // 请求收口派发观察者:回调产生的 DOM 动作在本轮动作表里,宿主一次回写。
+  __lsmFlushObservers();
   return JSON.stringify({
     ok: ("ok" in ov) ? !!ov.ok : __lsmFatal === null,
     value: ("value" in ov) ? ov.value : null,

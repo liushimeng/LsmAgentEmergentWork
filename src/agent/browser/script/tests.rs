@@ -49,6 +49,25 @@ fn eval_on(handle: &JsHandle, script: &str, doc_html: &str, url: &str) -> JsRepl
         .expect("JS 线程请求失败")
 }
 
+/// 带布局矩形的求值(观察者的几何判定依赖矩形)。
+fn eval_on_with_rects(handle: &JsHandle, script: &str, doc_html: &str, url: &str) -> JsReply {
+    let doc = Document::parse(doc_html, url);
+    let font = crate::agent::browser::render::FontSet::fallback();
+    let layout = crate::agent::browser::layout::compute(&doc, 1280.0, &font);
+    let rects = layout.rect_map();
+    let nodes = doc.snapshot_nodes_with_rects((1280, 720), &rects);
+    let script = script.to_string();
+    let e = env(url);
+    handle
+        .request(|tx| JsRequest::Eval {
+            script,
+            env: e,
+            nodes,
+            reply: tx,
+        })
+        .expect("JS 线程请求失败")
+}
+
 fn run_scripts(handle: &JsHandle, scripts: Vec<&str>, doc_html: &str, url: &str) -> JsReply {
     let doc = Document::parse(doc_html, url);
     let nodes = doc.snapshot_nodes();
@@ -428,5 +447,200 @@ fn 动态插入脚本可触发_load_回调() {
             .any(|a| a.kind == "set_title" && a.value.contains("模块就绪")),
         "脚本取回失败时不应假触发 onload:{:?}",
         reply.outcome.actions
+    );
+}
+
+// ---------- 阶段五第一步:观察者系列 ----------
+
+const OBS_PAGE: &str = "<html><head><title>观察者</title></head><body>\
+<div id='app' data-state='a'>初始</div><div id='box' style='width:120px;height:40px'>盒子</div>\
+</body></html>";
+
+#[test]
+fn mutation_observer_子节点变更触发回调() {
+    // 此前 env_js 的 MutationObserver 是空壳:构造成功但回调永不触发,
+    // 前端框架的「等 DOM 变化再渲染」链条整段停摆。
+    let handle = JsHandle::spawn();
+    let armed = eval_on(
+        &handle,
+        "(function(){ window.__mut = 0; \
+         var mo = new MutationObserver(function(rs){ window.__mut += rs.length; }); \
+         mo.observe(document.body, {childList: true, subtree: true}); \
+         document.body.appendChild(document.createElement('div')); \
+         return 'armed'; })()",
+        OBS_PAGE,
+        "https://a.test/",
+    );
+    assert!(armed.outcome.ok, "{:?}", armed.outcome.error);
+    let got = eval_on(&handle, "window.__mut", OBS_PAGE, "https://a.test/");
+    assert_eq!(got.outcome.value, "1", "子节点变更应派发一条 childList 记录");
+}
+
+#[test]
+fn mutation_observer_属性变更触发回调() {
+    let handle = JsHandle::spawn();
+    let armed = eval_on(
+        &handle,
+        "(function(){ window.__attr = 0; \
+         var mo = new MutationObserver(function(rs){ window.__attr += rs.length; }); \
+         mo.observe(document.getElementById('app'), {attributes: true}); \
+         document.getElementById('app').setAttribute('data-state', 'b'); \
+         return 'armed'; })()",
+        OBS_PAGE,
+        "https://a.test/",
+    );
+    assert!(armed.outcome.ok, "{:?}", armed.outcome.error);
+    let got = eval_on(&handle, "window.__attr", OBS_PAGE, "https://a.test/");
+    assert_eq!(got.outcome.value, "1", "属性变更应派发一条 attributes 记录");
+}
+
+#[test]
+fn mutation_observer_选项过滤_属性白名单() {
+    // attributeFilter 不含的属性名不得触发;不含 options.attributes 时默认不监听属性。
+    let handle = JsHandle::spawn();
+    let armed = eval_on(
+        &handle,
+        "(function(){ window.__flt = 0; \
+         var mo = new MutationObserver(function(rs){ window.__flt += rs.length; }); \
+         mo.observe(document.getElementById('app'), {attributes: true, attributeFilter: ['title']}); \
+         document.getElementById('app').setAttribute('data-state', 'c'); \
+         return 'armed'; })()",
+        OBS_PAGE,
+        "https://a.test/",
+    );
+    assert!(armed.outcome.ok, "{:?}", armed.outcome.error);
+    let got = eval_on(&handle, "window.__flt", OBS_PAGE, "https://a.test/");
+    assert_eq!(got.outcome.value, "0", "白名单外的属性不应触发观察者");
+}
+
+#[test]
+fn mutation_observer_宿主侧变更可见() {
+    // Agent 侧动作造成的 DOM 变化(快照 diff)也要通知页面脚本:
+    // 页面脚本此前只能靠轮询感知宿主改动。
+    let handle = JsHandle::spawn();
+    let armed = eval_on(
+        &handle,
+        "(function(){ window.__host = 0; \
+         var mo = new MutationObserver(function(rs){ window.__host += rs.length; }); \
+         mo.observe(document.getElementById('app'), {attributes: true}); \
+         return 'armed'; })()",
+        OBS_PAGE,
+        "https://a.test/",
+    );
+    assert!(armed.outcome.ok, "{:?}", armed.outcome.error);
+    // 换一份快照:data-state 由 a 变 b → 宿主侧 diff 合成 attributes 记录。
+    let changed = OBS_PAGE.replace("data-state='a'", "data-state='b'");
+    let second = eval_on(&handle, "'noop'", &changed, "https://a.test/");
+    assert!(second.outcome.ok, "{:?}", second.outcome.error);
+    let got = eval_on(&handle, "window.__host", &changed, "https://a.test/");
+    assert_eq!(got.outcome.value, "1", "宿主侧属性变化应合成 mutation 记录");
+}
+
+#[test]
+fn intersection_observer_视口内元素相交() {
+    let handle = JsHandle::spawn();
+    let armed = eval_on_with_rects(
+        &handle,
+        "(function(){ window.__io = 0; window.__ratio = -1; \
+         var io = new IntersectionObserver(function(es){ \
+           window.__io += es.length; window.__ratio = es[0].intersectionRatio; }); \
+         io.observe(document.getElementById('box')); \
+         return 'armed'; })()",
+        OBS_PAGE,
+        "https://a.test/",
+    );
+    assert!(armed.outcome.ok, "{:?}", armed.outcome.error);
+    let got = eval_on_with_rects(&handle, "window.__io", OBS_PAGE, "https://a.test/");
+    assert_eq!(got.outcome.value, "1", "首次观察应产生一条初始 entry");
+    let ratio = eval_on_with_rects(&handle, "window.__ratio", OBS_PAGE, "https://a.test/");
+    let v: f64 = ratio.outcome.value.parse().unwrap_or(-1.0);
+    assert!(v > 0.0, "视口内元素应有正的相交比例:{}", ratio.outcome.value);
+}
+
+#[test]
+fn resize_observer_尺寸变化触发() {
+    let handle = JsHandle::spawn();
+    let armed = eval_on_with_rects(
+        &handle,
+        "(function(){ window.__ro = 0; \
+         var ro = new ResizeObserver(function(es){ window.__ro += es.length; }); \
+         ro.observe(document.getElementById('box')); \
+         return 'armed'; })()",
+        OBS_PAGE,
+        "https://a.test/",
+    );
+    assert!(armed.outcome.ok, "{:?}", armed.outcome.error);
+    let got = eval_on_with_rects(&handle, "window.__ro", OBS_PAGE, "https://a.test/");
+    assert_eq!(got.outcome.value, "1", "首次观察应产生一条初始尺寸记录");
+    // 尺寸变化(快照矩形改变)后再观察 → 新的 entry。
+    let resized = OBS_PAGE.replace("width:120px;height:40px", "width:200px;height:80px");
+    let second = eval_on_with_rects(&handle, "'noop'", &resized, "https://a.test/");
+    assert!(second.outcome.ok, "{:?}", second.outcome.error);
+    let got2 = eval_on_with_rects(&handle, "window.__ro", &resized, "https://a.test/");
+    assert_eq!(got2.outcome.value, "2", "尺寸变化应再产生一条记录");
+}
+
+#[test]
+fn 观察者_窗口与全局可见() {
+    // 站点普遍写 `new window.MutationObserver(...)`;缺 window 暴露直接 TypeError。
+    let handle = JsHandle::spawn();
+    let reply = eval_on(
+        &handle,
+        "JSON.stringify([typeof MutationObserver, typeof window.MutationObserver, \
+         typeof IntersectionObserver, typeof ResizeObserver])",
+        OBS_PAGE,
+        "https://a.test/",
+    );
+    assert!(reply.outcome.ok, "{:?}", reply.outcome.error);
+    assert_eq!(
+        reply.outcome.value,
+        "[\"function\",\"function\",\"function\",\"function\"]",
+        "{}",
+        reply.outcome.value
+    );
+}
+
+#[test]
+fn append_prepend_存在且落地宿主() {
+    // 站点脚本普遍用 `el.append(x)` / `el.prepend(x)`;缺这两个方法直接抛
+    // "not a callable function",整段脚本后半截不执行(实测 example.com 的 s.js)。
+    let handle = JsHandle::spawn();
+    let reply = run_scripts(
+        &handle,
+        vec![
+            "(function(){ var d = document.createElement('span'); d.textContent = '新节点'; \
+              document.getElementById('app').append(d); return 'ok'; })()",
+        ],
+        PAGE,
+        "https://a.test/",
+    );
+    assert!(reply.outcome.ok, "{:?}", reply.outcome.error);
+    assert!(
+        reply
+            .outcome
+            .actions
+            .iter()
+            .any(|a| a.kind == "append_html" && a.value.contains("新节点")),
+        "append 应产生宿主插入动作:{:?}",
+        reply.outcome.actions
+    );
+
+    let pre = run_scripts(
+        &handle,
+        vec![
+            "(function(){ var d = document.createElement('b'); d.textContent = '前插'; \
+              document.getElementById('app').prepend(d); return 'ok'; })()",
+        ],
+        PAGE,
+        "https://a.test/",
+    );
+    assert!(pre.outcome.ok, "{:?}", pre.outcome.error);
+    assert!(
+        pre.outcome
+            .actions
+            .iter()
+            .any(|a| a.kind == "insert_html" && a.value.contains("前插")),
+        "prepend 应产生宿主前插动作:{:?}",
+        pre.outcome.actions
     );
 }
