@@ -2007,6 +2007,8 @@ dependencies = [
  "axuielement",
  "base64",
  "boa_engine",
+ "boa_interner",
+ "boa_parser",
  "clap",
  "core-foundation",
  "core-graphics",

@@ -4,6 +4,8 @@
 //! DOM 仍在宿主侧(kuchikiki),结构性修改以 action 回传,由 `dom_ops` 应用后
 //! 重新序列化回 `tab.html`。设计见 `docs/自定义浏览器和V8引擎/05-阶段二页面脚本与动态DOM设计.md`。
 
+pub mod amd_fill;
+pub mod diag;
 pub mod dom_ops;
 pub mod env_js;
 pub mod for_in_guard;

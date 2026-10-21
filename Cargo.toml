@@ -51,6 +51,8 @@ url = "2.5"
 # 设计见 docs/自定义浏览器和V8引擎/01-LsmAgentBrowser总体设计与分阶段路线图.md
 kuchikiki = "0.8"       # html5ever DOM + CSS 选择器(可变节点树)
 boa_engine = "0.20"     # 默认 JS 引导后端(纯 Rust,离线可编译)
+boa_parser = "0.20"    # JS 词法真源:诊断拆分器的 regex/division 消歧(离线可用,与 boa_engine 同版本)
+boa_interner = "0.20"  # boa_parser Lexer 的 Interner 依赖(离线可用)
 tiny-skia = "0.11"      # 软件光栅化
 fontdue = "0.9"         # 字体度量与字形栅格化
 encoding_rs = "0.8"     # 响应字符集解码(GBK/Shift_JIS 等)

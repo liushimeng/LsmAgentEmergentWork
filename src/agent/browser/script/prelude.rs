@@ -97,6 +97,10 @@ function __serEl(el) {
   }
   out += ">";
   if (__VOID_TAGS[tag]) return out;
+  // __pendingHtml:未入树元素被赋值过 innerHTML(set_html 的 @created 动作宿主无处落地),
+  // 原始 HTML 挂在这里,随 append_html/insert_html 的序列化原样带到宿主再解析,
+  // widget「createElement → innerHTML=模板 → appendChild」模式的内容不再丢失。
+  if (el.__pendingHtml != null) out += el.__pendingHtml;
   var kids = el.__kids || [];
   for (var i = 0; i < kids.length; i++) {
     var c = kids[i];
@@ -335,8 +339,7 @@ function __mk(n) {
       // 本地覆盖层同步记账:插入的 HTML 用伪元素占位,`t.lastChild` 等
       // 立即可读可写(co 辅助函数 `insertAdjacentHTML + lastChild` 模式)。
       var pseudo = __newEl("div");
-      pseudo.__text = h;
-      pseudo.__lsm_html = h;
+      pseudo.__pendingHtml = h;
       if (p === "afterbegin") { dynKids.unshift(pseudo); __push({ type: "insert_html", selector: n.sel, value: h }); }
       else { dynKids.push(pseudo); __push({ type: "append_html", selector: n.sel, value: h }); }
     },
@@ -504,7 +507,7 @@ function __newEl(tag) {
     insertAdjacentHTML: function (pos, html) {
       var p = String(pos || "beforeend").toLowerCase();
       var pseudo = __newEl("div");
-      pseudo.__text = String(html == null ? "" : html);
+      pseudo.__pendingHtml = String(html == null ? "" : html);
       if (p === "afterbegin" && this.__kids.length) this.insertBefore(pseudo, this.__kids[0]);
       else this.appendChild(pseudo);
     },
@@ -530,13 +533,19 @@ function __newEl(tag) {
     def(p, function () { return el.__attrs[p] == null ? "" : String(el.__attrs[p]); },
       function (v) { el.__attrs[p] = String(v); });
   });
-  def("innerHTML", function () { return __serEl({ __tag: t, __attrs: {}, __kids: el.__kids, __text: "" }); },
-    function (v) {
-      el.__kids = [];
-      el.__text = "";
-      __push({ type: "set_html", selector: "@created:" + t + ":" + el.__attrs.id, value: String(v) });
-    });
-  def("textContent", function () { return el.__text; }, function (v) { el.__text = String(v); el.__kids = []; });
+  def("innerHTML", function () {
+    if (el.__pendingHtml != null) return el.__pendingHtml;
+    return __serEl({ __tag: t, __attrs: {}, __kids: el.__kids, __text: "" });
+  }, function (v) {
+    el.__kids = [];
+    el.__text = "";
+    // 元素未入树:宿主端 @created set_html 无处落地,内容存 __pendingHtml,
+    // 挂载时随序列化原样带到宿主(见 __serEl)。
+    el.__pendingHtml = String(v);
+    __push({ type: "set_html", selector: "@created:" + t + ":" + el.__attrs.id, value: String(v) });
+  });
+  def("textContent", function () { return el.__pendingHtml != null ? el.__pendingHtml : el.__text; },
+    function (v) { el.__text = String(v); el.__kids = []; el.__pendingHtml = null; });
   // 子树查找:detached 元素树上按标签/类收集(消息中心等 widget 对
   // createElement 建出的子树直接 getElementsByTagName)。
   el.getElementsByTagName = function (t) {

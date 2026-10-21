@@ -164,6 +164,16 @@ impl ThreadRuntime {
         .map_err(|e| format!("注册 btoa 失败:{e}"))?;
         ctx.eval(Source::from_bytes(PRELUDE.as_bytes()))
             .map_err(|e| format!("PRELUDE 初始化失败:{e}"))?;
+        // LAEW_JS_DIAG=1 时装 define 陷阱:站点装载器安装全局 define 时被包裹,
+        // 原始首次执行(站点装载器调用约定)即被记录——重放不复现的根因是
+        // 装载器注册表跳过重复 define,只有首跑能观测。
+        if super::diag::diag_enabled() {
+            if let Err(e) = ctx.eval(Source::from_bytes(
+                super::diag::DEFINE_TRAP_JS.as_bytes(),
+            )) {
+                tracing::warn!(error = %e, "define 陷阱安装失败");
+            }
+        }
         Ok(Self { ctx, queue })
     }
 
@@ -270,9 +280,14 @@ impl ThreadRuntime {
             // 失败时 JS 侧捕获 e.stack 回传,压缩大脚本也能定位到行列;
             // 此前直接 ctx.eval 只拿到 "TypeError: xxx" 一句,无从定位。
             let origin = if s.src_url.is_empty() { "(inline)".to_string() } else { s.src_url.clone() };
+            // AMD 依赖数组静态补齐:无 deps 数组的 define(id, factory) 注入
+            // ['require','exports','module', ...静态 require('lit')] —— Boa 的
+            // fn.toString 壳让装载器源码级依赖解析落空,依赖不预载,工厂在
+            // 半成品上同步执行(实测百度地图 tangram 工厂 to_object 穿透)。
+            let filled = super::amd_fill::amd_fill_deps(&s.content);
             // Boa 0.20 for-in 规范偏差守卫:遍历 null/undefined 会抛错(规范应零次迭代),
             // `EXPR||{}` 改写在一切取值下与规范等价(见 for_in_guard.rs)。
-            let guarded = super::for_in_guard::guard_for_in(&s.content);
+            let guarded = super::for_in_guard::guard_for_in(&filled);
             let payload = serde_json::to_string(&guarded).unwrap_or_else(|_| "\"\"".into());
             let res = self.eval_string(&format!("__lsmRunScript({payload})"));
             if let Ok(body) = res {
@@ -288,6 +303,19 @@ impl ThreadRuntime {
                         "__cerror({})",
                         serde_json::to_string(&msg).unwrap_or_else(|_| "\"error\"".into())
                     ));
+                    // LAEW_JS_DIAG=1 时做语句级定位：Boa 0.20 运行时错误不带源码位置，
+                    // 压缩脚本只剩一句 TypeError 无从排查（实测百度地图 tangram 工厂），
+                    // 定位报告经 __cerror 进 console（Agent inspect 可见）+ 运行日志全文。
+                    if super::diag::diag_enabled() {
+                        let report = super::diag::localize(&mut self.ctx, &guarded, &origin);
+                        for line in report {
+                            tracing::warn!(origin = %origin, "{line}");
+                            self.eval_quiet(&format!(
+                                "__cerror({})",
+                                serde_json::to_string(&line).unwrap_or_else(|_| "\"diag\"".into())
+                            ));
+                        }
+                    }
                 }
             }
             // 外链脚本执行完要触发脚本元素的 load 事件:AMD 装载器靠它推进
@@ -739,4 +767,64 @@ fn check_connect_csp(base_url: &str, target: &str) -> Option<String> {
             }
         })
     })
+}
+
+#[cfg(test)]
+mod diag_probe {
+    //! 真实站点脚本语句级定位探针（离线，模块请求全部落空 = 前序会话已证仍可复现）。
+    //!
+    //! 用法：`LAEW_DIAG_LIB=/path/to/libs_b18b356.js cargo test --lib script::runtime::diag_probe -- --nocapture`
+    //! 缺省（env 未设置）时自动跳过——真实文件不入库（版本哈希 URL 会漂移）。
+
+    use super::*;
+
+    fn probe(path: &str) -> Vec<String> {
+        let src = std::fs::read_to_string(path).expect("读取真实脚本文件");
+        let mut rt = ThreadRuntime::new().expect("ThreadRuntime 构建");
+        // 与生产同条件：先跑一遍生产路径确认失败，再走定位器。
+        let env = PageEnv {
+            url: "https://map.baidu.com/".to_string(),
+            title: "百度地图".to_string(),
+            cookies: String::new(),
+            local_storage: Default::default(),
+            session_storage: Default::default(),
+            viewport_width: 1280,
+            viewport_height: 800,
+            scroll_x: 0.0,
+            scroll_y: 0.0,
+            user_agent: "Mozilla/5.0".to_string(),
+            prefers_dark: false,
+            csp: None,
+        };
+        let reply = rt.run_scripts(
+            &[ScriptSource {
+                kind: "external",
+                content: src.clone(),
+                src_url: "https://map.baidu.com/wolfman/static/common/pkg/libs_b18b356.js".to_string(),
+            }],
+            &env,
+            &[],
+        );
+        eprintln!("生产路径 outcome.error = {:?}", reply.outcome.error);
+        let guarded = super::super::for_in_guard::guard_for_in(&src);
+        super::super::diag::localize(&mut rt.ctx, &guarded, "libs_b18b356.js")
+    }
+
+    #[test]
+    fn 真实tangram工厂语句级定位() {
+        let Ok(path) = std::env::var("LAEW_DIAG_LIB") else {
+            eprintln!("skip: 未设置 LAEW_DIAG_LIB");
+            return;
+        };
+        if path.is_empty() {
+            eprintln!("skip: LAEW_DIAG_LIB 为空");
+            return;
+        }
+        let report = probe(&path);
+        for line in &report {
+            eprintln!("{line}");
+        }
+        // 探针断言：要么定位到具体语句，要么如实报告未复现（两种都是有效结果）。
+        assert!(report.iter().any(|l| l.contains("culprit") || l.contains("未能复现")));
+    }
 }
