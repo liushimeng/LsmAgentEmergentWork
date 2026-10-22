@@ -17,15 +17,15 @@ use windows::Win32::Graphics::Gdi::{
     BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HDC, PAINTSTRUCT, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus};
+use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus, SetFocus};
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
     GetMessageW, GetWindowTextW, LoadCursorW, PostQuitMessage, RegisterClassW, SetTimer,
     SetWindowTextW, ShowWindow, TranslateMessage, BS_PUSHBUTTON, CS_HREDRAW, CS_VREDRAW,
     CW_USEDEFAULT, ES_AUTOHSCROLL, HMENU, IDC_ARROW, MSG, SW_SHOWNORMAL, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_KEYDOWN, WM_PAINT, WM_TIMER, WNDCLASSW,
-    WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+    WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_KEYDOWN, WM_KILLFOCUS, WM_PAINT, WM_TIMER,
+    WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
 };
 
 use super::read_frame;
@@ -116,6 +116,12 @@ unsafe extern "system" fn edit_subclass(
         }
         return LRESULT(0);
     }
+    if msg == WM_KILLFOCUS {
+        // 失焦:回填宿主 URL(清掉误入的外来输入,与 macOS 侧同语义)。
+        if let Some((url, _, _)) = PENDING_URL.lock().unwrap().clone() {
+            let _ = SetWindowTextW(hwnd, PCWSTR(to_wide(&url).as_ptr()));
+        }
+    }
     DefSubclassProc(hwnd, msg, wp, lp)
 }
 
@@ -142,9 +148,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 }
             }
             if *CLOSE_FLAG.lock().unwrap() {
-                DestroyWindow(hwnd);
+                let _ = DestroyWindow(hwnd);
             } else if changed {
-                InvalidateRect(hwnd, None, false);
+                let _ = InvalidateRect(hwnd, None, false);
             }
             LRESULT(0)
         }
@@ -174,11 +180,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             LRESULT(0)
         }
         WM_CLOSE => {
-            DestroyWindow(hwnd);
+            let _ = DestroyWindow(hwnd);
             LRESULT(0)
         }
         WM_DESTROY => {
-            PostQuitMessage(0);
+            let _ = PostQuitMessage(0);
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
@@ -196,10 +202,10 @@ fn apply_urlbar(url: &str, can_back: bool, can_forward: bool) {
             }
         }
         if let Some(back) = BACK_BTN.lock().unwrap().map(|c| c.0) {
-            EnableWindow(back, can_back);
+            let _ = EnableWindow(back, can_back);
         }
         if let Some(fwd) = FWD_BTN.lock().unwrap().map(|c| c.0) {
-            EnableWindow(fwd, can_forward);
+            let _ = EnableWindow(fwd, can_forward);
         }
     }
 }
@@ -217,7 +223,7 @@ unsafe fn paint(hdc: HDC, hwnd: HWND) {
     };
     let brush = CreateSolidBrush(COLORREF(0x00F0F0F0));
     FillRect(hdc, &bar, brush);
-    DeleteObject(brush);
+    let _ = DeleteObject(brush);
     // 画面区:工具栏之下。
     let frame = FRAME.lock().unwrap();
     if let Some(f) = frame.as_ref() {
@@ -233,7 +239,7 @@ unsafe fn paint(hdc: HDC, hwnd: HWND) {
             },
             ..Default::default()
         };
-        StretchDIBits(
+        let _ = StretchDIBits(
             hdc,
             0,
             TOOLBAR_H,
@@ -257,7 +263,7 @@ unsafe fn paint(hdc: HDC, hwnd: HWND) {
         };
         let brush = CreateSolidBrush(COLORREF(0x00FFFFFF));
         FillRect(hdc, &area, brush);
-        DeleteObject(brush);
+        let _ = DeleteObject(brush);
     }
 }
 
@@ -377,10 +383,12 @@ pub fn run(width: u32, height: u32, title: &str) -> i32 {
 
         let _ = SetTimer(hwnd, TIMER_ID, TIMER_MS, None);
         let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
+        // 初始焦点给主窗口:地址栏编辑框不自动抢焦点(否则外部误入的按键
+        // 会写进地址栏,把宿主下发的 URL 顶掉)。
+        let _ = SetFocus(hwnd);
 
         // 读线程:stdin → 帧槽。
         std::thread::spawn(|| {
-            use std::io::Read as _;
             let mut stdin = std::io::stdin().lock();
             loop {
                 match read_frame(&mut stdin) {
@@ -439,6 +447,7 @@ pub fn run(width: u32, height: u32, title: &str) -> i32 {
 
 /// 消费 stdin 至 EOF(创建失败的兜底,防父进程写管道阻塞)。同步阻塞。
 fn drain_stdin() {
+    use std::io::Read as _;
     let mut stdin = std::io::stdin().lock();
     let mut buf = [0u8; 4096];
     while let Ok(n) = stdin.read(&mut buf) {

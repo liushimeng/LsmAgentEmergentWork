@@ -146,6 +146,9 @@ static FWD_BTN: once_cell::sync::Lazy<Mutex<IdCell>> =
     once_cell::sync::Lazy::new(|| Mutex::new(IdCell(std::ptr::null_mut())));
 /// 用户是否正在地址栏里编辑(编辑中不覆盖用户输入)。
 static EDITING: AtomicBool = AtomicBool::new(false);
+/// 宿主最后下发的 URL(地址栏失焦时回填,避免残留外来输入)。
+static LAST_URL: once_cell::sync::Lazy<Mutex<String>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(String::new()));
 
 // ---------- 工具栏常量 ----------
 /// 工具栏高度(点)。
@@ -246,6 +249,9 @@ unsafe fn apply_urlbar(url: &str, can_back: bool, can_forward: bool) {
     if std::env::var("LAEW_BROWSER_VIEW_DEBUG").is_ok() {
         eprintln!("[bview] apply_urlbar url={url:?} field={:?} editing={}", field, EDITING.load(Ordering::Relaxed));
     }
+    if let Ok(mut last) = LAST_URL.lock() {
+        *last = url.to_string();
+    }
     if !field.is_null() && !EDITING.load(Ordering::Relaxed) {
         send_void_id(field, sel(b"setStringValue:\0"), ns_str(url));
     }
@@ -305,9 +311,16 @@ extern "C" fn on_text_begin(_self: Id, _cmd: Sel, _note: Id) {
     EDITING.store(true, Ordering::Relaxed);
 }
 
-/// 地址栏结束编辑。
+/// 地址栏结束编辑:回填宿主下发的 URL(清掉误入的外来输入)。
 extern "C" fn on_text_end(_self: Id, _cmd: Sel, _note: Id) {
     EDITING.store(false, Ordering::Relaxed);
+    unsafe {
+        let field = ADDRESS_FIELD.lock().unwrap().0;
+        let url = LAST_URL.lock().map(|s| s.clone()).unwrap_or_default();
+        if !field.is_null() {
+            send_void_id(field, sel(b"setStringValue:\0"), ns_str(&url));
+        }
+    }
 }
 
 unsafe fn ensure_frameworks() -> bool {
@@ -483,6 +496,9 @@ pub fn run(width: u32, height: u32, title: &str) -> i32 {
         send_void_id(window, sel(b"setTitle:\0"), ns_str(title));
         send_void_id(window, sel(b"setDelegate:\0"), ctrl);
         send_void_bool(window, sel(b"setReleasedWhenClosed:\0"), false);
+        // 初始第一响应者:画面视图(否则可编辑的地址栏会自动抢焦点,
+        // 误入的按键会写进地址栏,把宿主下发的 URL 顶掉)。
+        send_void_id(window, sel(b"setInitialFirstResponder:\0"), std::ptr::null_mut());
 
         // 内容:NSImageView 铺满内容区下半部 + 等比缩放。
         let content = send_id(window, sel(b"contentView\0"));
