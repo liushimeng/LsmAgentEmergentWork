@@ -568,7 +568,11 @@ fn build_meta_json(env: &PageEnv) -> String {
 fn split_url(url: &str) -> (String, String, String, String, String, String, String) {
     match url::Url::parse(url) {
         Ok(u) => (
-            u.scheme().to_string(),
+            // URL 规范:location.protocol 带结尾冒号("https:")。
+            // 缺冒号会让站点拼协议相对地址(location.protocol + '//' + host)
+            // 变成 "https//host" —— 百度地图的 qt=ssn / qt=subwayscity 即因此 404,
+            // 地图初始化链断裂(白屏只剩几个色块)。
+            format!("{}:", u.scheme()),
             u.host_str()
                 .map(|h| match u.port() {
                     Some(p) => format!("{h}:{p}"),
@@ -582,7 +586,7 @@ fn split_url(url: &str) -> (String, String, String, String, String, String, Stri
             format!("{}://{}", u.scheme(), u.host_str().unwrap_or_default()),
         ),
         Err(_) => (
-            "https".into(),
+            "https:".into(),
             String::new(),
             String::new(),
             "/".into(),

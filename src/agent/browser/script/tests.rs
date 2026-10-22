@@ -877,3 +877,101 @@ fn VMpanic_后保留Context_不丢页面全局() {
     assert_eq!(check.outcome.value, "42");
     h.shutdown();
 }
+
+// ---------- 协议相对地址 / DOM 序列化(2026-10-22 第 174 轮) ----------
+
+#[test]
+fn location_protocol_带结尾冒号() {
+    // URL 规范:location.protocol = "https:"。缺冒号会让站点拼协议相对地址
+    // (location.protocol + '//' + host)变成 "https//host" —— 百度地图的
+    // qt=ssn / qt=subwayscity 即因此 404,地图数据链断裂。
+    let handle = JsHandle::spawn();
+    let reply = eval_on(
+        &handle,
+        "String(location.protocol)",
+        "<html><body></body></html>",
+        "https://a.test/x",
+    );
+    assert!(reply.outcome.ok, "{:?}", reply.outcome.error);
+    assert_eq!(reply.outcome.value.as_str(), "https:");
+}
+
+#[test]
+fn 游离元素_className_进序列化() {
+    let handle = JsHandle::spawn();
+    let doc = Document::parse(
+        "<html><body><div id='host'></div></body></html>",
+        "https://a.test/",
+    );
+    let nodes = doc.snapshot_nodes();
+    let sources = vec![ScriptSource {
+        kind: "inline",
+        content: "var d=document.createElement('div'); d.className='marked'; \
+                  document.getElementById('host').appendChild(d);"
+            .to_string(),
+        src_url: String::new(),
+    }];
+    let e = env("https://a.test/");
+    let reply = handle
+        .request(|tx| JsRequest::RunScripts {
+            scripts: sources,
+            env: e,
+            nodes,
+            reply: tx,
+        })
+        .expect("JS 线程请求失败");
+    assert!(reply.outcome.ok, "{:?}", reply.outcome.error);
+    let actions = reply.outcome.actions;
+    let applied = dom_ops::apply(&doc, &actions, "https://a.test/");
+    assert!(applied.applied > 0, "动作未落地:{actions:?}");
+    let out = doc.serialize_full();
+    assert!(out.contains("marked"), "游离元素 className 丢失:{out}");
+}
+
+#[test]
+fn 游离元素_cloneNode_深拷贝保留内容() {
+    let handle = JsHandle::spawn();
+    let doc = Document::parse(
+        "<html><body><div id='host'></div></body></html>",
+        "https://a.test/",
+    );
+    let nodes = doc.snapshot_nodes();
+    let sources = vec![ScriptSource {
+        kind: "inline",
+        content: "var t=document.createElement('div'); t.innerHTML='<b>模板</b>'; \
+                  var c=t.cloneNode(true); c.className='copy'; \
+                  document.getElementById('host').appendChild(c);"
+            .to_string(),
+        src_url: String::new(),
+    }];
+    let e = env("https://a.test/");
+    let reply = handle
+        .request(|tx| JsRequest::RunScripts {
+            scripts: sources,
+            env: e,
+            nodes,
+            reply: tx,
+        })
+        .expect("JS 线程请求失败");
+    assert!(reply.outcome.ok, "{:?}", reply.outcome.error);
+    dom_ops::apply(&doc, &reply.outcome.actions, "https://a.test/");
+    let out = doc.serialize_full();
+    assert!(out.contains("模板"), "cloneNode 深拷贝丢内容:{out}");
+    assert!(out.contains("copy"), "cloneNode 深拷贝丢类名:{out}");
+}
+
+#[test]
+fn 应用_append_node_保留子树() {
+    // 站点把已有节点搬进容器:必须按真实 outerHTML 搬,不能只搬文本。
+    let doc = Document::parse(
+        "<html><body><div id='src'><span>内容</span></div><div id='dst'></div></body></html>",
+        "https://a.test/",
+    );
+    let actions = vec![action("append_node", "#src", "#dst", "")];
+    let summary = dom_ops::apply(&doc, &actions, "https://a.test/");
+    assert_eq!(summary.applied, 1);
+    let out = doc.serialize_full();
+    let dst = doc.first("#dst").ok().flatten().unwrap();
+    let html = crate::agent::browser::document::outer_html(&dst);
+    assert!(html.contains("内容"), "子树未搬入:{html}");
+}

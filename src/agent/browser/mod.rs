@@ -303,13 +303,17 @@ pub struct LsmBrowserManager {
     font: render::FontSet,
     /// 有头帧查看器(惰性;headed 模式首个页面打开时启动,失败静默降级)。
     view: std::sync::Mutex<Option<view::ViewSink>>,
+    /// 有头查看器的交互命令通道(查看器工具栏/地址栏 → 引擎)。
+    view_cmd_tx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<view::ViewCommand>>>,
+    /// 自身弱引用(查看器命令处理任务用它回到引擎;非 Arc 场景为空)。
+    self_weak: std::sync::Mutex<std::sync::Weak<LsmBrowserManager>>,
 }
 
 /// 兼容旧调用点的类型名。
 pub type BrowserManager = LsmBrowserManager;
 
 static GLOBAL: Lazy<Arc<LsmBrowserManager>> =
-    Lazy::new(|| Arc::new(LsmBrowserManager::new()));
+    Lazy::new(|| LsmBrowserManager::new_arc());
 
 impl LsmBrowserManager {
     pub fn new() -> Self {
@@ -321,7 +325,16 @@ impl LsmBrowserManager {
             http: net::HttpClient::new(DEFAULT_UA),
             font: render::FontSet::load(),
             view: std::sync::Mutex::new(None),
+            view_cmd_tx: std::sync::Mutex::new(None),
+            self_weak: std::sync::Mutex::new(std::sync::Weak::new()),
         }
+    }
+
+    /// 构造 `Arc` 包裹的管理器:查看器命令任务需要弱引用回到引擎。
+    pub fn new_arc() -> Arc<Self> {
+        let me = Arc::new(Self::new());
+        *me.self_weak.lock().unwrap() = Arc::downgrade(&me);
+        me
     }
 
     /// 有头模式:确保查看器子进程在跑(幂等),并推首帧。
@@ -330,14 +343,73 @@ impl LsmBrowserManager {
         let title = format!("🌐 {} · {} — {}", tab.id, tab.title, tab.url);
         let mut guard = self.view.lock().unwrap();
         if guard.is_none() {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<view::ViewCommand>();
+            *self.view_cmd_tx.lock().unwrap() = Some(tx.clone());
             *guard = view::ViewSink::start(
                 tab.viewport.width,
                 tab.viewport.height,
                 &title,
+                tx,
             );
+            // 命令处理任务:查看器工具栏/地址栏 → 引擎导航。
+            // 需要 `Arc<Self>`(弱引用升级);非 Arc 场景(单测直接 new())无命令处理,
+            // 查看器仍可正常显示帧。
+            let weak = self.self_weak.lock().unwrap().clone();
+            if let Some(weak) = weak.upgrade() {
+                tokio::spawn(async move {
+                    while let Some(cmd) = rx.recv().await {
+                        weak.handle_view_command(cmd).await;
+                    }
+                });
+            }
         }
         drop(guard);
         self.push_frame(tab);
+    }
+
+    /// 处理查看器发来的交互命令(后退/前进/刷新/首页/地址栏导航)。
+    async fn handle_view_command(self: &Arc<Self>, cmd: view::ViewCommand) {
+        let page_id = self.foreground_page_id().await;
+        let Some(page_id) = page_id else { return };
+        let timeout = 45_000u64;
+        let _ = match cmd {
+            view::ViewCommand::Navigate(url) => {
+                let target = urlutil::resolve("", &url)
+                    .unwrap_or_else(|| url.clone());
+                self.navigate(&page_id, &target, timeout).await
+            }
+            view::ViewCommand::Back => self.history_nav(&page_id, "back", timeout).await,
+            view::ViewCommand::Forward => self.history_nav(&page_id, "forward", timeout).await,
+            view::ViewCommand::Reload => self.history_nav(&page_id, "reload", timeout).await,
+            view::ViewCommand::Home => self.navigate(&page_id, "about:blank", timeout).await,
+        };
+        self.refresh_view(&page_id).await;
+    }
+
+    /// 前台标签页 id(多标签时工具栏作用于前台页)。
+    async fn foreground_page_id(&self) -> Option<String> {
+        let inner = self.inner.lock().await;
+        let mut fallback: Option<String> = None;
+        for tab in inner.tabs.values() {
+            if fallback.is_none() {
+                fallback = Some(tab.id.clone());
+            }
+            if tab.foreground {
+                return Some(tab.id.clone());
+            }
+        }
+        fallback
+    }
+
+    /// 重新推送当前页面的帧与地址栏状态(导航/交互后调用)。
+    async fn refresh_view(&self, page_id: &str) {
+        let inner = self.inner.lock().await;
+        let Some(tab) = inner.tabs.get(page_id) else { return };
+        // 无头模式不启查看器(否则纯无头任务会被凭空拉起一个浏览器窗口)。
+        if !tab.mode.is_headed() {
+            return;
+        }
+        self.ensure_view(tab);
     }
 
     /// 渲染当前布局为视口 PNG 并推给查看器(查看器不存在时 no-op)。
@@ -364,10 +436,13 @@ impl LsmBrowserManager {
         if png.is_empty() {
             return;
         }
+        let can_back = tab.history_index > 0;
+        let can_forward = tab.history_index + 1 < tab.history.len();
         if let Ok(guard) = self.view.lock() {
             if let Some(sink) = guard.as_ref() {
                 sink.send_frame(&png);
                 sink.send_title(&format!("🌐 {} · {} — {}", tab.id, tab.title, tab.url));
+                sink.send_urlbar(&tab.url, can_back, can_forward);
             }
         }
     }

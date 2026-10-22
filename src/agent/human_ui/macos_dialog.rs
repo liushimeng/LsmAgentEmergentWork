@@ -55,10 +55,12 @@ extern "C" {
     fn objc_getClass(name: *const c_char) -> Id;
     fn sel_registerName(name: *const c_char) -> Sel;
     fn objc_allocateClassPair(superclass: Id, name: *const c_char, extra_bytes: usize) -> Id;
+    // imp 统一按 `*const c_void` 收:同一符号在不同模块声明成不同函数指针
+    // 类型会触发 clashing_extern_declarations(浏览器查看器要注册 5 参 IMP)。
     fn class_addMethod(
         cls: Id,
         name: Sel,
-        imp: extern "C" fn(Id, Sel, Id),
+        imp: *const c_void,
         types: *const c_char,
     ) -> i8;
     fn objc_registerClassPair(cls: Id);
@@ -572,7 +574,12 @@ fn controller_class() -> Id {
             return 0;
         }
         let ok = |m: extern "C" fn(Id, Sel, Id), name: &'static [u8]| {
-            class_addMethod(c, sel(name), m, b"v@:@\0".as_ptr().cast()) != 0
+            class_addMethod(
+                c,
+                sel(name),
+                m as *const c_void,
+                b"v@:@\0".as_ptr().cast(),
+            ) != 0
         };
         let all = ok(on_submit, b"submit:\0")
             & ok(on_cancel, b"cancel:\0")
@@ -667,7 +674,12 @@ fn relay_pad_class() -> Id {
             return 0;
         }
         let ok = |m: extern "C" fn(Id, Sel, Id), name: &'static [u8]| {
-            class_addMethod(c, sel(name), m, b"v@:@\0".as_ptr().cast()) != 0
+            class_addMethod(
+                c,
+                sel(name),
+                m as *const c_void,
+                b"v@:@\0".as_ptr().cast(),
+            ) != 0
         };
         let all = ok(on_pad_down, b"mouseDown:\0")
             & ok(on_pad_drag, b"mouseDragged:\0")
@@ -683,7 +695,7 @@ fn relay_pad_class() -> Id {
                 class_addMethod(
                     c,
                     sel(b"acceptsFirstResponder\0"),
-                    fpr,
+                    fpr as *const c_void,
                     b"c@:\0".as_ptr().cast(),
                 ) != 0
             };

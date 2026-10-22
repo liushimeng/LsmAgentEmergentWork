@@ -19,8 +19,21 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80
 }
 
+/// 守卫开关:`LAEW_JS_FORIN_GUARD=off` 关闭整条改写(诊断用)。
+///
+/// 改写是**源码级重写**,对压缩混淆代码有误伤风险(实测百度风控脚本
+/// abclite 在守卫开启时抛 ToObject、关闭时脚本跑通),保留开关便于对比。
+pub fn enabled() -> bool {
+    !std::env::var("LAEW_JS_FORIN_GUARD")
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no"))
+        .unwrap_or(false)
+}
+
 /// 对脚本源码做 `for...in` 守卫改写。无匹配时原样返回(零拷贝路径)。
 pub fn guard_for_in(src: &str) -> String {
+    if !enabled() {
+        return src.to_string();
+    }
     if !src.contains("for") || !src.contains(" in") {
         return src.to_string();
     }
@@ -267,3 +280,4 @@ mod tests {
         assert_eq!(guard_for_in(src), src);
     }
 }
+

@@ -136,6 +136,37 @@ pub fn apply(doc: &Document, actions: &[JsAction], base_url: &str) -> ApplySumma
                 }
                 summary.applied += 1;
             }
+            // 把已有节点(快照节点)搬进另一个容器:按宿主真实 outerHTML 克隆子树。
+            // 旧实现只推节点文本,站点 `container.appendChild(existingNode)`
+            // 落进 DOM 的只有一段文字,控件整棵子树丢失(百度地图 widget 即如此)。
+            "append_node" | "insert_node" => {
+                let Some(src) = find(doc, &action.selector) else {
+                    summary.failed += 1;
+                    continue;
+                };
+                let Some(dst) = find(doc, &action.key) else {
+                    summary.failed += 1;
+                    continue;
+                };
+                // 源是目标的祖先 → 搬运会成环,跳过。
+                if src.ancestors().any(|a| a == dst) {
+                    summary.failed += 1;
+                    continue;
+                }
+                let html = document::outer_html(&src);
+                if html.trim().is_empty() {
+                    summary.failed += 1;
+                    continue;
+                }
+                for frag in parse_fragment_nodes(&html) {
+                    if action.kind == "insert_node" {
+                        dst.insert_before(frag);
+                    } else {
+                        dst.append(frag);
+                    }
+                }
+                summary.applied += 1;
+            }
             "insert_html" => {
                 let Some(node) = find(doc, &action.selector) else {
                     summary.failed += 1;

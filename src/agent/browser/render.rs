@@ -164,6 +164,61 @@ impl FontSet {
             }
         }
 
+        // canvas/WebGL 区域:内核未实现 2D/WebGL 像素渲染(地图瓦片、图表、
+        // WebGL 游戏都在这里)。不画的话用户只看到「几个色素块」,无从判断
+        // 是页面没加载还是内核能力缺失;画明确的占位块 + 文字说明。
+        for b in &layout.boxes {
+            if !b.visible || !b.tag.eq_ignore_ascii_case("canvas") {
+                continue;
+            }
+            let (bx, by, bw, bh) = (b.x, b.y - scroll_y, b.w, b.h);
+            if bw < 48.0 || bh < 28.0 {
+                continue;
+            }
+            if bx > width as f64 || by > height as f64 || by + bh < 0.0 {
+                continue;
+            }
+            // 淡底(页面自己的背景色优先)
+            if b.background.is_none() {
+                fill_rect(&mut pixmap, bx as f32, by as f32, bw as f32, bh as f32, [236, 238, 242]);
+            }
+            // 虚线边框(灰)
+            let dash = 8.0_f32;
+            let edge = [176, 182, 190];
+            let mut px = bx as f32;
+            while px < (bx + bw) as f32 {
+                let seg = dash.min((bx + bw) as f32 - px);
+                fill_rect(&mut pixmap, px, by as f32, seg, 1.0, edge);
+                fill_rect(&mut pixmap, px, (by + bh - 1.0) as f32, seg, 1.0, edge);
+                px += dash * 2.0;
+            }
+            let mut py = by as f32;
+            while py < (by + bh) as f32 {
+                let seg = dash.min((by + bh) as f32 - py);
+                fill_rect(&mut pixmap, bx as f32, py, 1.0, seg, edge);
+                fill_rect(&mut pixmap, (bx + bw - 1.0) as f32, py, 1.0, seg, edge);
+                py += dash * 2.0;
+            }
+            // 说明文字(居中;宽度不足时只留前半句)
+            let full = "canvas 区域:内核未实现 2D/WebGL 像素渲染(此区域无内容)";
+            let short = "canvas 区域:内核未实现像素渲染";
+            let label = if bw >= 420.0 { full } else { short };
+            let size = 13.0_f64;
+            let est_w = label.chars().count() as f64 * size * 0.62;
+            let tx = bx + ((bw - est_w) / 2.0).max(8.0);
+            let ty = by + ((bh - size) / 2.0).max(4.0);
+            let line = crate::agent::browser::layout::TextLine {
+                text: label.to_string(),
+                x: tx,
+                y: ty,
+                size,
+                color: [120, 128, 138],
+                bold: false,
+                visible: true,
+            };
+            self.draw_line(&mut pixmap, &line, ty);
+        }
+
         // 阶段三第三步:图像(背景图与内容图)先于文字绘制。
         for paint in &layout.paints {
             if !paint.visible {

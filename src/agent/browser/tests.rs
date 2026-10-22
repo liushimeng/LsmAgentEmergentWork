@@ -424,3 +424,69 @@ async fn extract_未声明字段时自动抽取文本() {
     assert!(items[0]["text"].as_str().unwrap_or("").contains("甲条目"), "{v}");
     mgr.shutdown().await;
 }
+
+// ---------- 有头浏览器窗口交互(2026-10-22 第 174 轮) ----------
+
+#[tokio::test]
+async fn 工具栏导航命令_驱动引擎换页() {
+    // 浏览器窗口地址栏/工具栏的命令(view::ViewCommand)落到引擎侧:
+    // navigate 走真实导航,后退/前进走历史栈。
+    let mgr = LsmBrowserManager::new_arc();
+    let first = html_doc("<h1>PAGE-1</h1>");
+    let second = html_doc("<h1>PAGE-2</h1>");
+    let out = mgr
+        .new_page(&first, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .await
+        .unwrap();
+    let pid = out.page_id.clone();
+
+    mgr.handle_view_command(view::ViewCommand::Navigate(second.clone()))
+        .await;
+    let after = mgr.page_summary(&pid).await.unwrap();
+    assert_eq!(after.url, second, "地址栏导航未生效");
+
+    // 后退 → 回到第一页;前进 → 再回第二页。
+    mgr.handle_view_command(view::ViewCommand::Back).await;
+    let back = mgr.page_summary(&pid).await.unwrap();
+    assert_eq!(back.url, first, "后退未生效");
+    mgr.handle_view_command(view::ViewCommand::Forward).await;
+    let fwd = mgr.page_summary(&pid).await.unwrap();
+    assert_eq!(fwd.url, second, "前进未生效");
+    mgr.shutdown().await;
+}
+
+#[tokio::test]
+async fn canvas_区域_渲染出显式占位说明() {
+    // 内核未实现 2D/WebGL 像素渲染:画布区域必须显式说明,而不是留一块空白色块。
+    let mgr = LsmBrowserManager::new();
+    let html = "<html><head><title>C</title></head><body style='margin:0'>\
+               <canvas id='c' width='600' height='400' style='display:block;width:600px;height:400px'></canvas>\
+               </body></html>";
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(html.as_bytes());
+    let url = format!("data:text/html;base64,{b64}");
+    let out = mgr
+        .new_page(&url, BrowserMode::Hidden, None, Some(800), Some(500), false, true, 10_000)
+        .await
+        .unwrap();
+    let shot = mgr
+        .screenshot(&out.page_id, &serde_json::json!({"save_path": "/tmp/laew_test_canvas.png"}))
+        .await
+        .unwrap();
+    assert!(shot["byte_size"].as_u64().unwrap_or(0) > 0);
+    // 画布区域应有可见盒(占位底色 + 虚线边框),不是纯白。
+    let canvas_box = {
+        let inner = mgr.inner.lock().await;
+        let tab = inner.tabs.get(&out.page_id).unwrap();
+        tab.layout
+            .boxes
+            .iter()
+            .find(|b| b.tag.eq_ignore_ascii_case("canvas") && b.visible)
+            .cloned()
+    };
+    let Some(b) = canvas_box else {
+        panic!("canvas 未参与布局");
+    };
+    assert!(b.w > 100.0 && b.h > 100.0, "canvas 盒尺寸异常:{b:?}");
+    mgr.shutdown().await;
+}

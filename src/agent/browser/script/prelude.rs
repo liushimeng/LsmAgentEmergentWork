@@ -463,7 +463,7 @@ function __mk(n) {
       if (c) dynKids.push(c);
       __lsmRec("childList", el, { addedNodes: c ? [c] : [] });
       if (c && c.__detached) __push({ type: "append_html", selector: n.sel, value: __serEl(c) });
-      else if (c && c.__lsm_node) __push({ type: "append_html", selector: n.sel, value: String((c.__lsm_node && c.__lsm_node.text) || "") });
+      else if (c && c.__lsm_node) __push({ type: "append_node", selector: c.__lsm_node.sel, key: n.sel });
       return c;
     },
     insertBefore: function (c, ref) {
@@ -473,10 +473,13 @@ function __mk(n) {
         if (at >= 0) dynKids.splice(at, 0, c); else dynKids.push(c);
       }
       __lsmRec("childList", el, { addedNodes: c ? [c] : [] });
-      var html = "";
-      try { html = (c && c.__detached) ? __serEl(c) : String((c && c.__lsm_node && c.__lsm_node.text) || ""); }
-      catch (e) { html = ""; }
-      __push({ type: "insert_html", selector: n.sel, value: html });
+      if (c && c.__detached) {
+        var html = "";
+        try { html = __serEl(c); } catch (e) { html = ""; }
+        __push({ type: "insert_html", selector: n.sel, value: html });
+      } else if (c && c.__lsm_node) {
+        __push({ type: "insert_node", selector: c.__lsm_node.sel, key: n.sel });
+      }
       return c;
     },
     removeChild: function (c) {
@@ -746,7 +749,24 @@ function __newEl(tag) {
     click: function () {},
     focus: function () {},
     blur: function () {},
-    cloneNode: function () { return __newEl(t); },
+    // 深拷贝:属性 / innerHTML 原文 / 子树都带走(旧实现返回空元素,
+    // 站点「建模板 → cloneNode → 挂载」模式克隆出的控件是空壳)。
+    cloneNode: function (deep) {
+      var d = __newEl(t);
+      for (var k in el.__attrs) {
+        if (Object.prototype.hasOwnProperty.call(el.__attrs, k)) d.__attrs[k] = el.__attrs[k];
+      }
+      d.__pendingHtml = el.__pendingHtml == null ? null : String(el.__pendingHtml);
+      d.__text = el.__text;
+      d.__htmlKids = (el.__htmlKids || []).slice();
+      if (deep !== false) {
+        for (var i = 0; i < (el.__kids || []).length; i++) {
+          var kid = el.__kids[i];
+          d.__kids.push(kid && kid.cloneNode ? kid.cloneNode(true) : kid);
+        }
+      }
+      return d;
+    },
     querySelector: function () { return null; },
     querySelectorAll: function () { return []; },
     getBoundingClientRect: function () { return { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 }; }
@@ -760,6 +780,13 @@ function __newEl(tag) {
    "id", "class", "content", "async", "defer"].forEach(function (p) {
     def(p, function () { return el.__attrs[p] == null ? "" : String(el.__attrs[p]); },
       function (v) { el.__attrs[p] = String(v); });
+  });
+  // className 写通 class 属性:游离元素序列化时才能带上类名
+  // (站点普遍 `el.className = "x"`;此前只有 setAttribute 会落到 __attrs)。
+  def("className", function () {
+    return el.__attrs["class"] == null ? "" : String(el.__attrs["class"]);
+  }, function (v) {
+    el.__attrs["class"] = String(v);
   });
   def("innerHTML", function () {
     if (el.__pendingHtml != null) return el.__pendingHtml;
@@ -2137,6 +2164,11 @@ function __lsmErrText(e) {
   wrap("freeze", O, "Object.freeze", "arg0");
   wrap("seal", O, "Object.seal", "arg0");
   wrap("preventExtensions", O, "Object.preventExtensions", "arg0");
+  wrap("getPrototypeOf", O, "Object.getPrototypeOf", "arg0");
+  wrap("create", O, "Object.create", "arg0");
+  wrap("entries", O, "Object.entries", "arg0");
+  wrap("values", O, "Object.values", "arg0");
+  wrap("fromEntries", O, "Object.fromEntries", "arg0");
   wrap("hasOwnProperty", O.prototype, "hasOwnProperty", "this");
   wrap("propertyIsEnumerable", O.prototype, "propertyIsEnumerable", "this");
   wrap("isPrototypeOf", O.prototype, "isPrototypeOf", "this");

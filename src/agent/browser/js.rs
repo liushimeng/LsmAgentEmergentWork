@@ -174,7 +174,8 @@ fn build_meta(meta: &JsPageMeta<'_>) -> String {
 fn split_url(url: &str) -> (String, String, String, String, String, String, String) {
     match url::Url::parse(url) {
         Ok(u) => (
-            u.scheme().to_string(),
+            // URL 规范:location.protocol 带结尾冒号("https:")。
+            u.scheme().to_string() + ":",
             u.host_str().map(|h| match u.port() {
                 Some(p) => format!("{h}:{p}"),
                 None => h.to_string(),
@@ -186,7 +187,7 @@ fn split_url(url: &str) -> (String, String, String, String, String, String, Stri
             format!("{}://{}", u.scheme(), u.host_str().unwrap_or_default()),
         ),
         Err(_) => (
-            "https".into(),
+            "https:".into(),
             String::new(),
             String::new(),
             "/".into(),

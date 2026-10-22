@@ -93,6 +93,9 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 | `LAEW_WEB_PREFERS_DARK` | `1`/`true`/`yes`/`on` | `prefers-color-scheme: dark` 求值为真(样式引擎与 `matchMedia` 共用) |
 | `LAEW_WEB_ACCEPT_LANGUAGE` | 任意 `Accept-Language` 值 | 覆盖浏览器请求头合成层的 `Accept-Language`(默认 `zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7`)。见 `src/agent/browser/reqctx.rs` |
 | `LAEW_DOM_TRACE` | `1` | 打印 JS→DOM 动作账本(kind/selector/样本),诊断「页面空白 / JS 建好的 UI 没回写」。见 `src/agent/browser/script/dom_ops.rs` |
+| `LAEW_BROWSER_VIEW_ACTIVATE` | `1`/`true`/`yes`/`on` | 有头浏览器窗口启动时抢到前台(默认只 orderFront 不抢焦点,避免打断 TUI)。见 `src/agent/browser/view/macos.rs` |
+| `LAEW_BROWSER_VIEWER_BIN` | 任意可执行文件路径 | 覆盖有头查看器子进程的可执行文件(默认当前进程)。供库进程/自检拉起真正的 `laew __browser-view` 用。见 `src/agent/browser/view/mod.rs` |
+| `LAEW_JS_FORIN_GUARD` | `off`/`0`/`false`/`no` | 关闭 `for...in` 空值守卫的**源码级改写**(诊断用:压缩混淆脚本失败时排除改写误伤)。见 `src/agent/browser/script/for_in_guard.rs` |
 | `LAEW_DUMP_HTML` | 文件路径 | 脚本管线后的整页 HTML 落盘,供离线布局探针分析。见 `src/agent/browser/mod.rs` |
 | `LAEW_WEB_EVIDENCE` | `off`/`0`/`false`/`no` | 关闭网页取证纪律硬闸门。见 `src/agent/safety/web_evidence.rs` |
 | `LAEW_READ_IMAGE_B64` | `1`/`true`/`yes`/`on` | 恢复 Read 工具图片 base64 全文返回（缺省为存根）。见 `src/agent/tools/read.rs` |
@@ -125,6 +128,7 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 - **死循环守卫(两级)**：`src/agent/loop_guard.rs` 是**工具级**守卫(判定键 = 相邻两轮的 工具+参数+结果,抓「同动作同结果」);`src/agent/dead_loop/` 是**LLM 交互级**守卫(判定键 = 「模型已见信息集合」指纹 + 输出全量指纹,跨轮次做尾部周期扫描 + 低新颖度检测),补齐前者的三条盲区:换序打转 `A→B→A→B`、换工具打转、上下文自锁。两级同轮命中时**工具级优先**(证据更硬、可逐项复算)。止损后的根因归类与换路径裁决由 Quality-Check Agent 承担(`quality/dead_loop.rs::check_dead_loop`)。设计见 `docs/LLM交互死循环指纹检测与质检裁决/01-设计与解决方案.md`。
 - **终端守卫**：`src/tui/term_guard.rs`。终端窗口关闭后 crossterm `event::read` 永久 hang，通过独立看门狗线程轮询 `POLLHUP` + 0 超时挂断探测根治。
 - **LsmAgentBrowser 内核**：`src/agent/browser/` 是进程内自研浏览器——窗口/标签页、HTTP(S) 网络栈、DOM、布局、软件渲染、JS 执行全部在本进程，**不存在外部浏览器进程、调试端口或 CDP 协议**。设计见 `docs/自定义浏览器和V8引擎/`。`mode=headed` 由独立查看器子进程 `laew __browser-view` 以原生窗口显示软件渲染帧(macOS AppKit/Windows Win32,stdin 长度前缀帧协议,查看器退出自动回退纯无头);引擎线程零 UI 依赖。
+- **有头浏览器窗口 = 真浏览器形态**：窗口含**工具栏(后退/前进/刷新/首页)+ 地址栏 + 页面画面**。宿主→查看器走帧协议(`'i'` 帧 / `'t'` 标题 / `'u'` 地址栏状态 / `'c'` 关闭)；查看器→宿主走 stdout 按行 JSON 命令(`navigate`/`back`/`forward`/`reload`/`home`)，引擎据此做真实导航与历史栈操作，地址栏内容按当前页 URL 同步。设计见 `docs/自定义浏览器和V8引擎/20-浏览器窗口交互化与地图页白屏根因.md`。
 - **布局/渲染能力边界**：布局引擎支持百分比高度(视口→html→body 确定高传播,父高 auto 时按 CSS 语义退化);渲染器绘制背景/边框/外阴影(偏移实心矩形近似,blur 未实现)/图像/文字;表单控件有 UA 默认描边。canvas/WebGL 未实现(地图瓦片类页面主体不可渲染)。
 - **图片子资源（`browser/images.rs`）**：宿主预取 `<img src>` 与 CSS `url(...)` 背景图并解码为 RGBA8 **全内存**缓存（随标签页生命周期，进程退出即销毁）；布局层按固有尺寸排版替换元素（`<img>`），渲染层按 `object-fit` 贴图；开关/限额见 `LAEW_WEB_IMAGES` / `LAEW_WEB_MAX_IMAGES` / `LAEW_WEB_MAX_IMAGE_BYTES`。设计见 `docs/自定义浏览器和V8引擎/10-阶段三第三步图片渲染与替换元素设计.md`
 - **样式引擎（`browser/style/`）**：CSS 解析/级联/继承/单位/媒体查询/自定义属性唯一真源；外链 `<link rel=stylesheet>` 由 `browser/resources.rs` 宿主预取并**原位内联**为 `<style data-lsm-href=...>`（保持级联顺序），布局、渲染、JS `getComputedStyle`、`inspect(stylesheets)` 共用同一份 `ComputedStyle`。
@@ -439,6 +443,7 @@ Markdown Prompt 模板，两级发现：**项目级** `{工作目录}/.laew/comm
   - `15-百分比高度边框阴影绘制与日志降噪.md` — 百分比高度求解/边框与外阴影绘制/表单控件 UA 描边/DEBUG 日志第三方降噪(已完成)
   - `18-百度地图白屏根因与脚本DOM兼容性修复.md` — 脚本文档序执行/FIS 同步 define 兼容/交互后懒加载脚本/detached innerHTML 子树/定位父百分比高度(已完成)
   - `19-浏览器请求头合成层与抗风控指纹补齐.md` — 按请求目的地合成 UA/Referer/Origin/Accept/Sec-Fetch-*(缺 Referer 被风控 403 的根因)/CSS `background` 简写丢 `url(...)` 与精灵图位置/window 代理只读访问器赋值抛错/缺失标准全局(NodeFilter/createElementNS)/事件委托 matches/closest/inspect 可访问名 label/WorkFlow 未知依赖降级(已完成)
+  - `20-浏览器窗口交互化与地图页白屏根因.md` — 有头窗口升级为真浏览器(工具栏 + 地址栏 + 命令通道)/`location.protocol` 缺冒号导致协议相对地址 404/已有节点 appendChild 丢子树/游离元素 className 与 cloneNode 序列化缺陷/canvas 区域占位渲染/百度地图风控脚本失败的完整根因链(已完成)
 - `docs/Use_MCP/` — 通用 MCP 服务调用
 
 **上下文与会话**：
