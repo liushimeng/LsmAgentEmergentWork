@@ -17,6 +17,9 @@ pub struct FetchRequest {
     pub timeout_ms: u64,
     /// 响应体上限(字节)。主文档默认 32MB,下载可放宽。
     pub max_bytes: usize,
+    /// 浏览器请求头合成上下文(Referer/Sec-Fetch-*/Accept 等)。
+    /// `None` 表示「裸请求」(仅 UA + Cookie),仅用于本地协议等特殊通道。
+    pub context: Option<super::reqctx::RequestContext>,
 }
 
 impl FetchRequest {
@@ -28,7 +31,14 @@ impl FetchRequest {
             body: None,
             timeout_ms,
             max_bytes: 32 * 1024 * 1024,
+            context: None,
         }
+    }
+
+    /// 挂上浏览器请求头合成上下文(子资源请求用)。
+    pub fn with_context(mut self, ctx: super::reqctx::RequestContext) -> Self {
+        self.context = Some(ctx);
+        self
     }
 }
 
@@ -107,7 +117,15 @@ impl HttpClient {
         let mut method = req.method.to_ascii_uppercase();
         let mut body = req.body.clone();
         let mut chain = vec![current.clone()];
-        let headers = req.headers.clone();
+        // 浏览器请求头合成:显式头优先,合成头只补缺(见 reqctx 模块说明)。
+        let headers = match &req.context {
+            Some(ctx) => {
+                let mut c = ctx.clone();
+                c.method = method.clone();
+                super::reqctx::merge_headers(&req.headers, &c.headers(&current))
+            }
+            None => req.headers.clone(),
+        };
 
         for hop in 0..=10 {
             // 本地协议:不走网络。

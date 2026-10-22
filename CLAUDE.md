@@ -91,6 +91,9 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 | `LAEW_WEB_MAX_IMAGE_BYTES` | 正整数(默认 `12582912`) | 单张图片字节上限(默认 12MB) |
 | `LAEW_WEB_IMAGE_BUDGET_MS` | 正整数(默认 `20000`) | 单页图片加载总预算(毫秒),超限跳过剩余图片 |
 | `LAEW_WEB_PREFERS_DARK` | `1`/`true`/`yes`/`on` | `prefers-color-scheme: dark` 求值为真(样式引擎与 `matchMedia` 共用) |
+| `LAEW_WEB_ACCEPT_LANGUAGE` | 任意 `Accept-Language` 值 | 覆盖浏览器请求头合成层的 `Accept-Language`(默认 `zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7`)。见 `src/agent/browser/reqctx.rs` |
+| `LAEW_DOM_TRACE` | `1` | 打印 JS→DOM 动作账本(kind/selector/样本),诊断「页面空白 / JS 建好的 UI 没回写」。见 `src/agent/browser/script/dom_ops.rs` |
+| `LAEW_DUMP_HTML` | 文件路径 | 脚本管线后的整页 HTML 落盘,供离线布局探针分析。见 `src/agent/browser/mod.rs` |
 | `LAEW_WEB_EVIDENCE` | `off`/`0`/`false`/`no` | 关闭网页取证纪律硬闸门。见 `src/agent/safety/web_evidence.rs` |
 | `LAEW_READ_IMAGE_B64` | `1`/`true`/`yes`/`on` | 恢复 Read 工具图片 base64 全文返回（缺省为存根）。见 `src/agent/tools/read.rs` |
 | `LAEW_WEB_EVAL_TIMEOUT_MS` | 正整数(默认 `30000`) | eval_js 执行预算(阶段一做脚本长度上限与结果截断) |
@@ -321,6 +324,7 @@ agent/
       values.rs     ComputedStyle、长度/颜色/关键字、var() 替换
       tests.rs      样式引擎单元测试
     resources.rs   外链样式表收集 / 宿主预取 / 原位内联 / 网络台账
+    reqctx.rs      浏览器请求头合成层:按请求目的地合成 UA/Referer/Origin/Accept/Accept-Language/Sec-Fetch-*(抗风控指纹,主文档/脚本/样式/图片/XHR 五通道共用)
     layout/        布局引擎目录:块级流 + 文本换行(mod.rs)、Flex 容器(flex.rs)、
                    Grid 网格(grid.rs)、定位体系(position.rs)、布局单测(tests.rs)
     render.rs      fontdue + tiny-skia 软件渲染 + PNG
@@ -434,6 +438,7 @@ Markdown Prompt 模板，两级发现：**项目级** `{工作目录}/.laew/comm
   - `14-有头帧查看器与真实站点JS启动链路修复.md` — 有头帧查看器子进程 + 真实站点 JS 启动链路七处根治(已完成)
   - `15-百分比高度边框阴影绘制与日志降噪.md` — 百分比高度求解/边框与外阴影绘制/表单控件 UA 描边/DEBUG 日志第三方降噪(已完成)
   - `18-百度地图白屏根因与脚本DOM兼容性修复.md` — 脚本文档序执行/FIS 同步 define 兼容/交互后懒加载脚本/detached innerHTML 子树/定位父百分比高度(已完成)
+  - `19-浏览器请求头合成层与抗风控指纹补齐.md` — 按请求目的地合成 UA/Referer/Origin/Accept/Sec-Fetch-*(缺 Referer 被风控 403 的根因)/缺失标准全局(NodeFilter/createElementNS)/事件委托 matches/closest/inspect 可访问名 label/WorkFlow 未知依赖降级(已完成)
 - `docs/Use_MCP/` — 通用 MCP 服务调用
 
 **上下文与会话**：

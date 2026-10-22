@@ -189,6 +189,36 @@
     }
 
     #[test]
+    fn 宽容拓扑丢弃未知依赖并保留其余分层() {
+        // 第 174 轮:档位级重试时 Main-Work 局部重拆,后发单元引用已完成的前置单元
+        // → 悬空依赖边。严格 topo 会让整份计划作废、整条任务终止(实测烧 3 轮重试
+        // 120k tokens);宽容模式丢弃该边后按无依赖执行。
+        let workflows = vec![
+            wf("wf-1", &[]),
+            wf("wf-2", &["wf-1"]), // 正常依赖
+            wf("wf-3", &["wf-9"]), // 悬空依赖(wf-9 未声明)
+        ];
+        let err = topo_sort(&workflows).unwrap_err();
+        assert!(format!("{err}").contains("wf-9"), "严格模式应报未知 wf-9,实际 {err}");
+
+        let (layers, dropped) = topo_layers_lenient(&workflows).unwrap();
+        assert_eq!(dropped.len(), 1);
+        assert!(dropped[0].contains("wf-9"));
+        // wf-1 / wf-3 无有效依赖 → 同一层;wf-2 依赖 wf-1 → 下一层
+        assert_eq!(layers.len(), 2);
+        let first: Vec<&str> = layers[0].iter().map(|w| w.id.as_str()).collect();
+        assert!(first.contains(&"wf-1") && first.contains(&"wf-3"));
+        let second: Vec<&str> = layers[1].iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(second, vec!["wf-2"]);
+    }
+
+    #[test]
+    fn 宽容拓扑对循环依赖仍然报错() {
+        let workflows = vec![wf("wf-1", &["wf-2"]), wf("wf-2", &["wf-1"])];
+        assert!(topo_layers_lenient(&workflows).is_err(), "循环依赖必须仍是硬错误");
+    }
+
+    #[test]
     fn sanitize_depends_on_concurrent_note_is_not_a_dependency() {
         // 「无(与 wf-1 并发启动)」语义 = 无依赖(括号内是并行说明,非依赖边);
         // 首括号切分得占位符「无」→ 整条丢弃,wf-2 保持与 wf-1 同层并行

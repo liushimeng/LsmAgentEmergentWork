@@ -8,7 +8,7 @@
 
 use super::document::{self, Document};
 use super::{net, ConsoleRecord, NetworkRecord};
-use super::{Inner, DEFAULT_UA};
+use super::Inner;
 
 const MAX_STYLESHEETS_DEFAULT: usize = 16;
 const MAX_CSS_BYTES_DEFAULT: usize = 2 * 1024 * 1024;
@@ -248,9 +248,12 @@ pub async fn load_stylesheets(
         let mut req =
             net::FetchRequest::get(&link.href, timeout_ms.min(CSS_FETCH_TIMEOUT_MS).max(1_000));
         req.max_bytes = max_bytes;
-        if ua != DEFAULT_UA {
-            req.headers.push(("user-agent".to_string(), ua.to_string()));
-        }
+        // 样式表子资源:浏览器语义带 Referer + Sec-Fetch-*(style) 指纹头。
+        req.context = Some(super::reqctx::RequestContext::subresource(
+            base_url,
+            super::reqctx::Dest::Style,
+            ua,
+        ));
         match http.fetch(req, &mut inner.cookies).await {
             Ok(resp) => {
                 let status = resp.status;

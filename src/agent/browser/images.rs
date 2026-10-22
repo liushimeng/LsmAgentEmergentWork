@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::document::{self, Document};
-use super::{net, urlutil, ConsoleRecord, NetworkRecord, Inner, DEFAULT_UA};
+use super::{net, urlutil, ConsoleRecord, NetworkRecord, Inner};
 
 /// 单页图片数量上限(默认 48 张)。
 const MAX_IMAGES_DEFAULT: usize = 48;
@@ -308,9 +308,12 @@ pub async fn load_images(
                 .max(1_000),
         );
         req.max_bytes = max_bytes;
-        if ua != DEFAULT_UA {
-            req.headers.push(("user-agent".to_string(), ua.to_string()));
-        }
+        // 图片子资源:浏览器语义带 Referer + Sec-Fetch-*(image) 指纹头。
+        req.context = Some(super::reqctx::RequestContext::subresource(
+            base_url,
+            super::reqctx::Dest::Image,
+            ua,
+        ));
         match http.fetch(req, &mut inner.cookies).await {
             Ok(resp) => {
                 let status = resp.status;

@@ -20,7 +20,9 @@ impl MultiAgentOrchestrator {
         unit_retry_hint: &str,
     ) -> std::result::Result<TaskResult, QualityFailure> {
         // 依赖分层:同层 WorkFlow 互相无依赖,自动并行;跨层严格串行(自动感知 depends_on)
-        let layers = main_work::topo_layers(&plan.workflows).map_err(|e| QualityFailure {
+        // 第 174 轮:未知依赖降级为警告并丢弃(局部重拆的悬空边),循环依赖仍失败。
+        let (layers, dropped_deps) =
+            main_work::topo_layers_lenient(&plan.workflows).map_err(|e| QualityFailure {
             source: AgentRole::MainWork,
             reason: format!("拓扑分层失败: {e}"),
             retryable: false,
@@ -28,8 +30,11 @@ impl MultiAgentOrchestrator {
             cancelled: false,
             trace: None,
             usage: Usage::default(),
-            completed_digest: String::new(),
-        })?;
+                completed_digest: String::new(),
+            })?;
+        for d in &dropped_deps {
+            tracing::warn!("[拓扑分层] 未知依赖降级(边已丢弃,按无依赖执行): {d}");
+        }
         // 第 165 轮:全并行退化警示 —— 多单元落同一层意味着零依赖边,执行顺序完全
         // 由 Semaphore 槽位释放顺序决定(实测乱序互踩重试风暴,详见 tmpPlan/2026-10-13
         // _WorkFlow依赖解析全角标点丢失与串行兜底方案.md)。正常应已被串行链兜底

@@ -37,7 +37,7 @@ pub use parse::{parse_plan_markdown, parse_workflow_plan};
 pub use spec::{BranchSpec, LoopSpec, WorkFlowPlan, WorkFlowSpec};
 pub use topo::{
     dedup_workflow_ids, fallback_serial_chain, infer_depends_on, sanitize_depends_on,
-    serial_chain_applies, topo_layers, topo_sort,
+    serial_chain_applies, topo_layers, topo_layers_lenient, topo_sort,
 };
 // 原私有项:供本模块 impl 与测试经 `use super::*` 取用(可见域与拆分前等价)
 use delegate::{gather_spec_text, text_contains_any_ci, DESKTOP_GUI_STRICT_KEYWORDS};

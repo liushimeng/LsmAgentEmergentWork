@@ -17,7 +17,7 @@
 //! 校验失败直接 QualityFailure(精确原因、秒级重试,不烧 LLM QC);
 //! 校验通过跳过 LLM QC-main(对齐 degraded 路径,真实产物由每单元 QC 把守)。
 
-use crate::agent::main_work::{topo_layers, WorkFlowPlan, WorkFlowSpec};
+use crate::agent::main_work::{topo_layers_lenient, WorkFlowPlan, WorkFlowSpec};
 
 /// 默认循环上界:文本提到滚动/遍历但未给次数时兜底。
 const DEFAULT_LOOP_MAX_ITERATIONS: usize = 10;
@@ -194,9 +194,17 @@ pub fn validate_plan_blocking(plan: &WorkFlowPlan) -> Vec<String> {
             ));
         }
     }
-    // 拓扑校验:未知依赖 / 循环依赖(复用 topo_layers 单一事实源)
-    if let Err(e) = topo_layers(&plan.workflows) {
-        issues.push(format!("依赖拓扑非法: {e}"));
+    // 拓扑校验(第 174 轮改宽容模式):未知依赖**降级为警告并丢弃**(档位级重试时
+    // Main-Work 局部重拆,后发单元引用已完成的前置单元是常态,严格报错会让
+    // 整份计划作废、整条任务终止 —— 实测烧 3 轮重试 120k tokens);循环依赖
+    // 仍是硬错误(真 bug,无法自动恢复)。
+    match topo_layers_lenient(&plan.workflows) {
+        Ok((_, dropped)) => {
+            for d in dropped {
+                tracing::warn!("[计划校验] 未知依赖降级(边已丢弃,按无依赖执行): {d}");
+            }
+        }
+        Err(e) => issues.push(format!("依赖拓扑非法(循环依赖): {e}")),
     }
     issues
 }

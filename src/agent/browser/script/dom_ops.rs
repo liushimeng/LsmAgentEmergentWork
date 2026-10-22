@@ -48,6 +48,24 @@ pub struct ApplySummary {
 /// 不在此处理,由调用方在锁外执行。
 pub fn apply(doc: &Document, actions: &[JsAction], base_url: &str) -> ApplySummary {
     let mut summary = ApplySummary::default();
+    // LAEW_DOM_TRACE=1:诊断「页面空白/JS 建好的 UI 没回写」类问题 ——
+    // 打出动作账本(kind/selector/前 N 条样本),验证完即用环境变量关掉。
+    if std::env::var("LAEW_DOM_TRACE").is_ok() {
+        let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
+        for a in actions {
+            *kinds.entry(a.kind.clone()).or_default() += 1;
+        }
+        eprintln!("[domtrace] apply actions={} kinds={:?}", actions.len(), kinds);
+        for a in actions.iter().take(25) {
+            eprintln!(
+                "[domtrace]   kind={} selector={} key={} value={}",
+                a.kind,
+                a.selector,
+                a.key,
+                &a.value[..a.value.len().min(100)]
+            );
+        }
+    }
     for action in actions {
         match action.kind.as_str() {
             "set_attr" => {

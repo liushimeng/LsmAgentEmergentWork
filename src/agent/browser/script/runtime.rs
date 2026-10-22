@@ -61,6 +61,8 @@ struct ReqEnv {
     deadline: Instant,
     /// 当前页 CSP 快照（阶段四第二步：connect-src 门禁）。
     csp: Option<super::super::security::CspPolicy>,
+    /// 页面 UA(页面 XHR/fetch 必须带,否则风控直接判异常)。
+    user_agent: String,
 }
 
 thread_local! {
@@ -70,6 +72,7 @@ thread_local! {
         network: Vec::new(),
         deadline: Instant::now(),
         csp: None,
+        user_agent: String::new(),
     });
 }
 
@@ -254,6 +257,7 @@ impl ThreadRuntime {
             env_cell.network.clear();
             env_cell.deadline = deadline;
             env_cell.csp = env.csp.clone();
+            env_cell.user_agent = env.user_agent.clone();
         });
         self.eval_quiet("__lsmBegin()");
     }
@@ -662,6 +666,28 @@ fn blocking_fetch(
         .timeout(Duration::from_millis(20_000));
     if !cookies.is_empty() {
         builder = builder.header(reqwest::header::COOKIE, cookies);
+    }
+    // 浏览器指纹头(Referer/Origin/Sec-Fetch-*/Accept/UA):页面自身发起的
+    // fetch/XHR 必须带,否则站点风控(百度 heicha 等)返回 403/HTML 挑战页,
+    // 页面脚本解包失败抛 TypeError,交互链路整体静默失效。
+    let (page_url, page_ua) = REQ_ENV.with(|c| {
+        let env = c.borrow();
+        (env.base_url.clone(), env.user_agent.clone())
+    });
+    let ctx = super::super::reqctx::RequestContext::subresource(
+        &page_url,
+        super::super::reqctx::Dest::Xhr,
+        &page_ua,
+    )
+    .with_method(&method);
+    let synthesized = ctx.headers(target.as_str());
+    for (k, v) in &synthesized {
+        if let (Ok(name), Ok(val)) = (
+            reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+            reqwest::header::HeaderValue::from_str(v),
+        ) {
+            builder = builder.header(name, val);
+        }
     }
     if let Some(headers) = opts.get("headers").and_then(Value::as_object) {
         for (k, v) in headers {

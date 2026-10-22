@@ -17,6 +17,28 @@ pub fn topo_sort(workflows: &[WorkFlowSpec]) -> Result<Vec<WorkFlowSpec>> {
 /// - **确定性**:层内顺序 = 原 `workflows` 数组顺序(不依赖 HashMap 遍历序)。
 /// - 未知依赖 / 环:与 `topo_sort` 一致,报 `AgentError::WorkflowTopology`。
 pub fn topo_layers(workflows: &[WorkFlowSpec]) -> Result<Vec<Vec<WorkFlowSpec>>> {
+    topo_layers_impl(workflows, true).map(|(layers, _)| layers)
+}
+
+/// 宽容拓扑分层(第 174 轮):未知依赖**降级为警告并丢弃该边**后继续分层,
+/// 循环依赖仍然报错。返回 `(分层, 被丢弃的未知依赖描述)`。
+///
+/// 背景(实测 `llaew_20261022_110733.log`,百度地图任务):档位级重试时
+/// Main-Work 会**局部重拆**(已完成单元不再回传),后发的 wf-N 仍声明
+/// `depends_on wf-1`(已完成的单元)→ 严格 topo 报「依赖未知 wf=wf-1」,
+/// 整份计划作废、整条任务终止 —— 一个悬空依赖边烧掉 3 轮重试 120k tokens。
+/// 悬空边的真实语义是「前置已完成/不存在」,丢弃后按无依赖执行即可,
+/// 每单元 QC 仍对真实产物把守,不会放行质量损失。
+pub fn topo_layers_lenient(
+    workflows: &[WorkFlowSpec],
+) -> Result<(Vec<Vec<WorkFlowSpec>>, Vec<String>)> {
+    topo_layers_impl(workflows, false)
+}
+
+fn topo_layers_impl(
+    workflows: &[WorkFlowSpec],
+    strict: bool,
+) -> Result<(Vec<Vec<WorkFlowSpec>>, Vec<String>)> {
     let mut by_id: std::collections::HashMap<&str, &WorkFlowSpec> =
         std::collections::HashMap::new();
     for w in workflows {
@@ -24,16 +46,23 @@ pub fn topo_layers(workflows: &[WorkFlowSpec]) -> Result<Vec<Vec<WorkFlowSpec>>>
     }
     // 入度 = 它依赖的 wf 数;先校验所有依赖已知
     let mut in_degree: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut dropped: Vec<String> = Vec::new();
     for w in workflows {
         for dep in &w.depends_on {
             if !by_id.contains_key(dep.as_str()) {
-                return Err(AgentError::WorkflowTopology(format!(
-                    "wf={} 依赖未知 wf={}",
-                    w.id, dep
-                )));
+                if strict {
+                    return Err(AgentError::WorkflowTopology(format!(
+                        "wf={} 依赖未知 wf={}",
+                        w.id, dep
+                    )));
+                }
+                dropped.push(format!("wf={} 依赖未知 wf={}(边已丢弃,按无依赖执行)", w.id, dep));
+                continue;
             }
         }
-        in_degree.insert(w.id.as_str(), w.depends_on.len());
+        // 入度只数已知依赖;宽容模式下未知依赖已丢弃,不入度。
+        let known = w.depends_on.iter().filter(|d| by_id.contains_key(d.as_str())).count();
+        in_degree.insert(w.id.as_str(), known);
     }
 
     let mut layers: Vec<Vec<WorkFlowSpec>> = Vec::new();
@@ -79,7 +108,7 @@ pub fn topo_layers(workflows: &[WorkFlowSpec]) -> Result<Vec<Vec<WorkFlowSpec>>>
             "检测到循环依赖,无法拓扑排序".into(),
         ));
     }
-    Ok(layers)
+    Ok((layers, dropped))
 }
 
 /// I4(2026-09-14 第 51 轮):workflows 数组按 id 去重(保留首次出现)。

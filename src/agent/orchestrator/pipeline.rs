@@ -1223,8 +1223,8 @@ impl MultiAgentOrchestrator {
 
         // D9-8 决策审计(2026-09-19):Main-Work 流程拆解决策写入审计 JSONL。
         {
-            let layers = crate::agent::main_work::topo_layers(&plan.workflows)
-                .map(|l| l.len())
+            let layers = crate::agent::main_work::topo_layers_lenient(&plan.workflows)
+                .map(|(l, _)| l.len())
                 .unwrap_or(0);
             crate::agent::decision_audit::record_decompose(
                 session.id(),

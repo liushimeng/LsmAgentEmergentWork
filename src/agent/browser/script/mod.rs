@@ -275,6 +275,13 @@ pub(crate) async fn run_pipeline(
         html: raw_html.to_string(),
         ..Default::default()
     };
+    if std::env::var("LAEW_DOM_TRACE").is_ok() {
+        eprintln!(
+            "[domtrace] pipeline start raw_html_len={} scripts={}",
+            raw_html.len(),
+            raw_html.matches("<script").count(),
+        );
+    }
     if !scripts_enabled() {
         return out;
     }
@@ -354,9 +361,13 @@ pub(crate) async fn run_pipeline(
             }
             let mut req = super::net::FetchRequest::get(url, SCRIPT_FETCH_TIMEOUT_MS);
             req.max_bytes = MAX_EXTERNAL_BYTES;
-            if ua != super::DEFAULT_UA {
-                req.headers.push(("user-agent".to_string(), ua.to_string()));
-            }
+            // 外链脚本:浏览器语义带 Referer + Sec-Fetch-*(script) 指纹头。
+            // 缺 Referer 会被站点风控(百度 heicha/acs 等)判为异常请求。
+            req.context = Some(super::reqctx::RequestContext::subresource(
+                base_url,
+                super::reqctx::Dest::Script,
+                ua,
+            ));
             match http.fetch(req, &mut inner.cookies).await {
                 Ok(resp) => {
                     let text = resp.text();
@@ -451,6 +462,15 @@ pub(crate) async fn run_pipeline(
         let doc = super::document::Document::parse(&out.html, base_url);
         append_reply(&mut out, inner, base_url, &reply, &doc);
         out.html = doc.serialize_full();
+        if std::env::var("LAEW_DOM_TRACE").is_ok() {
+            eprintln!(
+                "[domtrace] round={} html_len={} has_app={} has_MapHolder={}",
+                round,
+                out.html.len(),
+                out.html.contains("id=\"app\""),
+                out.html.contains("MapHolder"),
+            );
+        }
         // 外链执行记账(含执行抛错的:真实浏览器里抛错的 script 同样不会重跑)。
         for url in &executed_externals {
             executed.insert(dom_ops::fingerprint(url));

@@ -289,6 +289,47 @@ function __lsmGeom(n) {
   return { x: 0, y: 0, w: 0, h: 0,
     rect: { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 } };
 }
+// 动态节点(__newEl 建出、未入快照)按「标签 + #id + .class + [attr]」做
+// 宽松选择器匹配(逗号分隔,逐个或)。matches/closest 委托匹配兜底用。
+function __lsmDynMatch(el, sel) {
+  if (!el) return false;
+  var parts = String(sel).split(",");
+  for (var p = 0; p < parts.length; p++) {
+    var s = parts[p].trim();
+    if (!s) continue;
+    // 去掉简单伪类/组合子(委托选择器如 ".a > .b" 取末段判定)。
+    s = s.replace(/::?[a-z-]+(\([^)]*\))?/gi, "");
+    var segs = s.split(/[\s>+~]+/);
+    s = segs[segs.length - 1];
+    if (!s || s === "*") return true;
+    var ok = true;
+    // 标签
+    var m = s.match(/^[a-zA-Z][a-zA-Z0-9-]*/);
+    var tag = m ? m[0].toLowerCase() : "";
+    var et = String(el.__tag || el.tagName || "").toLowerCase();
+    if (tag && tag !== "*" && et !== tag) ok = false;
+    // #id
+    var idm = s.match(/#([a-zA-Z0-9_-]+)/);
+    if (ok && idm && String(el.id || "") !== idm[1]) ok = false;
+    // .class
+    var cls = String(el.className || "");
+    var re = /\.([a-zA-Z0-9_-]+)/g;
+    var cm;
+    while (ok && (cm = re.exec(s))) {
+      if (cls.split(/\s+/).indexOf(cm[1]) < 0) ok = false;
+    }
+    // [attr] / [attr="v"]
+    var am;
+    var reA = /\[([a-zA-Z0-9_-]+)(?:\s*=\s*["']?([^"'\]]*)["']?)?\]/g;
+    while (ok && (am = reA.exec(s))) {
+      var av = el.getAttribute ? el.getAttribute(am[1]) : null;
+      if (av == null) ok = false;
+      else if (am[2] !== undefined && am[2] !== "" && av !== am[2]) ok = false;
+    }
+    if (ok) return true;
+  }
+  return false;
+}
 function __mk(n) {
   var attrs = n.attrs || {};
   // 布局几何:快照 rect [x,y,w,h] → clientWidth/offsetWidth 等属性。
@@ -379,6 +420,24 @@ function __mk(n) {
     scrollIntoView: function () { __push({ type: "scroll_to", selector: n.sel }); },
     scrollTo: function (x, y) { __push({ type: "scroll", value: String(y || 0) }); },
     querySelector: function (s) { return __lsmQueryOne(s, n.i); },
+    // matches/closest:事件委托(jQuery `$(document).on('click', sel, fn)`、各框架
+    // 委托)依赖 `el.matches()/el.closest()` 从 target 向上匹配委托选择器;
+    // 缺失则委托 handler 一跑就抛,面板按钮「点击无反应」(实测百度地图路线按钮)。
+    matches: function (sel) {
+      if (__lsmMatchSel(n.i, String(sel))) return true;
+      // 动态覆盖层节点按标签/类名做宽松匹配。
+      return __lsmDynMatch(el, String(sel));
+    },
+    matchesSelector: function (sel) { return this.matches(sel); },
+    closest: function (sel) {
+      var cur = el;
+      var guard = 0;
+      while (cur && guard++ < 32) {
+        if (cur.matches && cur.matches(String(sel))) return cur;
+        cur = cur.parentNode || null;
+      }
+      return null;
+    },
     getElementsByTagName: function (t) {
       var out = [];
       var tag = String(t).toLowerCase();
@@ -959,6 +1018,10 @@ var document = {
   getElementsByClassName: function (c) { return __lsmQuery("." + String(c)); },
   getElementsByName: function (n) { return __lsmQuery("[name=" + n + "]"); },
   createElement: function (tag) { return __newEl(tag); },
+  // createElementNS:SVG/图标站点(图表、地图图例)用 NS 建元素;内核暂不渲染 SVG,
+  // 但「建出来、能挂树、不崩」即可让面板/widget 完成初始化与挂载。
+  createElementNS: function (ns, tag) { return __newEl(tag); },
+  createSVGElement: function (tag) { return __newEl(tag); },
   createTextNode: function (t) { return { nodeType: 3, textContent: String(t), data: String(t) }; },
   createDocumentFragment: function () {
     return { __detached: true, __tag: "div", __attrs: {}, __kids: [], __text: "", nodeType: 11, appendChild: function (c) { this.__kids.push(c); return c; } };

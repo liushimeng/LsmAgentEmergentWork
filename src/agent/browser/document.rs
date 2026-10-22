@@ -171,6 +171,17 @@ impl Document {
         let text = truncate_chars(&collapse_ws(&visible_text_of(node)), 4000);
         let attrs = common_attrs(node);
         let value = self.runtime_value(node, &selector, &attrs, values);
+        // 关联 label[for=id] 文案(在 Document 上下文查询)。
+        let label_for = attrs.get("id").filter(|id| !id.is_empty()).and_then(|id| {
+            let sel = format!("label[for=\"{}\"]", id.replace('"', ""));
+            self.root
+                .select(&sel)
+                .ok()?
+                .map(|n| n.as_node().clone())
+                .map(|n| collapse_ws(&n.text_contents()))
+                .find(|t| !t.is_empty())
+        });
+        let label = accessible_name(node, &attrs, label_for);
         let (x, y, w, h) = rect.unwrap_or((0.0, 0.0, 0.0, 0.0));
         json!({
             "ok": true,
@@ -181,6 +192,7 @@ impl Document {
             "classes": attrs.get("class").cloned().unwrap_or_default()
                 .split_whitespace().collect::<Vec<_>>(),
             "text": text,
+            "label": label,
             "value": value,
             "href": attr(node, "href").and_then(|h| urlutil::resolve(&self.base_url, &h)),
             "attributes": attrs,
@@ -594,7 +606,43 @@ pub fn common_attrs(node: &NodeRef) -> HashMap<String, String> {
     out
 }
 
-/// 轻量 outerHTML 序列化:覆盖常见属性与子树文本。
+/// 可访问名(accessible name)推导:优先序 aria-label > data-title > title > alt >
+/// placeholder > value > 关联 `<label for>`。Web App 普遍用「无文本图标按钮 +
+/// data-title/CSS 背景图」,DOM 里没有文本节点,Agent 靠 `label` 才知道这是
+/// 什么控件(实测百度地图路线按钮 `div.route-button[data-title=路线]`)。
+pub fn accessible_name(
+    node: &NodeRef,
+    attrs: &HashMap<String, String>,
+    label_for: Option<String>,
+) -> String {
+    for key in ["aria-label", "data-title", "title", "alt", "placeholder"] {
+        if let Some(v) = attrs.get(key) {
+            let v = collapse_ws(v);
+            if !v.is_empty() {
+                return v;
+            }
+        }
+    }
+    // 按钮型 input 的 value 即按钮文案。
+    if tag_name(node) == "input" {
+        if let Some(t) = attrs.get("type") {
+            if matches!(t.as_str(), "button" | "submit" | "reset") {
+                if let Some(v) = attrs.get("value") {
+                    let v = collapse_ws(v);
+                    if !v.is_empty() {
+                        return v;
+                    }
+                }
+            }
+        }
+    }
+    if let Some(t) = label_for {
+        if !t.is_empty() {
+            return t;
+        }
+    }
+    String::new()
+}
 ///
 /// kuchikiki 内部使用 markup5ever 0.11,与工程直接依赖的 html5ever 0.29 类型不兼容,
 /// 因此不引入第二套序列化器;这里用 `common_attrs` 的已知属性集重建标签。
@@ -878,6 +926,49 @@ mod tests {
         let text = d.text();
         assert!(text.contains("Next"));
         assert!(!text.contains("color:red"));
+    }
+
+    #[test]
+    fn 可访问名从_data_title_等属性推导() {
+        // 无文本图标按钮(百度地图路线按钮形态):DOM 无文本节点,只能靠属性认控件。
+        let html = r#"<!doctype html><html><body>
+        <div class="searchbox-content-button route-button" data-title="路线"></div>
+        <input id="q" type="text" placeholder="搜地点、查公交、找路线">
+        <button title="搜索" class="b"></button>
+        <img alt="卫星图">
+        <label for="pw">密码</label><input id="pw" type="password">
+        </body></html>"#;
+        let d = Document::parse(html, "https://a.test/");
+        let pick = |sel: &str| {
+            let n = d.first(sel).unwrap().unwrap();
+            let attrs = common_attrs(&n);
+            let label_for = attrs.get("id").filter(|id| !id.is_empty()).and_then(|id| {
+                let s = format!("label[for=\"{}\"]", id.replace('"', ""));
+                d.root
+                    .select(&s)
+                    .ok()?
+                    .map(|x| x.as_node().clone())
+                    .map(|x| collapse_ws(&x.text_contents()))
+                    .find(|t| !t.is_empty())
+            });
+            accessible_name(&n, &attrs, label_for)
+        };
+        assert_eq!(pick(".route-button"), "路线");
+        assert_eq!(pick("input#q"), "搜地点、查公交、找路线");
+        assert_eq!(pick("button.b"), "搜索");
+        assert_eq!(pick("img"), "卫星图");
+        assert_eq!(pick("input#pw"), "密码");
+    }
+
+    #[test]
+    fn 元素JSON带可访问名字段() {
+        let html = r#"<!doctype html><html><body>
+        <div class="route-button" data-title="路线"></div></body></html>"#;
+        let d = Document::parse(html, "https://a.test/");
+        let n = d.first(".route-button").unwrap().unwrap();
+        let v = d.element_json(&n, 0, 1, None, &HashMap::new());
+        assert_eq!(v["label"], "路线");
+        assert_eq!(v["text"], "");
     }
 
     #[test]

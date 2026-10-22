@@ -14,6 +14,7 @@ pub mod js;
 pub mod layout;
 pub mod net;
 pub mod render;
+pub mod reqctx;
 pub mod resource;
 pub mod resources;
 pub mod script;
@@ -588,6 +589,12 @@ impl LsmBrowserManager {
         )
         .await;
         let html = pipeline.html;
+        // LAEW_DUMP_HTML=<路径>:把管线后的整页 HTML 落盘(诊断「JS 建好的 UI 没回写 /
+        // 布局空白」类问题的离线分析入口,与 tests 里的布局探针配套),默认关闭。
+        if let Ok(p) = std::env::var("LAEW_DUMP_HTML") {
+            let _ = std::fs::write(&p, &html);
+            eprintln!("[dump] wrote {} bytes to {}", html.len(), p);
+        }
         // 阶段三第三步:预取图片(替换元素固有尺寸参与布局)。
         let images_out = images::load_images(
             &mut inner,
@@ -818,6 +825,7 @@ impl LsmBrowserManager {
         let mut request = net::FetchRequest::get(url, timeout_ms.max(1_000));
         request.method = method.to_ascii_uppercase();
         request.body = body;
+        request.context = Some(reqctx::RequestContext::subresource("", reqctx::Dest::Document, ua));
         let (resp, from_cache) = if request.method == "GET" {
             // 阶段四第二步：GET 统一走带缓存的取页通道。
             if ua != DEFAULT_UA {
@@ -998,9 +1006,9 @@ impl LsmBrowserManager {
             }
         }
         let mut req = net::FetchRequest::get(url, timeout_ms.max(1_000));
-        if ua != DEFAULT_UA {
-            req.headers.push(("user-agent".to_string(), ua.to_string()));
-        }
+        // 主文档导航:浏览器语义 —— 顶层导航不带 Referer,但带完整 Accept/UA/
+        // Sec-Fetch-*(navigate) 指纹头;风控站点对「裸 UA」的主文档同样会拦。
+        req.context = Some(reqctx::RequestContext::subresource("", reqctx::Dest::Document, ua));
         let resp = self
             .http
             .fetch(req, &mut inner.cookies)
