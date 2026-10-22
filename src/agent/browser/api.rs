@@ -264,6 +264,11 @@ async fn apply_js_reply(
             });
         }
     }
+    drop(inner);
+    // 交互后补齐懒加载脚本:真实浏览器里 `require.async`/动态 <script> 会在
+    // 点击后立即取回执行;宿主若只在 open/navigate 跑管线,路线面板这类
+    // 懒加载 widget 会永远停在 loading 态(实测百度地图路线按钮)。
+    run_pending_scripts(mgr, pid, INTERACTION_SCRIPT_BUDGET_MS).await;
     reply
         .outcome
         .actions
@@ -276,6 +281,108 @@ async fn apply_js_reply(
         })
         .cloned()
         .collect()
+}
+
+/// 交互后单次脚本补齐墙钟预算(毫秒)。
+const INTERACTION_SCRIPT_BUDGET_MS: u64 = 8_000;
+/// 交互后脚本补齐轮次上限(懒加载链通常 1-3 轮)。
+const INTERACTION_SCRIPT_ROUNDS: usize = 12;
+
+/// 用页面当前 DOM 续跑脚本管线,只执行尚未执行过的 `<script>`。
+///
+/// 复用标签页持久 JS 线程(`tab.js`)与已执行指纹(`tab.executed_scripts`),
+/// 因此页面全局状态不丢、首屏脚本也不会重复初始化。
+async fn run_pending_scripts(mgr: &LsmBrowserManager, pid: &str, budget_ms: u64) {
+    let mut inner = mgr.inner.lock().await;
+    let (html, url, ua, viewport, session, rects, seed) = {
+        let Some(tab) = inner.tabs.get(pid) else {
+            return;
+        };
+        (
+            tab.html.clone(),
+            tab.url.clone(),
+            tab.user_agent.clone(),
+            (tab.viewport.width, tab.viewport.height),
+            tab.session_storage.clone(),
+            tab.layout.rect_map(),
+            script::PipelineSeed {
+                handle: tab.js.clone(),
+                executed: tab.executed_scripts.clone(),
+                max_rounds: INTERACTION_SCRIPT_ROUNDS,
+                budget_ms,
+            },
+        )
+    };
+    let pipeline = script::run_pipeline(
+        &mut inner,
+        &mgr.http,
+        &html,
+        &url,
+        &ua,
+        viewport,
+        &session,
+        None,
+        &rects,
+        seed,
+    )
+    .await;
+    let Some(tab) = inner.tabs.get_mut(pid) else {
+        return;
+    };
+    let changed = pipeline.html != html;
+    if changed {
+        tab.html = pipeline.html;
+    }
+    if let Some(h) = pipeline.js {
+        tab.js = Some(h);
+    }
+    if !pipeline.executed.is_empty() {
+        tab.executed_scripts = pipeline.executed;
+    }
+    for (k, v) in pipeline.form_values {
+        tab.form_values.insert(k, v);
+    }
+    for log in pipeline.console {
+        if tab.console.len() > 400 {
+            tab.console.remove(0);
+        }
+        tab.console.push(super::ConsoleRecord {
+            level: log.level,
+            text: log.text,
+            at_ms: super::now_ms(),
+        });
+    }
+    for rec in pipeline.network {
+        if tab.network.len() > 200 {
+            tab.network.remove(0);
+        }
+        tab.network.push(super::NetworkRecord {
+            url: rec.url,
+            method: if rec.method.is_empty() { "GET".to_string() } else { rec.method },
+            status: rec.status,
+            content_type: rec.content_type,
+            bytes: rec.bytes,
+            elapsed_ms: rec.elapsed_ms,
+            redirect: rec.redirect,
+            from_cache: false,
+            at_ms: super::now_ms(),
+        });
+    }
+    if changed {
+        let dom = Document::parse(&tab.html, &tab.url);
+        let media = super::style::MediaCtx::new(tab.viewport.width as f64, 720.0);
+        let sizes = super::images::ImageSizes::from_store(&tab.images);
+        tab.layout = super::layout::compute_full(
+            &dom,
+            tab.viewport.width as f64,
+            mgr.font(),
+            &media,
+            &sizes,
+        );
+        if tab.mode.is_headed() {
+            mgr.push_frame(tab);
+        }
+    }
 }
 
 /// 应用 DOM 动作并序列化(同步辅助函数)。

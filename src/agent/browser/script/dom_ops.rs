@@ -13,7 +13,9 @@ use crate::agent::browser::document::{self, Document};
 
 const MAX_INLINE_SCRIPTS: usize = 32;
 const MAX_INLINE_BYTES: usize = 256 * 1024;
-const MAX_EXTERNAL_SCRIPTS: usize = 16;
+/// 单轮外链脚本上限。需覆盖大型站点首屏全部静态脚本(百度地图 37 个),
+/// 否则跨轮补齐会让靠后的内联/外链脚本相对顺序失真。
+const MAX_EXTERNAL_SCRIPTS: usize = 64;
 
 /// 单轮应用结果:DOM 之外的副作用汇总,由调用方合并进 TabState/存储。
 #[derive(Debug, Default, Clone)]
@@ -217,12 +219,21 @@ fn parse_fragment_nodes(html: &str) -> Vec<NodeRef> {
         .unwrap_or_default()
 }
 
+/// 文档序脚本条目。内联脚本与外链 URL **必须保持 DOM 中的相对顺序**:
+/// 浏览器按文档顺序同步执行脚本,装载器初始化(`mod.js` → `require.resourceMap`
+/// → pkg 定义)依赖这一顺序;此前后收集成「全部内联 + 全部外链」两组再拼接,
+/// 等于把后半段内联脚本提前到所有外链之前执行(实测百度地图 FIS 装载器因此
+/// 拿不到 resourceMap 配置、pano 模块永不注册,页面白屏)。
+#[derive(Debug, Clone)]
+pub enum CollectedItem {
+    Inline(super::ScriptSource),
+    External(String),
+}
+
 /// 脚本收集产物。
 #[derive(Debug, Default)]
 pub struct CollectedScripts {
-    pub inline: Vec<super::ScriptSource>,
-    /// 外链脚本的绝对 URL(宿主侧预取后并入 inline 执行)。
-    pub external_urls: Vec<String>,
+    pub items: Vec<CollectedItem>,
 }
 
 /// 收集文档中的 `<script>`:内联文本直接提取,外链 src 返回 URL 清单。
@@ -232,6 +243,8 @@ pub fn collect_scripts(doc: &Document, base_url: &str, executed: &mut HashSet<u6
     let Ok(scripts) = doc.select("script") else {
         return out;
     };
+    let mut inline_count = 0usize;
+    let mut external_count = 0usize;
     for node in scripts {
         let src = document::attr(&node, "src");
         let typ = document::attr(&node, "type")
@@ -245,7 +258,7 @@ pub fn collect_scripts(doc: &Document, base_url: &str, executed: &mut HashSet<u6
             continue;
         }
         if let Some(src) = src {
-            if out.external_urls.len() >= MAX_EXTERNAL_SCRIPTS {
+            if external_count >= MAX_EXTERNAL_SCRIPTS {
                 continue;
             }
             if let Some(abs) = crate::agent::browser::urlutil::resolve(base_url, &src) {
@@ -257,34 +270,42 @@ pub fn collect_scripts(doc: &Document, base_url: &str, executed: &mut HashSet<u6
                     if executed.contains(&fingerprint(&abs)) {
                         continue;
                     }
-                    if !out.external_urls.contains(&abs) {
-                        out.external_urls.push(abs);
+                    if !out.items.iter().any(|it| matches!(it, CollectedItem::External(u) if *u == abs)) {
+                        out.items.push(CollectedItem::External(abs));
+                        external_count += 1;
                     }
                 } else if let Some(rest) = abs.strip_prefix("data:") {
                     // data: URL 直接作为内联内容。
-                    push_inline(&mut out, rest, executed, &abs);
+                    if inline_count < MAX_INLINE_SCRIPTS {
+                        if push_inline(&mut out, rest, executed, &abs) {
+                            inline_count += 1;
+                        }
+                    }
                 }
             }
             continue;
         }
         let text = node.text_contents();
-        if out.inline.len() >= MAX_INLINE_SCRIPTS || text.len() > MAX_INLINE_BYTES {
+        if inline_count >= MAX_INLINE_SCRIPTS || text.len() > MAX_INLINE_BYTES {
             continue;
         }
-        push_inline(&mut out, &text, executed, "");
+        if push_inline(&mut out, &text, executed, "") {
+            inline_count += 1;
+        }
     }
     out
 }
 
+/// 追加一条内联脚本；空内容/已执行过返回 `false`。
 fn push_inline(
     out: &mut CollectedScripts,
     content: &str,
     executed: &mut HashSet<u64>,
     src_url: &str,
-) {
+) -> bool {
     let fp = fingerprint(content);
     if executed.contains(&fp) {
-        return;
+        return false;
     }
     executed.insert(fp);
     // data: URL 简化处理:取逗号后内容,base64 变体按原样跳过。
@@ -296,13 +317,14 @@ fn push_inline(
         content.to_string()
     };
     if body.trim().is_empty() {
-        return;
+        return false;
     }
-    out.inline.push(super::ScriptSource {
+    out.items.push(CollectedItem::Inline(super::ScriptSource {
         kind: "inline",
         content: body,
         src_url: src_url.to_string(),
-    });
+    }));
+    true
 }
 
 /// 内容/URL 指纹:内联脚本与外链 URL 共用的执行记账键。

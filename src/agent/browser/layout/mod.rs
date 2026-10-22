@@ -751,23 +751,21 @@ impl<'a> LayoutCtx<'a> {
                 // 非定位子代的百分比高度以本盒内容高为包含块高 —— 仅当本盒高度
                 // 确定时成立,auto 高必须传 UNKNOWN_CB_H(不得把祖父确定高透传,
                 // 否则违背 CSS「百分比高度相对父内容高」的语义)。
-                let child_cb = if style.pos.is_positioned() {
-                    (
-                        bx + style.padding_left,
-                        start_y + style.padding_top,
-                        (bw - style.padding_left - style.padding_right).max(0.0),
-                        UNKNOWN_CB_H,
-                    )
-                } else if own_definite_h {
-                    (
-                        bx + style.padding_left,
-                        start_y + style.padding_top,
-                        (bw - style.padding_left - style.padding_right).max(0.0),
-                        (box_h - style.padding_top - style.padding_bottom).max(0.0),
-                    )
+                // 子代包含块高:本盒高度确定时(**无论是否定位**)即为内容盒高,
+                // 后代 `height:100%` 可正常求解;只有 auto 高才未知。
+                // 此前把「定位元素」一律当成未知高,`#app{height:720px}` 里的
+                // `#MapHolder{height:100%}` 退化成内容高(8px),地图容器塌缩。
+                let cb_h = if own_definite_h {
+                    (box_h - style.padding_top - style.padding_bottom).max(0.0)
                 } else {
-                    (cb.0, cb.1, cb.2, UNKNOWN_CB_H)
+                    UNKNOWN_CB_H
                 };
+                let child_cb = (
+                    bx + style.padding_left,
+                    start_y + style.padding_top,
+                    (bw - style.padding_left - style.padding_right).max(0.0),
+                    cb_h,
+                );
                 self.layout_children(
                     &child,
                     bx + style.padding_left,

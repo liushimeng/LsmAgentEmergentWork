@@ -135,11 +135,27 @@ fn 收集脚本_内联与外链() {
     );
     let mut executed = std::collections::HashSet::new();
     let collected = dom_ops::collect_scripts(&doc, "https://a.test/page", &mut executed);
-    assert_eq!(collected.inline.len(), 2);
-    assert_eq!(collected.external_urls, vec!["https://a.test/x.js".to_string()]);
-    // 重复收集按指纹去重。
+    // 文档序:head 内联 → head 外链 → body 内联。顺序不得重排。
+    assert_eq!(collected.items.len(), 3);
+    assert!(matches!(
+        &collected.items[0],
+        dom_ops::CollectedItem::Inline(s) if s.content.contains("a=1")
+    ));
+    assert!(matches!(
+        &collected.items[1],
+        dom_ops::CollectedItem::External(u) if u == "https://a.test/x.js"
+    ));
+    assert!(matches!(
+        &collected.items[2],
+        dom_ops::CollectedItem::Inline(s) if s.content.contains("b=2")
+    ));
+    // 重复收集:内联按指纹去重;外链由管线执行后记账,未执行前仍会出现。
     let again = dom_ops::collect_scripts(&doc, "https://a.test/page", &mut executed);
-    assert!(again.inline.is_empty());
+    assert_eq!(again.items.len(), 1, "内联应去重,仅剩未执行的外链");
+    assert!(matches!(
+        &again.items[0],
+        dom_ops::CollectedItem::External(u) if u == "https://a.test/x.js"
+    ));
 }
 
 // ---------- JS 线程(PRELUDE) ----------
@@ -643,4 +659,73 @@ fn append_prepend_存在且落地宿主() {
         "prepend 应产生宿主前插动作:{:?}",
         pre.outcome.actions
     );
+}
+
+#[test]
+fn detached_innerhtml_解析出可查询子树() {
+    let h = JsHandle::spawn();
+    let reply = eval_on(
+        &h,
+        r#"(function(){
+            var d = document.createElement('div');
+            d.innerHTML = ' <link/><table></table><a href="/a">a</a><input type="checkbox"/>';
+            var a = d.getElementsByTagName('A')[0];
+            var input = d.getElementsByTagName('input')[0];
+            return JSON.stringify({
+                aLen: d.getElementsByTagName('A').length,
+                iLen: d.getElementsByTagName('input').length,
+                href: a ? a.getAttribute('href') : null,
+                inputType: input ? input.getAttribute('type') : null,
+                kids: d.children.length
+            });
+        })()"#,
+        "<html><body></body></html>",
+        "https://a.test/",
+    );
+    let v = reply.outcome.value;
+    assert!(v.contains("\"aLen\":1"), "detached 子树应能按标签查询:{v}");
+    assert!(v.contains("\"iLen\":1"), "detached 子树应能按标签查询:{v}");
+    assert!(v.contains("\"href\":\"/a\""), "属性应可读:{v}");
+    assert!(v.contains("\"inputType\":\"checkbox\""), "属性应可读:{v}");
+    assert!(v.contains("\"kids\":4"), "children 应只含解析出的元素节点:{v}");
+    h.shutdown();
+}
+
+#[test]
+fn substr_按_annexb_语义可用() {
+    let h = JsHandle::spawn();
+    let reply = eval_on(
+        &h,
+        r#"JSON.stringify({
+            tail: 'array'.substr(1),
+            neg: 'abcdef'.substr(-2),
+            len: 'abcdef'.substr(1, 2),
+            negLen: 'abcdef'.substr(2, -1),
+            big: 'abcdef'.substr(2, 100)
+        })"#,
+        "<html><body></body></html>",
+        "https://a.test/",
+    );
+    let v = reply.outcome.value;
+    assert!(v.contains("\"tail\":\"rray\""), "{v}");
+    assert!(v.contains("\"neg\":\"ef\""), "{v}");
+    assert!(v.contains("\"len\":\"bc\""), "{v}");
+    assert!(v.contains("\"negLen\":\"\""), "{v}");
+    assert!(v.contains("\"big\":\"cdef\""), "{v}");
+    h.shutdown();
+}
+
+#[test]
+fn body_client_尺寸按视口兜底() {
+    let h = JsHandle::spawn();
+    let reply = eval_on(
+        &h,
+        "JSON.stringify({w: document.body.clientWidth, h: document.body.clientHeight})",
+        "<html><body><div>x</div></body></html>",
+        "https://a.test/",
+    );
+    let v = reply.outcome.value;
+    assert!(v.contains("\"w\":1280"), "body.clientWidth 应按视口兜底:{v}");
+    assert!(v.contains("\"h\":720"), "body.clientHeight 应按视口兜底:{v}");
+    h.shutdown();
 }

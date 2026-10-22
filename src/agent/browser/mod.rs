@@ -182,6 +182,8 @@ pub struct TabState {
     pub auto_follow: bool,
     /// 页面 JS 线程句柄(阶段二:持久 Boa Context,导航换页时重建)。
     pub js: Option<script::JsHandle>,
+    /// 已执行脚本指纹(首屏管线 + 交互后懒加载补齐共用一本账)。
+    pub executed_scripts: std::collections::HashSet<u64>,
     /// 已解码图片缓存(阶段三第三步:URL → RGBA8,全内存)。
     pub images: images::ImageStore,
     /// 安全上下文（CORS/CSP 缓存、页面源）。
@@ -582,6 +584,7 @@ impl LsmBrowserManager {
             &empty_session,
             csp_policy.as_ref(),
             &pre_rects,
+            script::PipelineSeed::default(),
         )
         .await;
         let html = pipeline.html;
@@ -696,6 +699,7 @@ impl LsmBrowserManager {
             highlight: false,
             auto_follow: false,
             js: pipeline.js,
+            executed_scripts: pipeline.executed,
             images: images_out.store,
             security: security::SecurityContext::new(),
         };
@@ -876,6 +880,7 @@ impl LsmBrowserManager {
             &session_snapshot,
             csp_policy.as_ref(),
             &pre_rects,
+            script::PipelineSeed::default(),
         )
         .await;
         let html = pipeline.html;
@@ -922,6 +927,7 @@ impl LsmBrowserManager {
             record_network(tab, rec);
         }
         tab.js = pipeline.js;
+        tab.executed_scripts = pipeline.executed.clone();
         tab.images = images_out.store;
         for rec in pipeline.network {
             record_network(tab, rec);

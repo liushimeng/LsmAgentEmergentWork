@@ -120,7 +120,8 @@ fn take_reply(req: &mut JsRequest) -> Option<std::sync::mpsc::Sender<JsReply>> {
     match req {
         JsRequest::RunScripts { reply, .. }
         | JsRequest::Eval { reply, .. }
-        | JsRequest::Dispatch { reply, .. } => Some(reply.clone()),
+        | JsRequest::Dispatch { reply, .. }
+        | JsRequest::Diag { reply, .. } => Some(reply.clone()),
         JsRequest::Shutdown => None,
     }
 }
@@ -162,6 +163,15 @@ impl ThreadRuntime {
             NativeFunction::from_fn_ptr(native_btoa),
         )
         .map_err(|e| format!("注册 btoa 失败:{e}"))?;
+        // ToObject 调试探针必须在 PRELUDE 求值前决定是否安装(默认不安装,
+        // 包装内建方法会改变属性身份,不能常驻)。
+        let trace_to_obj = std::env::var("LAEW_JS_TRACE_TOOBJ")
+            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+        ctx.eval(Source::from_bytes(
+            format!("globalThis.__lsmTraceToObjInstall = {trace_to_obj};").as_bytes(),
+        ))
+        .map_err(|e| format!("调试开关初始化失败:{e}"))?;
         ctx.eval(Source::from_bytes(PRELUDE.as_bytes()))
             .map_err(|e| format!("PRELUDE 初始化失败:{e}"))?;
         // LAEW_JS_DIAG=1 时装 define 陷阱:站点装载器安装全局 define 时被包裹,
@@ -188,6 +198,9 @@ impl ThreadRuntime {
             JsRequest::Eval {
                 script, env, nodes, ..
             } => Some(self.eval_user(&script, &env, &nodes)),
+            JsRequest::Diag {
+                source, origin, ..
+            } => Some(self.diag_source(&source, &origin)),
             JsRequest::Dispatch {
                 selector,
                 event,
@@ -210,6 +223,15 @@ impl ThreadRuntime {
         v.to_string(&mut self.ctx)
             .map(|s| s.to_std_string_escaped())
             .map_err(|e| format!("JS 结果转换失败:{e}"))
+    }
+
+    /// 调试:在持久 Context 上做语句级错误定位(不改变页面状态,仅前缀重放)。
+    fn diag_source(&mut self, src: &str, origin: &str) -> JsReply {
+        let lines = super::diag::localize(&mut self.ctx, src, origin);
+        let mut outcome = JsOutcome::default();
+        outcome.ok = true;
+        outcome.value = serde_json::to_string(&lines).unwrap_or_else(|_| "[]".into());
+        JsReply::from_outcome(outcome)
     }
 
     fn eval_quiet(&mut self, src: &str) {
@@ -284,10 +306,31 @@ impl ThreadRuntime {
             // ['require','exports','module', ...静态 require('lit')] —— Boa 的
             // fn.toString 壳让装载器源码级依赖解析落空,依赖不预载,工厂在
             // 半成品上同步执行(实测百度地图 tangram 工厂 to_object 穿透)。
-            let filled = super::amd_fill::amd_fill_deps(&s.content);
+            // 补齐与否取决于「此刻」页面上装的是哪种 AMD 装载器:脚本可以自己
+            // 替换全局 require/define(百度地图 mod.js 把内置 RequireJS 换成 FIS
+            // 同步装载器),因此必须逐个脚本在运行时判定,不能整批预设。
+            let amd_kind = self
+                .eval_string("__lsmAmdKind()")
+                .unwrap_or_else(|_| "none".to_string());
+            let filled = if super::amd_fill_enabled() && amd_kind != "fis" {
+                super::amd_fill::amd_fill_deps(&s.content)
+            } else {
+                s.content.clone()
+            };
             // Boa 0.20 for-in 规范偏差守卫:遍历 null/undefined 会抛错(规范应零次迭代),
             // `EXPR||{}` 改写在一切取值下与规范等价(见 for_in_guard.rs)。
-            let guarded = super::for_in_guard::guard_for_in(&filled);
+            let mut guarded = super::for_in_guard::guard_for_in(&filled);
+            // 调试:逐条语句标记 define 工厂体(LAEW_JS_TRACE_STMT=1)。
+            if std::env::var("LAEW_JS_TRACE_STMT")
+                .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(false)
+            {
+                guarded = super::diag::instrument_amd_factories(&guarded);
+            }
+            self.eval_quiet(&format!(
+                "__lsmSetCurrentScript({})",
+                serde_json::to_string(&origin).unwrap_or_else(|_| "\"\"".into())
+            ));
             let payload = serde_json::to_string(&guarded).unwrap_or_else(|_| "\"\"".into());
             let res = self.eval_string(&format!("__lsmRunScript({payload})"));
             if let Ok(body) = res {
@@ -492,6 +535,14 @@ fn build_meta_json(env: &PageEnv) -> String {
         "search": search,
         "hash": hash,
         "origin": origin,
+        // 调试开关:把 null/undefined 传入 ToObject 类内建调用的点记进 console
+        // (定位 "cannot convert 'null' or 'undefined' to object" 的调用方)。
+        "traceToObj": std::env::var("LAEW_JS_TRACE_TOOBJ")
+            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false),
+        "traceStmt": std::env::var("LAEW_JS_TRACE_STMT")
+            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false),
     })
     .to_string()
 }

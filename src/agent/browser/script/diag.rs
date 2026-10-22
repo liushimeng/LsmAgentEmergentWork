@@ -566,6 +566,9 @@ pub fn localize(ctx: &mut Context, src: &str, origin: &str) -> Vec<String> {
                 stmts.len()
             ));
             let prefix = concat_spans(src, &stmts[..k]);
+            if let DriverResult::Throw(m) = run_driver(ctx, &prefix) {
+                report.push(format!("[JS诊断] 前缀错误: {m}"));
+            }
             drill(ctx, &prefix, stmts[k].text(src), 0, &mut report);
             return report;
         }
@@ -877,9 +880,11 @@ fn locate_by_repair(ctx: &mut Context, prefix: &str, stmt: &str, level: usize, r
     // 报告切点所在行 ±3 行上下文。
     let line_start = stmt[..cut].rfind('\n').map(|p| p + 1).unwrap_or(0);
     let prev_nl = stmt[..line_start.saturating_sub(1)].rfind('\n').map(|p| p + 1).unwrap_or(0);
-    let ctx_end = (cut..stmt.len())
-        .find(|&i| stmt[i..].starts_with('\n'))
-        .map(|i| i + 1)
+    // 必须用 `find('\n')`(返回字符边界),不能逐字节 `stmt[i..]`:
+    // 多字节 UTF-8 字符中间的下标切片会 panic(实测 400KB 中文注释脚本)。
+    let ctx_end = stmt[cut..]
+        .find('\n')
+        .map(|p| cut + p + 1)
         .unwrap_or(stmt.len());
     let tail_end = (0..6)
         .fold(ctx_end, |acc, _| {
@@ -912,6 +917,82 @@ fn clip(s: &str, n: usize) -> String {
 
 #[cfg(test)]
 mod tests;
+
+/// 调试辅助:给每个顶层 `define(id, factory)` 的工厂体插入语句标记。
+/// 工厂被装载器调用时逐条记录 `__lsmStmtMark`，抛错后可从最后标记定位语句。
+pub(crate) fn instrument_amd_factories(src: &str) -> String {
+    if !src.contains("define(") {
+        return src.to_string();
+    }
+    let stmts = split_top_level(src);
+    let mut out = String::with_capacity(src.len() + stmts.len() * 48);
+    for sp in &stmts {
+        let text = sp.text(src);
+        // 仅调试 tangram(超大 IIFE,内部任意层级插桩会破坏压缩语法)。
+        if text.contains("tangram.js") {
+            if let Some(body) = extract_define_factory(text) {
+                out.push_str(&text[..body.body_open + 1]);
+                instrument_region(&text[body.body_open + 1..body.body_close], &mut out, 0);
+                out.push_str(&text[body.body_close..]);
+            } else {
+                out.push_str(text);
+            }
+        } else {
+            out.push_str(text);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// 递归给语句序列插标记;对较大的函数体再下钻一层(`depth < 2`)。
+fn instrument_region(inner: &str, out: &mut String, depth: usize) {
+    // 上一片段是否只是表达式前缀(`void` / `!` / `typeof` 等):
+    // 切分器偶尔会把 `void function(){}()` 拆成两段,中间插语句会造出
+    // `function(){}` 独立语句(非法)。
+    let mut prev_is_prefix = false;
+    for p in split_top_level(inner) {
+        let piece = p.text(inner);
+        let head = piece.trim_start();
+        let trimmed = head.trim_end();
+        // 这些片段是上一条语句的语法后缀,前面插语句会破坏语法
+        // (`else`/`catch`/`finally`/`while` do-while 尾等)。
+        let is_suffix = ["else", "catch", "finally", "while", ",", ")", "]", "}"]
+            .iter()
+            .any(|k| head.starts_with(k));
+        let insert = !is_suffix && !prev_is_prefix;
+        if insert {
+            let snippet: String = head.chars().take(80).collect();
+            out.push_str("__lsmStmtMark(");
+            out.push_str(&serde_json::to_string(&snippet).unwrap_or_else(|_| "\"\"".into()));
+            out.push_str(");\n");
+        }
+        if depth < 1 {
+            if let Some(b) = find_function_bodies(piece).first() {
+                let body_len = b.body_close.saturating_sub(b.body_open);
+                if body_len > 400 {
+                    out.push_str(&piece[..b.body_open + 1]);
+                    instrument_region(&piece[b.body_open + 1..b.body_close], out, depth + 1);
+                    out.push_str(&piece[b.body_close..]);
+                    out.push('\n');
+                    continue;
+                }
+            }
+        }
+        out.push_str(piece);
+        out.push('\n');
+        prev_is_prefix = matches!(
+            trimmed,
+            "void" | "typeof" | "delete" | "new" | "await" | "yield" | "!" | "~" | "+" | "-" | "++" | "--"
+        ) || ["=", "(", "[", ",", "?", ":", "&&", "||", "\\", "+", "-", "*", "/", "%", "<", ">", "!"]
+            .iter()
+            .any(|op| trimmed.ends_with(op));
+        if head.starts_with("function") || head.starts_with("class") {
+            // 完整表达式已消费。
+            prev_is_prefix = false;
+        }
+    }
+}
 
 /// 读取探针捕获日志并清理。
 fn collect_probe_log(ctx: &mut Context) -> Vec<String> {

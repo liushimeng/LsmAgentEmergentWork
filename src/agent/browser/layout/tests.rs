@@ -815,3 +815,18 @@ fn auto高父不向上透传祖父确定高() {
         inner.3
     );
 }
+
+#[test]
+fn 定位父元素确定高时子代百分比高度可求解() {
+    // #app 是 position:relative + 显式高 → 子代 height:100% 必须解析为 720。
+    // 此前「定位父」一律按未知包含块高处理,#MapHolder 退化为内容高(8px),
+    // 百度地图容器塌缩、地图初始化到 1px 视口。
+    let doc = Document::parse(
+        "<body><div id='app' style='position:relative;height:720px'>\
+            <div id='mh' style='height:100%'></div></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let mh = layout.rect_for("#mh").expect("mh 应有布局盒");
+    assert!((mh.3 - 720.0).abs() < 2.0, "定位父下 100% 应为 720,实际 {}", mh.3);
+}

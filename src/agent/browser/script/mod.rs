@@ -113,6 +113,12 @@ pub enum JsRequest {
         nodes: Vec<super::document::SnapshotNode>,
         reply: std::sync::mpsc::Sender<JsReply>,
     },
+    /// 语句级错误定位(调试用):在持久 Context 上对给定源码做前缀重放二分。
+    Diag {
+        source: String,
+        origin: String,
+        reply: std::sync::mpsc::Sender<JsReply>,
+    },
     Shutdown,
 }
 
@@ -143,6 +149,24 @@ impl JsHandle {
             .map_err(|_| "JS 执行超时(线程预算耗尽)".to_string())
     }
 
+    /// 对给定源码做语句级定位(需在 `spawn_blocking` 中调用)。
+    /// 诊断是离线分析,前缀重放次数远高于常规请求,故单独放宽墙钟。
+    pub fn diag(&self, source: String, origin: String) -> Result<Vec<String>, String> {
+        let (tx_reply, rx_reply) = std::sync::mpsc::channel::<JsReply>();
+        self.tx
+            .send(JsRequest::Diag {
+                source,
+                origin,
+                reply: tx_reply,
+            })
+            .map_err(|_| "JS 线程已退出".to_string())?;
+        let reply = rx_reply
+            .recv_timeout(Duration::from_secs(600))
+            .map_err(|_| "JS 诊断超时(600s)".to_string())?;
+        serde_json::from_str::<Vec<String>>(&reply.outcome.value)
+            .map_err(|e| format!("diag 结果非法:{e}"))
+    }
+
     /// 请求线程退出(导航换页/关页)。
     pub fn shutdown(&self) {
         let _ = self.tx.send(JsRequest::Shutdown);
@@ -153,6 +177,19 @@ impl JsHandle {
 pub fn scripts_enabled() -> bool {
     !matches!(
         std::env::var("LAEW_WEB_SCRIPT").unwrap_or_default().trim(),
+        "off" | "0" | "false" | "no"
+    )
+}
+
+/// AMD 依赖数组静态补齐开关。`LAEW_AMD_FILL=off` 关闭。
+///
+/// 补齐是为了绕开 Boa `fn.toString()` 只返回壳、装载器源码级依赖解析落空的缺陷;
+/// 但 FIS 系装载器(`define(id, factory)` 同步注册)只认两参形态,补成三参会被
+/// 转交给 RequireJS 分支,模块进 globalDefQueue 而永远进不了同步注册表
+/// (实测百度地图 pano 模块 "has not been loaded yet")。排查时可用本开关二分。
+pub fn amd_fill_enabled() -> bool {
+    !matches!(
+        std::env::var("LAEW_AMD_FILL").unwrap_or_default().trim(),
         "off" | "0" | "false" | "no"
     )
 }
@@ -175,6 +212,22 @@ pub struct PipelineOut {
     pub network: Vec<super::NetworkRecord>,
     pub js: Option<JsHandle>,
     pub form_values: HashMap<String, String>,
+    /// 已执行脚本指纹(内联内容/外链 URL)。交互后补齐懒加载脚本时作为种子,
+    /// 避免把首屏脚本整批重跑一遍。
+    pub executed: std::collections::HashSet<u64>,
+}
+
+/// 管线续跑种子。交互(eval_js / click 等)后页面可能注入新的 `<script>`
+/// (FIS `require.async` 懒加载 widget 模块),必须沿用**同一个 JS 线程**与
+/// 已执行指纹集合继续跑,否则要么重复执行首屏脚本、要么新模块永远不加载。
+#[derive(Default)]
+pub(crate) struct PipelineSeed {
+    pub handle: Option<JsHandle>,
+    pub executed: std::collections::HashSet<u64>,
+    /// 0 表示使用默认 `MAX_ROUNDS`。
+    pub max_rounds: usize,
+    /// 0 表示使用默认 `pipeline_budget_ms()`。
+    pub budget_ms: u64,
 }
 
 /// 脚本管线轮次上限。
@@ -216,6 +269,7 @@ pub(crate) async fn run_pipeline(
     session_storage: &HashMap<String, String>,
     csp: Option<&super::security::CspPolicy>,
     rects: &HashMap<String, (f64, f64, f64, f64)>,
+    seed: PipelineSeed,
 ) -> PipelineOut {
     let mut out = PipelineOut {
         html: raw_html.to_string(),
@@ -224,18 +278,20 @@ pub(crate) async fn run_pipeline(
     if !scripts_enabled() {
         return out;
     }
-    let mut executed = std::collections::HashSet::new();
-    let mut handle: Option<JsHandle> = None;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(pipeline_budget_ms());
+    let mut executed = seed.executed;
+    let mut handle: Option<JsHandle> = seed.handle;
+    let max_rounds = if seed.max_rounds == 0 { MAX_ROUNDS } else { seed.max_rounds };
+    let budget = if seed.budget_ms == 0 { pipeline_budget_ms() } else { seed.budget_ms };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget);
     let title_now = {
         let doc = super::document::Document::parse(raw_html, base_url);
         doc.title()
     };
-    for round in 0..MAX_ROUNDS {
+    for round in 0..max_rounds {
         if std::time::Instant::now() >= deadline {
             out.console.push(super::ConsoleRecord {
                 level: "warn".to_string(),
-                text: format!("脚本管线达到墙钟预算({}ms),已停止继续取回模块", pipeline_budget_ms()),
+                text: format!("脚本管线达到墙钟预算({}ms),已停止继续取回模块", budget),
                 at_ms: super::now_ms(),
             });
             break;
@@ -245,11 +301,21 @@ pub(crate) async fn run_pipeline(
             let doc = super::document::Document::parse(&out.html, base_url);
             dom_ops::collect_scripts(&doc, base_url, &mut executed)
         };
-        if collected.inline.is_empty() && collected.external_urls.is_empty() {
+        if collected.items.is_empty() {
             break;
         }
-        let mut scripts = collected.inline;
-        for url in &collected.external_urls {
+        // 按 DOM 文档序执行(内联/外链混排),不得拆成两组重排:
+        // 装载器初始化链(`mod.js` → `require.resourceMap` → pkg)依赖真实顺序。
+        let mut scripts = Vec::new();
+        for item in collected.items {
+            let url = match item {
+                dom_ops::CollectedItem::Inline(s) => {
+                    scripts.push(s);
+                    continue;
+                }
+                dom_ops::CollectedItem::External(u) => u,
+            };
+            let url = &url;
             // 阶段四第二步：CSP script-src 门禁（外链脚本 URL 白名单）。
             if let Some(policy) = csp {
                 if !policy.is_script_allowed(url, false) {
@@ -389,13 +455,14 @@ pub(crate) async fn run_pipeline(
         for url in &executed_externals {
             executed.insert(dom_ops::fingerprint(url));
         }
-        if round + 1 < MAX_ROUNDS {
+        if round + 1 < max_rounds {
             // 下一轮 collect_scripts 会检测是否有新注入的脚本。
             continue;
         }
         break;
     }
     out.js = handle;
+    out.executed = executed;
     out
 }
 

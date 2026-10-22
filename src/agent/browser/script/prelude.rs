@@ -25,6 +25,7 @@ var __lsmScriptCbs = {};
 var __lsmTimerSeq = 0;
 var __lsmNow = 0;
 var __lsmTimerRan = 0;
+function __lsmSetCurrentScript(o) { globalThis.__lsmCurrentScript = String(o || ""); }
 var __lsmFatal = null;
 var __lsmDispatchResult = { handled: false, defaultPrevented: false };
 // 阶段五第一步:观察者系列(MutationObserver/IntersectionObserver/ResizeObserver)。
@@ -51,7 +52,65 @@ function __clog(level, text) {
 }
 function __cerror(text) { __clog("error", text); }
 
+// ---------- Annex B 兼容:String.prototype.substr ----------
+// Boa 0.20 默认关闭 annex-b,`substr` 缺失;站点会自带补丁,但实测百度地图里
+// 落到一个 native 形态的实现上,`"array".substr(1)` 直接抛
+// "cannot convert 'null' or 'undefined' to object",tangram 初始化第一条
+// `createChain` 即被打断。这里按 Annex B.2.2.1 提供正确实现,并在每轮异常时
+// 重新断言(页面脚本可能覆盖成坏实现)。
+function __lsmSubstrPolyfill(start, length) {
+  var s = String(this);
+  var size = s.length;
+  var begin = Number(start);
+  if (begin !== begin) begin = 0;
+  else if (begin === Infinity) begin = size;
+  else if (begin === -Infinity) begin = 0;
+  else {
+    begin = begin < 0 ? Math.ceil(begin) : Math.floor(begin);
+    begin = begin < 0 ? Math.max(size + begin, 0) : Math.min(begin, size);
+  }
+  var len;
+  if (length === undefined) len = size;
+  else {
+    len = Number(length);
+    if (len !== len || len <= 0) len = 0;
+    else if (len === Infinity) len = size - begin;
+    else len = Math.min(Math.floor(len), size - begin);
+  }
+  return s.substring(begin, begin + len);
+}
+__lsmSubstrPolyfill.__lsmPolyfill = true;
+function __lsmEnsureSubstr() {
+  var cur = String.prototype.substr;
+  if (typeof cur === "function" && cur.__lsmPolyfill) return;
+  try {
+    Object.defineProperty(String.prototype, "substr", {
+      value: __lsmSubstrPolyfill,
+      writable: true,
+      enumerable: false,
+      configurable: true
+    });
+  } catch (e) {}
+}
+__lsmEnsureSubstr();
+// 调试:记录谁在运行期覆盖了 substr(仅有 LAEW_JS_TRACE_TOOBJ 时安装)。
+if (globalThis.__lsmTraceToObjInstall) {
+  try {
+    var __lsmSubstrVal = String.prototype.substr;
+    Object.defineProperty(String.prototype, "substr", {
+      configurable: true,
+      enumerable: false,
+      get: function () { return __lsmSubstrVal; },
+      set: function (v) {
+        try { __cerror("[substr] 被覆盖 -> " + String(v).slice(0, 120)); } catch (e) {}
+        __lsmSubstrVal = v;
+      }
+    });
+  } catch (e) {}
+}
+
 function __lsmRefresh(nodes, meta) {
+  __lsmEnsureSubstr();
   // 宿主侧变更 diff:与上一轮快照比对,合成 mutation 记录。
   // Agent 侧动作(input_text 写值、click 后 DOM 重建)只体现在快照里,
   // 页面脚本若无通知就只能轮询;这里把差异翻译成标准 mutation 记录喂给观察者。
@@ -75,6 +134,8 @@ function __lsmRefresh(nodes, meta) {
   navigator.userAgent = String(__lsmMeta.ua || "");
   __lsmSetViewport(Number(__lsmMeta.width) || 1280, Number(__lsmMeta.height) || 720);
   window.__lsmPrefersDark = !!__lsmMeta.prefersDark;
+  window.__lsmTraceToObj = !!__lsmMeta.traceToObj;
+  window.__lsmTraceStmt = !!__lsmMeta.traceStmt;
   window.scrollX = Number(__lsmMeta.scrollX) || 0;
   window.scrollY = Number(__lsmMeta.scrollY) || 0;
   window.pageXOffset = window.scrollX;
@@ -216,7 +277,10 @@ function __lsmGeom(n) {
       rect: { x: x, y: y, top: y, left: x, right: x + w, bottom: y + h, width: w, height: h } };
   }
   var tag = String((n && n.tag) || "").toLowerCase();
-  if (tag === "html") {
+  // html/body 没有布局盒(布局从 body 内容开始),用视口兜底:
+  // 真实浏览器 document.body.clientWidth/Height 恒为布局视口尺寸,
+  // 地图/全屏面板初始化直接读它,取 0 会让容器塌缩(实测百度地图)。
+  if (tag === "html" || tag === "body") {
     var vw = Math.round(Number(__lsmMeta.width) || 1280);
     var vh = Math.round(Number(__lsmMeta.height) || 720);
     return { x: 0, y: 0, w: vw, h: vh,
@@ -536,6 +600,9 @@ function __newEl(tag) {
     __tag: t,
     __attrs: {},
     __kids: [],
+    // innerHTML 赋值产生的可查询子树(仅用于 children/getElementsByTagName/
+    // querySelector 等读路径;序列化仍用 __pendingHtml 原文保真)。
+    __htmlKids: [],
     __text: "",
     nodeType: 1,
     tagName: t.toUpperCase(),
@@ -644,6 +711,10 @@ function __newEl(tag) {
     // 元素未入树:宿主端 @created set_html 无处落地,内容存 __pendingHtml,
     // 挂载时随序列化原样带到宿主(见 __serEl)。
     el.__pendingHtml = String(v);
+    // 同时解析出可查询子树:tangram 特性探测即 createElement→innerHTML→
+    // getElementsByTagName('input')[0]→input.checked,缺失子树会让 input 为
+    // undefined 并整层中断(实测百度地图白屏)。
+    try { el.__htmlKids = __parseHtml(el.__pendingHtml); } catch (e) { el.__htmlKids = []; }
     __lsmRec("childList", el, {});
     __push({ type: "set_html", selector: "@created:" + t + ":" + el.__attrs.id, value: String(v) });
   });
@@ -654,44 +725,214 @@ function __newEl(tag) {
     });
   // 子树查找:detached 元素树上按标签/类收集(消息中心等 widget 对
   // createElement 建出的子树直接 getElementsByTagName)。
+  // 子树遍历:innerHTML 解析出的 __htmlKids + 动态 __kids 都要覆盖。
+  function __walkKids(node, fn) {
+    var groups = [node.__htmlKids || [], node.__kids || []];
+    for (var g = 0; g < groups.length; g++) {
+      var ks = groups[g];
+      for (var i = 0; i < ks.length; i++) {
+        fn(ks[i]);
+        __walkKids(ks[i], fn);
+      }
+    }
+  }
   el.getElementsByTagName = function (t) {
     var out = [];
     var tag = String(t).toLowerCase();
-    (function walk(node) {
-      var ks = node.__kids || [];
-      for (var i = 0; i < ks.length; i++) {
-        var k = ks[i];
-        var kt = String((k.__tag || k.tagName || "")).toLowerCase();
-        if (tag === "*" || kt === tag) out.push(k);
-        walk(k);
-      }
-    })(el);
+    __walkKids(el, function (k) {
+      var kt = String((k.__tag || k.tagName || "")).toLowerCase();
+      if (tag === "*" || kt === tag) out.push(k);
+    });
     return out;
   };
   el.getElementsByClassName = function (c) {
     var out = [];
     var cls = String(c);
-    (function walk(node) {
-      var ks = node.__kids || [];
-      for (var i = 0; i < ks.length; i++) {
-        var k = ks[i];
-        var kc = String((k.className != null ? k.className : (k.__attrs && k.__attrs["class"]) || ""));
-        if (cls === "*" || kc.split(/\s+/).indexOf(cls) >= 0) out.push(k);
-        walk(k);
-      }
-    })(el);
+    __walkKids(el, function (k) {
+      var kc = String((k.className != null ? k.className : (k.__attrs && k.__attrs["class"]) || ""));
+      if (cls === "*" || kc.split(/\s+/).indexOf(cls) >= 0) out.push(k);
+    });
     return out;
   };
   def("innerText", function () { return el.__text; }, function (v) { el.__text = String(v); el.__kids = []; });
   def("value", function () { return el.__attrs.value || ""; }, function (v) { el.__attrs.value = String(v); });
+  // canvas:2D 上下文以「可调用的空实现」提供,让重度依赖 canvas 的页面
+  // (百度地图矢量渲染)完成初始化与事件绑定;像素内容暂不绘制。
+  if (t === "canvas") {
+    el.width = 300;
+    el.height = 150;
+    el.getContext = function (kind) {
+      var k = String(kind || "").toLowerCase();
+      if (k.indexOf("2d") !== 0) return null;
+      if (!el.__ctx2d) el.__ctx2d = __mkCanvas2d(el);
+      return el.__ctx2d;
+    };
+    el.toDataURL = function () { return "data:image/png;base64,"; };
+    el.getBoundingClientRect = function () {
+      return { x: 0, y: 0, top: 0, left: 0, right: el.width, bottom: el.height, width: el.width, height: el.height };
+    };
+  }
   // children 反射 __kids:createElement+appendChild 建出的子树立即被父节点可见
   // (百度地图 render() 容器 → platform = t.children[0] 链路依赖此语义)。
-  def("children", function () { return el.__kids.slice(); }, function (v) {});
-  def("childNodes", function () { return el.__kids.slice(); }, function (v) {});
-  def("firstChild", function () { return el.__kids.length ? el.__kids[0] : null; }, function (v) {});
-  def("lastChild", function () { return el.__kids.length ? el.__kids[el.__kids.length - 1] : null; }, function (v) {});
+  // children 只含元素节点(浏览器语义);childNodes 含文本节点。
+  def("children", function () {
+    return (el.__htmlKids || []).concat(el.__kids).filter(function (k) { return k && k.nodeType === 1; });
+  }, function (v) {});
+  def("childNodes", function () { return (el.__htmlKids || []).concat(el.__kids); }, function (v) {});
+  def("firstChild", function () {
+    var all = (el.__htmlKids || []).concat(el.__kids);
+    return all.length ? all[0] : null;
+  }, function (v) {});
+  def("lastChild", function () {
+    var all = (el.__htmlKids || []).concat(el.__kids);
+    return all.length ? all[all.length - 1] : null;
+  }, function (v) {});
   el.ownerDocument = document;
   return el;
+}
+
+// canvas 2D 上下文空实现(初始化兼容层,不产生像素)。
+function __mkCanvas2d(canvas) {
+  var noop = function () {};
+  var ctx = {
+    canvas: canvas,
+    fillStyle: "#000000", strokeStyle: "#000000", lineWidth: 1, lineCap: "butt", lineJoin: "miter",
+    miterLimit: 10, font: "10px sans-serif", textAlign: "start", textBaseline: "alphabetic",
+    globalAlpha: 1, globalCompositeOperation: "source-over", imageSmoothingEnabled: true,
+    shadowBlur: 0, shadowColor: "rgba(0,0,0,0)", shadowOffsetX: 0, shadowOffsetY: 0,
+    save: noop, restore: noop, beginPath: noop, closePath: noop, moveTo: noop, lineTo: noop,
+    quadraticCurveTo: noop, bezierCurveTo: noop, arc: noop, arcTo: noop, ellipse: noop, rect: noop,
+    fill: noop, stroke: noop, clip: noop, fillRect: noop, strokeRect: noop, clearRect: noop,
+    translate: noop, rotate: noop, scale: noop, transform: noop, setTransform: noop, resetTransform: noop,
+    drawImage: noop, putImageData: noop, setLineDash: noop, getLineDash: function () { return []; },
+    fillText: noop, strokeText: noop,
+    measureText: function (t) {
+      var size = parseFloat(ctx.font) || 10;
+      return { width: String(t == null ? "" : t).length * size * 0.55 };
+    },
+    createLinearGradient: function () { return { addColorStop: noop }; },
+    createRadialGradient: function () { return { addColorStop: noop }; },
+    createPattern: function () { return {}; },
+    createImageData: function (w, h) {
+      w = Math.max(0, w | 0); h = Math.max(0, h | 0);
+      var data;
+      try { data = new Uint8ClampedArray(w * h * 4); } catch (e) { data = []; }
+      return { width: w, height: h, data: data };
+    },
+    getImageData: function (x, y, w, h) {
+      w = Math.max(0, w | 0); h = Math.max(0, h | 0);
+      var data;
+      try { data = new Uint8ClampedArray(w * h * 4); } catch (e) { data = []; }
+      return { width: w, height: h, data: data };
+    },
+    isPointInPath: function () { return false; },
+    isPointInStroke: function () { return false; },
+    getContextAttributes: function () { return {}; }
+  };
+  return ctx;
+}
+
+// ---------- detached innerHTML 轻量解析 ----------
+// 只服务于「建好子树后按标签/类查询」这类读路径(tangram/jQuery 特性探测、
+// widget 模板拼装)。不做实体解码/命名空间/错误恢复,序列化仍走 __pendingHtml 原文。
+var __HTML_VOID = { area: 1, base: 1, br: 1, col: 1, embed: 1, hr: 1, img: 1, input: 1, link: 1, meta: 1, param: 1, source: 1, track: 1, wbr: 1 };
+function __mkTextNode(s) { return { nodeType: 3, textContent: String(s), data: String(s) }; }
+function __parseHtml(html) {
+  var s = String(html == null ? "" : html);
+  var root = [];
+  var stack = [{ kids: root, tag: "" }];
+  var i = 0, n = s.length;
+  function top() { return stack[stack.length - 1]; }
+  while (i < n) {
+    if (s.charAt(i) === "<") {
+      if (s.substr(i, 4) === "<!--") {
+        var ce = s.indexOf("-->", i + 4);
+        i = ce < 0 ? n : ce + 3;
+        continue;
+      }
+      if (s.charAt(i + 1) === "!" || s.charAt(i + 1) === "?") {
+        var de = s.indexOf(">", i + 2);
+        i = de < 0 ? n : de + 1;
+        continue;
+      }
+      if (s.charAt(i + 1) === "/") {
+        var gt = s.indexOf(">", i + 2);
+        if (gt < 0) break;
+        var closeTag = s.slice(i + 2, gt).trim().toLowerCase();
+        for (var k = stack.length - 1; k > 0; k--) {
+          if (stack[k].tag === closeTag) { stack.length = k; break; }
+        }
+        i = gt + 1;
+        continue;
+      }
+      var j = i + 1, quote = 0, end = -1;
+      for (; j < n; j++) {
+        var ch = s.charAt(j);
+        if (quote) { if (ch === quote) quote = 0; continue; }
+        if (ch === '"' || ch === "'") { quote = ch; continue; }
+        if (ch === ">") { end = j; break; }
+      }
+      if (end < 0) break;
+      var raw = s.slice(i + 1, end);
+      var selfClose = /\/\s*$/.test(raw);
+      if (selfClose) raw = raw.replace(/\/\s*$/, "");
+      var sp = raw.search(/[\s\/]/);
+      var tag = (sp < 0 ? raw : raw.slice(0, sp)).toLowerCase();
+      var attrStr = sp < 0 ? "" : raw.slice(sp);
+      var el = __newEl(tag);
+      var ai = 0, an = attrStr.length;
+      while (ai < an) {
+        while (ai < an && /\s/.test(attrStr.charAt(ai))) ai++;
+        if (ai >= an) break;
+        var astart = ai;
+        while (ai < an && !/[\s=]/.test(attrStr.charAt(ai))) ai++;
+        var name = attrStr.slice(astart, ai);
+        if (!name) { ai++; continue; }
+        while (ai < an && /\s/.test(attrStr.charAt(ai))) ai++;
+        var val = "";
+        if (attrStr.charAt(ai) === "=") {
+          ai++;
+          while (ai < an && /\s/.test(attrStr.charAt(ai))) ai++;
+          var q = attrStr.charAt(ai);
+          if (q === '"' || q === "'") {
+            var e = attrStr.indexOf(q, ai + 1);
+            if (e < 0) e = an;
+            val = attrStr.slice(ai + 1, e);
+            ai = e + 1;
+          } else {
+            var vs = ai;
+            while (ai < an && !/\s/.test(attrStr.charAt(ai))) ai++;
+            val = attrStr.slice(vs, ai);
+          }
+        }
+        el.__attrs[name.toLowerCase()] = val;
+        if (name === "id") el.id = val;
+        if (name === "class") el.className = val;
+      }
+      top().kids.push(el);
+      if (!selfClose && !__HTML_VOID[tag]) {
+        if (tag === "script" || tag === "style" || tag === "textarea" || tag === "title") {
+          var lower = s.toLowerCase();
+          var ci = lower.indexOf("</" + tag, end + 1);
+          var contentEnd = ci < 0 ? n : ci;
+          var content = s.slice(end + 1, contentEnd);
+          if (content) el.__kids.push(__mkTextNode(content));
+          var cgt = ci < 0 ? -1 : s.indexOf(">", ci);
+          i = cgt < 0 ? n : cgt + 1;
+          continue;
+        }
+        stack.push({ kids: el.__kids, tag: tag });
+      }
+      i = end + 1;
+      continue;
+    }
+    var nxt = s.indexOf("<", i);
+    if (nxt < 0) nxt = n;
+    var txt = s.slice(i, nxt);
+    if (txt) top().kids.push(__mkTextNode(txt));
+    i = nxt;
+  }
+  return root;
 }
 
 // ---------- document ----------
@@ -863,11 +1104,17 @@ function __lsmDelay(ms) {
   if (d > 60000) d = 60000;
   return d;
 }
+// 定时器注册来源(脚本 URL @ 最后语句标记):回调抛错时据此定位注册点。
+function __lsmTimerReg() {
+  try {
+    return String(globalThis.__lsmCurrentScript || "?") + " @ " + String(__lsmLastStmt || "");
+  } catch (e) { return ""; }
+}
 function setTimeout(fn, delay) {
   var id = ++__lsmTimerSeq;
   if (typeof fn === "function") {
     var args = Array.prototype.slice.call(arguments, 2);
-    __lsmTimers.push({ id: id, fn: fn, args: args, next: __lsmNow + __lsmDelay(delay), interval: __lsmDelay(delay), repeat: false });
+    __lsmTimers.push({ id: id, fn: fn, args: args, next: __lsmNow + __lsmDelay(delay), interval: __lsmDelay(delay), repeat: false, reg: __lsmTimerReg() });
   }
   return id;
 }
@@ -876,7 +1123,7 @@ function setInterval(fn, delay) {
   if (typeof fn === "function") {
     var args = Array.prototype.slice.call(arguments, 2);
     var d = Math.max(16, __lsmDelay(delay));
-    __lsmTimers.push({ id: id, fn: fn, args: args, next: __lsmNow + d, interval: d, repeat: true });
+    __lsmTimers.push({ id: id, fn: fn, args: args, next: __lsmNow + d, interval: d, repeat: true, reg: __lsmTimerReg() });
   }
   return id;
 }
@@ -909,7 +1156,7 @@ function __lsmTick() {
       }
       ran++;
       __lsmTimerRan++;
-      try { tm.fn.apply(null, tm.args || []); } catch (e) { __cerror("timer: " + String((e && e.stack) || e)); }
+      try { tm.fn.apply(null, tm.args || []); } catch (e) { __cerror("timer[" + String(tm.reg || "") + "]: " + String((e && e.stack) || e)); }
     }
     if (ran >= 64) break;
   }
@@ -1090,6 +1337,8 @@ var __lsmWin = {
   innerWidth: 1280, innerHeight: 720, outerWidth: 1280, outerHeight: 720,
   scrollX: 0, scrollY: 0, pageXOffset: 0, pageYOffset: 0,
   devicePixelRatio: 1, name: "", closed: false, isSecureContext: true,
+  // 遗留全局:站点脚本直接写裸 `status`(browser window.status 恒存在)。
+  status: "", defaultStatus: "",
   getComputedStyle: function (el) {
     var css = {};
     try {
@@ -1771,6 +2020,121 @@ function __lsmErrText(e) {
   try { if (e.lineNumber !== undefined) parts.push("line=" + e.lineNumber); } catch (x) {}
   if (!parts.length) { try { parts.push(String(e)); } catch (x) { parts.push("unprintable error"); } }
   return parts.join(" ");
+}
+// ---------- ToObject 调试探针(LAEW_JS_TRACE_TOOBJ=1,默认零输出) ----------
+// Boa 对 `Object.keys(null)` / `Object.defineProperty(undefined,...)` / `for-in null`
+// 抛 "cannot convert 'null' or 'undefined' to object",但运行时不带源码位置。
+// 开关打开时在这些内建入口记录调用,用于定位压缩脚本里的具体调用点。
+(function () {
+  if (!globalThis.__lsmTraceToObjInstall) return;
+  // where: "arg0" = 第一个参数做 ToObject, "this" = this 值做 ToObject。
+  function wrap(name, owner, label, where) {
+    try {
+      var orig = owner[name];
+      if (typeof orig !== "function") return;
+      var w = function (v) {
+        "use strict";
+        try {
+          var bad = where === "this"
+            ? (this === null || this === undefined)
+            : (v === null || v === undefined);
+          if (globalThis.__lsmTraceToObj && bad) {
+            __cerror("[toobj] " + label + " where=" + where + " this=" + String(this) + " arg0=" + String(v) + " argc=" + arguments.length);
+          }
+        } catch (e) {}
+        return orig.apply(this, arguments);
+      };
+      w.__lsmOrig = orig;
+      owner[name] = w;
+    } catch (e) {}
+  }
+  var O = Object;
+  wrap("keys", O, "Object.keys", "arg0");
+  wrap("getOwnPropertyNames", O, "Object.getOwnPropertyNames", "arg0");
+  wrap("getOwnPropertySymbols", O, "Object.getOwnPropertySymbols", "arg0");
+  wrap("assign", O, "Object.assign", "arg0");
+  wrap("defineProperty", O, "Object.defineProperty", "arg0");
+  wrap("defineProperties", O, "Object.defineProperties", "arg0");
+  wrap("getOwnPropertyDescriptor", O, "Object.getOwnPropertyDescriptor", "arg0");
+  wrap("getOwnPropertyDescriptors", O, "Object.getOwnPropertyDescriptors", "arg0");
+  wrap("setPrototypeOf", O, "Object.setPrototypeOf", "arg0");
+  wrap("freeze", O, "Object.freeze", "arg0");
+  wrap("seal", O, "Object.seal", "arg0");
+  wrap("preventExtensions", O, "Object.preventExtensions", "arg0");
+  wrap("hasOwnProperty", O.prototype, "hasOwnProperty", "this");
+  wrap("propertyIsEnumerable", O.prototype, "propertyIsEnumerable", "this");
+  wrap("isPrototypeOf", O.prototype, "isPrototypeOf", "this");
+  wrap("valueOf", O.prototype, "Object.valueOf", "this");
+  var A = Array.prototype;
+  ["forEach", "map", "filter", "some", "every", "reduce", "reduceRight", "indexOf",
+   "lastIndexOf", "join", "slice", "splice", "concat", "reverse", "sort", "pop", "shift",
+   "push", "unshift", "find", "findIndex", "includes"].forEach(function (m) {
+    wrap(m, A, "Array." + m, "this");
+  });
+  var S = String.prototype;
+  ["split", "slice", "substring", "substr", "charAt", "charCodeAt", "indexOf", "lastIndexOf",
+   "replace", "match", "search", "toLowerCase", "toUpperCase", "trim", "concat"].forEach(function (m) {
+    wrap(m, S, "String." + m, "this");
+  });
+  var R = RegExp.prototype;
+  ["exec", "test"].forEach(function (m) {
+    wrap(m, R, "RegExp." + m, "this");
+  });
+  var D = Date.prototype;
+  ["getTime", "getFullYear", "getMonth", "getDate", "getDay"].forEach(function (m) {
+    wrap(m, D, "Date." + m, "this");
+  });
+})();
+
+// 当前 AMD 装载器形态。宿主据此决定是否对脚本做 define 依赖数组补齐:
+// FIS 系装载器只认 `define(id, factory)` 两参同步注册,补齐后的三参形态会被
+// 它转交给 RequireJS 分支,模块进 globalDefQueue 而永不进同步注册表
+// (百度地图 pano 模块 "has not been loaded yet")。
+// 调试:define 工厂体语句标记(LAEW_JS_TRACE_STMT=1 时由宿主注入)。
+var __lsmLastStmt = "";
+function __lsmStmtMark(head) {
+  __lsmLastStmt = String(head);
+  if (globalThis.__lsmTraceStmt) __cerror("[stmt] " + __lsmLastStmt);
+}
+function __lsmAmdKind() {
+  try {
+    __lsmEnsureSubstr();
+    if (typeof require === "undefined" || !require) return "none";
+    var r = require;
+    if (r.s && r.s.contexts) return "requirejs";
+    if (typeof r.loadJs === "function" || typeof r.loadCss === "function" || typeof r.alias === "function") {
+      __lsmWrapAmdDefine();
+      return "fis";
+    }
+    if (typeof r.defined === "function") return "minimal";
+    return "unknown";
+  } catch (e) { return "none"; }
+}
+// 给同步 AMD 装载器(FIS)的 define 套一层归属包装:工厂抛错时记录模块 id。
+// 不包装时异常只会记到「调用 require 的那段脚本」名下,且 FIS 会把失败模块
+// 缓存成空 exports,后续 require 静默返回半成品(实测百度地图 tangram 工厂
+// 抛错 → window.T 永不赋值 → messageCenter 等整层 ReferenceError)。
+var __lsmAmdWrapped = false;
+function __lsmWrapAmdDefine() {
+  if (__lsmAmdWrapped) return;
+  if (typeof define !== "function") return;
+  var orig = define;
+  var wrapped = function (id, deps, factory) {
+    if (typeof id === "string" && typeof deps === "function") {
+      var mid = id;
+      var f = deps;
+      return orig(mid, function () {
+        try { return f.apply(this, arguments); }
+        catch (e) { __cerror("AMD 模块执行失败 " + mid + ": " + __lsmErrText(e) + " | last=" + __lsmLastStmt); throw e; }
+      });
+    }
+    return orig.apply(this, arguments);
+  };
+  wrapped.amd = orig.amd || {};
+  wrapped.__lsmWrapped = true;
+  try { window.define = wrapped; } catch (e) {}
+  try { define = wrapped; } catch (e) {}
+  __lsmAmdWrapped = true;
 }
 function __lsmRunScript(src) {
   try { (0, eval)(String(src)); }
