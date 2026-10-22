@@ -1470,6 +1470,19 @@ if (typeof Proxy === "function") {
       return undefined;
     },
     set: function (t, k, v) {
+      // 目标若是「非可配置的只读访问器」(站点反爬脚本的典型手法:
+      // `Object.defineProperty(window,'eval',{get:...,configurable:false})`
+      // 用来侦测页面是否调用 eval),浏览器语义是**静默失败**(sloppy)/
+      // 抛 TypeError(strict),而 Proxy [[Set]] 的后置校验会直接抛
+      // "Proxy trap set unexpected accessor descriptor" —— 一次赋值就把
+      // 整段站点初始化打断(实测百度地图反爬脚本遮蔽 window.eval)。
+      // 这里返回 false:让赋值退化为浏览器的「静默失败」语义。
+      try {
+        var d = Object.getOwnPropertyDescriptor(t, k);
+        if (d && d.configurable === false && !("value" in d) && !d.set) {
+          return false;
+        }
+      } catch (e) {}
       try { t[k] = v; } catch (e) {}
       // 同步为全局标识符:`window.foo = fn` 之后裸 `foo` 必须可见。
       try {

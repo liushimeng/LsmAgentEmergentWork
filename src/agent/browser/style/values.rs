@@ -53,6 +53,10 @@ pub struct ComputedStyle {
     pub object_fit: String,
     /// `background-image` 的 URL 原文(阶段三第三步;未解析为绝对地址)。
     pub background_image: Option<String>,
+    /// `background-position`(精灵图定位;None = 默认 0 0)。
+    pub background_position: Option<BackgroundPosition>,
+    /// `background-size`:"auto"(默认,按固有尺寸) | "cover" | "contain"。
+    pub background_size: String,
     /// 边框线宽(top/right/bottom/left)。默认 0;样式 `none` 侧不参与绘制。
     pub border_widths: [f64; 4],
     /// 边框绘制开关(top/right/bottom/left):`border-style:none/hidden` 为 false。
@@ -336,6 +340,8 @@ impl Default for ComputedStyle {
             grid_item: GridItemStyle::default(),
             object_fit: "fill".to_string(),
             background_image: None,
+            background_position: None,
+            background_size: "auto".to_string(),
             border_widths: [0.0; 4],
             border_drawn: [false; 4],
             border_colors: [BorderColor::CurrentColor; 4],
@@ -476,6 +482,13 @@ impl ComputedStyle {
                 .clone()
                 .map(|u| format!("url({u})"))
                 .unwrap_or_else(|| "none".to_string()),
+        );
+        out.insert("background-size".into(), self.background_size.clone());
+        out.insert(
+            "background-position".into(),
+            self.background_position
+                .map(|p| p.text())
+                .unwrap_or_else(|| "0% 0%".to_string()),
         );
         for (k, v) in &self.extra {
             out.entry(k.clone()).or_insert_with(|| v.clone());
@@ -724,11 +737,62 @@ pub fn apply_declaration(
             }
         }
         "background" => {
-            if value.eq_ignore_ascii_case("none") || value.eq_ignore_ascii_case("transparent") {
-                st.background = None;
-            } else if let Some(Some((rgb, alpha))) = parse_color(value) {
-                st.background = Some(blend_on_white(rgb, alpha));
+            // `background` 是简写:可同时含颜色、url(...)、位置、尺寸
+            // (`background:#fff url(a.png) no-repeat -15px -136px`)。
+            // 此前只取颜色、**丢掉 url(...) 与位置**,而绝大多数 Web UI 的
+            // 图标/按钮/精灵图都用简写写背景图 —— 结果整页 UI 渲染成空白
+            // (实测百度地图:搜索框、路线按钮全是背景图精灵,截图一片白)。
+            let tokens = split_bg_tokens(value);
+            let mut url: Option<String> = None;
+            let mut pos_tokens: Vec<String> = Vec::new();
+            let mut size: Option<String> = None;
+            let mut color_token: Option<String> = None;
+            for t in &tokens {
+                let low = t.to_ascii_lowercase();
+                if low.starts_with("url(") {
+                    url = parse_css_url(t);
+                    continue;
+                }
+                if low.starts_with("linear-gradient(") || low.starts_with("radial-gradient(") {
+                    continue; // 渐变暂不绘制
+                }
+                if low == "cover" || low == "contain" {
+                    size = Some(low);
+                    continue;
+                }
+                if low == "auto" {
+                    size = Some("auto".to_string());
+                    continue;
+                }
+                if is_background_position_token(&low) {
+                    pos_tokens.push(t.clone());
+                    continue;
+                }
+                if BG_IGNORED_TOKENS.contains(&low.as_str()) {
+                    continue;
+                }
+                if parse_color(t).is_some() {
+                    color_token = Some(t.clone());
+                }
             }
+            // 简写会重置 background-image / position / size(规范语义)。
+            st.background_image = url;
+            st.background_size = size.unwrap_or_else(|| "auto".to_string());
+            st.background_position = if pos_tokens.is_empty() {
+                None
+            } else {
+                parse_background_position(&pos_tokens.join(" "))
+            };
+            st.background = match color_token {
+                Some(c) => parse_color(&c).and_then(|v| v).map(|(rgb, alpha)| blend_on_white(rgb, alpha)),
+                None => None,
+            };
+        }
+        "background-position" => {
+            st.background_position = parse_background_position(value);
+        }
+        "background-size" => {
+            st.background_size = parse_background_size(value).unwrap_or_else(|| "auto".to_string());
         }
         "font-size" => {
             if let Some(v) = parse_font_size(value, parent.font_size, ctx) {
@@ -1217,6 +1281,8 @@ fn apply_initial(st: &mut ComputedStyle, key: &str, root: &ComputedStyle) {
         "background" | "background-color" => st.background = None,
         "object-fit" => st.object_fit = "fill".to_string(),
         "background-image" => st.background_image = None,
+        "background-position" => st.background_position = None,
+        "background-size" => st.background_size = "auto".to_string(),
         "opacity" => st.opacity = 1.0,
         _ => {}
     }
@@ -1225,6 +1291,188 @@ fn apply_initial(st: &mut ComputedStyle, key: &str, root: &ComputedStyle) {
 /// 解析 `url(...)` 形式的资源地址(阶段三第三步:背景图)。
 ///
 /// 只取单个 `url()`;`none`/多背景/渐变返回 `None`。
+/// `background-position` 单轴取值:像素偏移或百分比(关键字归一为百分比)。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BackgroundPos {
+    Px(f64),
+    Percent(f64),
+}
+
+impl BackgroundPos {
+    /// 布局期按「盒尺寸 - 图尺寸」解析成像素偏移(CSS 定位公式)。
+    pub fn resolve(self, box_size: f64, img_size: f64) -> f64 {
+        match self {
+            BackgroundPos::Px(p) => p,
+            BackgroundPos::Percent(p) => (box_size - img_size) * p / 100.0,
+        }
+    }
+
+    fn text(self) -> String {
+        match self {
+            BackgroundPos::Px(p) => format!("{p}px"),
+            BackgroundPos::Percent(p) => format!("{p}%"),
+        }
+    }
+}
+
+/// `background-position`(两轴)。`left/top/center/right/bottom` 归一为百分比,
+/// 故 `right bottom` 与 `100% 100%` 等价。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BackgroundPosition {
+    pub x: BackgroundPos,
+    pub y: BackgroundPos,
+}
+
+impl BackgroundPosition {
+    pub fn text(self) -> String {
+        format!("{} {}", self.x.text(), self.y.text())
+    }
+}
+
+/// 解析 `background-position` 长写/简写里的位置部分。
+///
+/// 支持:`left|center|right` / `top|center|bottom` / `<n>px` / `<n>%`,以及
+/// 1 个值(另一轴取 center)或 2 个值的组合。
+pub fn parse_background_position(value: &str) -> Option<BackgroundPosition> {
+    let tokens: Vec<&str> = value
+        .split_whitespace()
+        .filter(|t| !t.is_empty())
+        .collect();
+    if tokens.is_empty() {
+        return None;
+    }
+    let mut parts: Vec<BackgroundPos> = Vec::new();
+    let mut vertical_first = false;
+    for t in &tokens {
+        let low = t.to_ascii_lowercase();
+        let pos = match low.as_str() {
+            "left" => Some((BackgroundPos::Percent(0.0), true)),
+            "right" => Some((BackgroundPos::Percent(100.0), true)),
+            "top" => Some((BackgroundPos::Percent(0.0), false)),
+            "bottom" => Some((BackgroundPos::Percent(100.0), false)),
+            "center" => Some((BackgroundPos::Percent(50.0), true)),
+            "middle" => Some((BackgroundPos::Percent(50.0), false)),
+            _ => {
+                if let Some(p) = low.strip_suffix("px") {
+                    p.trim().parse::<f64>().ok().map(|v| (BackgroundPos::Px(v), true))
+                } else if let Some(p) = low.strip_suffix('%') {
+                    p.trim().parse::<f64>().ok().map(|v| (BackgroundPos::Percent(v), true))
+                } else {
+                    None
+                }
+            }
+        };
+        match pos {
+            Some((p, horizontal)) => {
+                if !parts.is_empty() && !horizontal {
+                    vertical_first = true;
+                }
+                parts.push(p);
+            }
+            None => return None,
+        }
+    }
+    match parts.len() {
+        1 => {
+            // 单值:水平关键字/长度 → 垂直取 center;垂直关键字 → 水平取 center。
+            if vertical_first {
+                Some(BackgroundPosition {
+                    x: BackgroundPos::Percent(50.0),
+                    y: parts[0],
+                })
+            } else {
+                Some(BackgroundPosition {
+                    x: parts[0],
+                    y: BackgroundPos::Percent(50.0),
+                })
+            }
+        }
+        2 => {
+            if vertical_first {
+                Some(BackgroundPosition {
+                    x: parts[1],
+                    y: parts[0],
+                })
+            } else {
+                Some(BackgroundPosition {
+                    x: parts[0],
+                    y: parts[1],
+                })
+            }
+        }
+        _ => None,
+    }
+}
+
+/// 解析 `background-size` 长写:`cover` / `contain` / `auto` / `<w> <h>`。
+pub fn parse_background_size(value: &str) -> Option<String> {
+    let low = value.trim().to_ascii_lowercase();
+    match low.as_str() {
+        "cover" | "contain" | "auto" => Some(low),
+        _ => {
+            // 只识别「一维/两维长度或百分比」;其他(如 `100px auto`)按 auto 处理。
+            let parts: Vec<&str> = low.split_whitespace().collect();
+            if parts.is_empty() || parts.len() > 2 {
+                return None;
+            }
+            for p in &parts {
+                let ok = p.ends_with("px")
+                    || p.ends_with('%')
+                    || *p == "auto"
+                    || p.parse::<f64>().is_ok();
+                if !ok {
+                    return None;
+                }
+            }
+            Some(low)
+        }
+    }
+}
+
+/// `background` 简写拆记号(括号内不拆,`url(...)` 保持完整)。
+fn split_bg_tokens(value: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0usize;
+    for ch in value.chars() {
+        match ch {
+            '(' => {
+                depth += 1;
+                cur.push(ch);
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                cur.push(ch);
+            }
+            c if depth == 0 && c.is_whitespace() => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// 是否是 `background` 简写里的位置记号(长度/百分比/方位关键字)。
+fn is_background_position_token(low: &str) -> bool {
+    matches!(
+        low,
+        "left" | "right" | "top" | "bottom" | "center" | "middle"
+    ) || low.ends_with("px")
+        || low.ends_with('%')
+}
+
+/// `background` 简写里的非颜色、非位置记号(重复/附着/盒子),解析时忽略。
+const BG_IGNORED_TOKENS: &[&str] = &[
+    "no-repeat", "repeat", "repeat-x", "repeat-y", "space", "round", "scroll", "fixed",
+    "local", "border-box", "padding-box", "content-box", "none",
+];
+
 pub fn parse_css_url(value: &str) -> Option<String> {
     let lower = value.to_ascii_lowercase();
     let pos = lower.find("url(")?;

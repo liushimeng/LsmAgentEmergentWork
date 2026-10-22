@@ -133,6 +133,9 @@ pub struct PaintBox {
     pub kind: PaintKind,
     pub visible: bool,
     pub z_index: i64,
+    /// 背景图在盒内的偏移(`background-position` 解析结果,像素)。
+    pub off_x: f64,
+    pub off_y: f64,
 }
 
 /// 图像类别:内容图(`<img>`)与背景图(`background-image`)。
@@ -513,6 +516,11 @@ impl<'a> LayoutCtx<'a> {
     }
 
     /// 背景图绘制指令(`background-image: url(...)`)。
+    ///
+    /// `background-size` 缺省为 `auto` → 按**固有尺寸**绘制(精灵图语义:
+    /// 一张大图按 `background-position` 偏移取一块),而非拉伸铺满;
+    /// `background-position` 按 CSS 公式解析成像素偏移:
+    /// `offset = (盒尺寸 - 图尺寸) * 百分比`,长度值直接取用。
     pub(crate) fn background_paint(
         &self,
         style: &ComputedStyle,
@@ -523,16 +531,29 @@ impl<'a> LayoutCtx<'a> {
     ) -> Option<PaintBox> {
         let raw = style.background_image.as_ref()?;
         let src = urlutil::resolve(&self.base_url, raw)?;
+        let (nw, nh) = self.images.natural(&src).unwrap_or((w.max(1.0), h.max(1.0)));
+        let size = style.background_size.as_str();
+        let (fit, draw_w, draw_h) = match size {
+            "cover" => ("cover", w, h),
+            "contain" => ("contain", w, h),
+            _ => ("none", nw, nh),
+        };
+        let (off_x, off_y) = match style.background_position {
+            Some(p) => (p.x.resolve(w, draw_w), p.y.resolve(h, draw_h)),
+            None => (0.0, 0.0),
+        };
         Some(PaintBox {
             src,
             x,
             y,
             w: w.max(0.0),
             h: h.max(0.0),
-            fit: "cover".to_string(),
+            fit: fit.to_string(),
             kind: PaintKind::Background,
             visible: style_visible(style),
             z_index: style.pos.z_index,
+            off_x,
+            off_y,
         })
     }
 
@@ -708,6 +729,8 @@ impl<'a> LayoutCtx<'a> {
                         kind: PaintKind::Content,
                         visible,
                         z_index: style.pos.z_index,
+                        off_x: 0.0,
+                        off_y: 0.0,
                     });
                 }
                 self.y = by + ih + style.margin_bottom.max(0.0);
@@ -957,6 +980,8 @@ impl<'a> LayoutCtx<'a> {
                         kind: PaintKind::Content,
                         visible,
                         z_index: child_style.pos.z_index,
+                        off_x: 0.0,
+                        off_y: 0.0,
                     });
                 }
                 buf.reserve_height(ih);

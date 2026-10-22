@@ -691,6 +691,8 @@ fn emit_item(ctx: &mut LayoutCtx, item: &mut Item, x: f64, y: f64, row: bool, de
             kind: PaintKind::Content,
             visible: style_visible(&cs),
             z_index: cs.pos.z_index,
+            off_x: 0.0,
+            off_y: 0.0,
         });
         return;
     }

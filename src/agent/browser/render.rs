@@ -172,7 +172,18 @@ impl FontSet {
             let Some(img) = images.get(&paint.src) else {
                 continue;
             };
-            draw_image(&mut pixmap, img, paint.x, paint.y, paint.w, paint.h, &paint.fit, scroll_y);
+            draw_image(
+                &mut pixmap,
+                img,
+                paint.x,
+                paint.y,
+                paint.w,
+                paint.h,
+                &paint.fit,
+                scroll_y,
+                paint.off_x,
+                paint.off_y,
+            );
         }
 
         for line in &layout.lines {
@@ -291,6 +302,7 @@ fn sample_bilinear(img: &DecodedImage, x: f64, y: f64) -> [u8; 4] {
 ///
 /// `x/y` 为页坐标,`w/h` 为目标盒(内容盒)尺寸;绘制矩形由 `fit` 决定,
 /// 超出目标盒的部分被裁剪(与 `cover` / `none` 语义一致)。
+#[allow(clippy::too_many_arguments)]
 fn draw_image(
     pixmap: &mut Pixmap,
     img: &DecodedImage,
@@ -300,6 +312,8 @@ fn draw_image(
     h: f64,
     fit: &str,
     scroll_y: f64,
+    off_x: f64,
+    off_y: f64,
 ) {
     let nw = img.width as f64;
     let nh = img.height as f64;
@@ -308,8 +322,9 @@ fn draw_image(
     }
     let top = y - scroll_y;
     let (ox, oy, dw, dh) = fit_rect(fit, nw, nh, w, h);
-    let dx = x + ox;
-    let dy = top + oy;
+    // off_x/off_y:background-position 偏移(精灵图取块);裁剪区仍是元素盒。
+    let dx = x + ox + off_x;
+    let dy = top + oy + off_y;
     let pw = pixmap.width() as f64;
     let ph = pixmap.height() as f64;
     // 绘制区与目标盒求交(目标盒即裁剪区)。
@@ -518,6 +533,8 @@ mod tests {
                 kind: layout::PaintKind::Content,
                 visible: true,
                 z_index: 0,
+                off_x: 0.0,
+                off_y: 0.0,
             }],
             width: 100.0,
             height: 100.0,

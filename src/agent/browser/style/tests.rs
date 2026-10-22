@@ -276,6 +276,39 @@ fn object_fit_与_背景图_可见于计算样式() {
 }
 
 #[test]
+fn background_简写解析出图片_位置_与颜色() {
+    // 图标/按钮/精灵图普遍用简写:`background: url(a.png) no-repeat -15px -136px`。
+    // 此前简写只取颜色、丢掉 url(...) —— 整页 UI 渲染成空白(实测百度地图)。
+    let (doc, engine) = doc_engine(
+        "<head><style>#t{background:#fff url(/a.png) no-repeat -15px -136px}</style></head>\
+         <body><div id=t>x</div></body>",
+        1280.0,
+    );
+    let t = style_of(&doc, &engine, "#t");
+    assert_eq!(t.background_image.as_deref(), Some("/a.png"));
+    let pos = t.background_position.expect("应解析出 background-position");
+    assert_eq!(pos.x, super::values::BackgroundPos::Px(-15.0));
+    assert_eq!(pos.y, super::values::BackgroundPos::Px(-136.0));
+    assert_eq!(t.background_size, "auto");
+    assert!(t.background.is_some(), "简写里的颜色也应保留");
+}
+
+#[test]
+fn background_position_关键字与百分比归一() {
+    use super::values::{parse_background_position, BackgroundPos};
+    let p = parse_background_position("right bottom").unwrap();
+    assert_eq!(p.x, BackgroundPos::Percent(100.0));
+    assert_eq!(p.y, BackgroundPos::Percent(100.0));
+    let p2 = parse_background_position("center").unwrap();
+    assert_eq!(p2.x, BackgroundPos::Percent(50.0));
+    assert_eq!(p2.y, BackgroundPos::Percent(50.0));
+    let p3 = parse_background_position("50% 10px").unwrap();
+    assert_eq!(p3.x, BackgroundPos::Percent(50.0));
+    assert_eq!(p3.y, BackgroundPos::Px(10.0));
+    assert!(parse_background_position("bogus").is_none());
+}
+
+#[test]
 fn 背景图_none_与_非法_object_fit_回落默认值() {
     let (doc, engine) = doc_engine(
         "<body><div id=t style='background-image:none;object-fit:bogus'>x</div></body>",

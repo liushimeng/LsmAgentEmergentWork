@@ -233,6 +233,11 @@ fn check_object_properties(
         for r in req {
             if let Some(field) = r.as_str() {
                 if !map.contains_key(field) {
+                    let available = schema
+                        .get("properties")
+                        .and_then(|v| v.as_object())
+                        .map(|p| allowed_fields_brief(p.keys().map(|k| k.as_str())))
+                        .unwrap_or_default();
                     return Err(AgentError::ToolSchemaValidation {
                         tool: tool_name.into(),
                         path: if path == "$" {
@@ -241,7 +246,9 @@ fn check_object_properties(
                             format!("{path}.{field}")
                         },
                         reason: "必填字段缺失".into(),
-                        expected: format!("存在字段 '{field}'"),
+                        expected: format!(
+                            "存在字段 '{field}';可用字段:{available}"
+                        ),
                         actual: "缺失".into(),
                     });
                 }
@@ -276,7 +283,13 @@ fn check_object_properties(
                             format!("{path}.{key}")
                         },
                         reason: "未声明的字段(Schema additionalProperties=false)".into(),
-                        expected: "不允许的字段".into(),
+                        // 把「可用字段」列出来:模型多传字段时,靠这条提示即可自行纠正,
+                        // 不必再花一轮 round-trip 试探(实测 MCP_Web_Use 反复传
+                        // item/include_ocr/snapshot_label 等未声明字段)。
+                        expected: format!(
+                            "不允许的字段;可用字段:{}",
+                            allowed_fields_brief(props.keys().map(|k| k.as_str()))
+                        ),
                         actual: format!("存在字段 '{key}'"),
                     });
                 }
@@ -285,6 +298,20 @@ fn check_object_properties(
     }
 
     Ok(())
+}
+
+/// 列可用字段(去重、排序、截断),用于 schema 校验失败的自纠正提示。
+fn allowed_fields_brief<'a>(fields: impl Iterator<Item = &'a str>) -> String {
+    let mut names: Vec<String> = fields.map(|s| s.to_string()).collect();
+    names.sort();
+    names.dedup();
+    const MAX: usize = 40;
+    if names.len() > MAX {
+        let head = names[..MAX].join(", ");
+        format!("{head}, …(共 {} 个)", names.len())
+    } else {
+        names.join(", ")
+    }
 }
 
 /// 获取 JSON 值的类型名称。
@@ -613,6 +640,42 @@ mod tests {
             AgentError::ToolSchemaValidation { path, reason, .. } => {
                 assert_eq!(path, "extra");
                 assert!(reason.contains("未声明"));
+            }
+            other => panic!("期望 ToolSchemaValidation,得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn 多余字段错误列出可用字段_便于模型自纠正() {
+        // 模型多传未声明字段时,报错里直接给出可用字段清单,省一轮试探。
+        let schema = json!({
+            "type": "object",
+            "properties": {"action": {"type": "string"}, "page_id": {"type": "string"}},
+            "additionalProperties": false
+        });
+        let err = validate_tool_args(TOOL, &schema, &json!({"action": "open", "item": 1}))
+            .unwrap_err();
+        match err {
+            AgentError::ToolSchemaValidation { expected, .. } => {
+                assert!(expected.contains("action"), "应列出可用字段 action,实际 {expected}");
+                assert!(expected.contains("page_id"), "应列出可用字段 page_id,实际 {expected}");
+            }
+            other => panic!("期望 ToolSchemaValidation,得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn 必填字段缺失错误列出可用字段() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"action": {"type": "string"}, "page_id": {"type": "string"}},
+            "required": ["action"]
+        });
+        let err = validate_tool_args(TOOL, &schema, &json!({"page_id": "p_1"})).unwrap_err();
+        match err {
+            AgentError::ToolSchemaValidation { expected, .. } => {
+                assert!(expected.contains("action"), "应提示必填字段 action,实际 {expected}");
+                assert!(expected.contains("page_id"), "应列出可用字段,实际 {expected}");
             }
             other => panic!("期望 ToolSchemaValidation,得到 {other:?}"),
         }

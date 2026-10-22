@@ -844,6 +844,8 @@ fn emit_item(
             kind: PaintKind::Content,
             visible: style_visible(&cs),
             z_index: cs.pos.z_index,
+            off_x: 0.0,
+            off_y: 0.0,
         });
         return;
     }

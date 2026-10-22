@@ -729,3 +729,105 @@ fn body_client_尺寸按视口兜底() {
     assert!(v.contains("\"h\":720"), "body.clientHeight 应按视口兜底:{v}");
     h.shutdown();
 }
+
+// ---------- 第 174 轮:window 代理 / 委托匹配 / 标准全局 ----------
+
+#[test]
+fn window_只读访问器赋值_静默失败不抛错() {
+    // 站点反爬脚本常做 `Object.defineProperty(window,'eval',{get,configurable:false})`
+    // 侦测页面是否调用 eval。此前 Proxy [[Set]] 后置校验会抛
+    // "Proxy trap set unexpected accessor descriptor",一次赋值就打断整段初始化。
+    // 浏览器语义是静默失败(sloppy),这里必须不抛。
+    let h = JsHandle::spawn();
+    let reply = eval_on(
+        &h,
+        r#"
+        var out = {};
+        try {
+            Object.defineProperty(window, '__ro', {
+                get: function () { return 7; },
+                configurable: false
+            });
+            out.def = 'ok';
+        } catch (e) { out.def = 'THROW:' + String(e); }
+        try { window.__ro = 1; out.assign = 'no-throw'; }
+        catch (e) { out.assign = 'THROW:' + String(e); }
+        try { window.__plain = 5; out.plain = String(window.__plain); }
+        catch (e) { out.plain = 'THROW:' + String(e); }
+        return JSON.stringify(out);
+        "#,
+        "<html><body></body></html>",
+        "https://a.test/",
+    );
+    let v = reply.outcome.value;
+    assert!(reply.outcome.ok, "{v}");
+    assert!(v.contains("\"def\":\"ok\""), "defineProperty 不得抛错:{v}");
+    assert!(v.contains("\"assign\":\"no-throw\""), "只读访问器赋值不得抛错:{v}");
+    assert!(v.contains("\"plain\":\"5\""), "普通属性赋值应正常:{v}");
+    h.shutdown();
+}
+
+#[test]
+fn 元素匹配_matches_closest_可用() {
+    // 事件委托(jQuery `$(document).on('click', sel, fn)`、各框架委托)依赖
+    // `el.matches()/el.closest()` 从 target 向上匹配委托选择器。
+    let h = JsHandle::spawn();
+    let reply = eval_on(
+        &h,
+        r#"
+        var el = document.querySelector('.route-button');
+        var out = {};
+        out.matches = String(el.matches('.route-button'));
+        out.compound = String(el.matches('.searchbox-content-button.right-button.route-button'));
+        out.closest = el.closest('.route-button') ? 'hit' : 'miss';
+        out.closestUp = el.closest('#left-panel') ? 'hit' : 'miss';
+        out.closestNone = el.closest('.nope');
+        return JSON.stringify(out);
+        "#,
+        "<html><body><div id=left-panel><div class='searchbox-content-button right-button route-button' data-title='路线'></div></div></body></html>",
+        "https://a.test/",
+    );
+    let v = reply.outcome.value;
+    assert!(v.contains("\"matches\":\"true\""), "{v}");
+    assert!(v.contains("\"compound\":\"true\""), "{v}");
+    assert!(v.contains("\"closest\":\"hit\""), "{v}");
+    assert!(v.contains("\"closestUp\":\"hit\""), "{v}");
+    assert!(v.contains("\"closestNone\":null"), "{v}");
+    h.shutdown();
+}
+
+#[test]
+fn 标准全局_NodeFilter_与_createElementNS_可用() {
+    let h = JsHandle::spawn();
+    let reply = eval_on(
+        &h,
+        r#"
+        var out = {};
+        try { out.nodeFilter = typeof NodeFilter; }
+        catch (e) { out.nodeFilter = 'THROW:' + String(e); }
+        try { out.showElement = String(NodeFilter && NodeFilter.SHOW_ELEMENT); }
+        catch (e) { out.showElement = 'THROW:' + String(e); }
+        try { out.filterAccept = String(NodeFilter && NodeFilter.FILTER_ACCEPT); }
+        catch (e) { out.filterAccept = 'THROW:' + String(e); }
+        try { out.nodeIterator = typeof NodeIterator; }
+        catch (e) { out.nodeIterator = 'THROW:' + String(e); }
+        try { out.createNS = typeof document.createElementNS; }
+        catch (e) { out.createNS = 'THROW:' + String(e); }
+        try {
+            var e = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+            out.svg = String(e && e.tagName).toLowerCase();
+        } catch (e2) { out.svg = 'THROW:' + String(e2); }
+        return JSON.stringify(out);
+        "#,
+        "<html><body></body></html>",
+        "https://a.test/",
+    );
+    let v = reply.outcome.value;
+    assert!(v.contains("\"nodeFilter\":\"object\""), "{v}");
+    assert!(v.contains("\"showElement\":\"1\""), "{v}");
+    assert!(v.contains("\"filterAccept\":\"1\""), "{v}");
+    assert!(v.contains("\"nodeIterator\":\"function\""), "{v}");
+    assert!(v.contains("\"createNS\":\"function\""), "{v}");
+    assert!(v.contains("\"svg\":\"svg\""), "{v}");
+    h.shutdown();
+}

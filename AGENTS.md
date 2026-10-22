@@ -438,7 +438,7 @@ Markdown Prompt 模板，两级发现：**项目级** `{工作目录}/.laew/comm
   - `14-有头帧查看器与真实站点JS启动链路修复.md` — 有头帧查看器子进程 + 真实站点 JS 启动链路七处根治(已完成)
   - `15-百分比高度边框阴影绘制与日志降噪.md` — 百分比高度求解/边框与外阴影绘制/表单控件 UA 描边/DEBUG 日志第三方降噪(已完成)
   - `18-百度地图白屏根因与脚本DOM兼容性修复.md` — 脚本文档序执行/FIS 同步 define 兼容/交互后懒加载脚本/detached innerHTML 子树/定位父百分比高度(已完成)
-  - `19-浏览器请求头合成层与抗风控指纹补齐.md` — 按请求目的地合成 UA/Referer/Origin/Accept/Sec-Fetch-*(缺 Referer 被风控 403 的根因)/缺失标准全局(NodeFilter/createElementNS)/事件委托 matches/closest/inspect 可访问名 label/WorkFlow 未知依赖降级(已完成)
+  - `19-浏览器请求头合成层与抗风控指纹补齐.md` — 按请求目的地合成 UA/Referer/Origin/Accept/Sec-Fetch-*(缺 Referer 被风控 403 的根因)/CSS `background` 简写丢 `url(...)` 与精灵图位置/window 代理只读访问器赋值抛错/缺失标准全局(NodeFilter/createElementNS)/事件委托 matches/closest/inspect 可访问名 label/WorkFlow 未知依赖降级(已完成)
 - `docs/Use_MCP/` — 通用 MCP 服务调用
 
 **上下文与会话**：
