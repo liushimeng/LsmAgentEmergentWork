@@ -2227,7 +2227,11 @@ function __lsmEvalUser(src) {
     try { __r = (0, eval)("(" + src + "\n)"); }
     catch (e1) {
       if (e1 && e1.name === "SyntaxError") {
-        if (/\breturn\b/.test(src)) { __r = (new Function(src))(); }
+        // 含 `return` 的语句体:用**间接 eval 包 IIFE**,不要走 `new Function`。
+        // Boa 0.20 的 `new Function` 编译出的函数体里只要有 `class` 声明,执行时
+        // 必 panic(`must be declarative environment`),整条页面 JS 线程被打死、
+        // 页面全局状态全丢(实测百度地图任务中途崩)。间接 eval 路径对 class 正常。
+        if (/\breturn\b/.test(src)) { __r = (0, eval)("(function(){\n" + src + "\n})()"); }
         else { __r = (0, eval)(src); }
       } else { throw e1; }
     }

@@ -831,3 +831,49 @@ fn 标准全局_NodeFilter_与_createElementNS_可用() {
     assert!(v.contains("\"svg\":\"svg\""), "{v}");
     h.shutdown();
 }
+
+// ---------- Boa VM panic 探针:找出 `must be declarative environment` 触发点 ----------
+
+#[test]
+fn eval_js_函数体内_class_声明不触发VMpanic() {
+    // Boa 0.20 的 `new Function` 函数体含 `class` 声明,执行时必 panic
+    // (`must be declarative environment`),整条页面 JS 线程被打死。
+    // `__lsmEvalUser` 已改为「间接 eval 包 IIFE」,本用例锁死该行为。
+    let cases: Vec<(&str, &str)> = vec![
+        ("fn_body_class+return", "class C {} return typeof C;"),
+        ("fn_body_class_only", "class C {} return 1;"),
+        ("nested_fn_class", "function f(){ class G {} return 1; } return f();"),
+        ("arrow_class", "return (() => { class C {} return 1; })();"),
+        ("iife_class", "return (function(){ class C {} return 1; })();"),
+        ("fn_body_let+return", "let x = 1; return x;"),
+        ("fn_body_const+return", "const y = 2; return y;"),
+    ];
+    for (name, src) in cases {
+        let h = JsHandle::spawn();
+        let reply = eval_on(&h, src, "<html><body></body></html>", "https://a.test/");
+        assert!(
+            reply.outcome.ok,
+            "用例 {name} 应成功:{}",
+            reply.outcome.error.clone().unwrap_or_default()
+        );
+        h.shutdown();
+    }
+}
+
+#[test]
+fn VMpanic_后保留Context_不丢页面全局() {
+    // panic 不能重建 Context(页面全局状态全丢);健康检查通过就保留。
+    let h = JsHandle::spawn();
+    // 先种一个全局
+    let seed = eval_on(&h, "window.__keep = 42; return window.__keep;", "<html><body></body></html>", "https://a.test/");
+    assert!(seed.outcome.ok, "{:?}", seed.outcome.error);
+    // 触发一次 VM panic(仍走 new Function 的站点代码路径)
+    let panic_src = "return (function(){ class P {} return 1; })();";
+    let bad = eval_on(&h, panic_src, "<html><body></body></html>", "https://a.test/");
+    assert!(bad.outcome.ok, "class 路径修复后不应再 panic:{:?}", bad.outcome.error);
+    // 全局仍在
+    let check = eval_on(&h, "return String(window.__keep);", "<html><body></body></html>", "https://a.test/");
+    assert!(check.outcome.ok, "{:?}", check.outcome.error);
+    assert_eq!(check.outcome.value, "42");
+    h.shutdown();
+}

@@ -106,13 +106,27 @@ pub(super) fn thread_main(rx: std::sync::mpsc::Receiver<JsRequest>) {
                 }
             }
             Err(_) => {
-                tracing::warn!("JS 线程 panic,重建 Context");
+                // Boa 0.20 的 VM panic(实测 `new Function` 函数体含 class 声明时
+                // 必抛 `must be declarative environment`)。**不能直接重建 Context**:
+                // 页面已经跑了几百个脚本,全局状态(map 实例/模块注册表/事件总线)全在
+                // Context 里,重建等于整页失忆、后续脚本全部静默失效。先做一次
+                // 最小求值健康检查 —— 还能跑就保留旧 Context,真坏了才重建。
+                tracing::warn!("JS 线程 panic(Boa VM),做健康检查后决定是否重建");
                 if let Some(tx) = reply_tx {
-                    let _ = tx.send(JsReply::error("JS 线程 panic,已重建 Context"));
+                    let _ = tx.send(JsReply::error(
+                        "JS 执行器内部 panic(Boa VM bug),该次调用失败",
+                    ));
                 }
-                match ThreadRuntime::new() {
-                    Ok(new_rt) => rt = new_rt,
-                    Err(_) => break,
+                let healthy = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    rt.eval_src("1")
+                }))
+                .is_ok();
+                if !healthy {
+                    tracing::warn!("JS Context 健康检查失败,重建");
+                    match ThreadRuntime::new() {
+                        Ok(new_rt) => rt = new_rt,
+                        Err(_) => break,
+                    }
                 }
             }
         }
