@@ -227,9 +227,14 @@ impl Document {
     }
 
     /// 交互元素列表(默认 inspect(elements) 的候选集)。
+    ///
+    /// 除原生可交互标签外,纳入「无文本图标控件」:`[data-title]` / `[aria-label]`
+    /// —— Web App 的按钮普遍是 `<div class=route-button data-title="路线">` +
+    /// CSS 背景图,DOM 里既无文本也无 href/role,不纳入就完全不可发现
+    /// (实测百度地图路线按钮)。
     pub fn interactive_nodes(&self) -> Vec<NodeRef> {
         self.select(
-            "a[href], button, input, textarea, select, [role=\"button\"], [role=\"link\"], [onclick]",
+            "a[href], button, input, textarea, select, [role=\"button\"], [role=\"link\"], [onclick], [data-title], [aria-label]",
         )
         .unwrap_or_default()
     }

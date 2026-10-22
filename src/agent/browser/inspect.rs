@@ -216,6 +216,32 @@ pub async fn inspect(
             };
             let total = text.chars().count();
             let clipped = document::truncate_chars(&text, limit);
+            // 页面可访问文本极少(画布/图标型 Web App:百度地图整页 DOM 文本仅 4 字)
+            // 时,追加「控件可访问名清单」—— Agent 由此知道页面上有哪些**可操作**
+            // 控件及其语义(`data-title`/`title`/`aria-label`/`placeholder`),
+            // 而不必靠猜 class 名反复试探。
+            let controls = if total < 200 {
+                let mut out: Vec<Value> = Vec::new();
+                for n in doc.interactive_nodes().into_iter().take(40) {
+                    let attrs = document::common_attrs(&n);
+                    let label = document::accessible_name(&n, &attrs, None);
+                    if label.is_empty() {
+                        continue;
+                    }
+                    out.push(json!({
+                        "selector": Document::stable_selector(&n),
+                        "tag": document::tag_name(&n),
+                        "label": label,
+                        "visible": document::is_visible(&n),
+                    }));
+                    if out.len() >= 24 {
+                        break;
+                    }
+                }
+                out
+            } else {
+                Vec::new()
+            };
             Ok(json!({
                 "page_id": page_id,
                 "text": clipped,
@@ -223,7 +249,8 @@ pub async fn inspect(
                 "chars": total,
                 "returned_chars": clipped.chars().count(),
                 "truncated": total > clipped.chars().count(),
-                "note": "source=layout 表示这是截图里能看到的文字;source=dom 表示布局层没有产出文本(元素被 display:none 剪枝或页面内容由 JS 生成)",
+                "controls": controls,
+                "note": "source=layout 表示这是截图里能看到的文字;source=dom 表示布局层没有产出文本(元素被 display:none 剪枝或页面内容由 JS 生成)。controls 在页面文本极少时列出可操作控件的可访问名(label 来自 aria-label/data-title/title/alt/placeholder)",
             }))
         }
         "page_health" => {
@@ -327,7 +354,7 @@ fn inspect_elements(
     params: &Value,
 ) -> EngineResult<Value> {
     let selector = p_str(params, "selector").unwrap_or(
-        "a[href], button, input, textarea, select, [role=\"button\"], [role=\"link\"], [onclick]",
+        "a[href], button, input, textarea, select, [role=\"button\"], [role=\"link\"], [onclick], [data-title], [aria-label]",
     );
     let nodes = match doc.select(selector) {
         Ok(v) => v,

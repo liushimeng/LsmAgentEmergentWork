@@ -286,6 +286,39 @@ async fn 页面文本与健康度可观测() {
 }
 
 #[tokio::test]
+async fn 文本极少时_inspect_text_列出控件可访问名() {
+    // 画布/图标型 Web App(百度地图)整页 DOM 文本仅 4 字,控件全靠
+    // data-title + CSS 背景图呈现 —— `inspect(text)` 在文本极少时补一份
+    // 「控件可访问名清单」,Agent 才知道页面上有什么可点的东西。
+    let mgr = LsmBrowserManager::new();
+    let url = html_doc(
+        "<div class='searchbox-content-button route-button' data-title='路线'></div>\
+         <input id=sole-input placeholder='搜地点、查公交、找路线'>",
+    );
+    let out = mgr
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .await
+        .unwrap();
+    let text = inspect::inspect(&mgr, &out.page_id, "text", &serde_json::json!({}))
+        .await
+        .unwrap();
+    let controls = text["controls"].as_array().cloned().unwrap_or_default();
+    let labels: Vec<String> = controls
+        .iter()
+        .filter_map(|c| c["label"].as_str().map(|s| s.to_string()))
+        .collect();
+    assert!(
+        labels.iter().any(|l| l == "路线"),
+        "应列出 data-title 推出的「路线」:{labels:?}"
+    );
+    assert!(
+        labels.iter().any(|l| l.contains("搜地点")),
+        "应列出 placeholder:{labels:?}"
+    );
+    mgr.shutdown().await;
+}
+
+#[tokio::test]
 async fn 空白页健康度给出可执行结论() {
     let mgr = LsmBrowserManager::new();
     let url = html_doc("");
