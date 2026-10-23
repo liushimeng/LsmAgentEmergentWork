@@ -10,9 +10,11 @@
 //! `1001` 参数错 / `2001` 执行失败 / `2004` 页面不存在 / `3001` 未检测到浏览器 /
 //! `4030` 工具被 `LAEW_CHROME_USE=off` 关闭 / `6001` 任务锚点越界。
 //!
-//! 基础框架 action 集:`open` / `list` / `close` / `control`(navigate/click/type/
-//! eval_js/screenshot/scroll/wait/back/forward/reload) / `inspect`(url/title/text/html/
-//! screenshot)。高级动作(HITL/sequence/explore 等)按设计文档分阶段补齐。
+//! 基础框架 action 集:`open` / `list` / `close` / `control`(navigate/click/click_text/
+//! type|input_text/key_press/eval_js/screenshot/scroll/wait/back/forward/reload) /
+//! `inspect`(url/title/text/html/elements/screenshot)。`inspect(elements)` 是元素
+//! 发现原语(可见可交互元素 + 稳定 selector),`type` 未命中回输入框候选,避免
+//! 模型盲猜 CSS 选择器。高级动作(HITL/sequence/explore 等)按设计文档分阶段补齐。
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -95,6 +97,22 @@ async fn inspect_html(
     })
 }
 
+/// inspect(elements):列出可见可交互元素,支持 `params.selector` 限定作用域、
+/// `params.text` 文本过滤、`params.max` 数量上限(默认 80,夹在 [1,200])。
+async fn inspect_elements(
+    page: &chromiumoxide::Page,
+    params: &Value,
+) -> std::result::Result<Value, (i32, String)> {
+    chrome_browser::visible_elements(
+        page,
+        str_arg(params, "selector"),
+        str_arg(params, "text"),
+        max_elements_arg(params),
+    )
+    .await
+    .map_err(|e| (CODE_EXEC_FAILED, e.to_string()))
+}
+
 pub(super) fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key)
         .and_then(Value::as_str)
@@ -156,6 +174,15 @@ pub(super) fn max_chars_arg(params: &Value) -> usize {
 
 /// 截断到 `max_chars` 个字符(按字符边界,不切坏 UTF-8),返回
 /// `(文本, 原始字符数, 是否截断)`。
+/// inspect(elements) 数量上限:默认 80,夹在 [1,200]。
+pub(super) fn max_elements_arg(params: &Value) -> usize {
+    params
+        .get("max")
+        .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())))
+        .map(|v| v.clamp(1, 200) as usize)
+        .unwrap_or(80)
+}
+
 pub(super) fn cap_chars(s: String, max_chars: usize) -> (String, usize, bool) {
     let chars = s.chars().count();
     if chars <= max_chars {
@@ -199,6 +226,32 @@ fn page_missing_message(page_id: &str) -> String {
     format!("页面不存在(可能已关闭或从未打开):{page_id};用 action=list 查看本工具存活页面")
 }
 
+/// 页面句柄仍在注册表、但底层 target 已销毁/崩溃(Chrome 155 首启偶发)。
+/// 原始错误是 futures-channel 的 `send failed because receiver is gone`。
+pub(super) fn is_dead_page_error(msg: &str) -> bool {
+    msg.contains("receiver is gone")
+        || msg.contains("Target closed")
+        || msg.contains("Session closed")
+        || msg.contains("target closed")
+}
+
+fn dead_page_message(page_id: &str, raw: &str) -> String {
+    format!(
+        "页面已失效(page_id={page_id} 的标签页已被销毁或崩溃):{raw};已从注册表剔除,\
+         请用 action=open 重新打开页面后继续"
+    )
+}
+
+/// 动作失败后若判定为死页,同步剔除注册表条目(避免下次 list 再返回幽灵页)。
+fn evict_if_dead(page_id: &str, msg: &str) -> bool {
+    if is_dead_page_error(msg) {
+        McpChromeUseTool::mgr().close_page(page_id);
+        true
+    } else {
+        false
+    }
+}
+
 #[async_trait]
 impl Tool for McpChromeUseTool {
     fn name(&self) -> &str {
@@ -209,10 +262,13 @@ impl Tool for McpChromeUseTool {
         "浏览器网页操控工具(Chrome/CDP,真 Chromium 渲染,双浏览器架构中默认优先使用)。\
 支持 headed 有头窗口(人工可直接看到并介入页面)与 hidden 无头模式(LAEW_CHROME_MODE)。\
 action=open 打开页面拿 page_id;list 列出页面;control 执行写操作(navigate/click/click_text/type|input_text/\
-key_press/eval_js/screenshot/scroll/wait/back/forward/reload);inspect 观测页面(url/title/text/html/screenshot);\
+key_press/eval_js/screenshot/scroll/wait/back/forward/reload);inspect 观测页面(url/title/text/html/elements/screenshot);\
 close 释放页面(page_id=all 全关并回收 Chrome 进程)。\
+★ **找不到选择器时先 inspect(info=\"elements\", params.text=\"路线\")**:列出可见可交互元素\
+(每项含可直接回传的 selector/tag/id/class/placeholder/text),再 click/type;不要盲猜 CSS。\
 ★ 纯文字按钮(「选为终点」「查询」「公交」等)优先 click_text(params.text=可见文字,可加 params.selector 限定作用域);\
-别反复猜 CSS 选择器。\
+只命中 tooltip 时会自动点相邻图标按钮。\
+★ type/input_text 选择器未命中会回 candidates(可见输入框 selector/placeholder),按候选改选。\
 ★ 联想/快捷键/回车提交用 key_press(params.key=Enter|Tab|ArrowDown|Escape...;可带 params.selector 先聚焦),\
 它发送真实 CDP 键盘事件;type 只做赋值+input/change。\
 ★ screenshot 务必给 params.save_path 落盘(只回路径+尺寸);不传才会回 base64。\
@@ -225,9 +281,11 @@ page_id 仅本工具内有效,不跨工具复用。\
     }
 
     fn parameters(&self) -> Value {
+        // 顶层不设 additionalProperties=false:运行时 `params_of` 明确兼容
+        // 「动作参数顶层直传」,模型也常把 max_chars/max/text 放顶层。
+        // Schema 拒绝会白白消耗两轮(实测 2026-10-23 复跑)。
         json!({
             "type": "object",
-            "additionalProperties": false,
             "required": ["action"],
             "properties": {
                 "action": {
@@ -246,7 +304,7 @@ page_id 仅本工具内有效,不跨工具复用。\
                 },
                 "info": {
                     "type": "string",
-                    "enum": ["url", "title", "text", "html", "screenshot"]
+                    "enum": ["url", "title", "text", "html", "elements", "screenshot"]
                 },
                 "params": {
                     "type": "object",
@@ -258,6 +316,7 @@ page_id 仅本工具内有效,不跨工具复用。\
                         "exact": { "type": "boolean", "description": "click_text 是否要求文本完全相等(默认 false=包含匹配)" },
                         "key": { "type": "string", "description": "key_press 的键名:Enter/Tab/Escape/ArrowDown/ArrowUp/ArrowLeft/ArrowRight/Backspace/Delete/Space 或单字符" },
                         "max_chars": { "type": "integer", "description": "inspect(text|html) 输出上限(默认 20000,范围 1000-200000)" },
+                        "max": { "type": "integer", "description": "inspect(elements) 最多返回多少个元素(默认 80,范围 1-200)" },
                         "script": { "type": "string", "description": "eval_js 的 JS 表达式/语句" },
                         "y": { "type": "integer", "description": "scroll 像素(正向下)" },
                         "ms": { "type": "integer", "description": "wait 固定等待毫秒(上限 30000)" },
@@ -416,9 +475,8 @@ async fn run_control(args: Value) -> Result<String> {
             else {
                 return envelope(CODE_PARAM_ERROR, "type/input_text 缺少 params.selector", json!({}));
             };
-            chrome_browser::type_text(&page, sel, text)
+            chrome_browser::type_text_ex(&page, sel, text)
                 .await
-                .map(|hit| json!({"selector": sel, "hit": hit}))
                 .map_err(|e| (CODE_EXEC_FAILED, e.to_string()))
         }
         "eval_js" => {
@@ -476,6 +534,11 @@ async fn run_control(args: Value) -> Result<String> {
 
     match result {
         Ok(data) => envelope(0, "ok", json!({"page_id": page_id, "control_action": control_action, "result": data})),
+        Err((_, msg)) if evict_if_dead(&page_id, &msg) => envelope(
+            CODE_PAGE_NOT_FOUND,
+            &dead_page_message(&page_id, &msg),
+            json!({"page_id": page_id, "control_action": control_action, "evicted": true}),
+        ),
         Err((code, msg)) => envelope(code, &msg, json!({"page_id": page_id, "control_action": control_action})),
     }
 }
@@ -501,6 +564,7 @@ async fn run_inspect(args: Value) -> Result<String> {
         }
         "text" => inspect_text(&page, params_of(&args)).await,
         "html" => inspect_html(&page, params_of(&args)).await,
+        "elements" => inspect_elements(&page, params_of(&args)).await,
         "screenshot" => match str_arg(params_of(&args), "save_path") {
             Some(path) => chrome_browser::screenshot_to_file(&page, path)
                 .await
@@ -516,6 +580,11 @@ async fn run_inspect(args: Value) -> Result<String> {
 
     match result {
         Ok(data) => envelope(0, "ok", json!({"page_id": page_id, "data": data})),
+        Err((_, msg)) if evict_if_dead(&page_id, &msg) => envelope(
+            CODE_PAGE_NOT_FOUND,
+            &dead_page_message(&page_id, &msg),
+            json!({"page_id": page_id, "info": info, "evicted": true}),
+        ),
         Err((code, msg)) => envelope(code, &msg, json!({"page_id": page_id, "info": info})),
     }
 }

@@ -111,54 +111,109 @@ pub async fn click_text(
             try {{ root = scopeSel ? document.querySelector(scopeSel) : document.body; }} catch (e) {{}}
             if (!root) return JSON.stringify({{hit:false, reason:'scope_not_found'}});
             function norm(s) {{ return String(s == null ? '' : s).replace(/\s+/g, ' ').trim(); }}
-            // 可点击性打分:纯文字按钮常是 div,且旁边还有同名 tooltip;
-            // 只按「文本最短」会点到 tooltip(实测百度地图「路线」)。
+            // 表单控件的 placeholder 是输入提示,不是按钮标签。
+            // 实测百度地图搜索框 placeholder=「搜地点、查公交、找路线」,
+            // 旧实现会把点击「路线」「公交」误判成点击 INPUT#sole-input。
+            function ownText(el) {{
+                var tag = String(el.tagName || '').toUpperCase();
+                if (tag === 'INPUT' || tag === 'TEXTAREA') {{
+                    if (/^(button|submit|reset)$/i.test(el.type || '')) return norm(el.value);
+                    return '';
+                }}
+                if (tag === 'SELECT') return '';
+                return norm(el.innerText || el.textContent || '');
+            }}
+            function labelOf(el) {{
+                try {{
+                    return norm(el.getAttribute('aria-label') || el.getAttribute('title') ||
+                                el.getAttribute('data-title') || '');
+                }} catch (e) {{ return ''; }}
+            }}
+            // 可点击性打分:纯文字按钮常是 div,图标按钮只有 aria-label/title。
             function clickScore(el) {{
                 var s = 0;
                 var tag = String(el.tagName || '').toUpperCase();
-                if (tag === 'BUTTON' || tag === 'A' || tag === 'INPUT' || tag === 'SELECT') s += 100;
+                if (tag === 'BUTTON' || tag === 'A') s += 100;
+                if (tag === 'INPUT' && /^(button|submit|reset)$/i.test(el.type || '')) s += 100;
                 var cls = '', id = '';
                 try {{ cls = String(el.className || ''); }} catch (e) {{}}
                 try {{ id = String(el.id || ''); }} catch (e) {{}}
                 if (/btn|button|tab|link|item/i.test(cls + ' ' + id)) s += 50;
-                try {{ if (String(el.getAttribute('role') || '') === 'button') s += 40; }} catch (e) {{}}
+                try {{
+                    var role = String(el.getAttribute('role') || '');
+                    if (role === 'button' || role === 'tab' || role === 'link' || role === 'menuitem') s += 40;
+                }} catch (e) {{}}
                 try {{ if (window.getComputedStyle(el).cursor === 'pointer') s += 30; }} catch (e) {{}}
                 try {{ if (typeof el.onclick === 'function') s += 10; }} catch (e) {{}}
                 try {{ if (el.tabIndex >= 0) s += 5; }} catch (e) {{}}
                 return s;
             }}
+            function visible(el) {{
+                try {{ var r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; }}
+                catch (e) {{ return false; }}
+            }}
             var all = root.querySelectorAll('*');
-            var best = null, bestScore = -1, bestLen = 1e9;
+            var best = null, bestScore = -1, bestLen = 1e9, bestText = '';
             for (var i = 0; i < all.length; i++) {{
                 var el = all[i];
-                var r = null;
-                try {{ r = el.getBoundingClientRect(); }} catch (e) {{}}
-                if (!r || r.width <= 0 || r.height <= 0) continue;
-                var visible = norm(el.innerText || el.textContent || '');
-                var label = '';
-                try {{
-                    label = norm(el.getAttribute('aria-label') || el.getAttribute('title') ||
-                                 el.getAttribute('data-title') || el.getAttribute('placeholder') || '');
-                }} catch (e) {{}}
-                var text = visible || label;
-                if (!text) continue;
+                if (!visible(el)) continue;
+                var tag = String(el.tagName || '').toUpperCase();
+                if (tag === 'TEXTAREA' || tag === 'SELECT') continue;
+                if (tag === 'INPUT' && !/^(button|submit|reset)$/i.test(el.type || '')) continue;
+                var txt = ownText(el);
+                var label = labelOf(el);
+                if (!txt && !label) continue;
                 var hit = exact
-                    ? (visible === target || label === target)
-                    : (visible.indexOf(target) >= 0 || label.indexOf(target) >= 0);
+                    ? (txt === target || label === target)
+                    : (txt.indexOf(target) >= 0 || label.indexOf(target) >= 0);
                 if (!hit) continue;
                 var score = clickScore(el);
-                // 先比可点击性;同分取文本最短(容器文本更长,最小者最接近按钮本身)。
-                if (score > bestScore || (score === bestScore && text.length < bestLen)) {{
-                    best = el; bestScore = score; bestLen = text.length;
+                // 完全相等优先于包含匹配(容器文本更长,最小者最接近按钮本身)。
+                if (txt && txt === target) score += 20;
+                var len = txt ? txt.length : label.length;
+                if (score > bestScore || (score === bestScore && len < bestLen)) {{
+                    best = el; bestScore = score; bestLen = len; bestText = txt || label;
                 }}
             }}
-            if (!best) return JSON.stringify({{hit:false}});
-            try {{ best.scrollIntoView({{block:'center'}}); }} catch (e) {{}}
-            try {{ best.click(); }} catch (e) {{}}
+            if (!best) return JSON.stringify({{hit:false, reason:'text_not_found', target:target}});
+            var clicked = best, via = 'self';
+            var cls0 = '';
+            try {{ cls0 = String(best.className || ''); }} catch (e) {{}}
+            // tooltip / 纯标签节点本身没有点击动作。改点它矩形周边最近的可点击元素
+            // (实测百度地图「路线」:真实按钮是 tooltip 上方的 route-button 图标,
+            //  tooltip 是 body 的直接子节点,向上找祖先找不到按钮)。
+            var labelish = /tooltip|label|hint|tip/i.test(cls0) || bestScore < 30;
+            if (labelish) {{
+                var br = best.getBoundingClientRect();
+                var tcx = (br.left + br.right) / 2, tcy = (br.top + br.bottom) / 2;
+                var nBest = null, nDist = 1e9, nScore = -1;
+                for (var j = 0; j < all.length; j++) {{
+                    var cand = all[j];
+                    if (cand === best || !visible(cand)) continue;
+                    var sc = clickScore(cand);
+                    if (sc < 40) continue;
+                    var cr = cand.getBoundingClientRect();
+                    var ccx = (cr.left + cr.right) / 2, ccy = (cr.top + cr.bottom) / 2;
+                    var d = Math.sqrt((ccx - tcx) * (ccx - tcx) + (ccy - tcy) * (ccy - tcy));
+                    if (d > 160) continue;
+                    if (d < nDist || (d === nDist && sc > nScore)) {{
+                        nBest = cand; nDist = d; nScore = sc;
+                    }}
+                }}
+                if (nBest) {{ clicked = nBest; via = 'neighbor'; bestScore = nScore; }}
+                else if (bestScore < 30) {{
+                    return JSON.stringify({{hit:false, reason:'matched_non_clickable',
+                        matched:{{tag:best.tagName, id:best.id||'', cls:cls0.slice(0,120), text:bestText}},
+                        hint:'命中文字但没有可点击元素;用 inspect(info="elements", params.text=...) 查看可点击元素,或改用 click(params.selector)'}});
+                }}
+            }}
+            try {{ clicked.scrollIntoView({{block:'center'}}); }} catch (e) {{}}
+            try {{ clicked.click(); }} catch (e) {{}}
             var cls = '';
-            try {{ cls = String(best.className || ''); }} catch (e) {{}}
-            return JSON.stringify({{hit:true, tag:best.tagName, id:best.id||'', cls:cls.slice(0,120), score:bestScore,
-                                     text:norm(best.innerText||best.textContent||'').slice(0,200)}});
+            try {{ cls = String(clicked.className || ''); }} catch (e) {{}}
+            return JSON.stringify({{hit:true, via:via, tag:clicked.tagName, id:clicked.id||'', cls:cls.slice(0,120),
+                                     score:bestScore, matched_text:bestText,
+                                     text:norm(clicked.innerText||clicked.textContent||clicked.value||'').slice(0,200)}});
         }})()"#,
         text = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into()),
         scope = serde_json::to_string(&scope).unwrap_or_else(|_| "null".into()),
@@ -167,6 +222,140 @@ pub async fn click_text(
     let v = eval_js(page, &js).await?;
     let raw = v.as_str().unwrap_or("{}");
     Ok(serde_json::from_str(raw).unwrap_or_else(|_| serde_json::json!({"hit": false, "raw": raw})))
+}
+
+/// 页面存活探测:`receiver is gone`(target 被销毁/崩溃)时立即失败。
+pub async fn page_alive(page: &Page) -> bool {
+    tokio::time::timeout(Duration::from_secs(5), page.evaluate("1"))
+        .await
+        .map(|r| r.is_ok())
+        .unwrap_or(false)
+}
+
+/// 列出当前可见、可交互的元素(元素发现原语)。
+///
+/// 现代站点大量按钮无稳定 id/class,整页 HTML 又可能 40 万字符。Agent 需要
+/// 一个「先看有哪些可点/可输入元素」的入口,再决定 click/type 的 selector。
+/// 返回 `{elements:[{selector,tag,id,cls,role,type,placeholder,text,label,x,y,w,h}], count}`;
+/// `selector` 由 id/稳定 class + `:nth-of-type` 组成,可直接回传给 click/type。
+pub async fn visible_elements(
+    page: &Page,
+    scope: Option<&str>,
+    text_filter: Option<&str>,
+    max: usize,
+) -> Result<Value> {
+    let max = max.clamp(1, 200);
+    let js = format!(
+        r#"(function(){{
+            var scopeSel = {scope};
+            var filter = {filter};
+            var max = {max};
+            var root = null;
+            try {{ root = scopeSel ? document.querySelector(scopeSel) : document.body; }} catch (e) {{}}
+            if (!root) return JSON.stringify({{elements:[], count:0, reason:'scope_not_found'}});
+            function norm(s) {{ return String(s == null ? '' : s).replace(/\s+/g, ' ').trim(); }}
+            function esc(s) {{
+                if (window.CSS && CSS.escape) return CSS.escape(s);
+                return String(s).replace(/([^a-zA-Z0-9_-])/g, '\\$1');
+            }}
+            function uniq(sel, el) {{
+                try {{ var list = document.querySelectorAll(sel); return list.length === 1 && list[0] === el; }}
+                catch (e) {{ return false; }}
+            }}
+            // 稳定选择器:优先 #id;否则 tag + 稳定 class + :nth-of-type 逐级上溯。
+            function cssPath(el) {{
+                if (el.id && uniq('#' + esc(el.id), el)) return '#' + esc(el.id);
+                var parts = [], cur = el, depth = 0;
+                while (cur && cur.nodeType === 1 && cur !== document.documentElement && depth < 6) {{
+                    var seg = cur.tagName.toLowerCase();
+                    var cls = String(cur.className || '').trim().split(/\s+/).filter(function(c) {{
+                        return /^[A-Za-z_][\w-]*$/.test(c) && c.length <= 30 && !/\d{{3,}}/.test(c);
+                    }}).slice(0, 2);
+                    if (cls.length) seg += '.' + cls.map(esc).join('.');
+                    var parent = cur.parentElement;
+                    if (parent) {{
+                        var same = Array.prototype.filter.call(parent.children, function(x) {{
+                            return x.tagName === cur.tagName;
+                        }});
+                        if (same.length > 1) seg += ':nth-of-type(' + (same.indexOf(cur) + 1) + ')';
+                    }}
+                    parts.unshift(seg);
+                    var candidate = parts.join(' > ');
+                    if (uniq(candidate, el)) return candidate;
+                    cur = parent; depth++;
+                }}
+                return parts.join(' > ');
+            }}
+            function visible(el) {{
+                try {{
+                    var r = el.getBoundingClientRect();
+                    if (r.width <= 0 || r.height <= 0) return false;
+                    var s = getComputedStyle(el);
+                    return s.visibility !== 'hidden' && s.display !== 'none' && s.opacity !== '0';
+                }} catch (e) {{ return false; }}
+            }}
+            function textOf(el) {{
+                var tag = String(el.tagName || '').toUpperCase();
+                if (tag === 'INPUT' || tag === 'TEXTAREA') {{
+                    if (/^(button|submit|reset)$/i.test(el.type || '')) return norm(el.value);
+                    return '';
+                }}
+                return norm(el.innerText || el.textContent || '');
+            }}
+            function isInteractive(el) {{
+                var tag = String(el.tagName || '').toUpperCase();
+                if (tag === 'A' || tag === 'BUTTON' || tag === 'SELECT' || tag === 'TEXTAREA') return true;
+                if (tag === 'INPUT') return !/^hidden$/i.test(el.type || '');
+                var role = String(el.getAttribute('role') || '');
+                if (/^(button|tab|link|menuitem|option|checkbox|radio|switch)$/.test(role)) return true;
+                if (el.hasAttribute('onclick') || el.hasAttribute('contenteditable')) return true;
+                if (el.hasAttribute('tabindex') && Number(el.getAttribute('tabindex')) >= 0) return true;
+                var cls = String(el.className || '') + ' ' + String(el.id || '');
+                if (/btn|button|tab|link|item|switch|checkbox|radio|menu|tool|icon/i.test(cls)) return true;
+                try {{ if (getComputedStyle(el).cursor === 'pointer') return true; }} catch (e) {{}}
+                return false;
+            }}
+            var out = [], scanned = 0, all = root.querySelectorAll('*');
+            for (var i = 0; i < all.length && out.length < max && scanned < 40000; i++) {{
+                var el = all[i]; scanned++;
+                if (el === root || !visible(el) || !isInteractive(el)) continue;
+                var txt = textOf(el).slice(0, 80);
+                var ph = '';
+                try {{ ph = norm(el.getAttribute('placeholder') || ''); }} catch (e) {{}}
+                var label = '';
+                try {{
+                    label = norm(el.getAttribute('aria-label') || el.getAttribute('title') ||
+                                el.getAttribute('data-title') || '');
+                }} catch (e) {{}}
+                if (!txt && !ph && !label && String(el.tagName).toUpperCase() !== 'INPUT') continue;
+                if (filter) {{
+                    var blob = (txt + ' ' + ph + ' ' + label).toLowerCase();
+                    if (blob.indexOf(filter.toLowerCase()) < 0) continue;
+                }}
+                var r = el.getBoundingClientRect();
+                out.push({{
+                    selector: cssPath(el),
+                    tag: el.tagName,
+                    id: el.id || '',
+                    cls: String(el.className || '').slice(0, 100),
+                    role: el.getAttribute('role') || '',
+                    type: el.getAttribute('type') || '',
+                    placeholder: ph,
+                    text: txt,
+                    label: label,
+                    x: Math.round(r.x), y: Math.round(r.y),
+                    w: Math.round(r.width), h: Math.round(r.height),
+                }});
+            }}
+            return JSON.stringify({{elements: out, count: out.length, scope: scopeSel || 'body'}});
+        }})()"#,
+        scope = serde_json::to_string(&scope).unwrap_or_else(|_| "null".into()),
+        filter = serde_json::to_string(&text_filter).unwrap_or_else(|_| "null".into()),
+        max = max,
+    );
+    let v = eval_js(page, &js).await?;
+    let raw = v.as_str().unwrap_or("{}");
+    Ok(serde_json::from_str(raw).unwrap_or_else(|_| serde_json::json!({"elements": [], "count": 0, "raw": raw})))
 }
 
 /// 键位元数据:(key, code, windowsVirtualKeyCode, text)。
@@ -299,6 +488,39 @@ pub async fn type_text(page: &Page, selector: &str, text: &str) -> Result<bool> 
     );
     let v = eval_js(page, &js).await?;
     Ok(v.as_bool().unwrap_or(false))
+}
+
+/// 按选择器输入文本;未命中时回可见输入框候选,便于模型改选正确 selector。
+///
+/// 实测模型会猜 `#route-inputstart`,而真实节点是 `input.route-start-input`
+/// (无 id)。只回 `{hit:false}` 会迫使模型继续盲猜或改用 eval_js。
+pub async fn type_text_ex(page: &Page, selector: &str, text: &str) -> Result<Value> {
+    if type_text(page, selector, text).await? {
+        return Ok(serde_json::json!({"selector": selector, "hit": true}));
+    }
+    let listed = visible_elements(page, None, None, 200).await?;
+    let candidates: Vec<Value> = listed
+        .get("elements")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter(|e| {
+                    matches!(
+                        e.get("tag").and_then(Value::as_str).unwrap_or(""),
+                        "INPUT" | "TEXTAREA"
+                    )
+                })
+                .take(8)
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(serde_json::json!({
+        "selector": selector,
+        "hit": false,
+        "candidates": candidates,
+        "hint": "选择器未命中输入框;从 candidates[].selector 里选一个,或先 inspect(info=\"elements\", params.text=...) 查看可见元素",
+    }))
 }
 
 /// 滚动:按像素(y 正向下)或滚动到选择器处。

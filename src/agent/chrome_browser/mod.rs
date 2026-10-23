@@ -173,6 +173,8 @@ struct BrowserHolder {
     _task: tokio::task::JoinHandle<()>,
     /// 一次性 user-data-dir(进程退出时清理)。
     user_data_dir: PathBuf,
+    /// Chrome 主进程 pid(等待真正退出后再删 profile;helper 仍存活时会重建目录)。
+    browser_pid: Option<u32>,
     /// 进程外 watchdog(主进程被强杀时负责回收 Chrome;正常收口时自行退出)。
     watchdog: Option<std::process::Child>,
 }
@@ -189,7 +191,18 @@ impl BrowserHolder {
                 }
             }
         }
-        let _ = std::fs::remove_dir_all(&self.user_data_dir);
+        // Chrome 退出是异步的:start_kill 只发起、不等待。helper/renderer 在
+        // 主进程死后仍可能短暂写 profile,先删会被重建(实测残留 8K Default 目录)。
+        // 先等主进程消失,再走带重试 + 静默窗确认的 remove_profile。
+        if let Some(pid) = self.browser_pid {
+            for _ in 0..50 {
+                if !watchdog::process_alive(pid) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        watchdog::remove_profile(&self.user_data_dir);
         // watchdog 观察 Chrome 退出即自行返回;这里只做一次非阻塞回收。
         if let Some(mut wd) = self.watchdog.take() {
             let _ = wd.try_wait();
@@ -319,6 +332,7 @@ impl ChromeManager {
             browser: Arc::new(browser),
             _task: task,
             user_data_dir: dir,
+            browser_pid,
             watchdog,
         });
         Ok(holder.as_ref().unwrap().browser.clone())
@@ -346,19 +360,58 @@ impl ChromeManager {
     }
 
     /// 打开 URL,返 `(page_id, 最终 URL, 标题)`。
+    ///
+    /// Chrome 155 首启期存在「标签页创建成功后 target 立即失效」的瞬态竞态
+    /// (实测 page_id 返回 12s 后 eval 报 `receiver is gone`)。这里做一次
+    /// 存活探测 + 同浏览器内重建,避免一次瞬态失败污染整个任务。
     pub async fn open(&self, url: &str) -> Result<(String, String, String)> {
         let browser = self.ensure_browser().await?;
+        let mut last_err: Option<AgentError> = None;
+        for attempt in 0..2 {
+            match self.open_once(&browser, url).await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    tracing::warn!(attempt, error = %e, "Chrome 新建标签页失败/立即失效,自动重试一次");
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| AgentError::ToolExecution {
+            tool: "chrome_browser".into(),
+            reason: "新建 Chrome 标签页失败(无具体错误)".into(),
+        }))
+    }
+
+    async fn open_once(
+        &self,
+        browser: &Arc<chromiumoxide::Browser>,
+        url: &str,
+    ) -> Result<(String, String, String)> {
         let page = tokio::time::timeout(Duration::from_secs(20), browser.new_page(url))
             .await
             .map_err(|_| AgentError::ToolExecution { tool: "chrome_browser".into(), reason: "新建 Chrome 标签页超时(20s)".into()})?
             .map_err(|e| AgentError::ToolExecution { tool: "chrome_browser".into(), reason: format!("新建 Chrome 标签页失败: {e}")})?;
-        page::navigate(&page, url).await?;
-        let (final_url, title) = page::url_and_title(&page).await;
+        // `new_page(url)` 本身会等待目标初始化与首文档装载完成,不再重复 goto
+        // (冗余双导航会放大启动竞态窗口)。仅当 URL 读不到时兜底导航。
+        let (mut final_url, mut title) = page::url_and_title(&page).await;
+        if final_url.is_empty() {
+            page::navigate(&page, url).await?;
+            (final_url, title) = page::url_and_title(&page).await;
+        }
+        if !page::page_alive(&page).await {
+            return Err(AgentError::ToolExecution {
+                tool: "chrome_browser".into(),
+                reason: "新建标签页初始化后立即失效(target 已销毁或崩溃)".into(),
+            });
+        }
         let (id, _) = self.register(page);
         Ok((id, final_url, title))
     }
 
-    /// 列出存活页面 `(page_id, 当前 URL)`(URL 读取为有界探测,失败按空串)。
+    /// 列出存活页面 `(page_id, 当前 URL)`。
+    ///
+    /// 同时剔除已失效页面:target 销毁/崩溃后 `Page` 句柄仍在注册表里,
+    /// 旧实现会把 url="" 的幽灵页返回给模型(实测 c_00000000)。
     pub async fn list_pages(&self) -> Vec<(String, String)> {
         let pages: Vec<(String, Arc<Page>)> = self
             .pages
@@ -366,9 +419,22 @@ impl ChromeManager {
             .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
             .unwrap_or_default();
         let mut out = Vec::with_capacity(pages.len());
+        let mut dead = Vec::new();
         for (id, page) in pages {
-            let (url, _) = page::url_and_title(&page).await;
-            out.push((id, url));
+            if page::page_alive(&page).await {
+                let (url, _) = page::url_and_title(&page).await;
+                out.push((id, url));
+            } else {
+                dead.push(id);
+            }
+        }
+        if !dead.is_empty() {
+            tracing::warn!(pages = ?dead, "剔除已失效的 Chrome 页面");
+            if let Ok(mut pages) = self.pages.lock() {
+                for id in dead {
+                    pages.remove(&id);
+                }
+            }
         }
         out
     }

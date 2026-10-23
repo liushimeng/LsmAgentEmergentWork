@@ -443,8 +443,7 @@ Markdown Prompt 模板，两级发现：**项目级** `{工作目录}/.laew/comm
 
 **三个 MCP 风格工具**（按工具）：
 - `docs/双浏览器工具架构/` — Chrome × LsmAgentBrowser 双浏览器工具总设计(命名映射/选用决策/分阶段路线图)
-- `docs/MCP_Web_Chrome_Use/` — Chrome/CDP 工具知识库(38 篇,含 HITL/反检测/站点治理系列) + `reference实现归档/`(历史实现 47 文件)
-- `docs/MCP_Web_Chrome_Use_CDP技术方案/` — Rust 操作 Chrome CDP 完整技术方案
+- `docs/MCP_Web_Chrome_Use/` — Chrome/CDP 工具知识库(46 篇,含 HITL/反检测/站点治理系列) + `CDP技术方案-Rust操作Chrome浏览器.md`(CDP 完整技术方案) + `reference实现归档/`(历史实现 47 文件)
 - `docs/MCP_Window_Use/` — 桌面窗口操控
 - `docs/MCP_Web_LsmAgentBrowser_Use/` — LsmAgentBrowser 内核、兼容层与阶段路线图
   - `08-阶段三布局引擎Flex与定位设计.md` — Flex + 定位体系(已完成)与 Phase 3 后续

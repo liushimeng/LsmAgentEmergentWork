@@ -29,4 +29,4 @@
 | `tests/browser_watchdog.rs` / `stealth_reveal_smoke.rs` / `web_use_smoke.rs` | Chrome 时代测试 | 待移植 |
 | `examples/stealth_baseline_probe.rs` | 反检测基线探针 | 待移植 |
 | `docs/MCP_Web_Chrome_Use/*.md`(38 篇)→ 已恢复为 `docs/MCP_Web_Chrome_Use/` | Chrome 版知识库 | 已恢复 |
-| `docs/浏览器CDP工具/*.md`(1 篇)→ 已恢复为 `docs/MCP_Web_Chrome_Use_CDP技术方案/` | CDP 技术方案 | 已恢复 |
+| `docs/浏览器CDP工具/*.md`(1 篇)→ 已合并入 `docs/MCP_Web_Chrome_Use/CDP技术方案-Rust操作Chrome浏览器.md` | CDP 技术方案 | 已恢复 |

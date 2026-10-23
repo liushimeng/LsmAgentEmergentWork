@@ -1,6 +1,8 @@
 # Rust 操作 Chrome 浏览器（CDP）完整技术方案
 
 > 本文件由原《CDP 技术信息 / 内存浏览器 / 已打开浏览器》三篇合并优化而成（2026-09-18）。
+> 2026-10-23 起从独立目录 `docs/MCP_Web_Chrome_Use_CDP技术方案/` 并入本知识库，
+> 与 `01-设计与解决方案.md`、`reference实现归档/` 同处一处维护。
 > 核心结论：**Rust 完全可以操作 Chrome / Chromium / Edge / Brave（所有 Chromium 内核）**，
 > 通过 CDP（Chrome DevTools Protocol）即可，原理与 Puppeteer / Playwright 一致，无需 Node/Python。
 

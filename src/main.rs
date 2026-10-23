@@ -1136,8 +1136,17 @@ async fn main() -> Result<()> {
         && !cli.sessions
         && cli.cmd.is_none();
     let default_level = if is_tui { "warn" } else { "info" };
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+    let mut env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| default_level.into());
+    // Chrome 155 新增的 Network.requestWillBeSentExtraInfo 等事件 chromiumoxide 0.9.1
+    // 无法反序列化,逐事件打 WARN(实测 3 秒 166 条)淹没工程事件;这是良性事件,
+    // 不影响 target/页面生命周期。只保留 chromiumoxide 的 ERROR(WS Connection error)。
+    // 需要原始报文排查时设 LAEW_CDP_RAW_LOG=1。
+    if std::env::var("LAEW_CDP_RAW_LOG").is_err() {
+        if let Ok(directive) = "chromiumoxide::handler=error".parse() {
+            env_filter = env_filter.add_directive(directive);
+        }
+    }
     // Agent 运行日志文件(2026-09-17 第 69 轮):`--debug` / `--info`(含单横线与
     // 大小写变体)时在工作目录生成 `llaew_{YYYYMMDD_HHMMSS}.log`(启动时刻命名),
     // `--debug` → DEBUG 级,`--info` → INFO 级;文件创建失败静默降级不影响主流程。

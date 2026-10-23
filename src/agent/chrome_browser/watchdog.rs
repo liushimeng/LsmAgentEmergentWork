@@ -37,7 +37,10 @@ pub async fn run(browser_pid: u32, user_data_dir: &Path) -> anyhow::Result<()> {
             }
             _ = tokio::time::sleep(Duration::from_millis(250)) => {
                 // Chrome 正常退出时 watchdog 立即退出,不长期悬挂。
+                // 此时主进程可能已先完成 shutdown,轮不到 EOF 分支;profile 必须
+                // 在这里清理,否则 temp 下残留 laew_chrome_*(实测 2 个)。
                 if !process_alive(browser_pid) {
+                    remove_profile(user_data_dir);
                     return Ok(());
                 }
             }
@@ -117,12 +120,24 @@ pub fn terminate_process(pid: u32) {
 
 /// 删除一次性浏览器 profile 目录(带重试,覆盖 Chrome 退出延迟持有的锁)。
 pub fn remove_profile(dir: &Path) {
-    for _ in 0..10 {
-        match std::fs::remove_dir_all(dir) {
-            Ok(()) => return,
-            Err(_) if !dir.exists() => return,
-            Err(_) => std::thread::sleep(Duration::from_millis(250)),
+    // Chrome 主进程退出后,helper/renderer 仍可能短暂持有 profile 内文件句柄;
+    // 2.5s 窗口实测不够(残留 8~12KB 的 Default 目录),放宽到 5s。
+    // 单次 remove_dir_all 成功也可能被残留 helper 重建,故要求「连续 2 次探测
+    // 均不存在」(约 500ms 静默窗)才算清理完成。
+    let mut clean_passes = 0;
+    for _ in 0..20 {
+        if dir.exists() {
+            let _ = std::fs::remove_dir_all(dir);
         }
+        if dir.exists() {
+            clean_passes = 0;
+        } else {
+            clean_passes += 1;
+            if clean_passes >= 2 {
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(250));
     }
 }
 

@@ -42,6 +42,41 @@ fn schema_含五个基础_action() {
     assert!(props.get("key").is_some());
     assert!(props.get("exact").is_some());
     assert!(props.get("max_chars").is_some());
+    assert!(props.get("max").is_some());
+    // 元素发现原语:模型不再盲猜 CSS 选择器。
+    let i_enums = schema["properties"]["info"]["enum"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(i_enums.contains(&"elements"));
+}
+
+#[test]
+fn schema_顶层允许动作参数直传() {
+    // 运行时 params_of 兼容顶层直传;Schema 不得再以 additionalProperties=false
+    // 拒绝 max_chars/max/text(实测模型自然写法会放顶层)。
+    let schema = McpChromeUseTool.parameters();
+    assert!(schema.get("additionalProperties").is_none());
+}
+
+#[test]
+fn max_elements_arg_夹取范围与默认值() {
+    assert_eq!(max_elements_arg(&json!({})), 80);
+    assert_eq!(max_elements_arg(&json!({"max": 0})), 1);
+    assert_eq!(max_elements_arg(&json!({"max": 999})), 200);
+    assert_eq!(max_elements_arg(&json!({"max": "25"})), 25);
+}
+
+#[test]
+fn 死页错误识别_receiver_gone() {
+    assert!(is_dead_page_error(
+        "工具执行失败[chrome_browser]: eval_js 失败: send failed because receiver is gone"
+    ));
+    assert!(is_dead_page_error("Target closed"));
+    assert!(!is_dead_page_error("选择器未命中"));
+    assert!(!is_dead_page_error("页面不存在"));
 }
 
 #[test]
