@@ -13,6 +13,8 @@ pub mod inspect;
 pub mod js;
 pub mod layout;
 pub mod net;
+/// 屏蔽页面状态栏 / 屏蔽页面进度栏(查看器帧合成层,`docs/双浏览器工具架构/02`)。
+pub mod page_bars;
 pub mod render;
 pub mod reqctx;
 pub mod resource;
@@ -70,6 +72,23 @@ impl BrowserMode {
             }
         }
         Self::interactive_default()
+    }
+
+    /// 显式 `LAEW_BROWSER_MODE` **优先于**工具传入的 `mode` 参数,再退回交互式默认。
+    ///
+    /// 用户在终端跑 `LAEW_BROWSER_MODE=headed laew ...` 是「我要看着浏览器跑」的强信号,
+    /// 应压过 LLM 自行挑选的 `mode`(实测百度地图任务里 LLM 会选 hidden 导致窗口不显示,
+    /// 用户反馈「看不到浏览器运行」)。未设环境变量时仍以工具参数为准。
+    pub fn from_env_or_arg(mode_arg: Option<&str>) -> Self {
+        if let Ok(v) = std::env::var("LAEW_BROWSER_MODE") {
+            if let Some(m) = Self::from_arg(&v) {
+                return m;
+            }
+        }
+        match mode_arg.and_then(Self::from_arg) {
+            Some(m) => m,
+            None => Self::interactive_default(),
+        }
     }
 
     /// 环境变量未设置时的默认档:**交互式终端(stdin/stdout 均为 TTY)默认有头**
@@ -179,6 +198,8 @@ pub struct TabState {
     pub user_agent: String,
     pub mode: BrowserMode,
     pub guard: GuardState,
+    /// 屏蔽页面状态栏/进度栏快照(查看器帧合成层渲染,`page_bars.rs`)。
+    pub bars: page_bars::PageBars,
     pub highlight: bool,
     pub auto_follow: bool,
     /// 页面 JS 线程句柄(阶段二:持久 Boa Context,导航换页时重建)。
@@ -320,6 +341,8 @@ pub struct LsmBrowserManager {
     view_cmd_tx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<view::ViewCommand>>>,
     /// 自身弱引用(查看器命令处理任务用它回到引擎;非 Arc 场景为空)。
     self_weak: std::sync::Mutex<std::sync::Weak<LsmBrowserManager>>,
+    /// 两条告知栏 1Hz 心跳的单实例闸(`page_bars.rs::ensure_bars_ticker`)。
+    bars_ticker_started: std::sync::atomic::AtomicBool,
 }
 
 /// 兼容旧调用点的类型名。
@@ -340,6 +363,7 @@ impl LsmBrowserManager {
             view: std::sync::Mutex::new(None),
             view_cmd_tx: std::sync::Mutex::new(None),
             self_weak: std::sync::Mutex::new(std::sync::Weak::new()),
+            bars_ticker_started: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -375,6 +399,8 @@ impl LsmBrowserManager {
                     }
                 });
             }
+            // 两条告知栏的 1Hz 心跳(全进程单实例,`page_bars.rs`)。
+            self.ensure_bars_ticker();
         }
         drop(guard);
         self.push_frame(tab);
@@ -435,7 +461,7 @@ impl LsmBrowserManager {
         if !alive {
             return;
         }
-        let Some(pixmap) = self.font.render_pixmap(
+        let Some(mut pixmap) = self.font.render_pixmap(
             &tab.layout,
             tab.viewport.width,
             tab.viewport.height,
@@ -445,6 +471,8 @@ impl LsmBrowserManager {
         ) else {
             return;
         };
+        // 屏蔽页面状态栏/进度栏:查看器帧合成层叠加(不进截图取证路径)。
+        page_bars::draw(&mut pixmap, &self.font, tab);
         let png = pixmap.encode_png().unwrap_or_default();
         if png.is_empty() {
             return;
@@ -791,6 +819,7 @@ impl LsmBrowserManager {
                 mode: "open".to_string(),
                 ..Default::default()
             },
+            bars: page_bars::PageBars::default(),
             highlight: false,
             auto_follow: false,
             js: pipeline.js,
@@ -1674,61 +1703,13 @@ fn mode_hint(requested: BrowserMode) -> Option<String> {
     }
 }
 
-fn find_reusable(inner: &Inner, url: &str) -> Option<String> {
-    let canonical = urlutil::canonical(url);
-    let exact = inner
-        .tabs
-        .values()
-        .find(|t| urlutil::canonical(&t.url) == canonical)
-        .map(|t| t.id.clone());
-    if exact.is_some() {
-        return exact;
-    }
-    inner
-        .tabs
-        .values()
-        .filter(|t| urlutil::same_origin(&t.url, url))
-        .min_by_key(|t| t.created_at_ms)
-        .map(|t| t.id.clone())
-}
-
-fn clear_session_if_empty(inner: &mut Inner) {
-    if inner.tabs.is_empty() {
-        inner.cookies.clear();
-        inner.local_storage.clear();
-        inner.windows.clear();
-    }
-}
-
-fn close_from_windows(inner: &mut Inner, ids: &[String]) {
-    for w in inner.windows.iter_mut() {
-        w.tabs.retain(|id| !ids.contains(id));
-        if let Some(active) = &w.active {
-            if ids.contains(active) {
-                w.active = w.tabs.first().cloned();
-            }
-        }
-    }
-    inner.windows.retain(|w| !w.tabs.is_empty());
-}
-
-/// 通知被关闭页面的 JS 线程退出(线程自行收尾,无需等待)。
-fn shutdown_js_handles(inner: &Inner, ids: &[String]) {
-    for id in ids {
-        if let Some(tab) = inner.tabs.get(id) {
-            if let Some(h) = &tab.js {
-                h.shutdown();
-            }
-        }
-    }
-}
-
-fn record_network(tab: &mut TabState, rec: NetworkRecord) {
-    tab.network.push(rec);
-    if tab.network.len() > 200 {
-        tab.network.remove(0);
-    }
-}
+// 会话生命周期自由函数已按 1800 行约定机械拆分至 `session_lifecycle.rs`
+// (调用点零改写,经此重导入保持原名字解析)。
+mod session_lifecycle;
+use session_lifecycle::{
+    clear_session_if_empty, close_from_windows, find_reusable, record_network,
+    shutdown_js_handles,
+};
 
 /// 全内存 HTTP 缓存开关（阶段四第二步）：`LAEW_WEB_CACHE=off` 关闭。
 fn cache_enabled() -> bool {

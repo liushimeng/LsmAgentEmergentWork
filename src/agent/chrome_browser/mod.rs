@@ -25,6 +25,7 @@ use crate::error::{AgentError, Result};
 mod page;
 #[cfg(test)]
 mod tests;
+pub mod status;
 pub mod watchdog;
 
 pub use page::*;

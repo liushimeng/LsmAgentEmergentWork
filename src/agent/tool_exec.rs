@@ -98,6 +98,28 @@ fn is_request_human_call(args: &serde_json::Value) -> bool {
     flat == Some("request_human") || nested == Some("request_human")
 }
 
+/// 工具调用的人读标签(活动台账用):工具名 + 首个关键参数摘要。
+/// 只取一个关键参数即可 —— 进度栏是给人看的,不是参数转储。
+fn tool_label(name: &str, args: &serde_json::Value) -> String {
+    const KEYS: [&str; 9] = [
+        "url", "action", "control_action", "info", "selector", "path", "file_path", "command",
+        "query",
+    ];
+    for k in KEYS {
+        if let Some(v) = args
+            .get(k)
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.trim().is_empty())
+        {
+            return format!(
+                "{name} {}",
+                crate::agent::web_activity::clip_chars(v, 48)
+            );
+        }
+    }
+    name.to_string()
+}
+
 impl Agent {
     /// 对比工具 Schema 的 `required` 列表,返回 args 中缺失的必填字段名(第 148 轮)。
     ///
@@ -139,6 +161,8 @@ impl Agent {
     ) -> ToolExec {
         // ★ 计时起点必须在 tool.execute() 之前(第 82 轮 P0-1)。
         let tool_call_started = std::time::Instant::now();
+        // 活动台账:当前工具调用标签(屏蔽页面进度栏第一行;作用域外 no-op)。
+        crate::agent::web_activity::note_tool(&tool_label(name, &args));
         // 第 131 轮网页取证纪律:Bash 不得顶替 MCP_Web_LsmAgentBrowser_Use 去探/抓任务目标站点。
         // 放在 Schema 预校验之后、tool.execute() 之前(与 ToolNotFound 同层级的前置闸门)。
         if let Some(denial) = self.check_web_evidence(name, &args) {

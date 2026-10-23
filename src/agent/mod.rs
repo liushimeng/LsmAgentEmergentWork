@@ -63,6 +63,9 @@ pub mod window;
 pub mod workflow;
 pub mod workflow_json_validate;
 pub mod workspace;
+// Agent 活动台账(task_local):「哪个 Agent 正在干什么」的唯一数据真源,
+// 供两条告知栏(屏蔽页面状态栏/进度栏)渲染。见 docs/双浏览器工具架构/02。
+pub mod web_activity;
 pub mod yolo;
 pub mod todo_state;
 

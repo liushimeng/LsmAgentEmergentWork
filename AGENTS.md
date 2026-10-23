@@ -99,6 +99,7 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 | `LAEW_DOM_TRACE` | `1` | 打印 JS→DOM 动作账本(kind/selector/样本),诊断「页面空白 / JS 建好的 UI 没回写」。见 `src/agent/browser/script/dom_ops.rs` |
 | `LAEW_BROWSER_VIEW_ACTIVATE` | `1`/`true`/`yes`/`on` | 有头浏览器窗口启动时抢到前台(默认只 orderFront 不抢焦点,避免打断 TUI)。见 `src/agent/browser/view/macos.rs` |
 | `LAEW_BROWSER_VIEWER_BIN` | 任意可执行文件路径 | 覆盖有头查看器子进程的可执行文件(默认当前进程)。供库进程/自检拉起真正的 `laew __browser-view` 用。见 `src/agent/browser/view/mod.rs` |
+| `LAEW_PAGE_BARS` | `off`/`0`/`false`/`no` | 关闭**屏蔽页面状态栏/进度栏**(两浏览器工具同参;Chrome 注入 JS + Lsm 查看器帧合成)。见 `src/agent/chrome_browser/status.rs`、`src/agent/browser/page_bars.rs`、`docs/双浏览器工具架构/02-屏蔽页面状态栏与进度栏.md` |
 | `LAEW_JS_FORIN_GUARD` | `off`/`0`/`false`/`no` | 关闭 `for...in` 空值守卫的**源码级改写**(诊断用:压缩混淆脚本失败时排除改写误伤)。见 `src/agent/browser/script/for_in_guard.rs` |
 | `LAEW_DUMP_HTML` | 文件路径 | 脚本管线后的整页 HTML 落盘,供离线布局探针分析。见 `src/agent/browser/mod.rs` |
 | `LAEW_WEB_EVIDENCE` | `off`/`0`/`false`/`no` | 关闭网页取证纪律硬闸门。见 `src/agent/safety/web_evidence.rs` |
@@ -134,6 +135,7 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 - **LsmAgentBrowser 内核**：`src/agent/browser/` 是进程内自研浏览器——窗口/标签页、HTTP(S) 网络栈、DOM、布局、软件渲染、JS 执行全部在本进程，**不存在外部浏览器进程、调试端口或 CDP 协议**。设计见 `docs/MCP_Web_LsmAgentBrowser_Use/`。`mode=headed` 由独立查看器子进程 `laew __browser-view` 以原生窗口显示软件渲染帧(macOS AppKit/Windows Win32,stdin 长度前缀帧协议,查看器退出自动回退纯无头);引擎线程零 UI 依赖。
 - **Chrome/CDP 驱动（`MCP_Web_Chrome_Use` 底层）**：`src/agent/chrome_browser/` 拉起本机 Chrome/Edge/Chromium 子进程(chromiumoxide 0.9)并做 CDP 操控；**进程外 watchdog**（隐藏子命令 `laew __browser-watchdog`）在主进程被强杀时依据 stdin pipe EOF 回收 Chrome 主进程与一次性 profile（否则残留孤儿 Chrome 占用 100MB+/个）。截图走 `params.save_path` 落盘（只回路径+尺寸），**不得回 base64**（实测 1.7MB/张会撑爆上下文并拖死推理）。设计见 `docs/MCP_Web_Chrome_Use/`（含实测结论 41-）。
 - **有头浏览器窗口 = 真浏览器形态**：窗口含**工具栏(后退/前进/刷新/首页)+ 地址栏 + 页面画面**。宿主→查看器走帧协议(`'i'` 帧 / `'t'` 标题 / `'u'` 地址栏状态 / `'c'` 关闭)；查看器→宿主走 stdout 按行 JSON 命令(`navigate`/`back`/`forward`/`reload`/`home`)，引擎据此做真实导航与历史栈操作，地址栏内容按当前页 URL 同步。设计见 `docs/MCP_Web_LsmAgentBrowser_Use/20-浏览器窗口交互化与地图页白屏根因.md`。
+- **屏蔽页面状态栏 / 屏蔽页面进度栏（两浏览器工具统一告知栏）**：Agent 打开浏览器窗口后页面覆盖区的两条常驻告知栏——**状态栏**（右上角：`LAEW Agent 控制中 · 具体Agent名` + 档位行 + **静态注意事项** + `guard_note`）与**进度栏**（左下角：**动态**当前动作 / 迭代·会话·耗时 + 进度条 / 任务摘要 / 最近 6 条事件时间线，长文本截断）。数据唯一真源 = `src/agent/web_activity.rs` 活动台账（task_local，并行 SubAgent 各读各的快照）；Chrome 侧注入 JS（`src/agent/chrome_browser/status.rs`，closed Shadow DOM + 顶层 frame 门 + 截图避让），Lsm 侧查看器帧合成（`src/agent/browser/page_bars.rs`，不进截图取证路径 + 1Hz 心跳重绘）。开关 `LAEW_PAGE_BARS=off`。设计见 `docs/双浏览器工具架构/02-屏蔽页面状态栏与进度栏.md`。
 - **布局/渲染能力边界**：布局引擎支持百分比高度(视口→html→body 确定高传播,父高 auto 时按 CSS 语义退化);渲染器绘制背景/边框/外阴影(偏移实心矩形近似,blur 未实现)/图像/文字;表单控件有 UA 默认描边。canvas/WebGL 未实现(地图瓦片类页面主体不可渲染)。
 - **图片子资源（`browser/images.rs`）**：宿主预取 `<img src>` 与 CSS `url(...)` 背景图并解码为 RGBA8 **全内存**缓存（随标签页生命周期，进程退出即销毁）；布局层按固有尺寸排版替换元素（`<img>`），渲染层按 `object-fit` 贴图；开关/限额见 `LAEW_WEB_IMAGES` / `LAEW_WEB_MAX_IMAGES` / `LAEW_WEB_MAX_IMAGE_BYTES`。设计见 `docs/MCP_Web_LsmAgentBrowser_Use/10-阶段三第三步图片渲染与替换元素设计.md`
 - **样式引擎（`browser/style/`）**：CSS 解析/级联/继承/单位/媒体查询/自定义属性唯一真源；外链 `<link rel=stylesheet>` 由 `browser/resources.rs` 宿主预取并**原位内联**为 `<style data-lsm-href=...>`（保持级联顺序），布局、渲染、JS `getComputedStyle`、`inspect(stylesheets)` 共用同一份 `ComputedStyle`。
@@ -263,6 +265,7 @@ agent/
   loop_guard.rs    ReAct 循环守卫(工具级无进展)
   dead_loop/       死循环守卫(LLM 交互级指纹检测:小循环/大循环)
   runtime_hints.rs Agent 循环运行时辅助
+  web_activity.rs  Agent 活动台账(task_local:屏蔽页面状态栏/进度栏数据唯一真源)
   context.rs       Agent-Context 独立实时上下文
   extrace.rs       提取/抽取工具输出关键信息的助手
   cancel.rs        取消竞争
@@ -319,13 +322,15 @@ agent/
     mcp_window_use/  MCP_Window_Use 工具目录
     mcp_web_lsm_browser_use/     MCP_Web_LsmAgentBrowser_Use 兼容层(mod/control/inspect/visit_ledger)
     mcp_chrome_use/      MCP_Web_Chrome_Use 工具(mod/tests,Chrome/CDP 基础框架)
-  chrome_browser/      Chrome/CDP 驱动(mod/page/tests:子进程拉起/回收、页面注册表、导航/eval/截图/点击/输入)
+  chrome_browser/      Chrome/CDP 驱动(mod/page/tests:子进程拉起/回收、页面注册表、导航/eval/截图/点击/输入;status.rs 屏蔽页面状态栏/进度栏注入)
     use_mcp/         Use_MCP 工具目录
 
   window/          窗口操控平台驱动层
   browser/         LsmAgentBrowser 进程内内核(无 Chrome / 无 CDP)
     mod.rs         单例 / 窗口 / 标签页 / page_id / 导航 / 关闭 / 截图 / 下载 / 存储
     api.rs         control_action 实现(点击/输入/选择/按键/滚动/JS/视口)
+    page_bars.rs   屏蔽页面状态栏/进度栏(查看器帧合成层绘制 + 动作落账 + 1Hz 心跳)
+    session_lifecycle.rs 会话生命周期自由函数(标签页复用/清空/窗口联动关闭/JS 线程收尾)
     inspect.rs     inspect info 实现(elements/dom/text/network/extract 等)
     images.rs      图片子资源加载/解码/全内存缓存(阶段三第三步)
     net.rs         HTTP(S) 网络栈 / 重定向 / Cookie / 字符集 / SSRF / TLS
@@ -442,7 +447,7 @@ Markdown Prompt 模板，两级发现：**项目级** `{工作目录}/.laew/comm
 - `docs/其他Agent工具定义/`
 
 **三个 MCP 风格工具**（按工具）：
-- `docs/双浏览器工具架构/` — Chrome × LsmAgentBrowser 双浏览器工具总设计(命名映射/选用决策/分阶段路线图)
+- `docs/双浏览器工具架构/` — Chrome × LsmAgentBrowser 双浏览器工具总设计(命名映射/选用决策/分阶段路线图);`02-屏蔽页面状态栏与进度栏.md` — 两条告知栏双引擎统一落地(术语定名/内容规格/Chrome 注入 × Lsm 帧合成/埋点)
 - `docs/MCP_Web_Chrome_Use/` — Chrome/CDP 工具知识库(46 篇,含 HITL/反检测/站点治理系列) + `CDP技术方案-Rust操作Chrome浏览器.md`(CDP 完整技术方案) + `reference实现归档/`(历史实现 47 文件)
 - `docs/MCP_Window_Use/` — 桌面窗口操控
 - `docs/MCP_Web_LsmAgentBrowser_Use/` — LsmAgentBrowser 内核、兼容层与阶段路线图

@@ -155,6 +155,24 @@ fn disabled() -> Result<String> {
     )
 }
 
+/// 截图取证避让:两条告知栏(屏蔽页面状态栏/进度栏)拍前挂起、拍完恢复,
+/// 证据图不入镜;未注入(hidden/未启用)时零 evaluate 开销。
+/// docs/双浏览器工具架构/02。
+async fn with_bars_suspended<T>(
+    page: &std::sync::Arc<chromiumoxide::Page>,
+    f: impl std::future::Future<Output = T>,
+) -> T {
+    let evade = chrome_browser::status::should_inject(McpChromeUseTool::mgr().mode().is_headed());
+    if evade {
+        chrome_browser::status::set_suspended(page, true).await;
+    }
+    let out = f.await;
+    if evade {
+        chrome_browser::status::set_suspended(page, false).await;
+    }
+    out
+}
+
 /// 取 control/inspect 参数对象(兼容顶层直传)。
 pub(super) fn params_of(args: &Value) -> &Value {
     args.get("params").filter(|p| p.is_object()).unwrap_or(args)
@@ -335,14 +353,29 @@ page_id 仅本工具内有效,不跨工具复用。\
         let Some(action) = str_arg(&args, "action").map(str::to_string) else {
             return envelope(CODE_PARAM_ERROR, "缺少 action", json!({}));
         };
-        match action.as_str() {
+        // 屏蔽页面状态栏/进度栏:动作前后向全部存活页面广播(docs/双浏览器工具架构/02)。
+        // 无浏览器实例/headed 未启用时零开销返回。
+        let label = chrome_browser::status::describe_web_action(&args);
+        chrome_browser::status::broadcast_start(&label).await;
+        let started = std::time::Instant::now();
+        let out = match action.as_str() {
             "open" => run_open(args).await,
             "list" => run_list().await,
             "close" => run_close(args).await,
             "control" => run_control(args).await,
             "inspect" => run_inspect(args).await,
             other => envelope(CODE_PARAM_ERROR, "未知 action", json!({"action": other})),
-        }
+        };
+        let ok = out
+            .as_deref()
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            .and_then(|v| v.get("code").and_then(Value::as_i64))
+            .map(|c| c == 0)
+            .unwrap_or(false);
+        chrome_browser::status::broadcast_done(&label, ok, started.elapsed().as_millis() as u64)
+            .await;
+        out
     }
 }
 
@@ -357,18 +390,35 @@ async fn run_open(args: Value) -> Result<String> {
     }
     let mgr = McpChromeUseTool::mgr();
     match mgr.open(&url).await {
-        Ok((page_id, final_url, title)) => envelope(
-            0,
-            "ok",
-            json!({
-                "page_id": page_id,
-                "url": final_url,
-                "title": title,
-                "engine": "chrome",
-                "mode": if mgr.mode().is_headed() { "headed" } else { "hidden" },
-                "tool_hint": "page_id 仅 MCP_Web_Chrome_Use 内有效;另一浏览器工具的 page_id 不跨工具复用",
-            }),
-        ),
+        Ok((page_id, final_url, title)) => {
+            // 屏蔽页面状态栏/进度栏:headed 时注入两条栏脚本并推首份全量载荷
+            // (含档位/注意事项;后续动作走 execute 的 broadcast 增量推)。
+            if chrome_browser::status::should_inject(mgr.mode().is_headed()) {
+                if let Some(page) = mgr.get_page(&page_id) {
+                    chrome_browser::status::ensure(&page).await;
+                    chrome_browser::status::push(
+                        &page,
+                        Some(&format!("open {url}")),
+                        None,
+                        str_arg(&args, "guard_note"),
+                        true,
+                    )
+                    .await;
+                }
+            }
+            envelope(
+                0,
+                "ok",
+                json!({
+                    "page_id": page_id,
+                    "url": final_url,
+                    "title": title,
+                    "engine": "chrome",
+                    "mode": if mgr.mode().is_headed() { "headed" } else { "hidden" },
+                    "tool_hint": "page_id 仅 MCP_Web_Chrome_Use 内有效;另一浏览器工具的 page_id 不跨工具复用",
+                }),
+            )
+        }
         Err(e) => {
             let msg = e.to_string();
             let code = if msg.contains("未检测到") {
@@ -488,17 +538,20 @@ async fn run_control(args: Value) -> Result<String> {
                 .map_err(|e| (CODE_EXEC_FAILED, e.to_string()))
         }
         // screenshot:优先 save_path 落盘(信封只回元数据,防 base64 爆上下文);
-        // 不传 save_path 时保持 base64 内联(兼容旧行为)。
-        "screenshot" => match str_arg(p, "save_path") {
-            Some(path) => chrome_browser::screenshot_to_file(&page, path)
-                .await
-                .map(|(path, bytes, w, h)| json!({"format": "png", "path": path, "bytes": bytes, "width": w, "height": h}))
-                .map_err(|e| (CODE_EXEC_FAILED, e.to_string())),
-            None => chrome_browser::screenshot_base64(&page)
-                .await
-                .map(|b64| json!({"format": "png", "image_base64": b64}))
-                .map_err(|e| (CODE_EXEC_FAILED, e.to_string())),
-        },
+        // 不传 save_path 时保持 base64 内联(兼容旧行为)。两条告知栏拍前避让。
+        "screenshot" => with_bars_suspended(&page, async {
+            match str_arg(p, "save_path") {
+                Some(path) => chrome_browser::screenshot_to_file(&page, path)
+                    .await
+                    .map(|(path, bytes, w, h)| json!({"format": "png", "path": path, "bytes": bytes, "width": w, "height": h}))
+                    .map_err(|e| (CODE_EXEC_FAILED, e.to_string())),
+                None => chrome_browser::screenshot_base64(&page)
+                    .await
+                    .map(|b64| json!({"format": "png", "image_base64": b64}))
+                    .map_err(|e| (CODE_EXEC_FAILED, e.to_string())),
+            }
+        })
+        .await,
         "scroll" => {
             let y = i64_arg(p, "y").unwrap_or(0);
             chrome_browser::scroll(&page, y, str_arg(p, "selector"))
@@ -565,16 +618,19 @@ async fn run_inspect(args: Value) -> Result<String> {
         "text" => inspect_text(&page, params_of(&args)).await,
         "html" => inspect_html(&page, params_of(&args)).await,
         "elements" => inspect_elements(&page, params_of(&args)).await,
-        "screenshot" => match str_arg(params_of(&args), "save_path") {
-            Some(path) => chrome_browser::screenshot_to_file(&page, path)
-                .await
-                .map(|(path, bytes, w, h)| json!({"format": "png", "path": path, "bytes": bytes, "width": w, "height": h}))
-                .map_err(|e| (CODE_EXEC_FAILED, e.to_string())),
-            None => chrome_browser::screenshot_base64(&page)
-                .await
-                .map(|b64| json!({"format": "png", "image_base64": b64}))
-                .map_err(|e| (CODE_EXEC_FAILED, e.to_string())),
-        },
+        "screenshot" => with_bars_suspended(&page, async {
+            match str_arg(params_of(&args), "save_path") {
+                Some(path) => chrome_browser::screenshot_to_file(&page, path)
+                    .await
+                    .map(|(path, bytes, w, h)| json!({"format": "png", "path": path, "bytes": bytes, "width": w, "height": h}))
+                    .map_err(|e| (CODE_EXEC_FAILED, e.to_string())),
+                None => chrome_browser::screenshot_base64(&page)
+                    .await
+                    .map(|b64| json!({"format": "png", "image_base64": b64}))
+                    .map_err(|e| (CODE_EXEC_FAILED, e.to_string())),
+            }
+        })
+        .await,
         other => return envelope(CODE_PARAM_ERROR, "未知 info(基础框架)", json!({"info": other})),
     };
 

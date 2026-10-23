@@ -161,7 +161,7 @@ js(页面表达式为真)、network_idle(网络静默毫秒),多条件取「与�
                 "new_window": { "type": "boolean", "default": false, "description": "open 时在独立逻辑窗口打开" },
                 "reuse": { "type": "boolean", "default": true, "description": "open 时同 URL/同站已有页面则复用" },
                 "mode": { "type": "string", "enum": ["headed", "hidden", "new_headless"], "default": "headed",
-                          "description": "请求的浏览器模式。阶段一为进程内无头内核,headed 会回退为 hidden 并在 data.mode_hint 说明" },
+                          "description": "浏览器模式。headed = 进程内内核 + 独立原生窗口查看器(用户可直接看到浏览器窗口,含后退/前进/刷新/地址栏);hidden = 纯无头无窗口。需要让用户看到浏览器运行过程时用 headed(默认)" },
                 "window_width": { "type": "integer", "minimum": 320, "maximum": 7680 },
                 "window_height": { "type": "integer", "minimum": 240, "maximum": 4320 },
                 "auto_expand_viewport": { "type": "boolean", "default": true },
@@ -223,7 +223,14 @@ js(页面表达式为真)、network_idle(网络静默毫秒),多条件取「与�
         let Some(action) = str_arg(&args, "action").map(str::to_string) else {
             return envelope(1001, "缺少 action", json!({}));
         };
-        match action.as_str() {
+        // 屏蔽页面状态栏/进度栏:动作前后落账(docs/双浏览器工具架构/02)。
+        // begin 用入参 page_id 精准落账(缺省广播),end 优先取输出里的新 page_id(open)。
+        let label = describe_lsm_action(&args);
+        let page_hint = str_arg(&args, "page_id").map(str::to_string);
+        let mgr = Self::mgr();
+        mgr.note_action_begin(page_hint.as_deref(), &label).await;
+        let started = std::time::Instant::now();
+        let out = match action.as_str() {
             "open" => run_open(args).await,
             "list" => run_list().await,
             "close" => run_close(args).await,
@@ -232,8 +239,87 @@ js(页面表达式为真)、network_idle(网络静默毫秒),多条件取「与�
             "sequence" | "batch" => run_sequence(args).await,
             "explore" => run_explore(args).await,
             other => envelope(1001, "未知 action", json!({"action": other})),
-        }
+        };
+        let ok = out.as_deref().ok().and_then(envelope_code).map(|c| c == 0).unwrap_or(false);
+        let effective = out
+            .as_deref()
+            .ok()
+            .and_then(envelope_page_id)
+            .or(page_hint);
+        mgr.note_action_end(effective.as_deref(), &label, ok, started.elapsed().as_millis() as u64)
+            .await;
+        out
     }
+}
+
+/// 把 Lsm 工具动作参数渲染成人读标签(进度栏第一行;与 Chrome 侧
+/// `chrome_browser::status::describe_web_action` 同款约定)。
+fn describe_lsm_action(args: &Value) -> String {
+    let action = str_arg(args, "action").unwrap_or("?");
+    let mut out = action.to_string();
+    match action {
+        "open" => {
+            if let Some(u) = str_arg(args, "url") {
+                out.push(' ');
+                out.push_str(u);
+            }
+        }
+        "control" => {
+            if let Some(ca) = str_arg(args, "control_action") {
+                out.push(' ');
+                out.push_str(ca);
+            }
+            if let Some(p) = args.get("params") {
+                for key in ["selector", "url", "text", "script", "key"] {
+                    if let Some(v) = p.get(key).and_then(Value::as_str) {
+                        out.push(' ');
+                        out.push_str(key);
+                        out.push('=');
+                        out.push_str(&crate::agent::web_activity::clip_chars(v, 40));
+                        break;
+                    }
+                }
+            }
+        }
+        "inspect" => {
+            if let Some(i) = str_arg(args, "info") {
+                out.push(' ');
+                out.push_str(i);
+            }
+        }
+        "sequence" | "batch" => {
+            let n = args.get("steps").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
+            out.push_str(&format!(" {n} 步"));
+        }
+        "explore" => {
+            let n = args.get("queries").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
+            out.push_str(&format!(" {n} 个维度"));
+        }
+        "close" => {
+            if let Some(p) = str_arg(args, "page_id") {
+                out.push(' ');
+                out.push_str(p);
+            }
+        }
+        _ => {}
+    }
+    crate::agent::web_activity::clip_chars(&out, 90)
+}
+
+/// 从统一信封文本里取 `code`(解析失败按 None,不影响主流程)。
+fn envelope_code(out: &str) -> Option<i64> {
+    serde_json::from_str::<Value>(out).ok()?.get("code")?.as_i64()
+}
+
+/// 从统一信封文本里取 `data.page_id`(open 的产物落账用)。
+fn envelope_page_id(out: &str) -> Option<String> {
+    let pid = serde_json::from_str::<Value>(out)
+        .ok()?
+        .get("data")?
+        .get("page_id")?
+        .as_str()?
+        .to_string();
+    Some(pid)
 }
 
 // ===================== open / list / close =====================
@@ -275,9 +361,7 @@ pub(super) async fn run_open(mut args: Value) -> Result<String> {
         );
     }
     let new_window = bool_arg(&args, "new_window", false);
-    let mode = str_arg(&args, "mode")
-        .and_then(BrowserMode::from_arg)
-        .unwrap_or_else(BrowserMode::from_env_or_default);
+    let mode = BrowserMode::from_env_or_arg(str_arg(&args, "mode"));
     let width = u64_arg(&args, "window_width").map(|v| v as u32);
     let height = u64_arg(&args, "window_height").map(|v| v as u32);
     let reuse = bool_arg(&args, "reuse", true);
@@ -435,14 +519,29 @@ fn substitute(value: &Value, current: &str, spawned: &str) -> Value {
 }
 
 async fn dispatch_action(action: &str, args: Value) -> Result<String> {
-    match action {
+    // sequence/batch 步内动作同样落账(进度栏逐步滚动显示,docs/双浏览器工具架构/02)。
+    let label = describe_lsm_action(&args);
+    let page_hint = str_arg(&args, "page_id").map(str::to_string);
+    let mgr = McpWebLsmBrowserUseTool::mgr();
+    mgr.note_action_begin(page_hint.as_deref(), &label).await;
+    let started = std::time::Instant::now();
+    let out = match action {
         "open" => run_open(args).await,
         "list" => run_list().await,
         "close" => run_close(args).await,
         "control" => control::run(args).await,
         "inspect" => inspect::run(args).await,
         other => envelope(1001, "sequence 步内 action 非法", json!({"action": other})),
-    }
+    };
+    let ok = out.as_deref().ok().and_then(envelope_code).map(|c| c == 0).unwrap_or(false);
+    let effective = out
+        .as_deref()
+        .ok()
+        .and_then(envelope_page_id)
+        .or(page_hint);
+    mgr.note_action_end(effective.as_deref(), &label, ok, started.elapsed().as_millis() as u64)
+        .await;
+    out
 }
 
 async fn run_sequence(args: Value) -> Result<String> {

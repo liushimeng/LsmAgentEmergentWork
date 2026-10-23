@@ -73,18 +73,28 @@ impl Agent {
         session: &mut Session,
         cancel: Option<&CancelToken>,
     ) -> Result<(String, Usage, ExecutionTrace)> {
-        match crate::agent::dynamic_subagent::runtime_for(
+        // 活动台账(屏蔽页面状态栏/进度栏数据源,docs/双浏览器工具架构/02):
+        // 记录「哪个 Agent、哪个会话、什么任务、几轮迭代」,工具执行链经
+        // task_local 读到本 Agent 快照。外层包裹,与 dynamic_subagent::scope 嵌套。
+        // (runtime 先行建立:其入参借用 session 的不可变引用,须在 body 持有
+        // &mut session 之前完成,否则借用冲突。)
+        let rt = crate::agent::dynamic_subagent::runtime_for(
             &self.profile.name,
             &self.profile,
             self.llm.clone(),
             session.id(),
             cancel,
-        ) {
-            Some(rt) => {
-                crate::agent::dynamic_subagent::scope(rt, self.run_session_body(session, cancel))
-                    .await
-            }
-            None => self.run_session_body(session, cancel).await,
+        );
+        let act = crate::agent::web_activity::begin(
+            &self.profile.name,
+            session.id(),
+            &crate::agent::web_activity::task_summary_from_context(session.context()),
+            self.max_iterations,
+        );
+        let body = crate::agent::web_activity::scope(act, self.run_session_body(session, cancel));
+        match rt {
+            Some(rt) => crate::agent::dynamic_subagent::scope(rt, body).await,
+            None => body.await,
         }
     }
 
@@ -214,6 +224,11 @@ impl Agent {
 
         for iter in 0..self.max_iterations {
             trace.iterations = iter + 1;
+            // 活动台账:迭代推进(屏蔽页面进度栏「第 N/M 轮」行;作用域外 no-op)。
+            crate::agent::web_activity::note_iter(
+                iter + 1,
+                &format!("第 {}/{} 轮 · 模型思考", iter + 1, self.max_iterations),
+            );
             // 第 118 轮:探索预算耗尽时在 trace 上打标,build_runtime_hints 会在
             // 后续 system 拼接时追加「进入执行期」提示到 LLM 上下文,引导 LLM 收敛
             // 到 input_text/click/wait 等写操作,减少 inspect/screenshot/eval_js 重复探查。

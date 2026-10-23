@@ -56,6 +56,69 @@ impl FontSet {
         text.chars().map(|c| self.char_width(c, size)).sum()
     }
 
+    /// 合成层文本行(屏蔽页面状态栏/进度栏专用,`page_bars.rs` 调用):
+    /// 按可用宽度 `max_w` 逐字截断(补 `…`)后栅格化绘制,返回实际绘制宽度。
+    /// 无字体时画占位色条(与页面文本的退化行为一致)。
+    /// `x/y` 为行左上角;`bold=true` 时双重绘制加粗(与页面 bold 同款近似)。
+    pub(crate) fn draw_overlay_text(
+        &self,
+        pixmap: &mut Pixmap,
+        x: f32,
+        y: f32,
+        text: &str,
+        size: f32,
+        color: [u8; 3],
+        bold: bool,
+        max_w: f32,
+    ) -> f32 {
+        if text.is_empty() || max_w <= 0.0 {
+            return 0.0;
+        }
+        // 截断:按字符累计宽度,超出可用宽度即止并补省略号。
+        let mut kept = String::new();
+        let mut used = 0.0f32;
+        let ellipsis = self.text_width("…", size as f64) as f32;
+        for ch in text.chars() {
+            let cw = self.char_width(ch, size as f64) as f32;
+            if used + cw > max_w - ellipsis && !kept.is_empty() {
+                kept.push('…');
+                break;
+            }
+            kept.push(ch);
+            used += cw;
+            if used >= max_w {
+                break;
+            }
+        }
+        let Some(font) = &self.font else {
+            // 无字体:占位色条,宽度反映文本长度(截断后)。
+            fill_rect(
+                pixmap,
+                x,
+                y + size * 0.35,
+                used.min(max_w),
+                (size * 0.35).max(2.0),
+                color,
+            );
+            return used;
+        };
+        let baseline = y + size;
+        let mut pen_x = x;
+        for ch in kept.chars() {
+            let (metrics, bitmap) = font.rasterize(ch, size);
+            if metrics.width > 0 && metrics.height > 0 {
+                let gx = pen_x + metrics.xmin as f32;
+                let gy = baseline - metrics.height as f32 - metrics.ymin as f32;
+                blend_glyph(pixmap, gx, gy, metrics.width, metrics.height, &bitmap, color);
+                if bold {
+                    blend_glyph(pixmap, gx + 1.0, gy, metrics.width, metrics.height, &bitmap, color);
+                }
+            }
+            pen_x += metrics.advance_width;
+        }
+        pen_x - x
+    }
+
     /// 渲染一页。`scroll_y` 为垂直滚动偏移;`full_page=true` 时高度取整页。
     ///
     /// `images` 为已解码图片缓存(阶段三第三步);缺失的图片跳过绘制。
