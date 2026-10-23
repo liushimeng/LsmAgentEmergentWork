@@ -130,7 +130,8 @@
             acceptance: vec!["登录成功".into()],
             delegate_to: AgentRole::SubAgent,
             max_iterations: Some(24),
-            original_prompt: None,
+            // 第 178 轮:批量优先提示按用户强制工具分流,必须有强制工具才注入。
+            original_prompt: Some("全程只使用 MCP_Web_LsmAgentBrowser_Use 完成操作".into()),
             pre_explore: true,
         };
         let input = build_subflow_input(&wf, &std::collections::HashMap::new(), "");
@@ -626,3 +627,51 @@
             ExecFailure::Abstain { .. } => panic!("真拆解失败不得被误判为弃权"),
         }
     }
+
+#[test]
+fn 强制工具判定_区分只使用与禁止使用() {
+    use super::workflows::mandated_tool;
+    let chrome_prompt = "全程只使用 `MCP_Web_Chrome_Use` 浏览器工具完成网页操作(不得使用 `MCP_Web_LsmAgentBrowser_Use`)";
+    assert!(mandated_tool(chrome_prompt, "MCP_Web_Chrome_Use"));
+    assert!(!mandated_tool(chrome_prompt, "MCP_Web_LsmAgentBrowser_Use"));
+    let lsm_prompt = "全程只使用 `MCP_Web_LsmAgentBrowser_Use` 完成操作(不得使用 `MCP_Web_Chrome_Use`)";
+    assert!(mandated_tool(lsm_prompt, "MCP_Web_LsmAgentBrowser_Use"));
+    assert!(!mandated_tool(lsm_prompt, "MCP_Web_Chrome_Use"));
+    // 未声明强制工具:都不得命中,避免写入工具专属批量范式。
+    let neutral = "打开网页并截图,可使用 MCP_Web_Chrome_Use 或 MCP_Web_LsmAgentBrowser_Use";
+    assert!(!mandated_tool(neutral, "MCP_Web_Chrome_Use"));
+    assert!(!mandated_tool(neutral, "MCP_Web_LsmAgentBrowser_Use"));
+}
+
+#[test]
+fn build_subflow_input_强制_chrome_时不注入_lsm_批量范式() {
+    // 实测回归(F1):Chrome 专属任务里旧提示词硬编码 explore/batch,持续诱导换工具。
+    let wf = WorkFlowSpec {
+        id: "wf-1".into(),
+        name: "Chrome 打开百度地图并规划路线".into(),
+        steps: vec!["open 页面".into()],
+        branches: vec![],
+        loops: vec![],
+        depends_on: vec![],
+        acceptance: vec!["路线结果".into()],
+        delegate_to: AgentRole::SubAgent,
+        max_iterations: Some(24),
+        original_prompt: Some(
+            "全程只使用 `MCP_Web_Chrome_Use`(不得使用 `MCP_Web_LsmAgentBrowser_Use`)".into(),
+        ),
+        pre_explore: true,
+    };
+    let input = build_subflow_input(&wf, &std::collections::HashMap::new(), "");
+    assert!(
+        !input.description.contains("action=explore"),
+        "Chrome 强制任务不得出现 Lsm 的 explore 范式: {}",
+        input.description
+    );
+    assert!(
+        !input.description.contains("action=batch"),
+        "Chrome 强制任务不得出现 Lsm 的 batch 范式: {}",
+        input.description
+    );
+    assert!(input.description.contains("click_text"), "应给 Chrome 专属用法: {}", input.description);
+    assert!(input.description.contains("key_press"), "应给 Chrome 专属用法: {}", input.description);
+}

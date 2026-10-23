@@ -3,6 +3,8 @@
 use super::*;
 use boa_engine::Source;
 use boa_engine::Context;
+// Boa 0.21: Token 的 span 由 `boa_ast::Spanned` trait 提供。
+use boa_engine::ast::Spanned;
 
 #[test]
 fn 顶层拆分_基本分号() {

@@ -31,10 +31,36 @@ fn schema_含五个基础_action() {
         .collect::<Vec<_>>();
     assert!(c_enums.contains(&"input_text"));
     assert!(c_enums.contains(&"type"));
-    // params 含 save_path / timeout_ms。
+    // 纯文字按钮 / 真实键盘事件(第 178 轮实测:百度地图「选为终点」无稳定选择器)。
+    assert!(c_enums.contains(&"click_text"));
+    assert!(c_enums.contains(&"key_press"));
+    // params 含 save_path / timeout_ms / text / key / exact / max_chars。
     let props = &schema["properties"]["params"]["properties"];
     assert!(props.get("save_path").is_some());
     assert!(props.get("timeout_ms").is_some());
+    assert!(props.get("text").is_some());
+    assert!(props.get("key").is_some());
+    assert!(props.get("exact").is_some());
+    assert!(props.get("max_chars").is_some());
+}
+
+#[test]
+fn cap_chars_按字符边界截断并保留统计() {
+    let (s, chars, truncated) = cap_chars("中文abc".repeat(3000), 1_000);
+    assert!(truncated);
+    assert_eq!(chars, 15_000);
+    assert!(s.chars().count() > 1_000, "截断提示本身也应保留:{s}");
+    assert!(s.contains("原始 15000 字符"), "{s}");
+    let (s2, chars2, t2) = cap_chars("短文本".to_string(), 20_000);
+    assert!(!t2 && chars2 == 3 && s2 == "短文本");
+}
+
+#[test]
+fn max_chars_arg_夹取范围与默认值() {
+    assert_eq!(max_chars_arg(&json!({})), 20_000);
+    assert_eq!(max_chars_arg(&json!({"max_chars": 10})), 1_000);
+    assert_eq!(max_chars_arg(&json!({"max_chars": 999_999})), 200_000);
+    assert_eq!(max_chars_arg(&json!({"max_chars": "40000"})), 40_000);
 }
 
 #[test]

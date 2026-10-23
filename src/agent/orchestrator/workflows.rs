@@ -961,16 +961,35 @@ pub(super) fn build_subflow_input(
     // 与 SubAgentRunner 注入的 system prompt hint 形成双保险(description 进 user 消息,
     // system hint 进 system 字段, 两者都在 LLM 上下文中)。
     if wf.pre_explore {
-        description.push_str(
-            "\n\n⚡ 批量优先(本单元硬约束,第 119 轮):\n\
-             ① 第一步用 MCP_Web_LsmAgentBrowser_Use(action=explore, page_id=<页面 id>, queries=[\n\
-             {\"info\":\"elements\"}, {\"info\":\"dom\",\"params\":{\"selector\":\"form\"}}, {\"info\":\"screenshot\"}\n\
-             ]) 一次收集页面状态;\n\
-             ② 结构清晰后用 MCP_Web_LsmAgentBrowser_Use(action=batch, steps=[input_text × N → click → wait → inspect 验证])\n\
-             一次提交全部写操作 + 验证;\n\
-             ❌ 禁止链式单步(inspect → click → inspect → screenshot → ...);\n\
-             ✅ 单次任务的 LLM round-trip 应 ≤ 6 次。",
-        );
+        // 第 178 轮:批量优先提示按**用户强制的浏览器工具**分流。
+        // 旧实现无条件写死 MCP_Web_LsmAgentBrowser_Use,在「全程只用
+        // MCP_Web_Chrome_Use」的任务里持续诱导模型换工具(F1 回归)。
+        // 判定依据优先取用户原始提示词(不含编排层自造的步骤文本)。
+        let mandatory = wf.original_prompt.as_deref().unwrap_or("");
+        let chrome_mandated = mandated_tool(mandatory, "MCP_Web_Chrome_Use");
+        let lsm_mandated = mandated_tool(mandatory, "MCP_Web_LsmAgentBrowser_Use");
+        if chrome_mandated && !lsm_mandated {
+            description.push_str(
+                "\n\n⚡ 连续优先(本单元硬约束,仅适用于 MCP_Web_Chrome_Use):\n\
+                 ① 一次 `eval_js` 读取多个输入框/按钮/可见文本,别链式单步 inspect;\n\
+                 ② 纯文字按钮用 `click_text(params.text=\"选为终点\")`,不要反复猜 CSS 选择器;\n\
+                 ③ 联想/回车/快捷键用 `key_press(params.key=\"Enter\"/\"ArrowDown\"/\"Tab\")`;\n\
+                 ④ 截图一律 `screenshot(params.save_path=...)`;\n\
+                 ✅ 单次任务的 LLM round-trip 应力争 ≤ 10 次。",
+            );
+        } else if lsm_mandated && !chrome_mandated {
+            description.push_str(
+                "\n\n⚡ 批量优先(本单元硬约束,仅适用于 MCP_Web_LsmAgentBrowser_Use):\n\
+                 ① 第一步用 MCP_Web_LsmAgentBrowser_Use(action=explore, page_id=<页面 id>, queries=[\n\
+                 {\"info\":\"elements\"}, {\"info\":\"dom\",\"params\":{\"selector\":\"form\"}}, {\"info\":\"screenshot\"}\n\
+                 ]) 一次收集页面状态;\n\
+                 ② 结构清晰后用 MCP_Web_LsmAgentBrowser_Use(action=batch, steps=[input_text × N → click → wait → inspect 验证])\n\
+                 一次提交全部写操作 + 验证;\n\
+                 ❌ 禁止链式单步(inspect → click → inspect → screenshot → ...);\n\
+                 ✅ 单次任务的 LLM round-trip 应 ≤ 6 次。",
+            );
+        }
+        // 未声明强制工具时不注入任何工具专属批量范式,避免把选用决策写死。
     }
     // 2026-09-19 第 91 轮 P0-8:wf.original_prompt 透传整段用户原始 prompt(兜底回退 wf.name)
     let original_prompt = wf.original_prompt.clone().or_else(|| Some(wf.name.clone()));
@@ -991,6 +1010,26 @@ pub(super) fn build_subflow_input(
         max_iterations: wf.max_iterations,
         pre_explore: wf.pre_explore,
     }
+}
+
+/// 判断用户提示词是否把某个工具定为**强制**工具。
+///
+/// 不能只看「工具名出现过」:提示词常同时写「只使用 A(不得使用 B)」,
+/// 两个工具名都在文中。这里只认「只使用/仅使用/只用/全程使用/必须使用」
+/// 之后 120 字符内出现的工具名。
+pub(super) fn mandated_tool(prompt: &str, tool: &str) -> bool {
+    const KWS: &[&str] = &["只使用", "仅使用", "只用", "全程使用", "必须使用"];
+    KWS.iter().any(|kw| {
+        prompt.match_indices(kw).any(|(i, _)| {
+            let tail: String = prompt[i..].chars().take(120).collect();
+            // 只看到同一子句结束为止:「只使用 A(不得使用 B)」里的 B 不算强制。
+            let clause = tail
+                .split(|c: char| matches!(c, ';' | '。' | '(' | '（' | '\n' | '；'))
+                .next()
+                .unwrap_or("");
+            clause.contains(tool)
+        })
+    })
 }
 
 // ===================== 第 146 轮:完成单元摘要(断点续跑) =====================

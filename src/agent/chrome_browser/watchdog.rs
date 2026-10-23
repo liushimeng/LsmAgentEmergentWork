@@ -18,6 +18,13 @@ pub const WATCHDOG_COMMAND: &str = "__browser-watchdog";
 /// 运行 watchdog,直到主进程 pipe EOF 或 Chrome 主进程退出。
 pub async fn run(browser_pid: u32, user_data_dir: &Path) -> anyhow::Result<()> {
     use tokio::io::AsyncReadExt;
+    // 目标进程已不在:直接收尾。**不要**进入 select —— `tokio::io::stdin()`
+    // 会派发阻塞读线程,若 stdin 长期不关闭(测试 harness 的管道就是如此),
+    // 后续 Runtime drop 会等待该阻塞任务,表现为看门狗测试永久挂起。
+    if !process_alive(browser_pid) {
+        remove_profile(user_data_dir);
+        return Ok(());
+    }
     let mut stdin = tokio::io::stdin();
     let mut buf = [0_u8; 64];
     loop {

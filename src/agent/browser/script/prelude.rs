@@ -781,6 +781,39 @@ function __newEl(tag) {
     def(p, function () { return el.__attrs[p] == null ? "" : String(el.__attrs[p]); },
       function (v) { el.__attrs[p] = String(v); });
   });
+  // <img> 的 src 赋值:BMap 瓦片装载器依赖 onload 推进(`new Image` /
+  // `createElement("img")` → 设 src → onload 才把瓦片写进 mapPane 并触发
+  // 地图 load 事件)。纯文本内核不做像素解码,这里按异步 load 语义放行:
+  // 默认 256×256(地图瓦片标准尺寸),真实像素由宿主图片管线随后取回渲染。
+  if (t === "img") {
+    el.onload = null;
+    el.onerror = null;
+    el.complete = false;
+    el.naturalWidth = 0;
+    el.naturalHeight = 0;
+    el.width = 0;
+    el.height = 0;
+    el.crossOrigin = null;
+    def("src",
+      function () { return el.__attrs.src == null ? "" : String(el.__attrs.src); },
+      function (v) {
+        var url = String(v == null ? "" : v);
+        el.__attrs.src = url;
+        if (!url) return;
+        setTimeout(function () {
+          // src 在加载前被改写:旧请求作废(真实浏览器同样不会触发旧 onload)。
+          if (String(el.__attrs.src || "") !== url) return;
+          el.complete = true;
+          if (!el.naturalWidth) el.naturalWidth = 256;
+          if (!el.naturalHeight) el.naturalHeight = 256;
+          if (!el.width) el.width = el.naturalWidth;
+          if (!el.height) el.height = el.naturalHeight;
+          try {
+            if (typeof el.onload === "function") el.onload.call(el, { type: "load", target: el });
+          } catch (e) { __cerror("img onload: " + String((e && e.stack) || e)); }
+        }, 0);
+      });
+  }
   // className 写通 class 属性:游离元素序列化时才能带上类名
   // (站点普遍 `el.className = "x"`;此前只有 setAttribute 会落到 __attrs)。
   def("className", function () {

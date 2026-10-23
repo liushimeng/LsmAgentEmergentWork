@@ -91,6 +91,191 @@ pub async fn click(page: &Page, selector: &str) -> Result<bool> {
     Ok(v.as_bool().unwrap_or(false))
 }
 
+/// 按**可见文字**点击元素(最小文本命中优先),可限定作用域选择器。
+///
+/// 现代站点大量按钮没有稳定 id/class(「选为终点」「查询」等纯文本按钮),
+/// 只给 CSS 选择器会迫使模型反复猜选择器甚至改用 eval_js 手搓事件。
+/// 返回 `{hit, tag, id, cls, text}`;`exact=true` 时要求整段文本完全相等。
+pub async fn click_text(
+    page: &Page,
+    text: &str,
+    scope: Option<&str>,
+    exact: bool,
+) -> Result<Value> {
+    let js = format!(
+        r#"(function(){{
+            var target = {text};
+            var scopeSel = {scope};
+            var exact = {exact};
+            var root = null;
+            try {{ root = scopeSel ? document.querySelector(scopeSel) : document.body; }} catch (e) {{}}
+            if (!root) return JSON.stringify({{hit:false, reason:'scope_not_found'}});
+            function norm(s) {{ return String(s == null ? '' : s).replace(/\s+/g, ' ').trim(); }}
+            // 可点击性打分:纯文字按钮常是 div,且旁边还有同名 tooltip;
+            // 只按「文本最短」会点到 tooltip(实测百度地图「路线」)。
+            function clickScore(el) {{
+                var s = 0;
+                var tag = String(el.tagName || '').toUpperCase();
+                if (tag === 'BUTTON' || tag === 'A' || tag === 'INPUT' || tag === 'SELECT') s += 100;
+                var cls = '', id = '';
+                try {{ cls = String(el.className || ''); }} catch (e) {{}}
+                try {{ id = String(el.id || ''); }} catch (e) {{}}
+                if (/btn|button|tab|link|item/i.test(cls + ' ' + id)) s += 50;
+                try {{ if (String(el.getAttribute('role') || '') === 'button') s += 40; }} catch (e) {{}}
+                try {{ if (window.getComputedStyle(el).cursor === 'pointer') s += 30; }} catch (e) {{}}
+                try {{ if (typeof el.onclick === 'function') s += 10; }} catch (e) {{}}
+                try {{ if (el.tabIndex >= 0) s += 5; }} catch (e) {{}}
+                return s;
+            }}
+            var all = root.querySelectorAll('*');
+            var best = null, bestScore = -1, bestLen = 1e9;
+            for (var i = 0; i < all.length; i++) {{
+                var el = all[i];
+                var r = null;
+                try {{ r = el.getBoundingClientRect(); }} catch (e) {{}}
+                if (!r || r.width <= 0 || r.height <= 0) continue;
+                var visible = norm(el.innerText || el.textContent || '');
+                var label = '';
+                try {{
+                    label = norm(el.getAttribute('aria-label') || el.getAttribute('title') ||
+                                 el.getAttribute('data-title') || el.getAttribute('placeholder') || '');
+                }} catch (e) {{}}
+                var text = visible || label;
+                if (!text) continue;
+                var hit = exact
+                    ? (visible === target || label === target)
+                    : (visible.indexOf(target) >= 0 || label.indexOf(target) >= 0);
+                if (!hit) continue;
+                var score = clickScore(el);
+                // 先比可点击性;同分取文本最短(容器文本更长,最小者最接近按钮本身)。
+                if (score > bestScore || (score === bestScore && text.length < bestLen)) {{
+                    best = el; bestScore = score; bestLen = text.length;
+                }}
+            }}
+            if (!best) return JSON.stringify({{hit:false}});
+            try {{ best.scrollIntoView({{block:'center'}}); }} catch (e) {{}}
+            try {{ best.click(); }} catch (e) {{}}
+            var cls = '';
+            try {{ cls = String(best.className || ''); }} catch (e) {{}}
+            return JSON.stringify({{hit:true, tag:best.tagName, id:best.id||'', cls:cls.slice(0,120), score:bestScore,
+                                     text:norm(best.innerText||best.textContent||'').slice(0,200)}});
+        }})()"#,
+        text = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into()),
+        scope = serde_json::to_string(&scope).unwrap_or_else(|_| "null".into()),
+        exact = if exact { "true" } else { "false" },
+    );
+    let v = eval_js(page, &js).await?;
+    let raw = v.as_str().unwrap_or("{}");
+    Ok(serde_json::from_str(raw).unwrap_or_else(|_| serde_json::json!({"hit": false, "raw": raw})))
+}
+
+/// 键位元数据:(key, code, windowsVirtualKeyCode, text)。
+fn key_meta(key: &str) -> (String, String, i64, Option<String>) {
+    match key {
+        "Enter" => ("Enter".into(), "Enter".into(), 13, Some("\r".into())),
+        "Tab" => ("Tab".into(), "Tab".into(), 9, None),
+        "Escape" | "Esc" => ("Escape".into(), "Escape".into(), 27, None),
+        "Backspace" => ("Backspace".into(), "Backspace".into(), 8, None),
+        "Delete" => ("Delete".into(), "Delete".into(), 46, None),
+        "ArrowDown" | "Down" => ("ArrowDown".into(), "ArrowDown".into(), 40, None),
+        "ArrowUp" | "Up" => ("ArrowUp".into(), "ArrowUp".into(), 38, None),
+        "ArrowLeft" | "Left" => ("ArrowLeft".into(), "ArrowLeft".into(), 37, None),
+        "ArrowRight" | "Right" => ("ArrowRight".into(), "ArrowRight".into(), 39, None),
+        "Home" => ("Home".into(), "Home".into(), 36, None),
+        "End" => ("End".into(), "End".into(), 35, None),
+        "PageUp" => ("PageUp".into(), "PageUp".into(), 33, None),
+        "PageDown" => ("PageDown".into(), "PageDown".into(), 34, None),
+        " " | "Space" => (" ".into(), "Space".into(), 32, Some(" ".into())),
+        other => {
+            let code = if other.len() == 1 && other.chars().all(|c| c.is_ascii_alphanumeric()) {
+                let ch = other.chars().next().unwrap().to_ascii_uppercase();
+                format!("Key{ch}")
+            } else {
+                String::new()
+            };
+            let vk = other
+                .chars()
+                .next()
+                .map(|c| c.to_ascii_uppercase() as i64)
+                .unwrap_or(0);
+            (other.to_string(), code, vk, Some(other.to_string()))
+        }
+    }
+}
+
+/// 向页面发送**真实键盘事件**(CDP Input.dispatchKeyEvent)。
+///
+/// 与 `type_text` 的 JS setter 路线互补:站点联想/快捷键监听 keydown 时,
+/// 仅赋值+input 事件不会触发(实测百度地图地址联想)。可先聚焦 selector,
+/// 再发送 keyDown/keyUp;`Enter` 带 `text="\r"`,表单与联想确认都能收到。
+pub async fn key_press(page: &Page, key: &str, selector: Option<&str>) -> Result<Value> {
+    use chromiumoxide::cdp::browser_protocol::input::{
+        DispatchKeyEventParams, DispatchKeyEventType,
+    };
+    if let Some(sel) = selector {
+        let js = format!(
+            r#"(function(){{ var el=document.querySelector({sel}); if(!el) return false; el.focus(); return document.activeElement === el; }})()"#,
+            sel = serde_json::to_string(sel).unwrap_or_default()
+        );
+        let _ = eval_js(page, &js).await?;
+    }
+    let (key_name, code, vk, text) = key_meta(key);
+    let mut down = DispatchKeyEventParams::builder()
+        .r#type(DispatchKeyEventType::KeyDown)
+        .key(key_name.clone())
+        .code(code.clone())
+        .windows_virtual_key_code(vk)
+        .native_virtual_key_code(vk);
+    if let Some(t) = text.clone() {
+        down = down.text(t);
+    }
+    let down = down.build().map_err(|e| err("key_press(keyDown)", e))?;
+    tokio::time::timeout(Duration::from_secs(CDP_BOUND_SECS), page.execute(down))
+        .await
+        .map_err(|_| timeout_err("key_press(keyDown)", CDP_BOUND_SECS))?
+        .map_err(|e| err("key_press(keyDown)", e))?;
+    let up = DispatchKeyEventParams::builder()
+        .r#type(DispatchKeyEventType::KeyUp)
+        .key(key_name.clone())
+        .code(code.clone())
+        .windows_virtual_key_code(vk)
+        .native_virtual_key_code(vk)
+        .build()
+        .map_err(|e| err("key_press(keyUp)", e))?;
+    tokio::time::timeout(Duration::from_secs(CDP_BOUND_SECS), page.execute(up))
+        .await
+        .map_err(|_| timeout_err("key_press(keyUp)", CDP_BOUND_SECS))?
+        .map_err(|e| err("key_press(keyUp)", e))?;
+    Ok(serde_json::json!({
+        "key": key_name,
+        "code": code,
+        "windows_virtual_key_code": vk,
+        "focused": selector,
+    }))
+}
+
+/// 读取选择器命中的第一个元素文本(可选:文档无匹配返回 None)。
+pub async fn element_text(page: &Page, selector: &str) -> Result<Option<String>> {
+    let js = format!(
+        r#"(function(){{ var el=null; try {{ el=document.querySelector({sel}); }} catch(e) {{ return null; }}
+            if (!el) return null; return String(el.innerText || el.textContent || ''); }})()"#,
+        sel = serde_json::to_string(selector).unwrap_or_default()
+    );
+    let v = eval_js(page, &js).await?;
+    Ok(v.as_str().map(str::to_string))
+}
+
+/// 读取选择器命中的第一个元素 outerHTML(可选)。
+pub async fn element_html(page: &Page, selector: &str) -> Result<Option<String>> {
+    let js = format!(
+        r#"(function(){{ var el=null; try {{ el=document.querySelector({sel}); }} catch(e) {{ return null; }}
+            if (!el) return null; return String(el.outerHTML || ''); }})()"#,
+        sel = serde_json::to_string(selector).unwrap_or_default()
+    );
+    let v = eval_js(page, &js).await?;
+    Ok(v.as_str().map(str::to_string))
+}
+
 /// 按 CSS 选择器输入文本(聚焦 + 原生 setter 赋值 + input/change 事件),
 /// 返回是否命中元素。
 pub async fn type_text(page: &Page, selector: &str, text: &str) -> Result<bool> {

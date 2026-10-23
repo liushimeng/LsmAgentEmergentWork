@@ -97,6 +97,10 @@ pub enum JsRequest {
         env: PageEnv,
         nodes: Vec<super::document::SnapshotNode>,
         reply: std::sync::mpsc::Sender<JsReply>,
+        /// JS 侧墙钟预算(0 = 用 `budget_ms()` 默认值)。页面首屏脚本总量
+        /// 可能远超 eval_js 的 10s;若沿用默认值,`event_loop` 在脚本执行完
+        /// 时已过 deadline,懒加载定时器(百度地图 `cG.load`)全部不触发。
+        budget_ms: u64,
     },
     /// Agent 的 eval_js:在持久 Context 上执行用户表达式。
     Eval {
@@ -131,7 +135,12 @@ pub struct JsHandle {
 impl JsHandle {
     pub fn spawn() -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<JsRequest>();
-        let builder = std::thread::Builder::new().name("lsm-page-js".to_string());
+        // 页面脚本线程需要较大的栈:Boa 0.22 解析/求值 20 万字符级压缩脚本
+        // (百度地图 initmap/反爬脚本)时递归深度显著高于默认 2MB,实测会
+        // stack overflow 直接 abort 整个进程(不可 catch)。
+        let builder = std::thread::Builder::new()
+            .name("lsm-page-js".to_string())
+            .stack_size(32 * 1024 * 1024);
         let _ = builder.spawn(move || runtime::thread_main(rx));
         Self { tx }
     }
@@ -141,11 +150,24 @@ impl JsHandle {
         &self,
         make: impl FnOnce(std::sync::mpsc::Sender<JsReply>) -> JsRequest,
     ) -> Result<JsReply, String> {
+        self.request_with_budget(make, budget_ms())
+    }
+
+    /// 带显式等待预算的请求。页面脚本管线把它绑定到**管线剩余墙钟**:
+    /// 重站点(百度地图首屏 60+ 脚本)单轮执行远超 eval_js 的 10s 默认预算,
+    /// 旧实现用同一默认值等 RunScripts,导致管线在脚本中途被判定超时,
+    /// 装载器/反爬脚本链断在中间(页面只剩外壳)。eval_js 交互仍走默认预算,
+    /// 不让单次页面求值把工具调用拖到分钟级。
+    pub fn request_with_budget(
+        &self,
+        make: impl FnOnce(std::sync::mpsc::Sender<JsReply>) -> JsRequest,
+        wait_ms: u64,
+    ) -> Result<JsReply, String> {
         let (tx_reply, rx) = std::sync::mpsc::channel::<JsReply>();
         self.tx
             .send(make(tx_reply))
             .map_err(|_| "JS 线程已退出".to_string())?;
-        rx.recv_timeout(Duration::from_millis(budget_ms() + 2_000))
+        rx.recv_timeout(Duration::from_millis(wait_ms + 2_000))
             .map_err(|_| "JS 执行超时(线程预算耗尽)".to_string())
     }
 
@@ -239,7 +261,9 @@ pub(crate) struct PipelineSeed {
 /// 放宽到 64。
 const MAX_ROUNDS: usize = 64;
 /// 整条脚本管线的墙钟预算(毫秒),可用 `LAEW_WEB_SCRIPT_PIPELINE_MS` 覆盖。
-const PIPELINE_BUDGET_MS: u64 = 40_000;
+// 整条脚本管线(多轮取回执行)的墙钟预算。40s 对百度地图这类首屏 60+ 脚本、
+// 含 195KB 反爬脚本的站点不够:实测在脚本链中途被截断,地图内核不启动。
+const PIPELINE_BUDGET_MS: u64 = 120_000;
 
 /// 管线墙钟预算(环境变量覆盖,下限 2000ms)。
 fn pipeline_budget_ms() -> u64 {
@@ -434,13 +458,23 @@ pub(crate) async fn run_pipeline(
             let doc = super::document::Document::parse(&out.html, base_url);
             doc.snapshot_nodes_with_rects(viewport, rects)
         };
+        // 等待预算 = 管线剩余墙钟(至少 2s)。不得沿用 eval_js 的 10s 默认值:
+        // 重站点首轮脚本总量常超过 10s,旧行为会把「还在正常执行」误判为超时。
+        let wait_ms = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .as_millis()
+            .max(2_000) as u64;
         let reply: Result<JsReply, String> = match tokio::task::spawn_blocking(move || {
-            h.request(|tx| JsRequest::RunScripts {
-                scripts,
-                env,
-                nodes,
-                reply: tx,
-            })
+            h.request_with_budget(
+                |tx| JsRequest::RunScripts {
+                    scripts,
+                    env,
+                    nodes,
+                    reply: tx,
+                    budget_ms: wait_ms,
+                },
+                wait_ms,
+            )
         })
         .await
         {

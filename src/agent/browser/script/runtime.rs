@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use boa_engine::context::ContextBuilder;
-use boa_engine::job::{FutureJob, JobQueue, NativeJob, SimpleJobQueue};
+use boa_engine::job::{Job, JobExecutor, SimpleJobExecutor};
 use boa_engine::{
     js_string, Context, JsArgs, JsResult, JsString, JsValue, NativeFunction, Source,
 };
@@ -30,26 +30,22 @@ const MAX_VALUE_CHARS: usize = 256 * 1024;
 /// 带预算的微任务队列:超出上限的 Promise job 直接丢弃,
 /// 防止 `function f(){ Promise.resolve().then(f) }` 式无限链拖死线程。
 struct BudgetedJobQueue {
-    inner: SimpleJobQueue,
+    inner: Rc<SimpleJobExecutor>,
     enqueued: Cell<u64>,
     cap: u64,
 }
 
-impl JobQueue for BudgetedJobQueue {
-    fn enqueue_promise_job(&self, job: NativeJob, context: &mut Context) {
+impl JobExecutor for BudgetedJobQueue {
+    fn enqueue_job(self: Rc<Self>, job: Job, context: &mut Context) {
         if self.enqueued.get() >= self.cap {
             return;
         }
         self.enqueued.set(self.enqueued.get() + 1);
-        self.inner.enqueue_promise_job(job, context);
+        self.inner.clone().enqueue_job(job, context);
     }
 
-    fn run_jobs(&self, context: &mut Context) {
-        self.inner.run_jobs(context);
-    }
-
-    fn enqueue_future_job(&self, _future: FutureJob, _context: &mut Context) {
-        // 本内核不使用 Boa 的 future job 通道,丢弃。
+    fn run_jobs(self: Rc<Self>, context: &mut Context) -> JsResult<()> {
+        self.inner.clone().run_jobs(context)
     }
 }
 
@@ -151,12 +147,12 @@ struct ThreadRuntime {
 impl ThreadRuntime {
     fn new() -> Result<Self, String> {
         let queue = Rc::new(BudgetedJobQueue {
-            inner: SimpleJobQueue::new(),
+            inner: Rc::new(SimpleJobExecutor::new()),
             enqueued: Cell::new(0),
             cap: MAX_JOB_ENQUEUE,
         });
         let mut ctx = ContextBuilder::new()
-            .job_queue(queue.clone())
+            .job_executor(queue.clone())
             .build()
             .map_err(|e| format!("Boa Context 构建失败:{e}"))?;
         ctx.runtime_limits_mut()
@@ -210,8 +206,9 @@ impl ThreadRuntime {
                 scripts,
                 env,
                 nodes,
+                budget_ms,
                 ..
-            } => Some(self.run_scripts(&scripts, &env, &nodes)),
+            } => Some(self.run_scripts(&scripts, &env, &nodes, budget_ms)),
             JsRequest::Eval {
                 script, env, nodes, ..
             } => Some(self.eval_user(&script, &env, &nodes)),
@@ -261,9 +258,10 @@ impl ThreadRuntime {
         }
     }
 
-    fn begin_request(&mut self, env: &PageEnv) {
+    fn begin_request(&mut self, env: &PageEnv, budget_ms: u64) {
         self.queue.enqueued.set(0);
-        let deadline = Instant::now() + Duration::from_millis(super::budget_ms());
+        let budget = if budget_ms == 0 { super::budget_ms() } else { budget_ms };
+        let deadline = Instant::now() + Duration::from_millis(budget);
         REQ_ENV.with(|c| {
             let mut env_cell = c.borrow_mut();
             env_cell.base_url = env.url.clone();
@@ -287,7 +285,11 @@ impl ThreadRuntime {
     }
 
     fn drain_jobs(&mut self) {
-        self.ctx.run_jobs();
+        // Boa 0.21+ 起 run_jobs 返回 Result:微任务异常不应静默吞掉,
+        // 但也不能打断整批脚本执行(与浏览器「未处理 rejection 只告警」一致)。
+        if let Err(e) = self.ctx.run_jobs() {
+            tracing::debug!(error = %e, "微任务执行失败");
+        }
     }
 
     /// 微任务 + 虚拟时钟定时器,直至无待处理/超上限/超预算。
@@ -310,8 +312,8 @@ impl ThreadRuntime {
         }
     }
 
-    fn run_scripts(&mut self, scripts: &[ScriptSource], env: &PageEnv, nodes: &[SnapshotNode]) -> JsReply {
-        self.begin_request(env);
+    fn run_scripts(&mut self, scripts: &[ScriptSource], env: &PageEnv, nodes: &[SnapshotNode], budget_ms: u64) -> JsReply {
+        self.begin_request(env, budget_ms);
         if let Err(e) = self.refresh(nodes, env) {
             return JsReply::error(e);
         }
@@ -402,7 +404,7 @@ impl ThreadRuntime {
     }
 
     fn eval_user(&mut self, script: &str, env: &PageEnv, nodes: &[SnapshotNode]) -> JsReply {
-        self.begin_request(env);
+        self.begin_request(env, 0);
         if let Err(e) = self.refresh(nodes, env) {
             return JsReply::error(e);
         }
@@ -427,7 +429,7 @@ impl ThreadRuntime {
     }
 
     fn dispatch(&mut self, selector: &str, event: &str, env: &PageEnv, nodes: &[SnapshotNode]) -> JsReply {
-        self.begin_request(env);
+        self.begin_request(env, 0);
         if let Err(e) = self.refresh(nodes, env) {
             return JsReply::error(e);
         }
@@ -899,6 +901,7 @@ mod diag_probe {
             }],
             &env,
             &[],
+            0,
         );
         eprintln!("生产路径 outcome.error = {:?}", reply.outcome.error);
         let guarded = super::super::for_in_guard::guard_for_in(&src);

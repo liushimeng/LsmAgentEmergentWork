@@ -86,6 +86,7 @@ fn run_scripts(handle: &JsHandle, scripts: Vec<&str>, doc_html: &str, url: &str)
             env: e,
             nodes,
             reply: tx,
+            budget_ms: 0,
         })
         .expect("JS 线程请求失败")
 }
@@ -918,6 +919,7 @@ fn 游离元素_className_进序列化() {
             env: e,
             nodes,
             reply: tx,
+            budget_ms: 0,
         })
         .expect("JS 线程请求失败");
     assert!(reply.outcome.ok, "{:?}", reply.outcome.error);
@@ -951,6 +953,7 @@ fn 游离元素_cloneNode_深拷贝保留内容() {
             env: e,
             nodes,
             reply: tx,
+            budget_ms: 0,
         })
         .expect("JS 线程请求失败");
     assert!(reply.outcome.ok, "{:?}", reply.outcome.error);
@@ -974,4 +977,49 @@ fn 应用_append_node_保留子树() {
     let dst = doc.first("#dst").ok().flatten().unwrap();
     let html = crate::agent::browser::document::outer_html(&dst);
     assert!(html.contains("内容"), "子树未搬入:{html}");
+}
+
+#[test]
+fn 标准_dom_构造器与事件子类齐备() {
+    // 实测百度地图反爬脚本 abclite:读 window.Document.prototype.createElement、
+    // new MouseEvent(...);缺失导致整段脚本 TypeError,BMAP_SECKEY 不落地。
+    let h = JsHandle::spawn();
+    let reply = eval_on(
+        &h,
+        r#"JSON.stringify({
+            doc: typeof Document,
+            hdoc: typeof HTMLDocument,
+            doc_win: typeof window.Document,
+            doc_ctor: (typeof HTMLDocument !== 'undefined' && document.constructor === HTMLDocument),
+            create_element_proto: typeof Document.prototype.createElement,
+            div: typeof HTMLDivElement,
+            input: typeof HTMLInputElement,
+            mouse: typeof MouseEvent,
+            keyboard: typeof KeyboardEvent,
+            pointer: typeof PointerEvent,
+            wheel: typeof WheelEvent,
+            input_evt: typeof InputEvent,
+            focus: typeof FocusEvent,
+            message: typeof MessageEvent,
+            touch: typeof Touch,
+            mk_mouse: (function(){ var e = new MouseEvent('mousedown', {clientX: 12, bubbles: true});
+                         return [e.type, e.clientX, e.bubbles].join('/'); })(),
+            mk_key: (function(){ var e = new KeyboardEvent('keydown', {key: 'Enter'});
+                       return [e.key, e.keyCode].join('/'); })()
+        })"#,
+        "<html><body><div id='x'>内容</div></body></html>",
+        "https://a.test/",
+    );
+    assert!(reply.outcome.ok, "求值失败:{:?}", reply.outcome.error);
+    let v: serde_json::Value = serde_json::from_str(&reply.outcome.value).expect("结果应为 JSON");
+    for key in [
+        "doc", "hdoc", "doc_win", "div", "input", "mouse", "keyboard", "pointer", "wheel",
+        "input_evt", "focus", "message", "touch",
+    ] {
+        assert_eq!(v[key], "function", "{key} 应为构造器:{v}");
+    }
+    assert_eq!(v["create_element_proto"], "function", "Document.prototype.createElement 缺失:{v}");
+    assert_eq!(v["doc_ctor"], true, "document.constructor 应为 HTMLDocument:{v}");
+    assert_eq!(v["mk_mouse"], "mousedown/12/true", "{v}");
+    assert_eq!(v["mk_key"], "Enter/13", "KeyboardEvent 应按 key 回填 keyCode:{v}");
 }

@@ -18,7 +18,7 @@
 //! 切分偏差由 SyntaxError 兜底：前缀重放抛 SyntaxError 视为切分界无效，跳过分界继续。
 //! 报告为多层 culprit 语句文本 + 位置链，供人读源码落地针对性 shim。
 
-use boa_engine::{Context, JsValue, Source};
+use boa_engine::{Context, Source};
 
 /// 语句报告阈值： culprit 语句短于此值即停止下钻。
 const REPORT_THRESHOLD: usize = 1500;
@@ -680,23 +680,27 @@ fn run_driver(ctx: &mut Context, body: &str) -> DriverResult {
     );
     let v = ctx.eval(Source::from_bytes(src.as_bytes()));
     match v {
-        Ok(JsValue::String(s)) => {
-            let text = s.to_std_string_escaped();
-            if let Some(msg) = text.strip_prefix("throw:") {
-                // 载荷内的 SyntaxError = 切分边界切坏（截断处不成语法），归 driver_error 跳过；
-                // 若是驱动器自身语法错,ctx.eval 早已走 Err 分支,不会到这里。
-                if msg.starts_with("SyntaxError") {
-                    DriverResult::DriverError(msg.to_string())
+        // Boa 0.21: JsValue 改为不透明结构(variant 经 `as_string` 取),
+        // 不再能直接模式匹配 `JsValue::String`。
+        Ok(v) => match v.as_string() {
+            Some(s) => {
+                let text = s.to_std_string_escaped();
+                if let Some(msg) = text.strip_prefix("throw:") {
+                    // 载荷内的 SyntaxError = 切分边界切坏(截断处不成语法),归 driver_error 跳过;
+                    // 若是驱动器自身语法错,ctx.eval 早已走 Err 分支,不会到这里。
+                    if msg.starts_with("SyntaxError") {
+                        DriverResult::DriverError(msg.to_string())
+                    } else {
+                        DriverResult::Throw(msg.to_string())
+                    }
+                } else if text == "ok" {
+                    DriverResult::Ok
                 } else {
-                    DriverResult::Throw(msg.to_string())
+                    DriverResult::DriverError(text)
                 }
-            } else if text == "ok" {
-                DriverResult::Ok
-            } else {
-                DriverResult::DriverError(text)
             }
-        }
-        Ok(_) => DriverResult::DriverError("驱动器返回非字符串".to_string()),
+            None => DriverResult::DriverError("驱动器返回非字符串".to_string()),
+        },
         Err(e) => {
             let msg = format!("{e}");
             DriverResult::DriverError(msg)

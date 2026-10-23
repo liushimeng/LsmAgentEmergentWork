@@ -363,6 +363,151 @@ pub const GLOBALS_JS: &str = r##"
     };
     G.CustomEvent.prototype = Object.create(G.Event.prototype);
   }
+  // Event 原型上的标准方法(实例自有方法仅供内部构造的旧对象;站点新建的
+  // 子类实例走原型链)。
+  (function () {
+    var P = G.Event.prototype;
+    if (!P.preventDefault) P.preventDefault = function () { this.defaultPrevented = true; };
+    if (!P.stopPropagation) P.stopPropagation = function () {};
+    if (!P.stopImmediatePropagation) P.stopImmediatePropagation = function () {};
+    if (!P.composedPath) P.composedPath = function () {
+      return this.target ? [this.target, G.document, G.window] : [];
+    };
+    if (!P.initEvent) P.initEvent = function (type, bubbles, cancelable) {
+      this.type = String(type);
+      this.bubbles = !!bubbles;
+      this.cancelable = !!cancelable;
+    };
+  })();
+  // --- 事件子类构造器 ---
+  // 站点与反爬脚本用 `new MouseEvent/KeyboardEvent(...)` 造事件(实测百度地图
+  // 反爬脚本直接 `new MouseEvent('mousedown', ...)`;缺失即 ReferenceError,
+  // 后续风控回调整层不执行)。以通用工厂按字段清单补齐,行为差异只在字段。
+  (function () {
+    function evtCtor(name, baseName, fields, defaults) {
+      if (typeof G[name] !== "undefined") return;
+      var Base = G[baseName] || G.Event;
+      var C = function (type, init) {
+        init = init || {};
+        G.Event.call(this, String(type), init);
+        this.view = init.view || G.window || null;
+        this.detail = init.detail === undefined ? 0 : init.detail;
+        if (fields) {
+          for (var i = 0; i < fields.length; i++) {
+            var f = fields[i];
+            if (init[f] !== undefined) this[f] = init[f];
+            else if (defaults && defaults[f] !== undefined) this[f] = defaults[f];
+            else this[f] = null;
+          }
+        }
+        if (init.ctrlKey !== undefined) this.ctrlKey = !!init.ctrlKey;
+        if (init.shiftKey !== undefined) this.shiftKey = !!init.shiftKey;
+        if (init.altKey !== undefined) this.altKey = !!init.altKey;
+        if (init.metaKey !== undefined) this.metaKey = !!init.metaKey;
+        if (this.ctrlKey === undefined) this.ctrlKey = false;
+        if (this.shiftKey === undefined) this.shiftKey = false;
+        if (this.altKey === undefined) this.altKey = false;
+        if (this.metaKey === undefined) this.metaKey = false;
+        var mods = { Control: !!this.ctrlKey, Shift: !!this.shiftKey, Alt: !!this.altKey, Meta: !!this.metaKey };
+        this.getModifierState = function (k) { return !!mods[String(k)]; };
+      };
+      C.prototype = Object.create(Base.prototype);
+      C.prototype.constructor = C;
+      G[name] = C;
+    }
+    var ui = ["detail", "view"];
+    var mouse = ["screenX", "screenY", "clientX", "clientY", "pageX", "pageY",
+                 "offsetX", "offsetY", "movementX", "movementY", "button", "buttons",
+                 "relatedTarget", "region"];
+    var mouseDefaults = { screenX: 0, screenY: 0, clientX: 0, clientY: 0, pageX: 0, pageY: 0,
+                          offsetX: 0, offsetY: 0, movementX: 0, movementY: 0, button: 0, buttons: 0 };
+    evtCtor("UIEvent", "Event", ui, { detail: 0 });
+    evtCtor("MouseEvent", "UIEvent", mouse, mouseDefaults);
+    evtCtor("PointerEvent", "MouseEvent",
+            ["pointerId", "pointerType", "isPrimary", "pressure", "tangentialPressure",
+             "tiltX", "tiltY", "twist", "width", "height"],
+            { pointerId: 0, pointerType: "mouse", isPrimary: true, pressure: 0,
+              tangentialPressure: 0, tiltX: 0, tiltY: 0, twist: 0, width: 1, height: 1 });
+    evtCtor("WheelEvent", "MouseEvent", ["deltaX", "deltaY", "deltaZ", "deltaMode"],
+            { deltaX: 0, deltaY: 0, deltaZ: 0, deltaMode: 0 });
+    evtCtor("KeyboardEvent", "UIEvent",
+            ["key", "code", "keyCode", "which", "charCode", "location", "repeat",
+             "isComposing", "locale"],
+            { key: "", code: "", keyCode: 0, which: 0, charCode: 0, location: 0,
+              repeat: false, isComposing: false });
+    // keyCode/which 的常用键位回填(老库仍按数值判断)。
+    (function () {
+      var C = G.KeyboardEvent;
+      if (!C || C.__lsmKeyCodes) return;
+      C.__lsmKeyCodes = true;
+      var table = { Enter: 13, Escape: 27, Tab: 9, Backspace: 8, Delete: 46, " ": 32,
+                    ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40,
+                    Home: 36, End: 35, PageUp: 33, PageDown: 34,
+                    Shift: 16, Control: 17, Alt: 18, Meta: 91 };
+      var orig = C;
+      var Wrapped = function (type, init) {
+        init = init || {};
+        orig.call(this, type, init);
+        if (!this.keyCode && init.keyCode === undefined && table[this.key] !== undefined) {
+          this.keyCode = table[this.key];
+          this.which = table[this.key];
+        }
+      };
+      Wrapped.prototype = orig.prototype;
+      G.KeyboardEvent = Wrapped;
+    })();
+    evtCtor("FocusEvent", "UIEvent", ["relatedTarget"]);
+    evtCtor("InputEvent", "UIEvent", ["data", "inputType", "isComposing", "dataTransfer"],
+            { isComposing: false });
+    evtCtor("CompositionEvent", "UIEvent", ["data", "locale"]);
+    evtCtor("DragEvent", "MouseEvent", ["dataTransfer"]);
+    evtCtor("ClipboardEvent", "Event", ["clipboardData"]);
+    evtCtor("MessageEvent", "Event", ["data", "origin", "lastEventId", "source", "ports"],
+            { origin: "", lastEventId: "" });
+    evtCtor("ErrorEvent", "Event", ["message", "filename", "lineno", "colno", "error"],
+            { message: "", filename: "", lineno: 0, colno: 0 });
+    evtCtor("ProgressEvent", "Event", ["lengthComputable", "loaded", "total"],
+            { lengthComputable: false, loaded: 0, total: 0 });
+    evtCtor("AnimationEvent", "Event", ["animationName", "elapsedTime", "pseudoElement"],
+            { animationName: "", elapsedTime: 0, pseudoElement: "" });
+    evtCtor("TransitionEvent", "Event", ["propertyName", "elapsedTime", "pseudoElement"],
+            { propertyName: "", elapsedTime: 0, pseudoElement: "" });
+    evtCtor("PopStateEvent", "Event", ["state"]);
+    evtCtor("HashChangeEvent", "Event", ["oldURL", "newURL"], { oldURL: "", newURL: "" });
+    evtCtor("StorageEvent", "Event", ["key", "oldValue", "newValue", "url", "storageArea"],
+            { key: "", url: "" });
+    evtCtor("BeforeUnloadEvent", "Event", ["returnValue"]);
+    evtCtor("PageTransitionEvent", "Event", ["persisted"], { persisted: false });
+    evtCtor("SubmitEvent", "Event", ["submitter"]);
+    evtCtor("TouchEvent", "UIEvent", ["touches", "targetTouches", "changedTouches", "altKey"],
+            { touches: [], targetTouches: [], changedTouches: [] });
+    if (typeof G.Touch === "undefined") {
+      G.Touch = function Touch(init) {
+        init = init || {};
+        this.identifier = init.identifier || 0;
+        this.target = init.target || null;
+        this.clientX = init.clientX || 0;
+        this.clientY = init.clientY || 0;
+        this.pageX = init.pageX || this.clientX;
+        this.pageY = init.pageY || this.clientY;
+        this.screenX = init.screenX || 0;
+        this.screenY = init.screenY || 0;
+        this.radiusX = init.radiusX || 0;
+        this.radiusY = init.radiusY || 0;
+        this.rotationAngle = init.rotationAngle || 0;
+        this.force = init.force || 0;
+      };
+    }
+  })();
+  if (typeof G.DOMException === "undefined") {
+    G.DOMException = function DOMException(message, name) {
+      this.message = String(message == null ? "" : message);
+      this.name = String(name || "Error");
+      this.code = 0;
+      this.stack = this.name + ": " + this.message;
+    };
+    G.DOMException.prototype = Object.create(typeof G.Error === "function" ? G.Error.prototype : Object.prototype);
+  }
 
   // --- DOM 接口占位(脚本常用 instanceof / new) ---
   if (typeof G.Node === "undefined") {
@@ -383,6 +528,96 @@ pub const GLOBALS_JS: &str = r##"
   if (typeof G.SVGElement === "undefined") {
     G.SVGElement = function SVGElement() {};
     G.SVGElement.prototype = Object.create(G.Element.prototype);
+  }
+  // --- Document / HTMLDocument 构造器 ---
+  // 反爬与指纹脚本普遍直接读 `window.Document.prototype.…`(实测百度地图
+  // abclite 脚本:`gb['Document']['prototype']['createElement']['m']`)。
+  // 缺失时属性链在 undefined 上继续取成员 → TypeError,整段反爬脚本中断,
+  // BMAP_SECKEY 不落地,依赖它的地图内核不启动(页面只剩外壳)。
+  if (typeof G.Document === "undefined") {
+    G.Document = function Document() {};
+    G.Document.prototype = Object.create(G.Node.prototype);
+    G.Document.prototype.constructor = G.Document;
+    G.Document.prototype.createElement = function (tag) {
+      return (G.document && G.document.createElement) ? G.document.createElement(tag) : null;
+    };
+    G.Document.prototype.createElementNS = function (ns, tag) {
+      return (G.document && G.document.createElementNS) ? G.document.createElementNS(ns, tag) : null;
+    };
+    G.Document.prototype.createTextNode = function (t) {
+      return G.document ? G.document.createTextNode(t) : null;
+    };
+    G.Document.prototype.createComment = function (t) {
+      return G.document ? G.document.createComment(t) : null;
+    };
+    G.Document.prototype.createDocumentFragment = function () {
+      return G.document ? G.document.createDocumentFragment() : null;
+    };
+    G.Document.prototype.getElementById = function (id) {
+      return G.document ? G.document.getElementById(id) : null;
+    };
+    G.Document.prototype.querySelector = function (s) {
+      return G.document ? G.document.querySelector(s) : null;
+    };
+    G.Document.prototype.querySelectorAll = function (s) {
+      return G.document ? G.document.querySelectorAll(s) : [];
+    };
+  }
+  if (typeof G.HTMLDocument === "undefined") {
+    G.HTMLDocument = function HTMLDocument() {};
+    G.HTMLDocument.prototype = Object.create(G.Document.prototype);
+    G.HTMLDocument.prototype.constructor = G.HTMLDocument;
+  }
+  if (typeof G.DocumentFragment === "undefined") {
+    G.DocumentFragment = function DocumentFragment() {};
+    G.DocumentFragment.prototype = Object.create(G.Node.prototype);
+  }
+  if (typeof G.CharacterData === "undefined") {
+    G.CharacterData = function CharacterData() {};
+    G.CharacterData.prototype = Object.create(G.Node.prototype);
+  }
+  if (typeof G.Text === "undefined") {
+    G.Text = function Text(data) { this.data = String(data == null ? "" : data); };
+    G.Text.prototype = Object.create(G.CharacterData.prototype);
+  }
+  if (typeof G.Comment === "undefined") {
+    G.Comment = function Comment(data) { this.data = String(data == null ? "" : data); };
+    G.Comment.prototype = Object.create(G.CharacterData.prototype);
+  }
+  if (typeof G.Attr === "undefined") {
+    G.Attr = function Attr() {};
+    G.Attr.prototype = Object.create(G.Node.prototype);
+  }
+  // 各 HTML*Element 构造器:站点/框架做 instanceof 与原型补丁时引用。
+  (function () {
+    var names = [
+      "HTMLHtmlElement", "HTMLHeadElement", "HTMLBodyElement", "HTMLDivElement",
+      "HTMLSpanElement", "HTMLAnchorElement", "HTMLInputElement", "HTMLButtonElement",
+      "HTMLFormElement", "HTMLImageElement", "HTMLCanvasElement", "HTMLScriptElement",
+      "HTMLLinkElement", "HTMLStyleElement", "HTMLSelectElement", "HTMLOptionElement",
+      "HTMLTextAreaElement", "HTMLTableElement", "HTMLTableRowElement",
+      "HTMLTableCellElement", "HTMLLIElement", "HTMLUListElement", "HTMLOListElement",
+      "HTMLParagraphElement", "HTMLMetaElement", "HTMLLabelElement",
+      "HTMLTemplateElement", "HTMLIFrameElement", "HTMLVideoElement",
+      "HTMLAudioElement", "HTMLMediaElement", "HTMLEmbedElement",
+      "HTMLObjectElement", "HTMLAreaElement", "HTMLMapElement", "HTMLBaseElement",
+      "HTMLTitleElement", "HTMLBRElement", "HTMLHRElement", "HTMLPreElement",
+      "HTMLQuoteElement", "HTMLModElement", "HTMLDListElement", "HTMLFieldSetElement",
+      "HTMLLegendElement", "HTMLOptGroupElement", "HTMLOutputElement",
+      "HTMLProgressElement", "HTMLMeterElement", "HTMLDetailsElement",
+      "HTMLDialogElement", "HTMLSlotElement"
+    ];
+    for (var i = 0; i < names.length; i++) {
+      if (typeof G[names[i]] !== "undefined") continue;
+      var C = function () {};
+      C.prototype = Object.create(G.HTMLElement.prototype);
+      C.prototype.constructor = C;
+      G[names[i]] = C;
+    }
+  })();
+  // 文档实例的真实构造器(站点用 `document.constructor === HTMLDocument` 做环境自证)。
+  if (G.document && G.HTMLDocument) {
+    try { G.document.constructor = G.HTMLDocument; } catch (e) {}
   }
   // NodeFilter:站点 polyfill(createTreeWalker/createNodeIterator)普遍引用
   // 全局 NodeFilter 常量,缺失即 ReferenceError(实测百度地图探针)。
@@ -456,13 +691,22 @@ pub const GLOBALS_JS: &str = r##"
     };
   }
   if (typeof G.Image === "undefined") {
+    // 真实浏览器里 `new Image()` 返回 HTMLImageElement。站点装载器
+    // (实测百度地图 DOM 渲染器 `new Image; img.onload=...; img.src=...`)
+    // 依赖 onload 推进图块装载;返回纯数据对象永远等不到事件,地图停在
+    // 「已建容器但没有瓦片/控件」状态。这里复用 createElement("img") 的
+    // 动态元素(prelude 为其 src 提供了异步 load 语义)。
     G.Image = function Image(w, h) {
-      this.width = w || 0;
-      this.height = h || 0;
-      this.src = "";
-      this.onload = null;
-      this.onerror = null;
-      this.complete = false;
+      var el = null;
+      try { el = document.createElement("img"); } catch (e) { el = null; }
+      if (!el) {
+        el = { width: w || 0, height: h || 0, src: "", onload: null, onerror: null, complete: false,
+               naturalWidth: 0, naturalHeight: 0, crossOrigin: null };
+        return el;
+      }
+      if (w !== undefined) el.width = w;
+      if (h !== undefined) el.height = h;
+      return el;
     };
   }
 

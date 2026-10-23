@@ -51,6 +51,50 @@ pub(super) fn envelope(code: i32, message: &str, data: Value) -> Result<String> 
     Ok(json!({"code": code, "message": message, "data": data}).to_string())
 }
 
+/// inspect(text):支持 `params.selector` 限定子树 + 输出上限。
+async fn inspect_text(
+    page: &chromiumoxide::Page,
+    params: &Value,
+) -> std::result::Result<Value, (i32, String)> {
+    let max_chars = max_chars_arg(params);
+    let selector = str_arg(params, "selector");
+    let text = match selector {
+        Some(sel) => chrome_browser::element_text(page, sel).await,
+        None => chrome_browser::visible_text(page).await.map(Some),
+    }
+    .map_err(|e| (CODE_EXEC_FAILED, e.to_string()))?;
+    Ok(match text {
+        Some(t) => {
+            let (text, chars, truncated) = cap_chars(t, max_chars);
+            json!({"text": text, "chars": chars, "truncated": truncated, "selector": selector})
+        }
+        None => json!({"text": null, "chars": 0, "truncated": false, "selector": selector,
+                       "note": "选择器未命中元素"}),
+    })
+}
+
+/// inspect(html):支持 `params.selector` 限定子树 + 输出上限。
+async fn inspect_html(
+    page: &chromiumoxide::Page,
+    params: &Value,
+) -> std::result::Result<Value, (i32, String)> {
+    let max_chars = max_chars_arg(params);
+    let selector = str_arg(params, "selector");
+    let html = match selector {
+        Some(sel) => chrome_browser::element_html(page, sel).await,
+        None => chrome_browser::outer_html(page).await.map(Some),
+    }
+    .map_err(|e| (CODE_EXEC_FAILED, e.to_string()))?;
+    Ok(match html {
+        Some(h) => {
+            let (html, chars, truncated) = cap_chars(h, max_chars);
+            json!({"html": html, "chars": chars, "truncated": truncated, "selector": selector})
+        }
+        None => json!({"html": null, "chars": 0, "truncated": false, "selector": selector,
+                       "note": "选择器未命中元素"}),
+    })
+}
+
 pub(super) fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key)
         .and_then(Value::as_str)
@@ -98,6 +142,33 @@ pub(super) fn params_of(args: &Value) -> &Value {
     args.get("params").filter(|p| p.is_object()).unwrap_or(args)
 }
 
+/// inspect(text|html) 输出上限:默认 20000 字符,夹在 [1000, 200000]。
+///
+/// 整页 HTML 在重站点常达 40 万字符(Baidu Map 实测约 400KB),直接回灌会
+/// 挤爆上下文并拖慢推理;给选择器时可只取目标子树,上限仍兜底。
+pub(super) fn max_chars_arg(params: &Value) -> usize {
+    params
+        .get("max_chars")
+        .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())))
+        .map(|v| v.clamp(1_000, 200_000) as usize)
+        .unwrap_or(20_000)
+}
+
+/// 截断到 `max_chars` 个字符(按字符边界,不切坏 UTF-8),返回
+/// `(文本, 原始字符数, 是否截断)`。
+pub(super) fn cap_chars(s: String, max_chars: usize) -> (String, usize, bool) {
+    let chars = s.chars().count();
+    if chars <= max_chars {
+        return (s, chars, false);
+    }
+    let cut: String = s.chars().take(max_chars).collect();
+    (
+        format!("{cut}\n…(截断:原始 {chars} 字符,仅显示前 {max_chars} 字符;可加 params.selector 或调大 params.max_chars)"),
+        chars,
+        true,
+    )
+}
+
 /// MCP_Web_Chrome_Use 工具。
 pub struct McpChromeUseTool;
 
@@ -137,10 +208,16 @@ impl Tool for McpChromeUseTool {
     fn description(&self) -> &str {
         "浏览器网页操控工具(Chrome/CDP,真 Chromium 渲染,双浏览器架构中默认优先使用)。\
 支持 headed 有头窗口(人工可直接看到并介入页面)与 hidden 无头模式(LAEW_CHROME_MODE)。\
-action=open 打开页面拿 page_id;list 列出页面;control 执行写操作(navigate/click/type|input_text/\
-eval_js/screenshot/scroll/wait/back/forward/reload);inspect 观测页面(url/title/text/html/screenshot);\
+action=open 打开页面拿 page_id;list 列出页面;control 执行写操作(navigate/click/click_text/type|input_text/\
+key_press/eval_js/screenshot/scroll/wait/back/forward/reload);inspect 观测页面(url/title/text/html/screenshot);\
 close 释放页面(page_id=all 全关并回收 Chrome 进程)。\
+★ 纯文字按钮(「选为终点」「查询」「公交」等)优先 click_text(params.text=可见文字,可加 params.selector 限定作用域);\
+别反复猜 CSS 选择器。\
+★ 联想/快捷键/回车提交用 key_press(params.key=Enter|Tab|ArrowDown|Escape...;可带 params.selector 先聚焦),\
+它发送真实 CDP 键盘事件;type 只做赋值+input/change。\
 ★ screenshot 务必给 params.save_path 落盘(只回路径+尺寸);不传才会回 base64。\
+★ inspect(html|text) 可用 params.selector 只取目标子树,默认 20000 字符截断(params.max_chars 可调),\
+避免整页 HTML 撑爆上下文。\
 ★ wait 支持 selector 就绪判定(params.selector+timeout_ms)。\
 page_id 仅本工具内有效,不跨工具复用。\
 当目标站点对 Chrome 风控(反复验证码/页面抹除/访问被拒)时,改用 MCP_Web_LsmAgentBrowser_Use。\
@@ -162,8 +239,8 @@ page_id 仅本工具内有效,不跨工具复用。\
                 "control_action": {
                     "type": "string",
                     "enum": [
-                        "navigate", "click", "type", "input_text", "eval_js",
-                        "screenshot", "scroll", "wait",
+                        "navigate", "click", "click_text", "type", "input_text",
+                        "key_press", "eval_js", "screenshot", "scroll", "wait",
                         "back", "forward", "reload"
                     ]
                 },
@@ -176,8 +253,11 @@ page_id 仅本工具内有效,不跨工具复用。\
                     "description": "control/inspect 动作参数",
                     "properties": {
                         "url": { "type": "string" },
-                        "selector": { "type": "string", "description": "click/type/input_text/scroll/wait(CSS);wait 时为就绪判定目标" },
-                        "text": { "type": "string", "description": "type/input_text 的输入文本" },
+                        "selector": { "type": "string", "description": "click/click_text/type/input_text/key_press/scroll/wait(CSS);wait 时为就绪判定目标;inspect 时限定取哪个子树" },
+                        "text": { "type": "string", "description": "type/input_text 的输入文本;click_text 时为要点击的可见文字" },
+                        "exact": { "type": "boolean", "description": "click_text 是否要求文本完全相等(默认 false=包含匹配)" },
+                        "key": { "type": "string", "description": "key_press 的键名:Enter/Tab/Escape/ArrowDown/ArrowUp/ArrowLeft/ArrowRight/Backspace/Delete/Space 或单字符" },
+                        "max_chars": { "type": "integer", "description": "inspect(text|html) 输出上限(默认 20000,范围 1000-200000)" },
                         "script": { "type": "string", "description": "eval_js 的 JS 表达式/语句" },
                         "y": { "type": "integer", "description": "scroll 像素(正向下)" },
                         "ms": { "type": "integer", "description": "wait 固定等待毫秒(上限 30000)" },
@@ -310,6 +390,25 @@ async fn run_control(args: Value) -> Result<String> {
                 .map(|hit| json!({"selector": sel, "hit": hit}))
                 .map_err(|e| (CODE_EXEC_FAILED, e.to_string()))
         }
+        // 按可见文字点击:现代站点纯文本按钮无稳定选择器(「选为终点」)。
+        "click_text" => {
+            let Some(text) = str_arg(p, "text") else {
+                return envelope(CODE_PARAM_ERROR, "click_text 缺少 params.text", json!({}));
+            };
+            let exact = p.get("exact").and_then(Value::as_bool).unwrap_or(false);
+            chrome_browser::click_text(&page, text, str_arg(p, "selector"), exact)
+                .await
+                .map_err(|e| (CODE_EXEC_FAILED, e.to_string()))
+        }
+        // 真实键盘事件:联想/快捷键/Enter 提交走 CDP Input.dispatchKeyEvent。
+        "key_press" => {
+            let Some(key) = str_arg(p, "key") else {
+                return envelope(CODE_PARAM_ERROR, "key_press 缺少 params.key", json!({}));
+            };
+            chrome_browser::key_press(&page, key, str_arg(p, "selector"))
+                .await
+                .map_err(|e| (CODE_EXEC_FAILED, e.to_string()))
+        }
         // input_text 与 type 同义(对齐 Lsm 版命名,实测模型对 type 可发现性差,
         // 曾绕行 eval_js 手搓键盘事件)。
         "type" | "input_text" => {
@@ -400,14 +499,8 @@ async fn run_inspect(args: Value) -> Result<String> {
             let (url, title) = chrome_browser::url_and_title(&page).await;
             Ok(json!({"url": url, "title": title, "info": info}))
         }
-        "text" => chrome_browser::visible_text(&page)
-            .await
-            .map(|t| json!({"text": t}))
-            .map_err(|e| (CODE_EXEC_FAILED, e.to_string())),
-        "html" => chrome_browser::outer_html(&page)
-            .await
-            .map(|h| json!({"html": h}))
-            .map_err(|e| (CODE_EXEC_FAILED, e.to_string())),
+        "text" => inspect_text(&page, params_of(&args)).await,
+        "html" => inspect_html(&page, params_of(&args)).await,
         "screenshot" => match str_arg(params_of(&args), "save_path") {
             Some(path) => chrome_browser::screenshot_to_file(&page, path)
                 .await
