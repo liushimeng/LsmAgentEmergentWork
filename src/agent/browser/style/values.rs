@@ -4,8 +4,24 @@
 //! 百分比长度按视口宽估算(简化,见设计文档"已知边界")。
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use super::gradient::{parse_gradient, GradientSpec};
 
 pub type Rgb = [u8; 3];
+
+/// 单角圆角半径:长度或百分比(百分比按 `min(w,h)/2` 求解,光栅化期归一)。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CornerRadius {
+    Px(f64),
+    Pct(f64),
+}
+
+impl Default for CornerRadius {
+    fn default() -> Self {
+        CornerRadius::Px(0.0)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ComputedStyle {
@@ -53,6 +69,9 @@ pub struct ComputedStyle {
     pub object_fit: String,
     /// `background-image` 的 URL 原文(阶段三第三步;未解析为绝对地址)。
     pub background_image: Option<String>,
+    /// `background-image` 的渐变(阶段六第一步);与 `background_image` 互斥,
+    /// `background` 简写与长写法都可能命中。`Arc` 共享避免级联克隆整表色标。
+    pub background_gradient: Option<Arc<GradientSpec>>,
     /// `background-position`(精灵图定位;None = 默认 0 0)。
     pub background_position: Option<BackgroundPosition>,
     /// `background-size`:"auto"(默认,按固有尺寸) | "cover" | "contain"。
@@ -65,8 +84,12 @@ pub struct ComputedStyle {
     /// `transparent` 归一为 alpha=0 的 `Rgba`。
     pub border_colors: [BorderColor; 4],
     /// `box-shadow` 外阴影层(内阴影/inset 不在此列,解析期丢弃)。
-    /// `blur` 渲染层近似为 0(不实现高斯模糊),仅绘制偏移+扩散实心矩形。
+    /// `blur` 自阶段六起真实生效(三趟盒式模糊近似高斯)。
     pub box_shadow: Vec<BoxShadow>,
+    /// 圆角半径(top-left / top-right / bottom-right / bottom-left)。
+    pub border_radius: [CornerRadius; 4],
+    /// `overflow:hidden|clip|scroll|auto` 归一为内容裁剪开关(非继承)。
+    pub overflow_clip: bool,
     /// 未建模属性的计算值文本(如 border-radius)。
     pub extra: BTreeMap<String, String>,
     /// 自定义属性表(继承用,不进入 `to_map`)。
@@ -340,12 +363,15 @@ impl Default for ComputedStyle {
             grid_item: GridItemStyle::default(),
             object_fit: "fill".to_string(),
             background_image: None,
+            background_gradient: None,
             background_position: None,
             background_size: "auto".to_string(),
             border_widths: [0.0; 4],
             border_drawn: [false; 4],
             border_colors: [BorderColor::CurrentColor; 4],
             box_shadow: Vec::new(),
+            border_radius: [CornerRadius::Px(0.0); 4],
+            overflow_clip: false,
             extra: BTreeMap::new(),
             custom: BTreeMap::new(),
         }
@@ -370,6 +396,19 @@ impl ComputedStyle {
 
     pub fn is_hidden(&self) -> bool {
         self.display == "none"
+    }
+
+    /// `border-radius` 计算值文本(getComputedStyle 用)。
+    fn border_radius_text(&self) -> String {
+        let corner = |c: &CornerRadius| match c {
+            CornerRadius::Px(v) => format!("{}px", num(*v)),
+            CornerRadius::Pct(v) => format!("{}%", num(*v)),
+        };
+        self.border_radius
+            .iter()
+            .map(corner)
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// 供 `getComputedStyle` / inspect 使用的计算值表(kebab-case)。
@@ -478,12 +517,20 @@ impl ComputedStyle {
         out.insert("object-fit".into(), self.object_fit.clone());
         out.insert(
             "background-image".into(),
-            self.background_image
-                .clone()
-                .map(|u| format!("url({u})"))
-                .unwrap_or_else(|| "none".to_string()),
+            if let Some(g) = &self.background_gradient {
+                g.raw.clone()
+            } else if let Some(u) = &self.background_image {
+                format!("url({u})")
+            } else {
+                "none".to_string()
+            },
         );
         out.insert("background-size".into(), self.background_size.clone());
+        out.insert("border-radius".into(), self.border_radius_text());
+        out.insert(
+            "overflow".into(),
+            if self.overflow_clip { "hidden" } else { "visible" }.to_string(),
+        );
         out.insert(
             "background-position".into(),
             self.background_position
@@ -744,6 +791,7 @@ pub fn apply_declaration(
             // (实测百度地图:搜索框、路线按钮全是背景图精灵,截图一片白)。
             let tokens = split_bg_tokens(value);
             let mut url: Option<String> = None;
+            let mut gradient: Option<Arc<GradientSpec>> = None;
             let mut pos_tokens: Vec<String> = Vec::new();
             let mut size: Option<String> = None;
             let mut color_token: Option<String> = None;
@@ -753,8 +801,9 @@ pub fn apply_declaration(
                     url = parse_css_url(t);
                     continue;
                 }
-                if low.starts_with("linear-gradient(") || low.starts_with("radial-gradient(") {
-                    continue; // 渐变暂不绘制
+                if let Some(g) = parse_gradient(t) {
+                    gradient = Some(Arc::new(g));
+                    continue;
                 }
                 if low == "cover" || low == "contain" {
                     size = Some(low);
@@ -777,6 +826,7 @@ pub fn apply_declaration(
             }
             // 简写会重置 background-image / position / size(规范语义)。
             st.background_image = url;
+            st.background_gradient = gradient;
             st.background_size = size.unwrap_or_else(|| "auto".to_string());
             st.background_position = if pos_tokens.is_empty() {
                 None
@@ -1087,7 +1137,9 @@ pub fn apply_declaration(
         "grid-row-start" => st.grid_item.row_start = parse_grid_line(value),
         "grid-row-end" => st.grid_item.row_end = parse_grid_line(value),
         "background-image" => {
+            // url() 走图片缓存;渐变走 `background_gradient`;多背景只取首层。
             st.background_image = parse_css_url(value);
+            st.background_gradient = parse_first_gradient(value);
         }
         "object-fit" => {
             let v = value.trim().to_ascii_lowercase();
@@ -1181,11 +1233,19 @@ pub fn apply_declaration(
         "box-shadow" => {
             st.box_shadow = parse_box_shadow(value);
         }
-        "border-radius"
-        | "overflow"
-        | "overflow-x"
-        | "overflow-y"
-        | "float"
+        "border-radius" | "-webkit-border-radius" => {
+            st.border_radius = parse_border_radius(value, st.font_size, ctx);
+        }
+        "overflow" => {
+            st.overflow_clip = parse_overflow(value);
+        }
+        "overflow-x" | "overflow-y" => {
+            // 任一轴裁剪即整体裁剪(视觉近似,滚动条不建模)。
+            if parse_overflow(value) {
+                st.overflow_clip = true;
+            }
+        }
+        "float"
         | "clear"
         | "text-decoration"
         | "cursor"
@@ -1280,10 +1340,15 @@ fn apply_initial(st: &mut ComputedStyle, key: &str, root: &ComputedStyle) {
         },
         "background" | "background-color" => st.background = None,
         "object-fit" => st.object_fit = "fill".to_string(),
-        "background-image" => st.background_image = None,
+        "background-image" => {
+            st.background_image = None;
+            st.background_gradient = None;
+        }
         "background-position" => st.background_position = None,
         "background-size" => st.background_size = "auto".to_string(),
         "opacity" => st.opacity = 1.0,
+        "border-radius" | "-webkit-border-radius" => st.border_radius = [CornerRadius::Px(0.0); 4],
+        "overflow" | "overflow-x" | "overflow-y" => st.overflow_clip = false,
         _ => {}
     }
 }
@@ -1484,6 +1549,56 @@ pub fn parse_css_url(value: &str) -> Option<String> {
     } else {
         Some(raw.to_string())
     }
+}
+
+/// `overflow` 关键字归一:hidden/clip/scroll/auto 均裁剪,visible 不裁。
+fn parse_overflow(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "hidden" | "clip" | "scroll" | "auto" | "overlay"
+    )
+}
+
+/// `border-radius` 简写:1-4 值 + 可选 `/` 椭圆第二组(取水平组,垂直组忽略)。
+/// 值为长度(px 等)或百分比;按 CSS 简写轮转展开到四角 tl/tr/br/bl。
+fn parse_border_radius(value: &str, font_size: f64, ctx: &ValueCtx) -> [CornerRadius; 4] {
+    let horiz = value.split('/').next().unwrap_or(value);
+    let toks: Vec<&str> = horiz.split_whitespace().collect();
+    if toks.is_empty() {
+        return [CornerRadius::Px(0.0); 4];
+    }
+    let parse_one = |t: &str| -> CornerRadius {
+        let t = t.trim();
+        if let Some(pct) = t.strip_suffix('%') {
+            if let Ok(v) = pct.trim().parse::<f64>() {
+                return CornerRadius::Pct(v.clamp(0.0, 100.0));
+            }
+        }
+        parse_length(t, font_size, ctx)
+            .filter(|v| *v > 0.0)
+            .map(CornerRadius::Px)
+            .unwrap_or_default()
+    };
+    let [a, b, c, d] = match toks.len() {
+        1 => [toks[0], toks[0], toks[0], toks[0]],
+        2 => [toks[0], toks[1], toks[0], toks[1]],
+        3 => [toks[0], toks[1], toks[2], toks[1]],
+        _ => [toks[0], toks[1], toks[2], toks[3]],
+    };
+    [parse_one(a), parse_one(b), parse_one(c), parse_one(d)]
+}
+
+/// `background-image` 长写法里的首个渐变(多背景只取首层;非渐变返回 None)。
+///
+/// 注意不可按逗号切分再逐段解析——渐变函数参数自带逗号(`linear-gradient(
+/// to right, a, b)`),必须整值交给 `parse_gradient`(它做的是顶层括号感知
+/// 切分);多背景层(`url(..), linear-gradient(..)`)按首层规则直接放弃。
+fn parse_first_gradient(value: &str) -> Option<Arc<GradientSpec>> {
+    let t = value.trim();
+    if t.is_empty() || t.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    parse_gradient(t).map(Arc::new)
 }
 
 fn normalize_display(value: &str) -> String {

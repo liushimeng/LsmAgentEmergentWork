@@ -95,6 +95,11 @@ fn layout_abs(
     // 内容片段按最终宽度重排并平移注入。
     let mut frag = ctx.measure_content(node, content_w, style, depth);
     translate(&mut frag, bx + pad_l, by + pad_t);
+    // 阶段六:定位元素视觉发射(修复 absolute/fixed 边框/阴影/渐变缺口);
+    // 自身视觉先于子树标记,子树组效果回补。
+    let seq = ctx.next_seq();
+    let tag = document::tag_name(node);
+    ctx.emit_element(seq, style, &tag, bx, by, bw, bh);
     ctx.push_box(ElementBox {
         selector: Document::stable_selector(node),
         tag: document::tag_name(node),
@@ -106,5 +111,7 @@ fn layout_abs(
         visible: style_visible(style),
         z_index: style.pos.z_index,
     });
+    let mark = ctx.display_len();
     super::append(ctx, frag);
+    ctx.apply_group(mark, style, bx, by, bw, bh);
 }

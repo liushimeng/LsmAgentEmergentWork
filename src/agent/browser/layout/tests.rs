@@ -830,3 +830,139 @@ fn 定位父元素确定高时子代百分比高度可求解() {
     let mh = layout.rect_for("#mh").expect("mh 应有布局盒");
     assert!((mh.3 - 720.0).abs() < 2.0, "定位父下 100% 应为 720,实际 {}", mh.3);
 }
+
+// ===================== 阶段六:显示列表发射与组效果 =====================
+
+use super::super::render::display::DisplayKind;
+
+#[test]
+fn 显示列表_父背景先于子背景() {
+    // 父黑底 + 子白底:父的 Background 项 seq 必须小于子(排序后先画)。
+    let doc = Document::parse(
+        "<body><div style='background:#111111'><div style='background:#eeeeee'>x</div></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let bgs: Vec<_> = layout
+        .display
+        .iter()
+        .filter(|i| matches!(i.kind, DisplayKind::Background { .. }))
+        .collect();
+    assert!(bgs.len() >= 2, "父子各应有背景项");
+    // 排序稳定:先出现的是父(先序 seq 小)。深色项 w 更大(撑满父宽)。
+    assert!(
+        bgs[0].w >= bgs[1].w,
+        "父背景应先画且更宽:{} vs {}",
+        bgs[0].w,
+        bgs[1].w
+    );
+}
+
+#[test]
+fn 显示列表_组透明度回补子树() {
+    let doc = Document::parse(
+        "<body><div style='opacity:0.5'><div style='background:#000000'>x</div></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let child_bg = layout
+        .display
+        .iter()
+        .find(|i| matches!(i.kind, DisplayKind::Background { fill: super::super::render::display::BgFill::Solid(rgb) } if rgb == [0u8, 0, 0]))
+        .expect("子黑盒背景项");
+    assert!(
+        (child_bg.opacity - 0.5).abs() < 1e-9,
+        "子项应继承组透明度 0.5,实际 {}",
+        child_bg.opacity
+    );
+}
+
+#[test]
+fn 显示列表_溢出裁剪回补子树() {
+    let doc = Document::parse(
+        "<body><div style='width:60px;height:30px;overflow:hidden'><div style='width:100px;height:100px;background:#ff0000'></div></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let child_bg = layout
+        .display
+        .iter()
+        .find(|i| matches!(i.kind, DisplayKind::Background { fill: super::super::render::display::BgFill::Solid(rgb) } if rgb == [255u8, 0, 0]))
+        .expect("子红盒背景项");
+    let clip = child_bg.clip.expect("子项应带裁剪矩形");
+    assert!(
+        (clip.0 - 8.0).abs() < 1e-6 && (clip.2 - 60.0).abs() < 1e-6,
+        "裁剪矩形应为父 padding 盒 (8,8,60,30),实际 {clip:?}"
+    );
+}
+
+#[test]
+fn 显示列表_flex条目边框不再缺失() {
+    // 此前 flex 条目从不产出边框/阴影绘制指令(只有容器路径调用
+    // push_border_and_shadow);阶段六 emit_element 统一修复。
+    let doc = Document::parse(
+        "<body><div style='display:flex'><div style='width:50px;height:20px;border:2px solid #ff0000'>a</div></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    assert!(
+        layout
+            .display
+            .iter()
+            .any(|i| matches!(i.kind, DisplayKind::Border { .. })),
+        "flex 条目应有边框显示项"
+    );
+}
+
+#[test]
+fn 显示列表_绝对定位元素边框不再缺失() {
+    let doc = Document::parse(
+        "<body><div style='position:absolute;left:10px;top:10px;width:50px;height:20px;border:1px solid #00ff00'></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    assert!(
+        layout
+            .display
+            .iter()
+            .any(|i| matches!(i.kind, DisplayKind::Border { .. })),
+        "absolute 元素应有边框显示项"
+    );
+}
+
+#[test]
+fn 显示列表_渐变背景项发射() {
+    let doc = Document::parse(
+        "<body><div style='width:100px;height:40px;background:linear-gradient(to right, #ff0000, #0000ff)'></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    assert!(
+        layout
+            .display
+            .iter()
+            .any(|i| matches!(i.kind, DisplayKind::Background { fill: super::super::render::display::BgFill::Gradient(_) })),
+        "渐变应产出 Background-Gradient 显示项"
+    );
+}
+
+#[test]
+fn 显示列表_模糊阴影携带blur半径() {
+    let doc = Document::parse(
+        "<body><div style='width:100px;height:50px;box-shadow:2px 4px 12px #000000'></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let shadow = layout
+        .display
+        .iter()
+        .find(|i| matches!(i.kind, DisplayKind::Shadow { .. }))
+        .expect("应有阴影显示项");
+    match &shadow.kind {
+        DisplayKind::Shadow { blur, .. } => assert!(
+            (*blur - 12.0).abs() < 1e-9,
+            "blur 应为 12,实际 {blur}"
+        ),
+        _ => unreachable!(),
+    }
+}

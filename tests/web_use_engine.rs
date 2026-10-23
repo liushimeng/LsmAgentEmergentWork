@@ -117,6 +117,19 @@ fn route(path: &str, with_headers: bool) -> (&'static str, String, Vec<(String, 
                 .to_string(),
             vec![],
         )
+    } else if path == "/visual-page" {
+        // 阶段六富视觉页:渐变横幅 + 圆角卡片 + 模糊阴影 + 溢出裁剪。
+        (
+            "200 OK",
+            "<!doctype html><html><head><title>富视觉页</title></head><body style='margin:0'>\
+             <div id='banner' style='width:400px;height:60px;background:linear-gradient(to right, #ff0000, #0000ff)'></div>\
+             <div id='card' style='width:120px;height:80px;background:#000000;border-radius:20px;margin-top:20px;box-shadow:6px 6px 14px #333333'></div>\
+             <div id='clip' style='width:60px;height:30px;overflow:hidden;background:#ffffff;margin-top:20px'>\
+             <div style='width:120px;height:60px;background:#00ff00'></div></div>\
+             </body></html>"
+                .to_string(),
+            vec![],
+        )
     } else if path == "/js-inline" {
         (
             "200 OK",
@@ -1090,6 +1103,68 @@ async fn wait_js条件与网络静默() {
     )
     .await;
     assert_eq!(both["code"], 0, "组合条件应返回:{both}");
+
+    exec(&tool, json!({"action": "close", "page_id": page_id})).await;
+}
+
+#[tokio::test]
+async fn 富视觉页面_渐变圆角阴影与溢出裁剪截图() {
+    // 阶段六端到端:显示列表渲染管线(渐变/圆角/模糊阴影/overflow 裁剪)
+    // 在真实工具链路(open → 截图落盘)下的像素级验证。
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+
+    let open = exec(
+        &tool,
+        json!({"action": "open", "url": format!("{base}/visual-page"), "mode": "hidden", "reuse": false}),
+    )
+    .await;
+    assert_eq!(open["code"], 0, "{open}");
+    let page_id = open["data"]["page_id"].as_str().unwrap().to_string();
+
+    let dir = std::env::temp_dir().join(format!("lsm_visual_{}", std::process::id()));
+    let path = dir.join("visual.png");
+    let shot = exec(
+        &tool,
+        json!({"action": "control", "page_id": page_id, "control_action": "screenshot",
+                "params": {"save_path": path.to_string_lossy(), "full_page": true}}),
+    )
+    .await;
+    assert_eq!(shot["code"], 0, "{shot}");
+    let bytes = std::fs::read(&path).expect("截图文件应存在");
+    assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "截图应为 PNG");
+
+    let img = image::load_from_memory(&bytes).unwrap().to_rgba8();
+    let px = |x: u32, y: u32| *img.get_pixel(x, y);
+    // 渐变横幅(body 默认 8px 边距,banner (8,8)-(408,68)):
+    // 左端红、右端蓝、中点混合。
+    let left = px(12, 30);
+    assert!(left[0] > 200 && left[2] < 60, "横幅左端应红:{left:?}");
+    let right = px(403, 30);
+    assert!(right[2] > 200 && right[0] < 60, "横幅右端应蓝:{right:?}");
+    let mid = px(207, 30);
+    assert!(
+        (90..170).contains(&mid[0]) && (90..170).contains(&mid[2]),
+        "横幅中点应约紫:{mid:?}"
+    );
+    // 圆角卡片(y∈[88,168),x∈[8,128),r=20):角外白、中心黑。
+    let corner = px(12, 92);
+    assert!(corner[0] > 200, "卡片左上角外应白:{corner:?}");
+    let center = px(68, 128);
+    assert!(center[0] < 50, "卡片中心应黑:{center:?}");
+    // 溢出裁剪(y∈[188,218),x∈[8,68)):容器内绿、越界白。
+    let inside = px(30, 200);
+    assert!(inside[1] > 200 && inside[0] < 60, "裁剪容器内应绿:{inside:?}");
+    let beyond = px(100, 200);
+    assert!(beyond[0] > 200 && beyond[1] > 200, "水平越界应被裁白:{beyond:?}");
+    // 模糊阴影:卡片右缘外侧(卡片 x∈[8,128))应出现半透明灰(20..235)。
+    let shadow_px = px(135, 120);
+    assert!(
+        shadow_px[0] > 20 && shadow_px[0] < 235,
+        "模糊阴影区应半透明:{shadow_px:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 
     exec(&tool, json!({"action": "close", "page_id": page_id})).await;
 }

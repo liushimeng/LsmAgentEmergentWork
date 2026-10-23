@@ -133,6 +133,9 @@ pub(crate) fn layout_container(
     ctx.advance_y(style.padding_top);
     let inner_w = (bw - style.padding_left - style.padding_right).max(0.0);
     let content_x = bx + style.padding_left;
+    // 阶段六:容器先序 seq 与子树显示项标记(组效果回补区间)。
+    let seq = ctx.next_seq();
+    let dmark = ctx.display_len();
     // 背景盒先占位,高度最后回填。
     ctx.push_box(ElementBox {
         selector: Document::stable_selector(node),
@@ -151,9 +154,13 @@ pub(crate) fn layout_container(
     let box_h = (ctx.cursor_y() - start_y + content_h).max(1.0);
     ctx.set_box_height(box_idx, box_h);
     // 阶段三第三步:容器背景图。
-    if let Some(paint) = ctx.background_paint(style, bx, start_y, bw, box_h) {
-        ctx.push_paint(paint);
+    let bg_paint = ctx.background_paint(style, bx, start_y, bw, box_h);
+    if let Some(paint) = &bg_paint {
+        ctx.push_paint(paint.clone());
     }
+    // 阶段六:组效果回补 + 自身视觉发射(修复 flex 容器边框/阴影缺口)。
+    let tag = document::tag_name(node);
+    ctx.finish_container(seq, dmark, style, &tag, bx, start_y, bw, box_h, bg_paint);
     ctx.advance_y(content_h + style.padding_bottom + style.margin_bottom.max(2.0));
 }
 
@@ -660,28 +667,27 @@ fn emit_item(ctx: &mut LayoutCtx, item: &mut Item, x: f64, y: f64, row: bool, de
         return;
     }
     let cs = item.style.clone();
+    let iw = if row { item.final_main } else { item.final_cross };
+    let ih = if row { item.final_cross } else { item.final_main };
+    // 阶段六:条目视觉发射(修复 flex 条目边框/阴影/渐变缺口)。
+    let seq = ctx.next_seq();
     ctx.push_box(ElementBox {
         selector: item.selector.clone(),
         tag: item.tag.clone(),
         x,
         y,
-        w: if row { item.final_main } else { item.final_cross },
-        h: if row { item.final_cross } else { item.final_main },
+        w: iw,
+        h: ih,
         background: cs.background,
         visible: style_visible(&cs),
         z_index: cs.pos.z_index,
     });
+    ctx.emit_element(seq, &cs, &item.tag, x, y, iw, ih);
     // 阶段三第三步:图片条目按最终尺寸绘制(object-fit 决定填充方式)。
     if let Some(src) = item.image.clone().filter(|s| ctx.image_loaded(s)) {
-        let cw = (if row { item.final_main } else { item.final_cross }
-            - cs.padding_left
-            - cs.padding_right)
-            .max(0.0);
-        let ch = (if row { item.final_cross } else { item.final_main }
-            - cs.padding_top
-            - cs.padding_bottom)
-            .max(0.0);
-        ctx.push_paint(PaintBox {
+        let cw = (iw - cs.padding_left - cs.padding_right).max(0.0);
+        let ch = (ih - cs.padding_top - cs.padding_bottom).max(0.0);
+        let paint = PaintBox {
             src,
             x: x + cs.padding_left,
             y: y + cs.padding_top,
@@ -693,15 +699,20 @@ fn emit_item(ctx: &mut LayoutCtx, item: &mut Item, x: f64, y: f64, row: bool, de
             z_index: cs.pos.z_index,
             off_x: 0.0,
             off_y: 0.0,
-        });
+        };
+        ctx.emit_image(&paint, cs.opacity);
+        ctx.push_paint(paint);
         return;
     }
+    let mark = ctx.display_len();
     let mut frag = item.frag.take().unwrap_or_default();
     let (pb, _) = item.pads_main(row);
     let (cb, _) = item.pads_cross(row);
     let (dx, dy) = if row { (x + pb, y + cb) } else { (x + cb, y + pb) };
     translate(&mut frag, dx, dy);
     append(ctx, frag);
+    // 阶段六:条目子树组效果回补(opacity / overflow)。
+    ctx.apply_group(mark, &cs, x, y, iw, ih);
     let _ = depth;
 }
 
@@ -754,5 +765,6 @@ pub(crate) fn text_fragment(ctx: &mut LayoutCtx, text: &str, cs: &ComputedStyle,
         paints: Vec::new(),
         borders: Vec::new(),
         shadows: Vec::new(),
+        display: Vec::new(),
     }
 }

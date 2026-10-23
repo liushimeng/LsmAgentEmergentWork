@@ -17,6 +17,7 @@ use kuchikiki::NodeRef;
 
 use super::document::{self, Document};
 use super::images::ImageSizes;
+use super::render::display::{self, BgFill, DisplayItem, DisplayKind};
 use super::render::FontSet;
 use super::style::{BorderColor, ComputedStyle, MediaCtx, StyleEngine};
 use super::urlutil;
@@ -81,6 +82,9 @@ pub struct Layout {
     pub borders: Vec<BorderDraw>,
     /// 外阴影绘制指令(`box-shadow` 近似):绘制在元素背景之下。
     pub shadows: Vec<ShadowDraw>,
+    /// 绘制显示列表(阶段六):布局期 DFS 按真实绘制序发射,渲染层唯一消费源;
+    /// 为空时渲染层回退旧管线(平铺五表合成)。上五表继续服务几何寻址/inspect。
+    pub display: Vec<DisplayItem>,
     pub width: f64,
     pub height: f64,
 }
@@ -101,8 +105,8 @@ pub struct BorderDraw {
     pub z_index: i64,
 }
 
-/// 外阴影绘制指令。`blur` 不实现高斯模糊,渲染为偏移+扩散的实心矩形
-/// (现代页面卡片/输入框普遍以阴影描边,近似后视觉可辨)。
+/// 外阴影绘制指令。`blur` 自阶段六起真实生效(渲染层三趟盒式模糊近似高斯);
+/// blur=0 时退化为旧「偏移+扩散实心矩形」行为。
 #[derive(Debug, Clone)]
 pub struct ShadowDraw {
     /// 元素盒矩形(页坐标)。
@@ -112,6 +116,7 @@ pub struct ShadowDraw {
     pub h: f64,
     pub dx: f64,
     pub dy: f64,
+    pub blur: f64,
     pub spread: f64,
     pub color: ([u8; 3], u8),
     pub visible: bool,
@@ -205,6 +210,8 @@ pub fn compute_full(
         paints: Vec::new(),
         borders: Vec::new(),
         shadows: Vec::new(),
+        display: Vec::new(),
+        seq: 0,
         images,
         base_url: doc.base_url.clone(),
         y: 8.0,
@@ -249,12 +256,16 @@ pub fn compute_full(
     // 边框/阴影随盒序按 z-index 稳定排序,渲染层按序叠画。
     ctx.borders.sort_by_key(|b| b.z_index);
     ctx.shadows.sort_by_key(|s| s.z_index);
+    // 阶段六:显示列表终排(z 分层 → DFS 先序 → 同元素通道序)。
+    let mut display_items = std::mem::take(&mut ctx.display);
+    display::sort_items(&mut display_items);
     Layout {
         lines: ctx.lines,
         boxes: ctx.boxes,
         paints: ctx.paints,
         borders: ctx.borders,
         shadows: ctx.shadows,
+        display: display_items,
         width: ctx.width,
         height,
     }
@@ -269,6 +280,8 @@ pub(crate) struct Fragment {
     pub paints: Vec<PaintBox>,
     pub borders: Vec<BorderDraw>,
     pub shadows: Vec<ShadowDraw>,
+    /// 片段内发射的显示项(阶段六):随片段整体平移注入。
+    pub display: Vec<DisplayItem>,
 }
 
 /// 平移片段内全部几何。
@@ -293,6 +306,9 @@ pub(crate) fn translate(fragment: &mut Fragment, dx: f64, dy: f64) {
         s.x += dx;
         s.y += dy;
     }
+    for it in &mut fragment.display {
+        it.translate(dx, dy);
+    }
 }
 
 /// 片段注入全局结果。
@@ -302,6 +318,7 @@ pub(crate) fn append(ctx: &mut LayoutCtx, fragment: Fragment) {
     ctx.paints.extend(fragment.paints);
     ctx.borders.extend(fragment.borders);
     ctx.shadows.extend(fragment.shadows);
+    ctx.display.extend(fragment.display);
 }
 
 /// 解析四边边框颜色:currentColor 代入文字色。
@@ -351,6 +368,7 @@ pub(crate) fn push_border_and_shadow(
             h,
             dx: layer.dx,
             dy: layer.dy,
+            blur: layer.blur,
             spread: layer.spread,
             color: layer.color.unwrap_or((style.color, 255)),
             visible,
@@ -388,6 +406,10 @@ pub(crate) struct LayoutCtx<'a> {
     paints: Vec<PaintBox>,
     borders: Vec<BorderDraw>,
     shadows: Vec<ShadowDraw>,
+    /// 绘制显示列表(阶段六):DFS 发射,终排后进 `Layout::display`。
+    display: Vec<DisplayItem>,
+    /// DFS 先序序号(显示列表排序键之一)。
+    seq: u64,
     /// 图片固有尺寸索引(阶段三第三步)。
     images: &'a ImageSizes,
     /// 页面 URL(相对图片地址解析基准)。
@@ -396,6 +418,188 @@ pub(crate) struct LayoutCtx<'a> {
 }
 
 impl<'a> LayoutCtx<'a> {
+    /// 分配一个 DFS 先序序号(元素视觉发射 / 文本行 flush 各取各的)。
+    pub(crate) fn next_seq(&mut self) -> u64 {
+        self.seq += 1;
+        self.seq - 1
+    }
+
+    /// 显示列表当前长度(组效果回补区间起点)。
+    pub(crate) fn display_len(&self) -> usize {
+        self.display.len()
+    }
+
+    /// flex/grid 容器收尾(阶段六):组效果回补 → 自身视觉发射 → 背景图显示项。
+    /// 与块级路径的「回补先于自身发射」次序一致。
+    pub(crate) fn finish_container(
+        &mut self,
+        seq: u64,
+        mark: usize,
+        style: &ComputedStyle,
+        tag: &str,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        bg_paint: Option<PaintBox>,
+    ) {
+        self.apply_group(mark, style, x, y, w, h);
+        self.emit_element(seq, style, tag, x, y, w, h);
+        if let Some(p) = &bg_paint {
+            self.emit_image(p, style.opacity);
+        }
+    }
+
+    /// 元素视觉发射器(阶段六):按 shadow→背景(色/渐变)→边框→canvas 占位
+    /// 的同 seq 通道序发射自身绘制项。全部建盒点(块级/行内/替换元素/flex/
+    /// grid/absolute)统一走这里,修复后三类路径边框与阴影静默丢失的缺口。
+    /// 组效果(自身 opacity/overflow)不在此应用——由 `apply_group` 对子树回补。
+    pub(crate) fn emit_element(
+        &mut self,
+        seq: u64,
+        style: &ComputedStyle,
+        tag: &str,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+    ) {
+        let visible = style_visible(style);
+        if !visible {
+            return;
+        }
+        let base = |kind| DisplayItem {
+            kind,
+            x,
+            y,
+            w,
+            h,
+            radius: style.border_radius,
+            z: style.pos.z_index,
+            seq,
+            opacity: style.opacity,
+            clip: None,
+        };
+        for layer in &style.box_shadow {
+            self.display.push(base(DisplayKind::Shadow {
+                dx: layer.dx,
+                dy: layer.dy,
+                blur: layer.blur,
+                spread: layer.spread,
+                color: layer.color.unwrap_or((style.color, 255)),
+            }));
+        }
+        if let Some(bg) = style.background {
+            self.display.push(base(DisplayKind::Background {
+                fill: BgFill::Solid(bg),
+            }));
+        }
+        if let Some(g) = &style.background_gradient {
+            // 背景色在渐变之下(CSS 语义):同 seq 同 rank,发射序即绘制序。
+            self.display.push(base(DisplayKind::Background {
+                fill: BgFill::Gradient(g.clone()),
+            }));
+        }
+        if style
+            .border_widths
+            .iter()
+            .zip(style.border_drawn.iter())
+            .any(|(bw, d)| *bw > 0.0 && *d)
+        {
+            self.display.push(base(DisplayKind::Border {
+                widths: style.border_widths,
+                colors: resolved_border_colors(style),
+            }));
+        }
+        if tag.eq_ignore_ascii_case("canvas") && w >= 48.0 && h >= 28.0 {
+            self.display.push(base(DisplayKind::CanvasNote {
+                pale: style.background.is_none(),
+            }));
+        }
+    }
+
+    /// 图像显示项发射(与平铺 `PaintBox` 并行;`opacity` 为所属元素自身透明度)。
+    pub(crate) fn emit_image(&mut self, paint: &PaintBox, opacity: f64) {
+        if !paint.visible {
+            return;
+        }
+        let seq = self.next_seq();
+        self.display.push(DisplayItem {
+            kind: DisplayKind::Image {
+                src: paint.src.clone(),
+                fit: paint.fit.clone(),
+                off_x: paint.off_x,
+                off_y: paint.off_y,
+            },
+            x: paint.x,
+            y: paint.y,
+            w: paint.w,
+            h: paint.h,
+            radius: [super::style::CornerRadius::Px(0.0); 4],
+            z: paint.z_index,
+            seq,
+            opacity,
+            clip: None,
+        });
+    }
+
+    /// 文本行显示项发射(flush 时调用,seq 取当下 → 文本按 flush 时机
+    /// 与前后块级兄弟正确分层)。
+    pub(crate) fn emit_text(&mut self, line: &TextLine) {
+        if !line.visible {
+            return;
+        }
+        let seq = self.next_seq();
+        self.display.push(DisplayItem {
+            kind: DisplayKind::Text {
+                text: line.text.clone(),
+                size: line.size,
+                color: line.color,
+                bold: line.bold,
+            },
+            x: line.x,
+            y: line.y,
+            w: 0.0,
+            h: 0.0,
+            radius: [super::style::CornerRadius::Px(0.0); 4],
+            z: 0,
+            seq,
+            opacity: 1.0,
+            clip: None,
+        });
+    }
+
+    /// 组效果回补(阶段六):对子树显示项应用 `opacity < 1` 乘法与
+    /// `overflow:hidden` padding 盒裁剪。`mark` 须在子树发射前记录;
+    /// 自身视觉项在调用**之后**发射,天然免于自身裁剪/二次透明。
+    pub(crate) fn apply_group(
+        &mut self,
+        mark: usize,
+        style: &ComputedStyle,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+    ) {
+        if style.opacity < 1.0 {
+            let op = style.opacity;
+            for it in &mut self.display[mark..] {
+                it.multiply_opacity(op);
+            }
+        }
+        if style.overflow_clip {
+            let rect = (
+                x + style.padding_left,
+                y + style.padding_top,
+                (w - style.padding_left - style.padding_right).max(0.0),
+                (h - style.padding_top - style.padding_bottom).max(0.0),
+            );
+            for it in &mut self.display[mark..] {
+                it.intersect_clip(rect);
+            }
+        }
+    }
+
     /// 子元素计算样式(委托样式引擎)。
     pub(crate) fn style_for(&self, node: &NodeRef, parent: &ComputedStyle) -> ComputedStyle {
         self.engine.computed(node, parent)
@@ -588,6 +792,7 @@ impl<'a> LayoutCtx<'a> {
                 paints: Vec::new(),
                 borders: Vec::new(),
                 shadows: Vec::new(),
+                display: Vec::new(),
             };
         }
         let y0 = self.y;
@@ -596,6 +801,7 @@ impl<'a> LayoutCtx<'a> {
         let paints0 = self.paints.len();
         let borders0 = self.borders.len();
         let shadows0 = self.shadows.len();
+        let display0 = self.display.len();
         let base0 = self.text_base;
         self.y = 0.0;
         self.text_base = 0.0;
@@ -632,6 +838,7 @@ impl<'a> LayoutCtx<'a> {
         let paints = self.paints.split_off(paints0);
         let borders = self.borders.split_off(borders0);
         let shadows = self.shadows.split_off(shadows0);
+        let display_items = self.display.split_off(display0);
         self.y = y0;
         self.text_base = base0;
         Fragment {
@@ -641,6 +848,7 @@ impl<'a> LayoutCtx<'a> {
             paints,
             borders,
             shadows,
+            display: display_items,
         }
     }
 
@@ -707,6 +915,8 @@ impl<'a> LayoutCtx<'a> {
                 } else {
                     (0.0, 0.0)
                 };
+                // 阶段六:显示项发射(元素视觉 + 内容图)。
+                let seq = self.next_seq();
                 self.boxes.push(ElementBox {
                     selector,
                     tag: "img".to_string(),
@@ -718,8 +928,9 @@ impl<'a> LayoutCtx<'a> {
                     visible,
                     z_index: style.pos.z_index,
                 });
+                self.emit_element(seq, &style, "img", bx + dx, by + dy, iw, ih);
                 if let Some(src) = isrc.filter(|s| self.image_loaded(s)) {
-                    self.paints.push(PaintBox {
+                    let paint = PaintBox {
                         src,
                         x: bx + dx + style.padding_left,
                         y: by + dy + style.padding_top,
@@ -731,7 +942,9 @@ impl<'a> LayoutCtx<'a> {
                         z_index: style.pos.z_index,
                         off_x: 0.0,
                         off_y: 0.0,
-                    });
+                    };
+                    self.emit_image(&paint, style.opacity);
+                    self.paints.push(paint);
                 }
                 self.y = by + ih + style.margin_bottom.max(0.0);
                 continue;
@@ -742,6 +955,9 @@ impl<'a> LayoutCtx<'a> {
                 let mark_boxes = self.boxes.len();
                 let mark_borders = self.borders.len();
                 let mark_shadows = self.shadows.len();
+                // 阶段六:元素先序 seq 与子树显示项标记(组效果回补区间)。
+                let seq = self.next_seq();
+                let mark_display = self.display.len();
                 self.y += style.margin_top;
                 let bx = x + style.margin_left;
                 // 盒宽(border box,不含 margin):auto 时撑满父内容宽减 margin;
@@ -818,11 +1034,19 @@ impl<'a> LayoutCtx<'a> {
                     z_index: style.pos.z_index,
                 });
                 // 阶段三第三步:背景图(绘制在元素背景色之上、文字之下)。
-                if let Some(paint) = self.background_paint(&style, bx, start_y, bw, box_h) {
-                    self.push_paint(paint);
+                let bg_paint = self.background_paint(&style, bx, start_y, bw, box_h);
+                if let Some(paint) = &bg_paint {
+                    self.push_paint(paint.clone());
                 }
                 // 边框/外阴影绘制指令(不占几何;relative 偏移需同步平移)。
                 push_border_and_shadow(self, &style, bx, start_y, bw, box_h);
+                // 阶段六:子树组效果回补(先于自身视觉发射 → 自身不裁剪/不二次透明)。
+                self.apply_group(mark_display, &style, bx, start_y, bw, box_h);
+                let tag = document::tag_name(&child);
+                self.emit_element(seq, &style, &tag, bx, start_y, bw, box_h);
+                if let Some(paint) = &bg_paint {
+                    self.emit_image(paint, style.opacity);
+                }
                 // 阶段三:relative/sticky 整体偏移(不影响占位)。
                 if matches!(style.pos.position.as_str(), "relative" | "sticky") {
                     let dx = style.pos.left.unwrap_or(0.0) - style.pos.right.unwrap_or(0.0);
@@ -843,6 +1067,9 @@ impl<'a> LayoutCtx<'a> {
                         for s in &mut self.shadows[mark_shadows..] {
                             s.x += dx;
                             s.y += dy;
+                        }
+                        for it in &mut self.display[mark_display..] {
+                            it.translate(dx, dy);
                         }
                     }
                 }
@@ -911,11 +1138,15 @@ impl<'a> LayoutCtx<'a> {
         if self.inline_box_worthy(node, style) {
             let (w, h) = self.inline_box_size(node, style, avail_w);
             let (dx, dy) = relative_offset(style);
+            let bx = line_x + style.margin_left + style.padding_left + dx;
+            let by = self.y + dy;
+            // 阶段六:显示项发射(行内元素视觉,边框/阴影/背景/渐变全量)。
+            let seq = self.next_seq();
             self.boxes.push(ElementBox {
                 selector: Document::stable_selector(node),
                 tag: document::tag_name(node),
-                x: line_x + style.margin_left + style.padding_left + dx,
-                y: self.y + dy,
+                x: bx,
+                y: by,
                 w,
                 h,
                 background: style.background,
@@ -923,14 +1154,9 @@ impl<'a> LayoutCtx<'a> {
                 z_index: style.pos.z_index,
             });
             // 输入框/按钮等交互元素的边框与外阴影(绘制不占几何)。
-            push_border_and_shadow(
-                self,
-                style,
-                line_x + style.margin_left + style.padding_left + dx,
-                self.y + dy,
-                w,
-                h,
-            );
+            push_border_and_shadow(self, style, bx, by, w, h);
+            let tag = document::tag_name(node);
+            self.emit_element(seq, style, &tag, bx, by, w, h);
         }
         for child in node.children() {
             if let Some(text) = child.as_text() {
@@ -958,6 +1184,8 @@ impl<'a> LayoutCtx<'a> {
                 let ix = line_x + child_style.margin_left + child_style.padding_left;
                 let iy = self.y;
                 let visible = style_visible(&child_style);
+                // 阶段六:显示项发射(元素视觉 + 内容图)。
+                let seq = self.next_seq();
                 self.boxes.push(ElementBox {
                     selector: Document::stable_selector(&child),
                     tag: "img".to_string(),
@@ -969,8 +1197,9 @@ impl<'a> LayoutCtx<'a> {
                     visible,
                     z_index: child_style.pos.z_index,
                 });
+                self.emit_element(seq, &child_style, "img", ix, iy, iw, ih);
                 if let Some(src) = isrc.filter(|s| self.image_loaded(s)) {
-                    self.paints.push(PaintBox {
+                    let paint = PaintBox {
                         src,
                         x: ix,
                         y: iy,
@@ -982,7 +1211,9 @@ impl<'a> LayoutCtx<'a> {
                         z_index: child_style.pos.z_index,
                         off_x: 0.0,
                         off_y: 0.0,
-                    });
+                    };
+                    self.emit_image(&paint, child_style.opacity);
+                    self.paints.push(paint);
                 }
                 buf.reserve_height(ih);
                 continue;
@@ -1064,7 +1295,7 @@ impl<'a> LayoutCtx<'a> {
             "right" => (max_w - line_w).max(0.0),
             _ => 0.0,
         };
-        self.lines.push(TextLine {
+        let line = TextLine {
             text: content,
             x: x + offset,
             y: self.y,
@@ -1072,7 +1303,10 @@ impl<'a> LayoutCtx<'a> {
             color: run.color,
             bold: run.bold,
             visible: run.visible,
-        });
+        };
+        // 阶段六:文本显示项(flush 时取新 seq → 与前后块级兄弟正确分层)。
+        self.emit_text(&line);
+        self.lines.push(line);
         self.y += line_height;
     }
 }

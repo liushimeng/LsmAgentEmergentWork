@@ -4,6 +4,7 @@
 //! 布局、渲染、JS 快照与 inspect 共用同一份计算样式真源。
 //! 设计见 `docs/自定义浏览器和V8引擎/06-阶段二第二步CSS级联与外链样式加载设计.md`。
 
+pub mod gradient;
 pub mod selector;
 pub mod values;
 
@@ -14,9 +15,11 @@ use std::collections::BTreeMap;
 
 use kuchikiki::NodeRef;
 
+pub use gradient::{GradientKind, GradientSpec, GradientStop};
 pub use values::BorderColor;
 pub use values::BoxShadow;
 pub use values::ComputedStyle;
+pub use values::CornerRadius;
 pub use values::FlexWrap;
 pub use values::GridFlow;
 pub use values::GridLine;

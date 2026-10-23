@@ -108,6 +108,9 @@ pub(crate) fn layout_container(
     ctx.advance_y(style.padding_top);
     let inner_w = (bw - style.padding_left - style.padding_right).max(0.0);
     let content_x = bx + style.padding_left;
+    // 阶段六:容器先序 seq 与子树显示项标记(组效果回补区间)。
+    let seq = ctx.next_seq();
+    let dmark = ctx.display_len();
     // 背景盒先占位,高度最后回填。
     ctx.push_box(ElementBox {
         selector: Document::stable_selector(node),
@@ -125,9 +128,13 @@ pub(crate) fn layout_container(
     let box_h = (ctx.cursor_y() - start_y + content_h).max(1.0);
     ctx.set_box_height(box_idx, box_h);
     // 阶段三第三步:容器背景图。
-    if let Some(paint) = ctx.background_paint(style, bx, start_y, bw, box_h) {
-        ctx.push_paint(paint);
+    let bg_paint = ctx.background_paint(style, bx, start_y, bw, box_h);
+    if let Some(paint) = &bg_paint {
+        ctx.push_paint(paint.clone());
     }
+    // 阶段六:组效果回补 + 自身视觉发射(修复 grid 容器边框/阴影缺口)。
+    let tag = document::tag_name(node);
+    ctx.finish_container(seq, dmark, style, &tag, bx, start_y, bw, box_h, bg_paint);
     ctx.advance_y(content_h + style.padding_bottom + style.margin_bottom.max(2.0));
 }
 
@@ -819,6 +826,8 @@ fn emit_item(
         return;
     }
     let cs = item.style.clone();
+    // 阶段六:条目视觉发射(修复 grid 条目边框/阴影/渐变缺口)。
+    let seq = ctx.next_seq();
     ctx.push_box(ElementBox {
         selector: item.selector.clone(),
         tag: item.tag.clone(),
@@ -830,11 +839,12 @@ fn emit_item(
         visible: style_visible(&cs),
         z_index: cs.pos.z_index,
     });
+    ctx.emit_element(seq, &cs, &item.tag, x, y, used_w, used_h);
     // 阶段三第三步:图片条目按最终尺寸绘制(object-fit 决定填充方式)。
     if let Some(src) = item.image.clone().filter(|s| ctx.image_loaded(s)) {
         let cw = (used_w - pl - item.style.padding_right).max(0.0);
         let ch = (used_h - pt - pb).max(0.0);
-        ctx.push_paint(PaintBox {
+        let paint = PaintBox {
             src,
             x: x + pl,
             y: y + pt,
@@ -846,12 +856,17 @@ fn emit_item(
             z_index: cs.pos.z_index,
             off_x: 0.0,
             off_y: 0.0,
-        });
+        };
+        ctx.emit_image(&paint, cs.opacity);
+        ctx.push_paint(paint);
         return;
     }
+    let mark = ctx.display_len();
     let mut frag = item.frag.take().unwrap_or_default();
     translate(&mut frag, x + pl, y + pt);
     append(ctx, frag);
+    // 阶段六:条目子树组效果回补(opacity / overflow)。
+    ctx.apply_group(mark, &cs, x, y, used_w, used_h);
 }
 
 /// 条目对齐:`auto` 跟随容器 `*-items`(start/end 已在样式层归一)。

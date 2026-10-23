@@ -440,3 +440,65 @@ fn 属性名归一化_覆盖驼峰与自定义属性() {
     assert_eq!(norm("position"), "position");
     assert_eq!(norm("--MainColor"), "--maincolor", "自定义属性仅小写化");
 }
+
+// ===================== 阶段六:圆角 / 溢出 / 渐变样式解析 =====================
+
+use super::values::CornerRadius;
+
+fn inline_style(decl: &str) -> ComputedStyle {
+    let html = format!("<body><div style='{decl}'>x</div></body>");
+    let (doc, engine) = doc_engine(&html, 800.0);
+    style_of(&doc, &engine, "div")
+}
+
+#[test]
+fn 圆角简写_一至四值展开() {
+    let t = inline_style("border-radius:8px");
+    assert!(matches!(t.border_radius[0], CornerRadius::Px(v) if (v - 8.0).abs() < 1e-9));
+    assert_eq!(t.border_radius[1], t.border_radius[0]);
+    let t = inline_style("border-radius:8px 4px");
+    assert!(matches!(t.border_radius[0], CornerRadius::Px(v) if (v - 8.0).abs() < 1e-9));
+    assert!(matches!(t.border_radius[1], CornerRadius::Px(v) if (v - 4.0).abs() < 1e-9));
+    // 3 值:tl tr bl → br = tr。
+    let t = inline_style("border-radius:8px 4px 2px");
+    assert!(matches!(t.border_radius[2], CornerRadius::Px(v) if (v - 2.0).abs() < 1e-9));
+    assert!(matches!(t.border_radius[3], CornerRadius::Px(v) if (v - 4.0).abs() < 1e-9));
+}
+
+#[test]
+fn 圆角_百分比与椭圆斜杠() {
+    let t = inline_style("border-radius:50%");
+    assert!(matches!(t.border_radius[0], CornerRadius::Pct(v) if (v - 50.0).abs() < 1e-9));
+    // 椭圆简写取水平半径组。
+    let t = inline_style("border-radius:16px 8px / 4px 2px");
+    assert!(matches!(t.border_radius[0], CornerRadius::Px(v) if (v - 16.0).abs() < 1e-9));
+}
+
+#[test]
+fn 溢出关键字归一为裁剪开关() {
+    for kw in ["hidden", "clip", "scroll", "auto"] {
+        let t = inline_style(&format!("overflow:{kw}"));
+        assert!(t.overflow_clip, "{kw} 应裁剪");
+    }
+    let t = inline_style("overflow:visible");
+    assert!(!t.overflow_clip);
+    let t = inline_style("overflow-x:hidden");
+    assert!(t.overflow_clip, "单轴 hidden 也应裁剪");
+}
+
+#[test]
+fn 背景长写法渐变生效() {
+    let t = inline_style("background-image:linear-gradient(to right, #ff0000, #0000ff)");
+    assert!(t.background_gradient.is_some(), "渐变应入 background_gradient");
+    assert!(t.background_image.is_none(), "渐变不占用 url 字段");
+    let t = inline_style("background-image:none");
+    assert!(t.background_gradient.is_none());
+}
+
+#[test]
+fn 圆角与溢出计算值文本可见() {
+    let t = inline_style("border-radius:8px;overflow:hidden");
+    let m = t.to_map();
+    assert_eq!(m.get("border-radius").map(String::as_str), Some("8px 8px 8px 8px"));
+    assert_eq!(m.get("overflow").map(String::as_str), Some("hidden"));
+}
