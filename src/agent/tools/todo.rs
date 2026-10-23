@@ -4,7 +4,7 @@
 //!
 //! 设计:
 //! - 单工具多 action(`create` / `update` / `read` / `clear`),对齐
-//!   MCP_Window_Use / MCP_Web_Use 单工具多 action 风格
+//!   MCP_Window_Use / MCP_Web_LsmAgentBrowser_Use 单工具多 action 风格
 //! - 数据持久化放在 [`crate::agent::todo_state`] 的进程内 Mutex 中
 //! - 不变量:`in_progress` 状态项 ≤ 1;ID 单调递增;status/priority 兼容别名
 //! - 调用方:SubAgent-Work(`builtin_registry`)+ Main-Work(`main_work_registry`);

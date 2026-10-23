@@ -906,7 +906,7 @@ impl MultiAgentOrchestrator {
             Self::prompt_with_retry_hint(Self::original_user_prompt(session), retry_hint);
 
         // 2026-09-18 第 89 轮:simple 档统一 SubAgentRunner(原 WebUseRunner 已删除,
-        // 浏览器操控由 SubAgent-Work 的 MCP_Web_Use 工具承担;出口兜底与页面复用
+        // 浏览器操控由 SubAgent-Work 的 MCP_Web_LsmAgentBrowser_Use 工具承担;出口兜底与页面复用
         // 提示已在 SubAgentRunner 内实现)。
         let exec_role = AgentRole::SubAgent;
         let exec_label = "SubAgent";

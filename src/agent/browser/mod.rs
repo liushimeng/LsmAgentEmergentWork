@@ -1,7 +1,7 @@
 //! LsmAgentBrowser:进程内自研浏览器内核。
 //!
 //! 取代 Chrome + CDP:窗口/标签页、网络栈、DOM、布局、渲染、JS 执行全部在本进程。
-//! `MCP_Web_Use` 的对外契约由 `tools/mcp_web_use` 兼容层保持不变。
+//! `MCP_Web_LsmAgentBrowser_Use` 的对外契约由 `tools/mcp_web_lsm_browser_use` 兼容层保持不变。
 //!
 //! 设计见 `docs/自定义浏览器和V8引擎/`。
 
@@ -260,7 +260,7 @@ pub struct CloseOutcome {
     pub message: String,
 }
 
-/// 统一错误:`code` 与 `MCP_Web_Use` 信封错误码一致。
+/// 统一错误:`code` 与 `MCP_Web_LsmAgentBrowser_Use` 信封错误码一致。
 #[derive(Debug, Clone)]
 pub struct EngineError {
     pub code: i32,

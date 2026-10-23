@@ -2,7 +2,7 @@
 //!
 //! 基于步骤 / branches / 验收文本的关键词匹配备注与归一:第 89 轮(2026-09-18)
 //! Chromium-WebUse Agent 删除后,执行器统一为 SubAgent-Work(桌面窗口操控走
-//! MCP_Window_Use 工具,浏览器操控走 MCP_Web_Use 工具),本模块仅保留信号
+//! MCP_Window_Use 工具,浏览器操控走 MCP_Web_LsmAgentBrowser_Use 工具),本模块仅保留信号
 //! 探测用于「LLM 写了历史遗留 delegate 值时的归一纠正」。
 
 use super::*;
@@ -18,7 +18,7 @@ use super::*;
 // 控件树 / 视觉坐标双路线窗口操控;Bash 全量可用,osascript 等降级路径天然兼容)。
 //
 // 2026-09-18 第 89 轮:Chromium-WebUse Agent 删除。浏览器操控同样降级为
-// SubAgent-Work 的 MCP_Web_Use 工具,执行器唯一化 —— 推断结果只剩
+// SubAgent-Work 的 MCP_Web_LsmAgentBrowser_Use 工具,执行器唯一化 —— 推断结果只剩
 // Some(SubAgent)(信号命中,归一纠正)或 None(无信号,保持原值)。
 
 pub(super) const SUBAGENT_KEYWORDS: &[&str] = &[
@@ -104,7 +104,7 @@ pub(super) const WEB_DOM_GUI_KEYWORDS: &[&str] = &[
 /// 2026-09-16 第 61 轮:浏览器/网页操控关键词(原 Chromium-WebUse 信号)。
 /// ★ 第 82 轮:补充 AI 对话类网站强信号 + 中文提交按钮 selector 名。
 /// 第 89 轮:信号保留但仅用于「确认这是浏览器类流程 → 归一 SubAgent-Work
-/// (持 MCP_Web_Use 工具)」,不再路由到专项 Runner。
+/// (持 MCP_Web_LsmAgentBrowser_Use 工具)」,不再路由到专项 Runner。
 pub(super) const WEB_USE_KEYWORDS: &[&str] = &[
     "browsernew",
     "browsercontrol",
@@ -177,7 +177,7 @@ pub(super) fn gather_spec_text(spec: &WorkFlowSpec) -> String {
 /// 2026-09-18 第 89 轮(执行器唯一化后):
 ///   1. 桌面 GUI 强信号(微信/钉钉/飞书/MCP_Window_Use/UIA/控件树 等) → SubAgent
 ///      (SubAgent-Work 在 macOS / Windows 持 MCP_Window_Use 工具,Bash 全量可用)
-///   2. web 命中(含 URL)→ SubAgent(SubAgent-Work 持 MCP_Web_Use 工具,
+///   2. web 命中(含 URL)→ SubAgent(SubAgent-Work 持 MCP_Web_LsmAgentBrowser_Use 工具,
 ///      浏览器操控与 shell 辅助可同单元完成)
 ///   3. 仅 shell 词 → SubAgent
 ///   4. 都没命中 → None(保持 Main-Work 显式选择)
@@ -198,7 +198,7 @@ pub fn infer_delegate_to(spec: &WorkFlowSpec) -> Option<AgentRole> {
     if desktop_gui_hit {
         return Some(AgentRole::SubAgent);
     }
-    // 规则 2:web 命中(含 URL)→ SubAgent(MCP_Web_Use 承担浏览器操控,
+    // 规则 2:web 命中(含 URL)→ SubAgent(MCP_Web_LsmAgentBrowser_Use 承担浏览器操控,
     // LLM 若写了历史遗留 delegate 值在此归一)。
     if web_hit || url_hit {
         return Some(AgentRole::SubAgent);
@@ -403,7 +403,7 @@ mod infer_tests {
     fn wenxin_url_with_input_box_routes_to_webuse() {
         // 第 75 轮 P0 修复核心回归:用户真实失败任务。
         // steps 同时含 web 词(打开网址/wenxin.baidu.com)和 web DOM 词(输入框/按钮),
-        // 第 89 轮:浏览器类流程统一 SubAgent-Work(MCP_Web_Use 工具)。
+        // 第 89 轮:浏览器类流程统一 SubAgent-Work(MCP_Web_LsmAgentBrowser_Use 工具)。
         let spec = WorkFlowSpec {
             id: "wf-wenxin".into(),
             name: "文心一言对话".into(),
@@ -428,7 +428,7 @@ mod infer_tests {
 
     #[test]
     fn pure_browser_open_url_routes_to_webuse() {
-        // 通用 web 场景:无 strict GUI 词,只有 web 词 → SubAgent(MCP_Web_Use)
+        // 通用 web 场景:无 strict GUI 词,只有 web 词 → SubAgent(MCP_Web_LsmAgentBrowser_Use)
         let spec = WorkFlowSpec {
             id: "wf-browser-open".into(),
             name: "浏览器截图".into(),
@@ -475,7 +475,7 @@ mod infer_tests {
 
     #[test]
     fn web_with_shell_helper_still_routes_to_webuse() {
-        // web 任务主体 + shell 辅助(常见模式):不开 GUI strict → SubAgent(MCP_Web_Use + Bash 同单元可用)。
+        // web 任务主体 + shell 辅助(常见模式):不开 GUI strict → SubAgent(MCP_Web_LsmAgentBrowser_Use + Bash 同单元可用)。
         let spec = WorkFlowSpec {
             id: "wf-sh-web".into(),
             name: "网页辅助".into(),

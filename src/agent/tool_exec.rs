@@ -65,14 +65,16 @@ fn flush_batch(start: &mut Option<usize>, end: usize, out: &mut Vec<(usize, usiz
 /// 单条工具调用的总执行超时预算判定(2026-10-16,纯函数,可单测):
 /// - `Bash` → 无预算(Bash 自带进程级超时,默认 120s/上限 600s,外层再砍
 ///   会误伤合法长命令);
-/// - `MCP_Web_Use` 的 `request_human` → 无预算(HITL 人工等待合法长,
+/// - `MCP_Web_LsmAgentBrowser_Use` 的 `request_human` → 无预算(HITL 人工等待合法长,
 ///   hub 自带 30 分钟总上限 + 逐次 +2 分钟,与 sequence 步级豁免同语义);
 /// - env `LAEW_TOOL_TIMEOUT_SECS`(默认 300,`0` = 关闭,回退旧行为)。
 fn tool_exec_budget(name: &str, args: &serde_json::Value) -> Option<std::time::Duration> {
     if name == "Bash" {
         return None;
     }
-    if name == "MCP_Web_Use" && is_request_human_call(args) {
+    if (name == "MCP_Web_LsmAgentBrowser_Use" || name == "MCP_Web_Chrome_Use")
+        && is_request_human_call(args)
+    {
         return None;
     }
     let secs = std::env::var("LAEW_TOOL_TIMEOUT_SECS")
@@ -85,7 +87,7 @@ fn tool_exec_budget(name: &str, args: &serde_json::Value) -> Option<std::time::D
     Some(std::time::Duration::from_secs(secs))
 }
 
-/// `MCP_Web_Use` 调用是否为 `request_human`(扁平与 params 嵌套两种形态都认,
+/// `MCP_Web_LsmAgentBrowser_Use` 调用是否为 `request_human`(扁平与 params 嵌套两种形态都认,
 /// 与 `merge_open_params` 的宽松解析同风格)。
 fn is_request_human_call(args: &serde_json::Value) -> bool {
     let flat = args.get("control_action").and_then(serde_json::Value::as_str);
@@ -137,7 +139,7 @@ impl Agent {
     ) -> ToolExec {
         // ★ 计时起点必须在 tool.execute() 之前(第 82 轮 P0-1)。
         let tool_call_started = std::time::Instant::now();
-        // 第 131 轮网页取证纪律:Bash 不得顶替 MCP_Web_Use 去探/抓任务目标站点。
+        // 第 131 轮网页取证纪律:Bash 不得顶替 MCP_Web_LsmAgentBrowser_Use 去探/抓任务目标站点。
         // 放在 Schema 预校验之后、tool.execute() 之前(与 ToolNotFound 同层级的前置闸门)。
         if let Some(denial) = self.check_web_evidence(name, &args) {
             let elapsed_ms = tool_call_started.elapsed().as_millis() as u64;
@@ -188,7 +190,7 @@ impl Agent {
                                     tool: name.to_string(),
                                     reason: format!(
                                         "执行超时(>{}s),底层操作可能已挂死;\
-                                         若是浏览器操作,建议先 MCP_Web_Use close(page_id=\"all\") \
+                                         若是浏览器操作,建议先 MCP_Web_LsmAgentBrowser_Use close(page_id=\"all\") \
                                          回收浏览器后重试,或改用其它路径",
                                         budget.as_secs()
                                     ),
@@ -247,16 +249,21 @@ impl Agent {
 
     /// 网页取证纪律前置闸门(第 131 轮,纯判定 + 无 IO)。
     ///
-    /// 仅对 `Bash` 生效,且必须同时满足:开关未关 / 当前工具面含 `MCP_Web_Use`(有替代
+    /// 仅对 `Bash` 生效,且必须同时满足:开关未关 / 当前工具面含 `MCP_Web_LsmAgentBrowser_Use`(有替代
     /// 路径才拦)/ 命令命中网络取证模式 / 命令里的 host 落在任务锚点域内。命中返回拒绝
-    /// 文案(直接把模型推回 MCP_Web_Use),否则 `None` 放行。详见
+    /// 文案(直接把模型推回 MCP_Web_LsmAgentBrowser_Use),否则 `None` 放行。详见
     /// `src/agent/safety/web_evidence.rs`。
     fn check_web_evidence(&self, name: &str, args: &serde_json::Value) -> Option<String> {
         if name != "Bash" || !crate::agent::safety::web_evidence::web_evidence_enabled() {
             return None;
         }
         let cmd = args.get("command")?.as_str()?;
-        let has_web_use = self.profile.tools.names().iter().any(|n| *n == "MCP_Web_Use");
+        let has_web_use = self
+            .profile
+            .tools
+            .names()
+            .iter()
+            .any(|n| *n == "MCP_Web_LsmAgentBrowser_Use" || *n == "MCP_Web_Chrome_Use");
         let anchor = crate::agent::safety::target_anchor::current_target_anchor();
         let violation = crate::agent::safety::web_evidence::check_bash_against_web_evidence(
             cmd,
@@ -432,7 +439,7 @@ mod tests {
             crate::agent::tools::grep::GrepTool.parallel_safe(&arg),
             "Grep 应可并发"
         );
-        // 反例:Bash(子进程副作用)/ TodoWrite(共享状态)/ MCP_Web_Use(独占浏览器)
+        // 反例:Bash(子进程副作用)/ TodoWrite(共享状态)/ MCP_Web_LsmAgentBrowser_Use(独占浏览器)
         // Round 124:BashTool 加 BashMode 字段后需走实例方法,`::new()` 默认 ReadWrite。
         assert!(
             !crate::agent::tools::bash::BashTool::new().parallel_safe(&arg),
@@ -443,8 +450,8 @@ mod tests {
             "TodoWrite 不得并发"
         );
         assert!(
-            !crate::agent::tools::mcp_web_use::McpWebUseTool.parallel_safe(&arg),
-            "MCP_Web_Use 独占浏览器,不得并发"
+            !crate::agent::tools::mcp_web_lsm_browser_use::McpWebLsmBrowserUseTool.parallel_safe(&arg),
+            "MCP_Web_LsmAgentBrowser_Use 独占浏览器,不得并发"
         );
     }
 
@@ -608,14 +615,14 @@ mod tests {
         assert_eq!(tool_exec_budget("Bash", &json!({"command":"sleep 1"})), None);
         assert_eq!(
             tool_exec_budget(
-                "MCP_Web_Use",
+                "MCP_Web_LsmAgentBrowser_Use",
                 &json!({"action":"control","control_action":"request_human"})
             ),
             None
         );
         assert_eq!(
             tool_exec_budget(
-                "MCP_Web_Use",
+                "MCP_Web_LsmAgentBrowser_Use",
                 &json!({"action":"control","control_action":"click","selector":"#a"})
             ),
             tool_exec_budget("Read", &json!({"file_path":"x"}))

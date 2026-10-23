@@ -332,7 +332,7 @@ pub(super) struct WfUnitOk {
 /// 执行一个 WorkFlow 单元:SubAgent 执行 + Quality-Check(+ Debug 采集)。
 ///
 /// 第 89 轮(2026-09-18)起执行器统一为 SubAgentRunner(原 Chromium-WebUse 专项
-/// Runner 已删除,浏览器操控由 SubAgent-Work 的 MCP_Web_Use 工具承担;
+/// Runner 已删除,浏览器操控由 SubAgent-Work 的 MCP_Web_LsmAgentBrowser_Use 工具承担;
 /// 桌面窗口操控由 MCP_Window_Use 工具承担)。QC / Debug / 取消 / 进度通道全链路复用。
 ///
 /// 自由函数 + Arc 参数化,串行直通与 tokio::spawn 并行两种调用路径共用同一份逻辑;
@@ -432,7 +432,7 @@ pub(super) async fn run_wf_unit(
         let sub_started = std::time::Instant::now();
         // 第 146 轮:访问台账快照(本单元本 attempt 的导航足迹起点;
         // QC 用 footprint delta 做覆盖类期望的机械对账,零 LLM 成本)。
-        let nav_seq0 = crate::agent::tools::mcp_web_use::visit_ledger::seq();
+        let nav_seq0 = crate::agent::tools::mcp_web_lsm_browser_use::visit_ledger::seq();
         let outcome = sub_agent
             .run_unit_with_cancel(&input, &session_id, &cancel)
             .await
@@ -548,7 +548,7 @@ pub(super) async fn run_wf_unit(
         let actual_for_qc = format!(
             "{}\n\n【机械导航足迹(工具层统计,零幻觉)】{}",
             outcome.text,
-            crate::agent::tools::mcp_web_use::visit_ledger::footprint_since(nav_seq0),
+            crate::agent::tools::mcp_web_lsm_browser_use::visit_ledger::footprint_since(nav_seq0),
         );
         let (mut qc, qc_usage) = quality
             .check_subagent_with_source(
@@ -880,8 +880,8 @@ pub(super) fn apply_retry_hint_overlay(input: &mut SubFlowInput, local_hint: &st
     };
     // 第 107 轮:Window/Web 混用是桌面任务的高成本失败根因。QC 同时提到两个工具
     // 时,必须明确“桌面目标不降级为 Web”;纯 Web 任务不受该护栏影响。
-    let tool_route_guard = if local_hint.contains("MCP_Window_Use") && local_hint.contains("MCP_Web_Use") {
-        "\n🚫 桌面目标路由护栏:目标仍是独立桌面软件时,禁止把 MCP_Web_Use 作为完成证据;\
+    let tool_route_guard = if local_hint.contains("MCP_Window_Use") && local_hint.contains("MCP_Web_LsmAgentBrowser_Use") {
+        "\n🚫 桌面目标路由护栏:目标仍是独立桌面软件时,禁止把 MCP_Web_LsmAgentBrowser_Use 作为完成证据;\
          必须根据 MCP_Window_Use 的真实错误修正 app_name/bundle_id/query 后继续。"
     } else {
         ""
@@ -963,10 +963,10 @@ pub(super) fn build_subflow_input(
     if wf.pre_explore {
         description.push_str(
             "\n\n⚡ 批量优先(本单元硬约束,第 119 轮):\n\
-             ① 第一步用 MCP_Web_Use(action=explore, page_id=<页面 id>, queries=[\n\
+             ① 第一步用 MCP_Web_LsmAgentBrowser_Use(action=explore, page_id=<页面 id>, queries=[\n\
              {\"info\":\"elements\"}, {\"info\":\"dom\",\"params\":{\"selector\":\"form\"}}, {\"info\":\"screenshot\"}\n\
              ]) 一次收集页面状态;\n\
-             ② 结构清晰后用 MCP_Web_Use(action=batch, steps=[input_text × N → click → wait → inspect 验证])\n\
+             ② 结构清晰后用 MCP_Web_LsmAgentBrowser_Use(action=batch, steps=[input_text × N → click → wait → inspect 验证])\n\
              一次提交全部写操作 + 验证;\n\
              ❌ 禁止链式单步(inspect → click → inspect → screenshot → ...);\n\
              ✅ 单次任务的 LLM round-trip 应 ≤ 6 次。",
@@ -1035,7 +1035,7 @@ pub(super) fn build_completed_digest<'a>(
         return String::new();
     }
     // 末行附访问台账覆盖度口径(第 146 轮):重规划时页面级「去过哪」直接可对账。
-    let cov = crate::agent::tools::mcp_web_use::visit_ledger::coverage_payload();
+    let cov = crate::agent::tools::mcp_web_lsm_browser_use::visit_ledger::coverage_payload();
     let s = &cov["summary"];
     let _ = writeln!(
         out,

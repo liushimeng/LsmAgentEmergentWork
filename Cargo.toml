@@ -58,6 +58,10 @@ fontdue = "0.9"         # 字体度量与字形栅格化
 encoding_rs = "0.8"     # 响应字符集解码(GBK/Shift_JIS 等)
 futures = "0.3"
 
+# MCP_Web_Chrome_Use 底层驱动(双浏览器工具架构,Chrome/CDP 方案;
+# 选型沿用历史方案,见 docs/MCP_Web_Chrome_Use_CDP技术方案/)。
+chromiumoxide = "0.9"
+
 # 人工介入弹窗(第 137 轮):Windows 侧 PNG 解码重采样(macos 下另有 Vision OCR 用途);
 # 自 macos-only 依赖提升为全平台
 image = "0.25"

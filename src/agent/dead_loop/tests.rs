@@ -109,11 +109,11 @@ fn 正常轮询等待零误伤() {
     let mut g = DeadLoopGuard::with_settings(true, WIN);
     let mut ctx: Vec<ChatMessage> = vec![ChatMessage::user("等待页面加载")];
     let calls = vec![(
-        "MCP_Web_Use".to_string(),
+        "MCP_Web_LsmAgentBrowser_Use".to_string(),
         serde_json::json!({"action": "control", "params": {"control_action": "wait"}}),
     )];
     for i in 0..WIN {
-        g.begin_turn("Test", &ctx, None, &["MCP_Web_Use".into()]);
+        g.begin_turn("Test", &ctx, None, &["MCP_Web_LsmAgentBrowser_Use".into()]);
         ctx.push(ChatMessage::tool_result("t1", format!("等待 {i}0ms,剩余元素 {i}"), false));
         let verdict = g.end_turn(i, &format!("再看一眼页面 {i}"), "", &calls);
         assert!(matches!(verdict, DeadLoopVerdict::Progress), "第 {i} 轮: {verdict:?}");

@@ -6,7 +6,7 @@
 //! - `hard`(高等难度):需要书面方案,委派 Plan
 //!
 //! 2026-09-22 ReAct 改造:Yolo 持有**信息收集型工具面**(Read / Glob / Grep / Bash
-//! 只读侦察 / MCP_Web_Use 观察类 action + SubAgent 只读子 Agent),分类前按
+//! 只读侦察 / MCP_Web_LsmAgentBrowser_Use 观察类 action + SubAgent 只读子 Agent),分类前按
 //! Thought→Action→Observation 循环自主收集信息;结构化分类经
 //! `submit_task_classification` 提交,采用**延迟强制**(探索轮 auto、末轮强制
 //! 收口,见 `AgentProfile.defer_emit_force`)。
@@ -109,7 +109,7 @@ pub struct TaskClassification {
     /// 2026-09-18 第 84 轮:删除 "windowuse" 产出(WindowUse Agent 已删除,
     /// 桌面窗口操控由 SubAgent-Work 的 MCP_Window_Use 工具承担)。
     /// 2026-09-18 第 89 轮:删除 "webuse" 产出(Chromium-WebUse Agent 已删除,
-    /// 浏览器操控由 SubAgent-Work 的 MCP_Web_Use 工具承担)。
+    /// 浏览器操控由 SubAgent-Work 的 MCP_Web_LsmAgentBrowser_Use 工具承担)。
     #[serde(default)]
     pub suggested_delegate: Option<String>,
     /// 2026-09-19 Round 92: Debug Agent activation scope control.
@@ -215,7 +215,7 @@ impl YoloRunner {
     ///
     /// 2026-09-22 ReAct 改造:迭代预算 4 → 8(信息收集需要多轮 Thought→Action→Observation);
     /// 显式 `with_explore_budget(0)` 关闭第 118 轮的 explore 提示 —— 该提示文案面向
-    /// 浏览器/桌面操控(「禁止再开新 inspect / screenshot」),对 Yolo 的 MCP_Web_Use
+    /// 浏览器/桌面操控(「禁止再开新 inspect / screenshot」),对 Yolo 的 MCP_Web_LsmAgentBrowser_Use
     /// 信息收集语义是误导。Yolo 的收口节奏由 `AgentProfile.defer_emit_force`
     /// 与 `max_iterations` 协同保障(末轮强制 emit)。
     pub fn new(llm: Arc<dyn crate::llm::LlmClient>) -> Self {
@@ -478,7 +478,7 @@ fn extract_user_prompt(context: &[ChatMessage]) -> String {
 /// WindowUse Agent 已删除,桌面窗口操控任务走 medium 档由 Main-Work
 /// 关键词推断委派给 SubAgent-Work(MCP_Window_Use 工具)。
 /// 2026-09-18 第 89 轮:删除网页操控关键词表与 "webuse" 产出 ——
-/// Chromium-WebUse Agent 已删除,浏览器操控由 SubAgent-Work 的 MCP_Web_Use
+/// Chromium-WebUse Agent 已删除,浏览器操控由 SubAgent-Work 的 MCP_Web_LsmAgentBrowser_Use
 /// 工具承担(网页类任务仍按 Yolo 提示词最低判 medium,拆解后统一 SubAgent 执行)。
 ///
 /// 关键词表覆盖:
@@ -1002,7 +1002,7 @@ mod tests {
 
     #[test]
     fn infer_suggested_delegate_web_keywords_return_none() {
-        // 2026-09-18 第 89 轮:Chromium-WebUse Agent 已删除(降级为 MCP_Web_Use 工具),
+        // 2026-09-18 第 89 轮:Chromium-WebUse Agent 已删除(降级为 MCP_Web_LsmAgentBrowser_Use 工具),
         // 网页类关键词不再产出 "webuse";执行器统一 SubAgent,无需专项委派。
         let cases = [
             "帮我打开网页 https://example.com 并截图",

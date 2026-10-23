@@ -335,7 +335,7 @@ impl ExecutionTrace {
 
         // 5.5) 委派错配信号(2026-09-17 第 75 轮):Runner 实际角色 ≠ WorkFlow 期望角色。
         // 弱信号,不进入 `is_failed()`;第 89 轮起执行器统一为 SubAgent-Work
-        // (浏览器操控由 MCP_Web_Use 工具承担),该信号保留用于未来新增执行器时的
+        // (浏览器操控由 MCP_Web_LsmAgentBrowser_Use 工具承担),该信号保留用于未来新增执行器时的
         // 路由对账,TUI 据此打印 `[路由错配]` 诊断行(见 `src/tui/dispatch.rs`)。
         if let (Some(r), Some(i)) = (self.runner_role, self.intended_role) {
             if r != i && self.tool_calls == 0 {
@@ -442,9 +442,9 @@ impl ExecutionTrace {
             output_bytes,
             elapsed_ms,
             error_summary: error_truncated,
-            // 2026-09-19 第 91 轮 P0-5:per-tool 截断长度(MCP_Window_Use/MCP_Web_Use JSON 较大,提宽到 2048)
+            // 2026-09-19 第 91 轮 P0-5:per-tool 截断长度(MCP_Window_Use/MCP_Web_LsmAgentBrowser_Use JSON 较大,提宽到 2048)
             output_summary: output_summary.chars().take(match tool {
-                "MCP_Window_Use" | "MCP_Web_Use" => 2048,
+                "MCP_Window_Use" | "MCP_Web_LsmAgentBrowser_Use" | "MCP_Web_Chrome_Use" => 2048,
                 _ => 512,
             }).collect(),
         });
@@ -693,7 +693,7 @@ mod tests {
     fn web_trace_with_url(url: &str) -> ExecutionTrace {
         let mut t = ExecutionTrace::default();
         t.tool_call_log.push(ToolCallLogEntry {
-            tool: "MCP_Web_Use".to_string(),
+            tool: "MCP_Web_LsmAgentBrowser_Use".to_string(),
             args_json: format!(r#"{{"action":"open","url":"{url}"}}"#),
             ok: true,
             output_bytes: 200,

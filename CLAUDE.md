@@ -8,7 +8,8 @@
 
 由 LLM 驱动的 Rust Agent CLI（二进制名 **`laew`**）。支持 **Anthropic**（anthropic-messages）与
 **OpenAI**（openai-completions）双协议，**多 Agent 架构**（8 角色 + 三档难度），
-内置 Bash / Read / Write / Edit / Glob / Grep 六个核心工具 + MCP_Web_Use 浏览器操控（自研进程内内核 LsmAgentBrowser，无 Chrome/CDP）
+内置 Bash / Read / Write / Edit / Glob / Grep 六个核心工具 + MCP_Web_Chrome_Use 浏览器操控（Chrome/CDP，真 Chromium 渲染，支持人工交互，**默认优先**）
++ MCP_Web_LsmAgentBrowser_Use 浏览器操控（自研进程内内核 LsmAgentBrowser，无 Chrome/CDP，**反-反爬专用**，Chrome 被风控时切换；双工具架构见 `docs/双浏览器工具架构/`）
 + MCP_Window_Use 桌面窗口操控 + Use_MCP 通用 MCP 服务调用（真 MCP 协议客户端） + SubAgent 自感知动态委派
 + Skill 渐进式披露 + 决策审计 + 离线模式 + 上下文自动压缩 + 工作区感知。
 TUI 多轮对话 + `-p` 单轮模式 + `-f` 文件提示词模式 + `--debug`/`--info` 运行日志模式
@@ -78,7 +79,10 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 | `LAEW_SELF_SPAWN` | `off`/`0`/`false`/`no` | 关闭自感知动态子 Agent。见 `src/agent/self_awareness.rs` |
 | `LAEW_TARGET_ANCHOR` | `off`/`0`/`false`/`no` | 关闭任务锚点全部四层。详见「领域概念 · 任务锚点」 |
 | `LAEW_TARGET_ANCHOR_BLOCK` | `off`/`0`/`false`/`no` | 仅关闭 L3 工具级阻断，保留 L1/L2/L4（观察模式） |
-| `LAEW_BROWSER_MODE` | `headed`/`hidden`/`new_headless` | 浏览器模式。`headed` = 进程内无头内核 + 独立查看器子进程(`laew __browser-view`)原生窗口显示渲染帧,查看器不可用自动回退纯无头。**未设置时默认按交互性判定**:stdin/stdout 均为 TTY 默认 `headed`(终端用户可直接看到浏览器窗口),否则 `hidden`(管道/cargo test/CI 零影响)。见 `src/agent/browser/mod.rs`、`src/agent/browser/view/` |
+| `LAEW_BROWSER_MODE` | `headed`/`hidden`/`new_headless` | LsmAgentBrowser 内核模式。`headed` = 进程内无头内核 + 独立查看器子进程(`laew __browser-view`)原生窗口显示渲染帧,查看器不可用自动回退纯无头。**未设置时默认按交互性判定**:stdin/stdout 均为 TTY 默认 `headed`(终端用户可直接看到浏览器窗口),否则 `hidden`(管道/cargo test/CI 零影响)。见 `src/agent/browser/mod.rs`、`src/agent/browser/view/` |
+| `LAEW_CHROME_MODE` | `headed`/`hidden` | MCP_Web_Chrome_Use 的 Chrome 启动形态。`headed` = 有头窗口(人工可介入);未设置时同按交互性自动判定。见 `src/agent/chrome_browser/mod.rs` |
+| `LAEW_CHROME_USE` | `off`/`0`/`false`/`no` | 关闭 MCP_Web_Chrome_Use 工具(回退单内核行为)。见 `src/agent/tools/mcp_chrome_use/mod.rs` |
+| `LAEW_BROWSER_PATH` | Chrome/Edge 可执行文件路径 | MCP_Web_Chrome_Use 浏览器探测优先路径(缺省按平台默认安装位探测) |
 | `LAEW_WEB_SCRIPT` | `off`/`0`/`false`/`no` | 关闭页面脚本执行与 JS 线程(阶段二);`eval_js` 回退阶段一快照桥。见 `src/agent/browser/script/` |
 | `LAEW_WEB_SCRIPT_BUDGET_MS` | 正整数(默认 `10000`) | 单次页面脚本管线(导航/eval_js/事件分发)墙钟预算。见 `src/agent/browser/script/mod.rs::budget_ms` |
 | `LAEW_WEB_SCRIPT_PIPELINE_MS` | 正整数(默认 `40000`,下限 `2000`) | 整条脚本管线(多轮脚本取回执行)墙钟预算。见 `src/agent/browser/script/mod.rs::pipeline_budget_ms` |
@@ -120,21 +124,21 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 - **接入记录** = `protocol(anthropic|openai) + provider_name + model_name + end_point + api_key` 五元组 + `context_max_size`（默认 800K，`0` = 不限制），存 SQLite `providers` 表，可多条，`is_active` 唯一。
 - **运行日志文件**：`--debug`/`--info` 在工作目录生成 `llaew_YYYYMMDD_HHMMSS.log`（已 gitignore）。实现见 `src/logging.rs`。
 - **工具定义协议差异**：Anthropic 用 `tools[].{name,description,input_schema}`；OpenAI 用 `tools[].{type:"function",function:{name,description,parameters}}`。
-- **任务锚点（TargetAnchor，`safety/target_anchor.rs`）**：从用户原文机械抽取的目标硬约束（**不经 LLM**），全局单例。跨五层设防：L0 输入保真；L1 编排器澄清门；L2 Main-Work 提示词约束 + 澄清单元阻断；L3 `MCP_Web_Use` 显式 URL 越界返 `code=6001`；L4 QC 目标一致性硬门 + `target_drift` 强信号。开关 `LAEW_TARGET_ANCHOR=off` 全关；`LAEW_TARGET_ANCHOR_BLOCK=off` 仅关 L3 阻断。
-- **网页取证纪律**：网页任务的证据只能来自 `MCP_Web_Use`——不可达时**如实报告并停止**，禁止改用 `curl/ping/nc` 等 Bash 网络命令探测任务目标站点。三层设防：(1) 提示词约束；(2) 运行时硬闸门 `src/agent/safety/web_evidence.rs`；(3) `LAEW_WEB_EVIDENCE=off` 全关回退。
+- **任务锚点（TargetAnchor，`safety/target_anchor.rs`）**：从用户原文机械抽取的目标硬约束（**不经 LLM**），全局单例。跨五层设防：L0 输入保真；L1 编排器澄清门；L2 Main-Work 提示词约束 + 澄清单元阻断；L3 `MCP_Web_LsmAgentBrowser_Use` 显式 URL 越界返 `code=6001`；L4 QC 目标一致性硬门 + `target_drift` 强信号。开关 `LAEW_TARGET_ANCHOR=off` 全关；`LAEW_TARGET_ANCHOR_BLOCK=off` 仅关 L3 阻断。
+- **网页取证纪律**：网页任务的证据只能来自 `MCP_Web_LsmAgentBrowser_Use`——不可达时**如实报告并停止**，禁止改用 `curl/ping/nc` 等 Bash 网络命令探测任务目标站点。三层设防：(1) 提示词约束；(2) 运行时硬闸门 `src/agent/safety/web_evidence.rs`；(3) `LAEW_WEB_EVIDENCE=off` 全关回退。
 - **人工介入可见性**：`request_human` 的「该走人工」响应附 `next_action` + 完整 `human_assist` 载荷；输入硬闸 6002 与收尾探针首次命中则**直接自动弹出**（auto-HITL）。「取消任务」是真取消（返 `code=4002` 并置位进程级旗标 `human_cancel`）。`request_human` 不强制 `page_id`（无页可解锁时走任务级提问）。
 - **人工介入弹窗 = Rust 原生子进程（`human_ui/`）**：`laew __hitl-dialog <payload.json>` 隐藏子进程——macOS 走 AppKit FFI、Windows 走 Win32。铁律：布局是 Rust 纯函数单一真源，最大化/还原只用自身设定值重排、**永不回读窗口 frame**。支持选项多选、auto-HITL 自动弹出、焦点不抢夺、Windows macOS 风格主题。
 - **TUI 多行粘贴保真**：bracketed paste 整体接收，≥2 行粘贴一律转 marker 保真。Windows conhost / 部分 ConPTY 不支持 bracketed paste，通过三级粘贴判定（40ms 队列探测 → 击键节奏武装 → 正常提交）根治多行提示词被逐行拆成多次提交。实现见 `tui/paste.rs` + `tui/input/mod.rs`。
 - **死循环守卫(两级)**：`src/agent/loop_guard.rs` 是**工具级**守卫(判定键 = 相邻两轮的 工具+参数+结果,抓「同动作同结果」);`src/agent/dead_loop/` 是**LLM 交互级**守卫(判定键 = 「模型已见信息集合」指纹 + 输出全量指纹,跨轮次做尾部周期扫描 + 低新颖度检测),补齐前者的三条盲区:换序打转 `A→B→A→B`、换工具打转、上下文自锁。两级同轮命中时**工具级优先**(证据更硬、可逐项复算)。止损后的根因归类与换路径裁决由 Quality-Check Agent 承担(`quality/dead_loop.rs::check_dead_loop`)。设计见 `docs/LLM交互死循环指纹检测与质检裁决/01-设计与解决方案.md`。
 - **终端守卫**：`src/tui/term_guard.rs`。终端窗口关闭后 crossterm `event::read` 永久 hang，通过独立看门狗线程轮询 `POLLHUP` + 0 超时挂断探测根治。
-- **LsmAgentBrowser 内核**：`src/agent/browser/` 是进程内自研浏览器——窗口/标签页、HTTP(S) 网络栈、DOM、布局、软件渲染、JS 执行全部在本进程，**不存在外部浏览器进程、调试端口或 CDP 协议**。设计见 `docs/自定义浏览器和V8引擎/`。`mode=headed` 由独立查看器子进程 `laew __browser-view` 以原生窗口显示软件渲染帧(macOS AppKit/Windows Win32,stdin 长度前缀帧协议,查看器退出自动回退纯无头);引擎线程零 UI 依赖。
-- **有头浏览器窗口 = 真浏览器形态**：窗口含**工具栏(后退/前进/刷新/首页)+ 地址栏 + 页面画面**。宿主→查看器走帧协议(`'i'` 帧 / `'t'` 标题 / `'u'` 地址栏状态 / `'c'` 关闭)；查看器→宿主走 stdout 按行 JSON 命令(`navigate`/`back`/`forward`/`reload`/`home`)，引擎据此做真实导航与历史栈操作，地址栏内容按当前页 URL 同步。设计见 `docs/自定义浏览器和V8引擎/20-浏览器窗口交互化与地图页白屏根因.md`。
+- **LsmAgentBrowser 内核**：`src/agent/browser/` 是进程内自研浏览器——窗口/标签页、HTTP(S) 网络栈、DOM、布局、软件渲染、JS 执行全部在本进程，**不存在外部浏览器进程、调试端口或 CDP 协议**。设计见 `docs/MCP_Web_LsmAgentBrowser_Use/`。`mode=headed` 由独立查看器子进程 `laew __browser-view` 以原生窗口显示软件渲染帧(macOS AppKit/Windows Win32,stdin 长度前缀帧协议,查看器退出自动回退纯无头);引擎线程零 UI 依赖。
+- **有头浏览器窗口 = 真浏览器形态**：窗口含**工具栏(后退/前进/刷新/首页)+ 地址栏 + 页面画面**。宿主→查看器走帧协议(`'i'` 帧 / `'t'` 标题 / `'u'` 地址栏状态 / `'c'` 关闭)；查看器→宿主走 stdout 按行 JSON 命令(`navigate`/`back`/`forward`/`reload`/`home`)，引擎据此做真实导航与历史栈操作，地址栏内容按当前页 URL 同步。设计见 `docs/MCP_Web_LsmAgentBrowser_Use/20-浏览器窗口交互化与地图页白屏根因.md`。
 - **布局/渲染能力边界**：布局引擎支持百分比高度(视口→html→body 确定高传播,父高 auto 时按 CSS 语义退化);渲染器绘制背景/边框/外阴影(偏移实心矩形近似,blur 未实现)/图像/文字;表单控件有 UA 默认描边。canvas/WebGL 未实现(地图瓦片类页面主体不可渲染)。
-- **图片子资源（`browser/images.rs`）**：宿主预取 `<img src>` 与 CSS `url(...)` 背景图并解码为 RGBA8 **全内存**缓存（随标签页生命周期，进程退出即销毁）；布局层按固有尺寸排版替换元素（`<img>`），渲染层按 `object-fit` 贴图；开关/限额见 `LAEW_WEB_IMAGES` / `LAEW_WEB_MAX_IMAGES` / `LAEW_WEB_MAX_IMAGE_BYTES`。设计见 `docs/自定义浏览器和V8引擎/10-阶段三第三步图片渲染与替换元素设计.md`
+- **图片子资源（`browser/images.rs`）**：宿主预取 `<img src>` 与 CSS `url(...)` 背景图并解码为 RGBA8 **全内存**缓存（随标签页生命周期，进程退出即销毁）；布局层按固有尺寸排版替换元素（`<img>`），渲染层按 `object-fit` 贴图；开关/限额见 `LAEW_WEB_IMAGES` / `LAEW_WEB_MAX_IMAGES` / `LAEW_WEB_MAX_IMAGE_BYTES`。设计见 `docs/MCP_Web_LsmAgentBrowser_Use/10-阶段三第三步图片渲染与替换元素设计.md`
 - **样式引擎（`browser/style/`）**：CSS 解析/级联/继承/单位/媒体查询/自定义属性唯一真源；外链 `<link rel=stylesheet>` 由 `browser/resources.rs` 宿主预取并**原位内联**为 `<style data-lsm-href=...>`（保持级联顺序），布局、渲染、JS `getComputedStyle`、`inspect(stylesheets)` 共用同一份 `ComputedStyle`。
 - **页面模型**：`page_id` 格式 `p_` + 8 位十六进制；窗口/标签页、历史栈、Cookie Jar、localStorage/sessionStorage 全部内存驻留，`close(page_id="all")` 或进程退出即销毁。`open` 支持同 URL/同站复用，`new_tab`/`_blank` 返回 `spawned_page_id`。
 - **JS 引擎**：`JsRuntime` 抽象；阶段一默认 `boa_engine`（纯 Rust，离线可编译），DOM 通过快照桥暴露 `document/window/location/storage`；`rusty_v8` 作为可选目标后端（`v8-backend` 特性），上层接口不变。
-- **页面观察与就绪判定**：`MutationObserver`/`IntersectionObserver`/`ResizeObserver` 在 PRELUDE 层**真实派发**（记账点/选项过滤/子树/旧值/阈值）；宿主侧变更经快照 diff 合成 mutation 记录（Agent 侧动作对页面脚本可见）。`control(wait)` 是就绪判定原语：`selector`+`state`(visible/hidden/attached/detached)、`text`、`js`、`network_idle` 可组合取「与」，超时返 2002。设计见 `docs/自定义浏览器和V8引擎/17-阶段五第一步页面观察与就绪判定设计.md`。
+- **页面观察与就绪判定**：`MutationObserver`/`IntersectionObserver`/`ResizeObserver` 在 PRELUDE 层**真实派发**（记账点/选项过滤/子树/旧值/阈值）；宿主侧变更经快照 diff 合成 mutation 记录（Agent 侧动作对页面脚本可见）。`control(wait)` 是就绪判定原语：`selector`+`state`(visible/hidden/attached/detached)、`text`、`js`、`network_idle` 可组合取「与」，超时返 2002。设计见 `docs/MCP_Web_LsmAgentBrowser_Use/17-阶段五第一步页面观察与就绪判定设计.md`。
 - **页面能力与安全**：网络请求走本进程 `reqwest`（rustls），沿用 `LAEW_TLS_INSECURE` 与 SSRF 私网拦截；任务锚点 6001 继续在显式 URL 动作入口生效；页面脚本执行、原生窗口、资源加载器分别在阶段二/三/四补齐。
 - **人工介入**：`control(request_human)` 桥接 `human_assist`（桌面原生弹窗 / TUI），返回 0/4001/4002；取消任务同时置位进程级旗标。弹窗实现见 `src/agent/human_ui/`。
 
@@ -142,10 +146,10 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 
 | 角色 | 身份 | 职责 | 工具面 |
 |------|------|------|--------|
-| **Yolo Agent** | `LsmAgentEmergentWork-Yolo` | 入口层：每条输入做 目的→目标→意图 三步分析；任务**三档分类**（simple/medium/hard）；**目标可解析性判定**：填 `target_status`，目标不可解析时编排器直接回问用户（澄清门）不进 WorkFlow；**任务该不该接由模型自行判断**，编排器无任何政策性拒绝门 | `Read`/`Glob`/`Grep`/`Bash`（只读侦察）/ `MCP_Web_Use`（观察类）/ `SubAgent`（只读并行） |
+| **Yolo Agent** | `LsmAgentEmergentWork-Yolo` | 入口层：每条输入做 目的→目标→意图 三步分析；任务**三档分类**（simple/medium/hard）；**目标可解析性判定**：填 `target_status`，目标不可解析时编排器直接回问用户（澄清门）不进 WorkFlow；**任务该不该接由模型自行判断**，编排器无任何政策性拒绝门 | `Read`/`Glob`/`Grep`/`Bash`（只读侦察）/ `MCP_Web_LsmAgentBrowser_Use`（观察类）/ `SubAgent`（只读并行） |
 | **Plan Agent** | `LsmAgentEmergentWork-Plan` | 规划层：仅在 hard 任务时启用；输出 Markdown 方案到 `plans/{session_id}-{seq}.md` | `Read`/`Write` |
-| **Main-Work Agent** | `LsmAgentEmergentWork-Main-Work` | 流程层：接收 medium/hard 任务，拆 WorkFlow 列表（Kahn 分层 + 同层并行）；编排循环 ReAct 化；复用 LoopGuard 编排层原地打转同样止损 | `Bash`/`Read`/`Glob`/`Grep`/`MCP_Web_Use`（编排前探查）/ `TodoWrite`/`SubAgent` |
-| **SubAgent-Work Agent** | `LsmAgentEmergentWork-SubAgent-Work` | 执行层最小单元，每个流程处理单元委派一个 SubAgent；提示词 ReAct 化 + 工具连续工作模式 + 无进展止损 | `Bash`/`Read`/`Write`/`Edit`/`Glob`/`Grep` + `MCP_Window_Use`（仅 macOS/Windows）+ `MCP_Web_Use` + `Use_MCP` + `TodoWrite` |
+| **Main-Work Agent** | `LsmAgentEmergentWork-Main-Work` | 流程层：接收 medium/hard 任务，拆 WorkFlow 列表（Kahn 分层 + 同层并行）；编排循环 ReAct 化；复用 LoopGuard 编排层原地打转同样止损 | `Bash`/`Read`/`Glob`/`Grep`/`MCP_Web_LsmAgentBrowser_Use`（编排前探查）/ `TodoWrite`/`SubAgent` |
+| **SubAgent-Work Agent** | `LsmAgentEmergentWork-SubAgent-Work` | 执行层最小单元，每个流程处理单元委派一个 SubAgent；提示词 ReAct 化 + 工具连续工作模式 + 无进展止损 | `Bash`/`Read`/`Write`/`Edit`/`Glob`/`Grep` + `MCP_Window_Use`（仅 macOS/Windows）+ `MCP_Web_LsmAgentBrowser_Use` + `Use_MCP` + `TodoWrite` |
 | **Quality-Check Agent** | `LsmAgentEmergentWork-Quality-Check` | 质检层：每个执行单元完成后必经 QC；**目标一致性硬门**：用户指定 X、实际操作 Y 一律判 Fail + `retryable=false`；**死循环硬门 + 根因裁决通道**：轨迹带 `dead_loop` 诊断时 pass 一律被机械门拒收，并由 `check_dead_loop` 归类根因(`same_action`/`same_target`/`context_stuck`/`budget_starved`)+ 给出可执行换路径,注入单元局部重试 hint | 可选 `Read` |
 | **SessionContext Agent** | `LsmAgentEmergentWork-SessionContext` | 会话层：每个用户任务完成后汇总并写入 `session_memory` 表；Yolo 下次处理时自动注入最近 N 条历史摘要 | 无工具 |
 | **Debug Agent** | `LsmAgentEmergentWork-Debug` | 调试层：仅在 `-debug` 调试模式下启用；任务结束后对采集的 trace 做评估，产出四章节报告 | 无工具 |
@@ -171,7 +175,8 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 | 工具 | 能力 | 平台门控 | 设计文档 |
 |------|------|----------|----------|
 | **MCP_Window_Use** | 桌面窗口操控：`action` 枚举分发（`open`/`list`/`find`/`inspect`/`control`/`ocr`/`screenshot`）；双路线（Windows UIA Pattern 优先 + Win32 消息 + 物理鼠标键盘兜底；macOS AX 控件树 + 物理输入；Linux wmctrl/xdotool 物理层） | **仅 macOS/Windows** 运行时注册；Linux 走物理层兜底 | `docs/MCP_Window_Use/01-设计与解决方案.md` |
-| **MCP_Web_Use** | 浏览器操控（LsmAgentBrowser 进程内内核）：`action` 枚举分发（`open`/`list`/`close`/`control`/`inspect`/`sequence`/`batch`/`explore`）；`control_action` 48 个写操作；`inspect` 23 个观察维度；单步 + 连续（`sequence` ≤24 steps）；HTTP(S) + DOM + 布局 + 软件渲染 + Boa JS；全内存 Cookie/存储 | 跨 Windows/macOS/Linux；无外部浏览器进程 | `docs/自定义浏览器和V8引擎/03-MCP_Web_Use兼容层设计.md` |
+| **MCP_Web_Chrome_Use** | 浏览器操控（Chrome/CDP，chromiumoxide 0.9，真 Chromium 渲染，headed 窗口支持人工介入；**日常 80-90% 网页任务默认优先**）：`action` 枚举分发（`open`/`list`/`close`/`control`/`inspect` 基础集） | 跨 Windows/macOS/Linux；需本机装 Chrome/Edge/Chromium/Brave（`LAEW_BROWSER_PATH` 可指路径） | `docs/双浏览器工具架构/01-设计与解决方案.md`、`docs/MCP_Web_Chrome_Use/` |
+| **MCP_Web_LsmAgentBrowser_Use** | 浏览器操控（LsmAgentBrowser 进程内内核，**反-反爬专用**）：`action` 枚举分发（`open`/`list`/`close`/`control`/`inspect`/`sequence`/`batch`/`explore`）；`control_action` 48 个写操作；`inspect` 23 个观察维度；单步 + 连续（`sequence` ≤24 steps）；HTTP(S) + DOM + 布局 + 软件渲染 + Boa JS；全内存 Cookie/存储 | 跨 Windows/macOS/Linux；无外部浏览器进程 | `docs/MCP_Web_LsmAgentBrowser_Use/03-MCP_Web_LsmAgentBrowser_Use兼容层设计.md` |
 | **Use_MCP** | 通用 MCP（Model Context Protocol）服务调用统一入口：**真 MCP 协议客户端**（JSON-RPC 2.0），连接外部 MCP server（stdio 子进程 / Streamable HTTP）；单工具 `action` 枚举分发 | 跨平台（由外部 MCP server 决定能力） | `docs/Use_MCP/01-设计与解决方案.md` |
 
 ### 自感知动态子 Agent（Self-Awareness SubAgent）
@@ -311,7 +316,9 @@ agent/
     subagent.rs    SubAgentTool
     read_detect.rs ReadTool 二进制/编码自动探测
     mcp_window_use/  MCP_Window_Use 工具目录
-    mcp_web_use/     MCP_Web_Use 兼容层(mod/control/inspect/visit_ledger)
+    mcp_web_lsm_browser_use/     MCP_Web_LsmAgentBrowser_Use 兼容层(mod/control/inspect/visit_ledger)
+    mcp_chrome_use/      MCP_Web_Chrome_Use 工具(mod/tests,Chrome/CDP 基础框架)
+  chrome_browser/      Chrome/CDP 驱动(mod/page/tests:子进程拉起/回收、页面注册表、导航/eval/截图/点击/输入)
     use_mcp/         Use_MCP 工具目录
 
   window/          窗口操控平台驱动层
@@ -434,8 +441,11 @@ Markdown Prompt 模板，两级发现：**项目级** `{工作目录}/.laew/comm
 - `docs/其他Agent工具定义/`
 
 **三个 MCP 风格工具**（按工具）：
+- `docs/双浏览器工具架构/` — Chrome × LsmAgentBrowser 双浏览器工具总设计(命名映射/选用决策/分阶段路线图)
+- `docs/MCP_Web_Chrome_Use/` — Chrome/CDP 工具知识库(38 篇,含 HITL/反检测/站点治理系列) + `reference实现归档/`(历史实现 47 文件)
+- `docs/MCP_Web_Chrome_Use_CDP技术方案/` — Rust 操作 Chrome CDP 完整技术方案
 - `docs/MCP_Window_Use/` — 桌面窗口操控
-- `docs/自定义浏览器和V8引擎/` — LsmAgentBrowser 内核、兼容层与阶段路线图
+- `docs/MCP_Web_LsmAgentBrowser_Use/` — LsmAgentBrowser 内核、兼容层与阶段路线图
   - `08-阶段三布局引擎Flex与定位设计.md` — Flex + 定位体系(已完成)与 Phase 3 后续
   - `12-阶段四第二步缓存与安全接入主管线设计.md` — HttpCache/CSP/CORS 接入主管线 + clip 区域截图(已完成)
   - `13-JS运行时兼容性与页面诊断能力.md` — 选择器引擎/AMD 装载/动态脚本 load/`page_health` 诊断(已完成)
@@ -495,7 +505,7 @@ Markdown Prompt 模板，两级发现：**项目级** `{工作目录}/.laew/comm
 | `tests/agent_loop.rs` | Agent 主循环功能 |
 | `tests/cli_provider.rs` | 真实二进制 CLI：`provider` / `mcp` 增删列切 |
 | `tests/project_context.rs` | 项目说明文件五级发现链 + 注入幂等 |
-| `tests/web_use_engine.rs` | MCP_Web_Use × LsmAgentBrowser 端到端（mock HTTP,无外网/无浏览器） |
+| `tests/web_use_engine.rs` | MCP_Web_LsmAgentBrowser_Use × LsmAgentBrowser 端到端（mock HTTP,无外网/无浏览器） |
 | `tests/macos_ax_smoke.rs` | macOS Accessibility 冒烟（依赖宿主 TCC 授权） |
 
 ### 写集成测试的规矩

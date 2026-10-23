@@ -1,6 +1,6 @@
 //! Windows 弹窗后端:Rust 直调 Win32 API(第 137 轮原生重构)。
 //!
-//! 设计见 `docs/MCP_Web_Use/03-人工介入弹窗原生UI方案.md` §7。要点:
+//! 设计见 `docs/MCP_Web_LsmAgentBrowser_Use/03-人工介入弹窗原生UI方案.md` §7。要点:
 //! - 只在 `laew __hitl-dialog` 子进程内运行;窗口类 + 标准控件(BUTTON/EDIT/STATIC)
 //!   + `IsDialogMessageW` 消息循环(Tab 导航 / Enter=默认按钮 / Esc=取消);
 //! - **WM_SIZE 全量重排** —— 最大化/还原/拖拽缩放共享一条布局路径(坐标由纯函数
@@ -10,7 +10,7 @@
 //!   image crate 解码链整链删除,零外部进程路径保持);「⛶ 最大化」按钮同步移除
 //!   (系统标题栏保留 WS_MAXIMIZEBOX,WM_SIZE 全量重排天然覆盖);
 //! - 2026-10-14:**macOS 风格主题接入**(`windows_theme.rs` 唯一真源,设计见
-//!   `docs/MCP_Web_Use/27-Windows弹窗macOS风格界面美化.md`):窗口类背景/按钮
+//!   `docs/MCP_Web_LsmAgentBrowser_Use/27-Windows弹窗macOS风格界面美化.md`):窗口类背景/按钮
 //!   owner-draw/WM_CTLCOLOR*/DWM chrome/每秒进程窗口自遍历全部经主题模块;
 //!   多选项勾选态由 `WinState::opt_checked` 台账单一真源(不再依赖系统勾选态)。
 //!   杀开关 `LAEW_WIN_THEME=off` 回退系统原生观感;

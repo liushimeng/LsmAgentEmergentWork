@@ -1,4 +1,4 @@
-//! 自动化控制 API:`MCP_Web_Use(control, control_action=...)` 的内核实现。
+//! 自动化控制 API:`MCP_Web_LsmAgentBrowser_Use(control, control_action=...)` 的内核实现。
 //!
 //! 所有动作在进程内完成:DOM 查询、表单序列化、点击/输入语义、滚动、JS 执行。
 //! 需要网络的动作(链接跳转/表单提交)复用 [`super::LsmBrowserManager`] 的导航能力。

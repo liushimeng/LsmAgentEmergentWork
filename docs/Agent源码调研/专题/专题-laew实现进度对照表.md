@@ -601,7 +601,7 @@ git 状态 / 平台 / 日期,只能 `ls` 试探,常猜错构建命令(`npm test`
 - **兼容性降级**：网络不可达/渲染失败返回结构化信封；无外部浏览器依赖，CI 可直接跑。
 - **交互语义**：链接/按钮/表单提交、输入、下拉、按键、滚动、截图、下载均在进程内完成。
 - **事件台账**：每页记录网络请求与 JS console，供 `inspect(network/console)` 读取。
-- **路由**：`MCP_Web_Use` 工具面保持不变，由 SubAgent-Work 调用；编排/QC/SessionContext 链路不变。
+- **路由**：`MCP_Web_LsmAgentBrowser_Use` 工具面保持不变，由 SubAgent-Work 调用；编排/QC/SessionContext 链路不变。
 - **验证**：`cargo test --lib` + `tests/web_use_engine.rs`（mock HTTP，无外网/无浏览器）。
 
 ## 第 69 轮（2026-09-17）— 输出 log 文件功能与全链路日志埋点
@@ -984,7 +984,7 @@ Thought→Action→Observation 闭环在不同层的落地。
 | L82 DeepSeek `guard/repeat-tool-reminder`（P2） | 无重复工具软提醒 / 无 canonicalize | ✅ | 软提醒经 `runtime_hints` 注入 system 末尾（不污染上下文、不破坏 cache 前缀）；canonicalize 直接复用既有 `stable_json_string`（对象 key 递归排序 = DeepSeek `deep key-sort JSON` 等价实现），LLM 调换参数顺序不误判为新动作 | 同上 |
 | AtomCode `parallel_safe(args)` / Claude Code `partitionToolCalls`+`isConcurrencySafe`（P1） | 同一响应内多 tool_calls 全部串行 | ✅ | `tools/mod.rs::Tool::parallel_safe(args)`（默认 `false`，只读三件套 `Read`/`Glob`/`Grep` 覆写 `true`）+ `agent/tool_exec.rs`（新增）：连续 safe 段 ≥2 切批 → `join_all` + `Semaphore` 限流 → **按 call index 缓存结果**，主循环仍按原序后处理与回填 | 同上 |
 | AtomCode `ATOMCODE_MAX_PARALLEL_TOOLS=4` / Claude Code `…MAX_TOOL_USE_CONCURRENCY=10` | 并发上限不可配 | ✅ | `LAEW_MAX_PARALLEL_TOOLS`（默认 4，取 AtomCode 保守值：laew 单元预算小）；`LAEW_PARALLEL_TOOLS=off` 一键回退全串行 | 同上 |
-| 第 119 轮 §7 未来方向 ③「`build_runtime_hints` 角色化」 | explore_budget 耗尽文案写死浏览器语义，代码任务收到「去 click」的错误指令 | ✅ | `runtime_hints.rs::HintRole{Ui,Execute,Gather,Judge}` + `RuntimeHintCtx` + `build_runtime_hints_with`；角色由 `AgentProfile::hint_role(trace)` 派生 —— **关键**：`builtin_registry()` 无条件含 `MCP_Web_Use`，静态看工具面会把所有代码单元判成 UI 任务，故 Ui/Execute 分叉改由「本单元**实际调用过**什么工具」决定 | 同上 |
+| 第 119 轮 §7 未来方向 ③「`build_runtime_hints` 角色化」 | explore_budget 耗尽文案写死浏览器语义，代码任务收到「去 click」的错误指令 | ✅ | `runtime_hints.rs::HintRole{Ui,Execute,Gather,Judge}` + `RuntimeHintCtx` + `build_runtime_hints_with`；角色由 `AgentProfile::hint_role(trace)` 派生 —— **关键**：`builtin_registry()` 无条件含 `MCP_Web_LsmAgentBrowser_Use`，静态看工具面会把所有代码单元判成 UI 任务，故 Ui/Execute 分叉改由「本单元**实际调用过**什么工具」决定 | 同上 |
 | 第 119 轮 §3.3 收口预告（仅 Yolo defer 模式） | 执行层跑满预算前零预警，模型不知道预算快没了 | ✅ 通用化 | `agent_loop.rs::deadline_hint` 两分支：有 emit → 原 Yolo 文案（指名强制提交）；无 emit → 执行层文案（停止新动作 + 输出「实际产出与 expected_output 的对应关系」） | 同上 |
 | Thought 显式化无早期机制（`NO_TEXT_CONVERGE_THRESHOLD=8` 才第一次提醒） | 提醒来得太晚（预算 16~32 轮，第 8 轮才响） | ✅ | `runtime_hints.rs::THOUGHT_NUDGE_AT=2`：连续 2 轮「仅 tool_use 无文本」即提醒补写 Thought，**只提醒不终止**（终止仍由 8 轮阈值负责） | 同上 |
 | 执行层提示词零 ReAct 表述（对比 Yolo 有完整「信息收集(ReAct 模式)」节） | 多轮行为全靠模型自发 | ✅ | `system_prompt/mod.rs`：`SUB_AGENT_BASE_PROMPT` 新增「## 执行循环(ReAct 模式)」节（三段节奏 + 5 条硬性约束 + 明示无进展阈值）；`sub_agent_tools_hint()` 新增「## 连续工作模式」节（把既有复合工具 `sequence`/`input_batch`/`batch`/`workflow`/`explore`/`TodoWrite` 与 ReAct 循环绑定 + 单工具批次规则）；双协议 tail 改写 | 同上 |
@@ -997,7 +997,7 @@ Thought→Action→Observation 闭环在不同层的落地。
 - **Observation 进进展键是本轮最关键的设计决策**：外部三家（opencode / DeepSeek / AtomCode）
   都只用「工具 + 参数」判重复，于是「同一 inspect 等页面变化」「同一 curl 等服务起来」
   这类**正确的轮询**会被判死循环。laew 把结果摘要一起纳入，「同动作 + 同结果」才算无进展；
-- **等待类调用透明化**：`wait_like()` 识别 `MCP_Web_Use/MCP_Window_Use` 的 `wait`、
+- **等待类调用透明化**：`wait_like()` 识别 `MCP_Web_LsmAgentBrowser_Use/MCP_Window_Use` 的 `wait`、
   纯 `sleep N` 的 Bash、`SubAgent(action=result|history)` 轮询 —— 这类调用**既不计入也不打断**
   重复链，于是 `Read(x) → wait → Read(x) → wait → Read(x)` 仍正确判为 3 次无进展；
 - **宽限轮**：首次命中 `ABORT_AT` 不直接杀，先推 user 消息强提醒再给一轮机会 ——

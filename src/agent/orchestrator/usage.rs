@@ -11,7 +11,7 @@ use super::*;
 ///
 /// 2026-09-17 第 74 轮:差异化处理 MCP_* / Bash / Read / Write / Edit / Glob / Grep 工具,
 /// 在 tool 前缀独立标识, 减少 TUI 信息密度(用户主诉「输出太多看不清」):
-/// - MCP_Web_Use(第 89 轮单工具化):action=open url=X / control act=X sel=Y text=Z / inspect info=X
+/// - MCP_Web_LsmAgentBrowser_Use(第 89 轮单工具化):action=open url=X / control act=X sel=Y text=Z / inspect info=X
 /// - MCP_Window_Use:action=X query=Y / control act=X path=Y
 /// - Bash:command=X(截 40)
 /// - Read/Write/Edit:path=X(截 50)
@@ -26,7 +26,7 @@ pub(super) fn tool_args_digest(tool_name: &str, args_json: &str) -> String {
     };
     // 工具级差异化分支(2026-09-17 第 74 轮)
     match tool_name {
-        "MCP_Web_Use" => {
+        "MCP_Web_LsmAgentBrowser_Use" | "MCP_Web_Chrome_Use" => {
             // ★ 2026-09-18 第 89 轮:浏览器操控统一入口差异化摘要(原 Browser* 四分支合并)。
             // 每个 action 只显示排查必需的最小字段,值统一截 ≤30 字符:
             // - open:url=X mode=Y;list:(无参);close:page_id=X
@@ -397,21 +397,21 @@ mod tests {
     use super::*;
 
     // 2026-09-17 第 74 轮:tool_args_digest 差异化测试。
-    // 2026-09-18 第 89 轮:Browser* 四分支合并为 MCP_Web_Use 单工具摘要。
+    // 2026-09-18 第 89 轮:Browser* 四分支合并为 MCP_Web_LsmAgentBrowser_Use 单工具摘要。
 
     #[test]
-    fn tool_args_digest_mcp_web_use_open() {
+    fn tool_args_digest_mcp_web_lsm_browser_use_open() {
         let args = r#"{"action":"open","url":"https://wenxin.baidu.com/","mode":"hidden"}"#;
-        let s = tool_args_digest("MCP_Web_Use", args);
+        let s = tool_args_digest("MCP_Web_LsmAgentBrowser_Use", args);
         assert!(s.contains("action=open"), "实际: {s}");
         assert!(s.contains("mode=hidden"), "实际: {s}");
         assert!(s.contains("url=https://wenxin.baidu.com/"), "实际: {s}");
     }
 
     #[test]
-    fn tool_args_digest_mcp_web_use_control() {
+    fn tool_args_digest_mcp_web_lsm_browser_use_control() {
         let args = r#"{"action":"control","page_id":"p_abc","control_action":"input_text","params":{"selector":"textarea","text":"hello world"}}"#;
-        let s = tool_args_digest("MCP_Web_Use", args);
+        let s = tool_args_digest("MCP_Web_LsmAgentBrowser_Use", args);
         assert!(s.contains("act=input_text"), "实际: {s}");
         assert!(s.contains("sel=textarea"), "实际: {s}");
         assert!(s.contains("text=hello world"), "实际: {s}");
@@ -419,17 +419,17 @@ mod tests {
     }
 
     #[test]
-    fn tool_args_digest_mcp_web_use_inspect() {
+    fn tool_args_digest_mcp_web_lsm_browser_use_inspect() {
         let args = r#"{"action":"inspect","page_id":"p_abc","info":"elements","params":{"selector":".response"}}"#;
-        let s = tool_args_digest("MCP_Web_Use", args);
+        let s = tool_args_digest("MCP_Web_LsmAgentBrowser_Use", args);
         assert!(s.contains("info=elements"), "实际: {s}");
         assert!(s.contains("sel=.response"), "实际: {s}");
     }
 
     #[test]
-    fn tool_args_digest_mcp_web_use_close() {
+    fn tool_args_digest_mcp_web_lsm_browser_use_close() {
         let args = r#"{"action":"close","page_id":"p_ff00ee11"}"#;
-        let s = tool_args_digest("MCP_Web_Use", args);
+        let s = tool_args_digest("MCP_Web_LsmAgentBrowser_Use", args);
         assert!(s.contains("action=close"), "实际: {s}");
         assert!(s.contains("page=p_ff00ee11"), "实际: {s}");
     }
@@ -594,14 +594,14 @@ mod tests {
     #[test]
     fn tool_args_digest_web_eval_js_expression_head() {
         let args = r#"{"action":"control","page_id":"p_1","control_action":"eval_js","params":{"expression":"document.querySelector('.code img').src"}}"#;
-        let s = tool_args_digest("MCP_Web_Use", args);
+        let s = tool_args_digest("MCP_Web_LsmAgentBrowser_Use", args);
         assert!(s.contains("js=document.querySelector"), "应带表达式头: {s}");
     }
 
     #[test]
     fn tool_args_digest_web_ocr_marker_and_save_path() {
         let args = r#"{"action":"control","page_id":"p_1","control_action":"screenshot","params":{"save_path":"/tmp/laew/captcha.png","ocr":true}}"#;
-        let s = tool_args_digest("MCP_Web_Use", args);
+        let s = tool_args_digest("MCP_Web_LsmAgentBrowser_Use", args);
         assert!(s.contains("ocr"), "应带 ocr 标记: {s}");
         assert!(s.contains("out=captcha.png"), "应带落盘文件名: {s}");
         assert!(!s.contains("/tmp/laew"), "不应带完整路径: {s}");
@@ -614,7 +614,7 @@ mod tests {
             r#"{{"action":"control","page_id":"p_1","control_action":"download","params":{{"url":"data:image/png;base64,{}"}}}}"#,
             "iVBOR".repeat(200)
         );
-        let s = tool_args_digest("MCP_Web_Use", &args);
+        let s = tool_args_digest("MCP_Web_LsmAgentBrowser_Use", &args);
         assert!(s.contains("url=[data:"), "data: URL 应折叠: {s}");
         assert!(!s.contains("iVBOR"), "data 载荷不得出现: {s}");
     }

@@ -121,7 +121,7 @@ fn mentions_unbounded_iteration(text: &str) -> bool {
 ///
 /// 这类单元在 DAG 里**结构上不可能完成**:WorkFlow 单元运行在 Kahn 分层调度中,
 /// 没有暂停等待用户输入的语义;唯一能触达用户的 `HumanAssistHub` 只被
-/// `MCP_Web_Use control_action=request_human` 使用,reason 枚举是验证码/短信/扫码一类
+/// `MCP_Web_LsmAgentBrowser_Use control_action=request_human` 使用,reason 枚举是验证码/短信/扫码一类
 /// **页面阻断**,不含「目标不明确」。
 ///
 /// 于是执行层只能用 `Bash echo "澄清问询已发出"` + `Write` 落盘假装提问,QC 按
@@ -289,7 +289,7 @@ mod tests {
         let plan = plan_of(vec![wf_named(
             "wf-2",
             "打开网站",
-            vec!["MCP_Web_Use(action=open)"],
+            vec!["MCP_Web_LsmAgentBrowser_Use(action=open)"],
             vec!["需用户确认站点后才算完成"],
         )]);
         assert!(validate_plan_blocking(&plan).iter().any(|i| i.contains("伪单元")));
@@ -319,13 +319,13 @@ mod tests {
             wf_named(
                 "wf-2",
                 "打开目标网站 + explore 批量观察首页结构",
-                vec!["MCP_Web_Use(action=open, url=https://www.anthropic.com/)"],
+                vec!["MCP_Web_LsmAgentBrowser_Use(action=open, url=https://www.anthropic.com/)"],
                 vec!["final_url 主域 = anthropic.com"],
             ),
             wf_named(
                 "wf-3",
                 "提取按时间排序的最新 3 篇文章",
-                vec!["MCP_Web_Use(action=control, control_action=eval_js)"],
+                vec!["MCP_Web_LsmAgentBrowser_Use(action=control, control_action=eval_js)"],
                 vec!["返回数组 length >= 3"],
             ),
             wf_named(

@@ -2,7 +2,7 @@
 //!
 //! 第 100/118/119 轮 TUI 渲染自 `dispatch.rs` 机械拆出(2026-10-08 第 130 轮,
 //! dispatch.rs 逼近 1700 行临界);第 130 轮新增弹窗前端的通知行与事件打印,
-//! 详案见 `docs/MCP_Web_Use/03-人工介入弹窗UI动态加载方案.md` §7。
+//! 详案见 `docs/MCP_Web_LsmAgentBrowser_Use/03-人工介入弹窗UI动态加载方案.md` §7。
 //!
 //! 呈现端双通道:macOS/Windows 弹窗接管时(**via=gui**)TUI 只打通知行 + 结果事件,
 //! **不读 stdin**(根治阻塞读残留);弹窗失败(`GuiFailed`)无缝降级回本文件的

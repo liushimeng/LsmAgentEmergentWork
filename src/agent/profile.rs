@@ -92,7 +92,7 @@ impl AgentProfile {
     ///
     /// 结构化输出通道:分类结果必须经 `submit_task_classification` 工具提交。
     /// 2026-09-22 ReAct 改造:开启 `defer_emit_force`,允许 Yolo 在分类前按
-    /// Thought→Action→Observation 循环自主调用 Read/Glob/Grep/Bash/MCP_Web_Use
+    /// Thought→Action→Observation 循环自主调用 Read/Glob/Grep/Bash/MCP_Web_LsmAgentBrowser_Use
     /// 收集信息;仅迭代预算最后一轮强制 emit 收口。
     pub fn yolo_profile() -> Self {
         let mut p = Self::with_self_awareness(
@@ -119,7 +119,7 @@ impl AgentProfile {
 
     /// Main-Work Agent profile(流程层,WorkFlow 编排)。
     ///
-    /// 2026-09-23 第 122 轮:工具面新增 MCP_Web_Use(编排层信息收集) + 编排提示词
+    /// 2026-09-23 第 122 轮:工具面新增 MCP_Web_LsmAgentBrowser_Use(编排层信息收集) + 编排提示词
     /// ReAct 化 + 启用 LoopGuard(第 120 轮基础设施)。详见
     /// `docs/Main-Work工具扩展与ReAct改造/01-设计与解决方案.md`。
     pub fn main_work_profile() -> Self {
@@ -381,7 +381,7 @@ impl AgentProfile {
 
     /// runtime hint 的角色分叉(第 120 轮:根治「代码任务被提示去 click」)。
     ///
-    /// **为什么不能只看工具面**:`builtin_registry()` 无条件注册 `MCP_Web_Use`
+    /// **为什么不能只看工具面**:`builtin_registry()` 无条件注册 `MCP_Web_LsmAgentBrowser_Use`
     /// (第 89 轮,内核三平台一致无需平台门控),所以 SubAgent-Work 的工具面**永远**
     /// 含浏览器工具 —— 按 profile 静态派生会让所有代码/文件类单元都收到浏览器文案。
     /// 因此 `Ui` / `Execute` 的分叉改由**本单元实际调用过什么工具**决定(`trace`):
@@ -391,7 +391,7 @@ impl AgentProfile {
     /// 1. 有 `emit_tool` → 结构化结论出口角色:`defer_emit_force` 开 = [`HintRole::Gather`]
     ///    (Yolo 信息收集),否则 = [`HintRole::Judge`](Quality-Check 判定)
     /// 2. 工具面为空 → [`HintRole::Judge`](SessionContext / Debug / Compact,纯文本生成)
-    /// 3. `trace.tool_call_log` 出现过 `MCP_Web_Use` / `MCP_Window_Use` → [`HintRole::Ui`]
+    /// 3. `trace.tool_call_log` 出现过 `MCP_Web_LsmAgentBrowser_Use` / `MCP_Window_Use` → [`HintRole::Ui`]
     /// 4. 其余 → [`HintRole::Execute`](Plan / Main-Work / SubAgent-Work / WorkFlow /
     ///    动态子 Agent 的纯代码文件类单元)
     ///
@@ -405,7 +405,9 @@ impl AgentProfile {
     ) -> crate::agent::runtime_hints::HintRole {
         use crate::agent::runtime_hints::HintRole;
         use crate::agent::tools::{
-            mcp_web_use::MCP_WEB_USE_TOOL_NAME, mcp_window_use::MCP_WINDOW_USE_TOOL_NAME,
+            mcp_chrome_use::MCP_WEB_CHROME_USE_TOOL_NAME,
+            mcp_web_lsm_browser_use::MCP_WEB_LSM_BROWSER_USE_TOOL_NAME,
+            mcp_window_use::MCP_WINDOW_USE_TOOL_NAME,
         };
         if self.emit_tool.is_some() {
             return if self.defer_emit_force {
@@ -418,7 +420,9 @@ impl AgentProfile {
             return HintRole::Judge;
         }
         let used_ui = trace.tool_call_log.iter().any(|e| {
-            e.tool == MCP_WEB_USE_TOOL_NAME || e.tool == MCP_WINDOW_USE_TOOL_NAME
+            e.tool == MCP_WEB_LSM_BROWSER_USE_TOOL_NAME
+                || e.tool == MCP_WEB_CHROME_USE_TOOL_NAME
+                || e.tool == MCP_WINDOW_USE_TOOL_NAME
         });
         if used_ui {
             HintRole::Ui
@@ -497,7 +501,8 @@ mod tests {
             "Glob",
             "Grep",
             "Bash",
-            "MCP_Web_Use",
+            "MCP_Web_LsmAgentBrowser_Use",
+            "MCP_Web_Chrome_Use",
             "submit_task_classification",
         ] {
             assert!(names.contains(&t.to_string()), "Yolo 工具面应含 {t}: {names:?}");
@@ -566,7 +571,7 @@ mod tests {
     }
 
     /// Plan 工具面:Read/Write(方案落盘)+ Glob/Grep + Bash(只读侦察)
-    /// + MCP_Web_Use/MCP_Window_Use(规划前观察页面/窗口结构);不持 Edit。
+    /// + MCP_Web_LsmAgentBrowser_Use/MCP_Window_Use(规划前观察页面/窗口结构);不持 Edit。
     #[test]
     fn plan_profile_has_read_and_write() {
         let p = AgentProfile::plan_profile();
@@ -586,7 +591,7 @@ mod tests {
         assert!(!names.iter().any(|n| n == "Write"));
     }
 
-    /// 2026-09-23 第 122 轮:Main-Work 编排层信息收集型工具面 5 件 + MCP_Web_Use +
+    /// 2026-09-23 第 122 轮:Main-Work 编排层信息收集型工具面 5 件 + MCP_Web_LsmAgentBrowser_Use +
     /// SubAgent;仍不持 Write / Edit;`defer_emit_force=false`(对齐 SubAgent-Work)。
     #[test]
     fn main_work_profile_includes_react_tool_surface() {
@@ -598,7 +603,8 @@ mod tests {
             "Glob",
             "Grep",
             "TodoWrite",
-            "MCP_Web_Use",
+            "MCP_Web_LsmAgentBrowser_Use",
+            "MCP_Web_Chrome_Use",
             "SubAgent",
         ] {
             assert!(
@@ -627,20 +633,20 @@ mod tests {
         assert!(names.contains(&"Write".to_string()));
     }
 
-    /// 2026-09-18 第 89 轮:SubAgent-Work 持 MCP_Web_Use(浏览器操控统一入口,
+    /// 2026-09-18 第 89 轮:SubAgent-Work 持 MCP_Web_LsmAgentBrowser_Use(浏览器操控统一入口,
     /// 全平台),系统提示词同步注入使用说明(与工具注册一致)。
     #[test]
-    fn sub_agent_has_mcp_web_use_tool_and_prompt() {
+    fn sub_agent_has_mcp_web_lsm_browser_use_tool_and_prompt() {
         let p = AgentProfile::sub_agent_work_profile();
         let names = tool_names(&p);
         assert!(
-            names.contains(&"MCP_Web_Use".to_string()),
-            "SubAgent-Work 工具面应含 MCP_Web_Use: {names:?}"
+            names.contains(&"MCP_Web_LsmAgentBrowser_Use".to_string()),
+            "SubAgent-Work 工具面应含 MCP_Web_LsmAgentBrowser_Use: {names:?}"
         );
         let rendered = p.system_prompt.render(crate::config::Protocol::Anthropic);
         assert!(
-            rendered.contains("MCP_Web_Use 工具使用说明"),
-            "SubAgent-Work 系统提示词应含 MCP_Web_Use 使用说明"
+            rendered.contains("MCP_Web_LsmAgentBrowser_Use 工具使用说明"),
+            "SubAgent-Work 系统提示词应含 MCP_Web_LsmAgentBrowser_Use 使用说明"
         );
         for action in ["open", "control", "inspect"] {
             assert!(

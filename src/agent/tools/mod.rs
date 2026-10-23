@@ -20,7 +20,8 @@ pub mod edit;
 pub mod emit;
 pub mod glob;
 pub mod grep;
-pub mod mcp_web_use;
+pub mod mcp_chrome_use;
+pub mod mcp_web_lsm_browser_use;
 pub mod mcp_window_use;
 pub mod read;
 pub mod read_detect;
@@ -56,7 +57,7 @@ pub trait Tool: Send + Sync {
     /// `isConcurrencySafe`):同一工具可按 `args` 决定能否并发。本轮所有
     /// 有副作用或独占物理资源的工具一律 `false` —— Bash(子进程副作用 +
     /// 命令间可能有隐式顺序)、Write/Edit(落盘)、TodoWrite(共享 Mutex 状态)、
-    /// SubAgent(内部已自带 `buffer_unordered` 并发)、MCP_Web_Use /
+    /// SubAgent(内部已自带 `buffer_unordered` 并发)、MCP_Web_LsmAgentBrowser_Use /
     /// MCP_Window_Use(浏览器单实例 / 桌面单前台焦点,物理上不可并发)。
     ///
     /// 编排侧见 `agent_loop.rs` 的分批并发执行:只有**连续的** `true` 段且
@@ -295,7 +296,8 @@ pub fn main_work_registry_inner() -> ToolRegistry {
             .register(Arc::new(glob::GlobTool))
             .register(Arc::new(grep::GrepTool))
             .register(Arc::new(todo::TodoWriteTool::shared()))
-            .register(Arc::new(mcp_web_use::McpWebUseTool)),
+            .register(Arc::new(mcp_web_lsm_browser_use::McpWebLsmBrowserUseTool))
+            .register(Arc::new(mcp_chrome_use::McpChromeUseTool)),
     ))
 }
 
@@ -304,7 +306,7 @@ pub fn main_work_registry_inner() -> ToolRegistry {
 /// 写操作(Write / Edit)带有沙箱拦截,限制在工作目录与系统临时目录。
 /// 2026-09-18 第 84 轮:macOS / Windows 追加 MCP_Window_Use(桌面窗口操控统一入口,
 /// 平台门控见 [`mcp_window_use::mcp_window_use_available`])。
-/// 2026-09-18 第 89 轮:全平台追加 MCP_Web_Use(浏览器网页操控统一入口,
+/// 2026-09-18 第 89 轮:全平台追加 MCP_Web_LsmAgentBrowser_Use(浏览器网页操控统一入口,
 /// LsmAgentBrowser 三平台一致,错误返回结构化信封,无需平台门控)。
 /// 2026-09-22 第 114 轮:追加 SubAgent(自感知动态启动子 Agent 工具,
 /// 运行时经 task-local 注入;总开关 `LAEW_SELF_SPAWN=off` 时不注册)。
@@ -322,7 +324,8 @@ pub fn builtin_registry() -> ToolRegistry {
         .register(Arc::new(glob::GlobTool))
         .register(Arc::new(grep::GrepTool))
         .register(Arc::new(todo::TodoWriteTool::shared()))
-        .register(Arc::new(mcp_web_use::McpWebUseTool));
+        .register(Arc::new(mcp_web_lsm_browser_use::McpWebLsmBrowserUseTool))
+        .register(Arc::new(mcp_chrome_use::McpChromeUseTool));
     reg = register_use_mcp(reg);
     reg = register_subagent(reg);
     if mcp_window_use::mcp_window_use_available() {
@@ -344,7 +347,8 @@ pub fn builtin_registry_with_work_dir(work_dir: PathBuf) -> ToolRegistry {
         .register(Arc::new(glob::GlobTool))
         .register(Arc::new(grep::GrepTool))
         .register(Arc::new(todo::TodoWriteTool::shared()))
-        .register(Arc::new(mcp_web_use::McpWebUseTool));
+        .register(Arc::new(mcp_web_lsm_browser_use::McpWebLsmBrowserUseTool))
+        .register(Arc::new(mcp_chrome_use::McpChromeUseTool));
     reg = register_use_mcp(reg);
     reg = register_subagent(reg);
     if mcp_window_use::mcp_window_use_available() {
@@ -354,7 +358,7 @@ pub fn builtin_registry_with_work_dir(work_dir: PathBuf) -> ToolRegistry {
 }
 
 /// Yolo Agent 工具注册表(2026-09-22 ReAct 改造):
-/// - **信息收集型工具面**:Read / Glob / Grep / Bash(只读侦察)/ MCP_Web_Use(观察类 action);
+/// - **信息收集型工具面**:Read / Glob / Grep / Bash(只读侦察)/ MCP_Web_LsmAgentBrowser_Use(观察类 action);
 ///   分类前按 ReAct(Thought→Action→Observation)循环自主收集信息。
 /// - **结构化输出通道** `submit_task_classification`(L6/L19);
 /// - **只读子 Agent**(第 114 轮:`ReadOnlyChildren`,只读侦察型)。
@@ -372,14 +376,15 @@ pub fn yolo_registry() -> ToolRegistry {
             .register(Arc::new(glob::GlobTool))
             .register(Arc::new(grep::GrepTool))
             .register(Arc::new(bash::BashTool::new()))
-            .register(Arc::new(mcp_web_use::McpWebUseTool))
+            .register(Arc::new(mcp_web_lsm_browser_use::McpWebLsmBrowserUseTool))
+            .register(Arc::new(mcp_chrome_use::McpChromeUseTool))
             .register(Arc::new(emit::SubmitTaskClassification)),
     )
 }
 
 /// Plan Agent 工具注册表:Read + Write + Glob + Grep(规划与调研)
 /// + Bash 只读侦察(`BashTool::readonly()`,与 Main-Work 同款代码层强制)
-/// + MCP_Web_Use / MCP_Window_Use(观察类探索:规划前摸清页面/窗口结构;
+/// + MCP_Web_LsmAgentBrowser_Use / MCP_Window_Use(观察类探索:规划前摸清页面/窗口结构;
 ///   Window 工具平台门控,仅 macOS/Windows 注册)
 /// + SubAgent(第 114 轮:并行方案调研,策略 `FullChildren`)。
 ///
@@ -392,7 +397,8 @@ pub fn plan_registry() -> ToolRegistry {
         .register(Arc::new(glob::GlobTool))
         .register(Arc::new(grep::GrepTool))
         .register(Arc::new(bash::BashTool::readonly()))
-        .register(Arc::new(mcp_web_use::McpWebUseTool));
+        .register(Arc::new(mcp_web_lsm_browser_use::McpWebLsmBrowserUseTool))
+        .register(Arc::new(mcp_chrome_use::McpChromeUseTool));
     if mcp_window_use::mcp_window_use_available() {
         reg = reg.register(Arc::new(mcp_window_use::McpWindowUseTool));
     }
@@ -402,7 +408,7 @@ pub fn plan_registry() -> ToolRegistry {
 /// Main-Work Agent 工具注册表(2026-09-23 第 122 轮:编排层信息收集型工具面):
 /// - **只读侦察**:Bash(`BashTool::readonly()` Round 124 代码层只读)/ Read /
 ///   Glob / Grep(项目结构与符号检索)
-/// - **网页信息收集**:`MCP_Web_Use`(新增,2026-09-23;编排前探查目标 URL /
+/// - **网页信息收集**:`MCP_Web_LsmAgentBrowser_Use`(新增,2026-09-23;编排前探查目标 URL /
 ///   入口 / DOM 结构,避免盲拆)
 /// - **顶层规划**:`TodoWrite`(编排清单 ≥3 步时先 create 全量,每完成一项 update)
 /// - **并行委派**:SubAgent(第 114 轮:把独立 WorkFlow 交给并行子 Agent)
@@ -472,7 +478,8 @@ mod names_tests {
                 "Glob",
                 "Grep",
                 "Bash",
-                "MCP_Web_Use",
+                "MCP_Web_LsmAgentBrowser_Use",
+                "MCP_Web_Chrome_Use",
                 "submit_task_classification",
                 "SubAgent",
             ]
@@ -628,31 +635,31 @@ mod names_tests {
     }
 
     #[test]
-    fn builtin_registry_mcp_web_use_all_platforms() {
-        // 2026-09-18 第 89 轮:MCP_Web_Use 全平台注册(内核三平台一致,
+    fn builtin_registry_mcp_web_lsm_browser_use_all_platforms() {
+        // 2026-09-18 第 89 轮:MCP_Web_LsmAgentBrowser_Use 全平台注册(内核三平台一致,
         // 未装浏览器返回结构化 3001 信封,无需平台门控)。
         for reg in [builtin_registry(), builtin_registry_with_work_dir(PathBuf::from("."))] {
             let names = reg.names();
             assert!(
-                names.contains(&"MCP_Web_Use"),
-                "MCP_Web_Use 应注册: {names:?}"
+                names.contains(&"MCP_Web_LsmAgentBrowser_Use"),
+                "MCP_Web_LsmAgentBrowser_Use 应注册: {names:?}"
             );
         }
     }
 
     #[test]
-    fn main_work_plan_quality_exclude_mcp_web_use() {
-        // 2026-09-22 ReAct 改造:Yolo 工具面已扩展为含 MCP_Web_Use(用于意图判断所需的
+    fn main_work_plan_quality_exclude_mcp_web_lsm_browser_use() {
+        // 2026-09-22 ReAct 改造:Yolo 工具面已扩展为含 MCP_Web_LsmAgentBrowser_Use(用于意图判断所需的
         // 网页信息收集:open/list/inspect/screenshot 观察类 action)。
         // 其它入口/编排/质检角色仍不持浏览器操控工具(权限面不扩大)。
-        // 第 122 轮(2026-09-23)修订:Main-Work 也加入 MCP_Web_Use(编排层信息收集),
-        // 本断言拆分为 main_work_includes_mcp_web_use + plan_and_quality_exclude_mcp_web_use
+        // 第 122 轮(2026-09-23)修订:Main-Work 也加入 MCP_Web_LsmAgentBrowser_Use(编排层信息收集),
+        // 本断言拆分为 main_work_includes_mcp_web_lsm_browser_use + plan_and_quality_exclude_mcp_web_lsm_browser_use
         // 见下方。保留本断言仅验证 Yolo 与 Plan/Quality 的相对位置。
-        // 本轮修订:Plan 亦加入 MCP_Web_Use(规划前观察页面结构,提示词约束观察类
+        // 本轮修订:Plan 亦加入 MCP_Web_LsmAgentBrowser_Use(规划前观察页面结构,提示词约束观察类
         // action 优先)——仅 QC 维持不含。
-        assert!(yolo_registry().names().contains(&"MCP_Web_Use"));
-        assert!(plan_registry().names().contains(&"MCP_Web_Use"));
-        assert!(!quality_registry().names().contains(&"MCP_Web_Use"));
+        assert!(yolo_registry().names().contains(&"MCP_Web_LsmAgentBrowser_Use"));
+        assert!(plan_registry().names().contains(&"MCP_Web_LsmAgentBrowser_Use"));
+        assert!(!quality_registry().names().contains(&"MCP_Web_LsmAgentBrowser_Use"));
     }
 
     // 第二十轮候选 5(2026-09-21):TodoWrite 注册面验证 —— SubAgent-Work 与
@@ -672,15 +679,15 @@ mod names_tests {
     }
 
     // 第 122 轮(2026-09-23):Main-Work 注册面验证 —— 编排层信息收集型工具面
-    // 5 件(Bash / Read / Glob / Grep / TodoWrite) + MCP_Web_Use + SubAgent;
+    // 5 件(Bash / Read / Glob / Grep / TodoWrite) + MCP_Web_LsmAgentBrowser_Use + SubAgent;
     // 仍不持 Write / Edit(流程层只编排不落源代码);也不持 MCP_Window_Use
     // (桌面窗口操控归 SubAgent-Work,平台门控 + 单一焦点守卫)。
     #[test]
     fn main_work_registry_includes_react_recon_surface() {
         let registry = main_work_registry();
         let names = registry.names();
-        // 必备工具面(Bash / Read / Glob / Grep / TodoWrite / SubAgent + 新增 MCP_Web_Use)
-        for t in ["Bash", "Read", "Glob", "Grep", "TodoWrite", "MCP_Web_Use", "SubAgent"] {
+        // 必备工具面(Bash / Read / Glob / Grep / TodoWrite / SubAgent + 新增 MCP_Web_LsmAgentBrowser_Use)
+        for t in ["Bash", "Read", "Glob", "Grep", "TodoWrite", "MCP_Web_LsmAgentBrowser_Use", "SubAgent"] {
             assert!(names.contains(&t), "Main-Work 应含 {t}: {names:?}");
         }
         // 仍不持 Write / Edit
@@ -693,26 +700,26 @@ mod names_tests {
     }
 
     // ==== 第 122 轮修订 ====:
-    // 把原来的 `main_work_plan_quality_exclude_mcp_web_use`(强制 Main-Work 不持
-    // MCP_Web_Use)拆分为两条独立断言:Main-Work 现含 MCP_Web_Use(第 122 轮新增),
+    // 把原来的 `main_work_plan_quality_exclude_mcp_web_lsm_browser_use`(强制 Main-Work 不持
+    // MCP_Web_LsmAgentBrowser_Use)拆分为两条独立断言:Main-Work 现含 MCP_Web_LsmAgentBrowser_Use(第 122 轮新增),
     // Plan / Quality 仍不含(粒度对齐:plan/quality 不参与网页信息收集)。
-    // 本轮修订:Plan 加入 MCP_Web_Use(规划前探索页面结构),仅 QC 维持不含。
+    // 本轮修订:Plan 加入 MCP_Web_LsmAgentBrowser_Use(规划前探索页面结构),仅 QC 维持不含。
     #[test]
-    fn main_work_includes_mcp_web_use() {
+    fn main_work_includes_mcp_web_lsm_browser_use() {
         assert!(
-            main_work_registry().names().contains(&"MCP_Web_Use"),
-            "Main-Work 编排层应持 MCP_Web_Use(信息收集): {:?}",
+            main_work_registry().names().contains(&"MCP_Web_LsmAgentBrowser_Use"),
+            "Main-Work 编排层应持 MCP_Web_LsmAgentBrowser_Use(信息收集): {:?}",
             main_work_registry().names()
         );
     }
 
     #[test]
-    fn plan_includes_mcp_web_use_quality_excludes() {
+    fn plan_includes_mcp_web_lsm_browser_use_quality_excludes() {
         assert!(
-            plan_registry().names().contains(&"MCP_Web_Use"),
-            "Plan 规划层应持 MCP_Web_Use(规划前观察页面结构)"
+            plan_registry().names().contains(&"MCP_Web_LsmAgentBrowser_Use"),
+            "Plan 规划层应持 MCP_Web_LsmAgentBrowser_Use(规划前观察页面结构)"
         );
-        assert!(!quality_registry().names().contains(&"MCP_Web_Use"));
+        assert!(!quality_registry().names().contains(&"MCP_Web_LsmAgentBrowser_Use"));
     }
 
     /// Plan 工具面:观察类探索 + 只读侦察 + plans/ 写入;不持 Edit(不修改源代码)。

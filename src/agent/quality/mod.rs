@@ -239,7 +239,7 @@ fn build_unit_qc_prompt_full(
          「纯 wait 空等」),无论执行是否达标都判 Fail 且 retryable=true,issues 中逐一指出\n\
          被漏掉的动词;纯等待/时间差/进程存活不构成任何 UI 操作的完成证据。\n\
          桌面目标保真(第 109 轮):用户原始输入指向独立桌面软件(豆包/微信/钉钉/飞书/QQ 等)\n\
-         且未明确说「网页/Web 版」时 —— 执行轨迹全部落在 MCP_Web_Use 操作该软件的网页版\n\
+         且未明确说「网页/Web 版」时 —— 执行轨迹全部落在 MCP_Web_LsmAgentBrowser_Use 操作该软件的网页版\n\
          不构成等效完成(判 Fail 且 retryable=true,issues 指出工具错配,应改用 MCP_Window_Use);\n\
          suggestion 中禁止推荐「改用网页版/Web 版替代桌面软件」。\n\
          \n\
@@ -357,7 +357,7 @@ impl QualityRunner {
 
     /// [`check_subagent`] 的来源角色参数化版本:
     /// 让质检报告 source 与提示词标题反映真实执行角色(第 89 轮起执行器统一
-    /// SubAgent,浏览器操控由 MCP_Web_Use 工具承担,参数保留供未来执行器扩展)。
+    /// SubAgent,浏览器操控由 MCP_Web_LsmAgentBrowser_Use 工具承担,参数保留供未来执行器扩展)。
     ///
     /// `original_prompt`(2026-09-19 第 93 轮):用户原始输入(第一性事实)。
     /// 实测微信聊天任务中,Main-Work 把「主动聊天/发送消息」降级为「保活等待」,

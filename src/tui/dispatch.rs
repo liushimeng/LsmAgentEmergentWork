@@ -818,7 +818,7 @@ impl TuiSession {
                     *wallclock_ms as f64 / 1000.0,
                 );
                 // 2026-09-16 第 64 轮(第 89 轮更新):浏览器类任务失败时额外打印诊断。
-                // Chromium-WebUse Agent 已删除,浏览器操控由 SubAgent-Work 的 MCP_Web_Use
+                // Chromium-WebUse Agent 已删除,浏览器操控由 SubAgent-Work 的 MCP_Web_LsmAgentBrowser_Use
                 // 工具承担;tool_calls=0 的排查方向相应更新。
                 if reason.contains("tool_calls=0") || reason.contains("no_tool_use") {
                     println!("  [浏览器任务失败诊断] 详见下方 [trace]/[tool]/[failure] 段;若 tool_calls=0 排查方向:1) 目标 URL 不可达或返回 2001 时如实告知用户;2) 选择器失效时先 inspect(elements) 重新探测,不要凭名字硬猜。");

@@ -1,6 +1,6 @@
 //! Windows 弹窗 macOS 风格主题(唯一真源,2026-10-14)。
 //!
-//! 设计见 `docs/MCP_Web_Use/27-Windows弹窗macOS风格界面美化.md`。职责边界:
+//! 设计见 `docs/MCP_Web_LsmAgentBrowser_Use/27-Windows弹窗macOS风格界面美化.md`。职责边界:
 //! - 本模块**只管观感**:配色板(浅/深双档,随系统外观)、owner-draw 控件自绘图元
 //!   (圆角主/次按钮、macOS 开关)、WM_CTLCOLOR* 文本配色、DWM 窗口 chrome
 //!   (标题栏同色/沉浸式深色/圆角)、**本进程全部顶层窗口自遍历补挂**;

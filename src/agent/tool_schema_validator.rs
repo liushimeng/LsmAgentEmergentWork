@@ -54,7 +54,7 @@ fn validate_value(tool_name: &str, schema: &Value, value: &Value, path: &str) ->
     if let Some(enum_val) = schema.get("enum") {
         if let Some(arr) = enum_val.as_array() {
             if !arr.iter().any(|v| v == value) {
-                // 最近邻指路:实际值可能是子动作/嵌套参数(如 MCP_Web_Use 的
+                // 最近邻指路:实际值可能是子动作/嵌套参数(如 MCP_Web_LsmAgentBrowser_Use 的
                 // `navigate` 实为 control_action),提示改用正确的字段层级。
                 let actual_str = value.as_str().unwrap_or("");
                 let hint = if !actual_str.is_empty()
@@ -284,7 +284,7 @@ fn check_object_properties(
                         },
                         reason: "未声明的字段(Schema additionalProperties=false)".into(),
                         // 把「可用字段」列出来:模型多传字段时,靠这条提示即可自行纠正,
-                        // 不必再花一轮 round-trip 试探(实测 MCP_Web_Use 反复传
+                        // 不必再花一轮 round-trip 试探(实测 MCP_Web_LsmAgentBrowser_Use 反复传
                         // item/include_ocr/snapshot_label 等未声明字段)。
                         expected: format!(
                             "不允许的字段;可用字段:{}",

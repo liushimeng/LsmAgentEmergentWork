@@ -677,7 +677,7 @@ fn hint_role_derivation_uses_observed_tools_not_static_surface() {
         AgentProfile::session_context_profile().hint_role(&empty),
         HintRole::Judge
     );
-    // 关键:builtin_registry() 无条件含 MCP_Web_Use,但**没真调用过** → Execute
+    // 关键:builtin_registry() 无条件含 MCP_Web_LsmAgentBrowser_Use,但**没真调用过** → Execute
     assert_eq!(
         AgentProfile::sub_agent_work_profile().hint_role(&empty),
         HintRole::Execute,
@@ -689,7 +689,7 @@ fn hint_role_derivation_uses_observed_tools_not_static_surface() {
     );
     // 真调用过浏览器 / 桌面 → Ui
     let mut used_web = ExecutionTrace::default();
-    used_web.record_tool_call("MCP_Web_Use", "{}", true, 8, 1, "", "ok");
+    used_web.record_tool_call("MCP_Web_LsmAgentBrowser_Use", "{}", true, 8, 1, "", "ok");
     assert_eq!(
         AgentProfile::sub_agent_work_profile().hint_role(&used_web),
         HintRole::Ui
@@ -781,9 +781,9 @@ fn trace_render_prompt_exposes_react_evidence() {
 // 编排层 ReAct 化补齐(对齐第 120 轮执行层 SubAgentWork)。验证:
 // 1. Main-WorkRunner 编排时若连续 4 次完全相同的工具调用 → 触发 LoopGuard 止损
 //    (与 SubAgentWork 共享同一份 LoopGuard 双阈值);
-// 2. Main-Work 工具面含 MCP_Web_Use(用于编排前网页前提验证);
-// 3. hint_role 派生:Main-Work 工具面无 MCP_Web_Use 调用 → HintRole::Execute;
-//    若真动过 MCP_Web_Use → HintRole::Ui。
+// 2. Main-Work 工具面含 MCP_Web_LsmAgentBrowser_Use(用于编排前网页前提验证);
+// 3. hint_role 派生:Main-Work 工具面无 MCP_Web_LsmAgentBrowser_Use 调用 → HintRole::Execute;
+//    若真动过 MCP_Web_LsmAgentBrowser_Use → HintRole::Ui。
 // 设计见 docs/Main-Work工具扩展与ReAct改造/01-设计与解决方案.md §3.4。
 
 /// 一轮返回 Read 同一个文件(持续 4 轮)的 LLM —— 编排层 doom_loop 端到端。
@@ -867,14 +867,14 @@ async fn main_work_runner_doom_loop_stops() {
     );
 }
 
-/// 验证:Main-Work 工具面含 MCP_Web_Use,与 SubAgent-Work 的全集合保持兼容。
+/// 验证:Main-Work 工具面含 MCP_Web_LsmAgentBrowser_Use,与 SubAgent-Work 的全集合保持兼容。
 #[test]
-fn main_work_profile_tool_names_mcp_web_use() {
+fn main_work_profile_tool_names_mcp_web_lsm_browser_use() {
     let profile = AgentProfile::main_work_profile();
     let names: Vec<&str> = profile.tools.names();
     assert!(
-        names.contains(&"MCP_Web_Use"),
-        "Main-Work 编排层应持 MCP_Web_Use(信息收集),实际: {names:?}"
+        names.contains(&"MCP_Web_LsmAgentBrowser_Use"),
+        "Main-Work 编排层应持 MCP_Web_LsmAgentBrowser_Use(信息收集),实际: {names:?}"
     );
     assert!(names.contains(&"Bash"));
     assert!(names.contains(&"Read"));
@@ -887,7 +887,7 @@ fn main_work_profile_tool_names_mcp_web_use() {
     assert!(!names.contains(&"Edit"));
 }
 
-/// 验证:Main-Work hint_role 派生 —— 未用 MCP_Web_Use → HintRole::Execute
+/// 验证:Main-Work hint_role 派生 —— 未用 MCP_Web_LsmAgentBrowser_Use → HintRole::Execute
 /// (与 SubAgent-Work 代码类单元一致)。
 #[tokio::test]
 async fn main_work_hint_role_execute_when_no_ui_tool_used() {
@@ -903,9 +903,9 @@ async fn main_work_hint_role_execute_when_no_ui_tool_used() {
     let mut session = Session::new();
     session.context_mut().push(ChatMessage::user("编排"));
     let (_text, _usage, trace) = agent.run_session(&mut session).await.unwrap();
-    // trace.tool_call_log 应只含 Read,无 MCP_Web_Use → HintRole::Execute
+    // trace.tool_call_log 应只含 Read,无 MCP_Web_LsmAgentBrowser_Use → HintRole::Execute
     let used_ui = trace.tool_call_log.iter().any(|e| {
-        e.tool == crate::agent::tools::mcp_web_use::MCP_WEB_USE_TOOL_NAME
+        e.tool == crate::agent::tools::mcp_web_lsm_browser_use::MCP_WEB_LSM_BROWSER_USE_TOOL_NAME
             || e.tool == crate::agent::tools::mcp_window_use::MCP_WINDOW_USE_TOOL_NAME
     });
     assert!(!used_ui, "本用例不应触发 Ui 角色(只用 Read)");

@@ -7,9 +7,9 @@
 
 use super::format::clip_cols;
 
-/// MCP_Web_Use `{code,message,data}` 信封的精简摘要。
+/// MCP_Web_LsmAgentBrowser_Use `{code,message,data}` 信封的精简摘要。
 ///
-/// ★ 2026-09-17 第 79 轮 P2-5 引入(format.rs);第 89 轮随 MCP_Web_Use 更名;
+/// ★ 2026-09-17 第 79 轮 P2-5 引入(format.rs);第 89 轮随 MCP_Web_LsmAgentBrowser_Use 更名;
 /// **第 99 轮迁入本子模块**(format.rs 已达临界线)+ 扩展:
 /// - `save_path` → `out=<文件名>`、`byte_size` → `bytes=N`(screenshot/download 落盘);
 /// - `reused=true` → `reused`(open 复用一眼可辨);

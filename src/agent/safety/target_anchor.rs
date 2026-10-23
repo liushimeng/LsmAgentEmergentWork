@@ -22,7 +22,7 @@
 //!
 //! 本模块是 L1(澄清门)/ L3(工具门)/ L4(验收门)共用的**唯一事实源**:
 //! - L1 `unresolved_reference` → 编排器澄清短路(回问用户,不进 WorkFlow);
-//! - L3 `check_open_against_target_anchor` → `MCP_Web_Use action=open` 越界返回 code=6001;
+//! - L3 `check_open_against_target_anchor` → `MCP_Web_LsmAgentBrowser_Use action=open` 越界返回 code=6001;
 //! - L4 `detect_target_drift` → `ExecutionTrace` 的 `target_drift` 失败信号 + QC 目标一致性门。
 //!
 //! 设计见 `tmpPlan/2026-09-24_03-任务锚点与防目标漂移根治方案.md`。
@@ -448,7 +448,7 @@ impl TargetAnchor {
                 "  规则: 本任务的全部网页操作只允许落在上述站点内。目标站点不可达\n\
                  (超时/连接失败/404/需登录)时,**唯一正确动作是如实报告失败并结束**;\n\
                  严禁改用其它站点、搜索引擎、缓存或名称相似的替代品 —— 可以失败,不可以乱跑。\n\
-                 MCP_Web_Use action=open 返回 code=6001 表示你正在偏离锚点,必须立即停止该路径。",
+                 MCP_Web_LsmAgentBrowser_Use action=open 返回 code=6001 表示你正在偏离锚点,必须立即停止该路径。",
             );
         }
         if self.unresolved_reference {
@@ -1111,7 +1111,7 @@ mod tests {
     #[test]
     fn target_drift_flags_off_anchor_web_tool_call() {
         let calls = vec![call(
-            "MCP_Web_Use",
+            "MCP_Web_LsmAgentBrowser_Use",
             r#"{"action":"open","url":"https://www.ithome.com/"}"#,
         )];
         assert_eq!(
@@ -1123,8 +1123,8 @@ mod tests {
     #[test]
     fn target_drift_ignores_anchor_host_calls() {
         let calls = vec![
-            call("MCP_Web_Use", r#"{"action":"open","url":"https://www.anthropic.com/"}"#),
-            call("MCP_Web_Use", r#"{"action":"inspect","page_id":"p_1"}"#),
+            call("MCP_Web_LsmAgentBrowser_Use", r#"{"action":"open","url":"https://www.anthropic.com/"}"#),
+            call("MCP_Web_LsmAgentBrowser_Use", r#"{"action":"inspect","page_id":"p_1"}"#),
         ];
         assert!(detect_target_drift(&calls, &anchored("anthropic.com")).is_empty());
     }
@@ -1139,7 +1139,7 @@ mod tests {
     #[test]
     fn target_drift_never_fires_with_empty_anchor() {
         let calls = vec![call(
-            "MCP_Web_Use",
+            "MCP_Web_LsmAgentBrowser_Use",
             r#"{"action":"open","url":"https://www.ithome.com/"}"#,
         )];
         assert!(detect_target_drift(&calls, &TargetAnchor::default()).is_empty());
@@ -1148,8 +1148,8 @@ mod tests {
     #[test]
     fn target_drift_dedupes_multiple_off_anchor_calls() {
         let calls = vec![
-            call("MCP_Web_Use", r#"{"action":"open","url":"https://www.ithome.com/a"}"#),
-            call("MCP_Web_Use", r#"{"action":"navigate","page_id":"p_1","control_action":"navigate","params":{"url":"https://ithome.com/b"}}"#),
+            call("MCP_Web_LsmAgentBrowser_Use", r#"{"action":"open","url":"https://www.ithome.com/a"}"#),
+            call("MCP_Web_LsmAgentBrowser_Use", r#"{"action":"navigate","page_id":"p_1","control_action":"navigate","params":{"url":"https://ithome.com/b"}}"#),
         ];
         assert_eq!(
             detect_target_drift(&calls, &anchored("anthropic.com")),
@@ -1161,7 +1161,7 @@ mod tests {
     fn target_drift_skips_failed_calls() {
         // 第 135 轮:被 L3 工具层 6001 拦下的越界尝试不再重复计强信号
         let calls = vec![(
-            "MCP_Web_Use".to_string(),
+            "MCP_Web_LsmAgentBrowser_Use".to_string(),
             r#"{"action":"open","url":"https://www.ithome.com/"}"#.to_string(),
             false,
         )];
@@ -1174,7 +1174,7 @@ mod tests {
     #[test]
     fn target_drift_ignores_css_selector_lookalikes() {
         let calls = vec![call(
-            "MCP_Web_Use",
+            "MCP_Web_LsmAgentBrowser_Use",
             r#"{"action":"batch","steps":[{"action":"control","control_action":"click","params":{"selector":"div.kr-loading-more-button"}}]}"#,
         )];
         assert!(
@@ -1188,11 +1188,11 @@ mod tests {
     fn target_drift_ignores_non_navigation_url_fields() {
         let calls = vec![
             call(
-                "MCP_Web_Use",
+                "MCP_Web_LsmAgentBrowser_Use",
                 r#"{"action":"control","control_action":"eval_js","params":{"expression":"Array.from(document.querySelectorAll('img')).map(i=>i.src)"}}"#,
             ),
             call(
-                "MCP_Web_Use",
+                "MCP_Web_LsmAgentBrowser_Use",
                 r#"{"action":"open","url":"https://36kr.com/"}"#,
             ),
         ];
@@ -1204,7 +1204,7 @@ mod tests {
     fn target_drift_still_catches_navigate_and_sequence_steps() {
         let calls = vec![
             call(
-                "MCP_Web_Use",
+                "MCP_Web_LsmAgentBrowser_Use",
                 r#"{"action":"control","control_action":"navigate","page_id":"p_1","params":{"url":"https://www.ithome.com/0/"}}"#,
             ),
         ];
@@ -1214,7 +1214,7 @@ mod tests {
         );
 
         let seq = vec![call(
-            "MCP_Web_Use",
+            "MCP_Web_LsmAgentBrowser_Use",
             r#"{"action":"sequence","page_id":"p_1","steps":[{"action":"control","control_action":"new_tab","params":{"url":"https://news.ycombinator.com/"}}]}"#,
         )];
         assert_eq!(

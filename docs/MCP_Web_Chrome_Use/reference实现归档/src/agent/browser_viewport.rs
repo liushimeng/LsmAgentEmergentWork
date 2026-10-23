@@ -1,0 +1,677 @@
+//! 浏览器窗口 / 视口尺寸决策(第 125 轮起从 `browser.rs` 机械搬移,第 139 轮扩展)。
+//!
+//! 本模块是「尺寸」的唯一真源,只放纯函数 + 测量 JS,**不持有任何浏览器状态**,
+//! 便于单测锁死。两类决策:
+//!
+//! 1. [`viewport_fit_plan`] —— 页面**内容**超出**视口**时向上扩(第 125 轮,
+//!    ≤2K 上限);只放大不缩小。
+//! 2. [`headed_window_plan`] —— 有头模式下窗口**外框**超出**屏幕工作区**时向下收
+//!    (第 139 轮),并补偿浏览器 chrome 高度,保证**页面视口** ≥ 720p。
+//!
+//! 为什么不用自己探测屏幕分辨率:`window.screen.availWidth/availHeight` 就是
+//! 浏览器算好的**工作区**(已扣 Dock/任务栏),`outerHeight - innerHeight` 就是
+//! **chrome 高度**,两者天生跨平台且随 DPR 正确换算,比自建各平台原生 FFI 可靠。
+
+use serde_json::Value;
+
+// =================== 第 125 轮(2026-09-23):视口基准 1080p 与 2K 自动扩展 ===================
+
+/// 全模式默认启动窗口:1920×1080(1080p)。hidden 原 1440×900 视口过窄,
+/// 现代 Web 应用(min-width > 1440 的后台/SaaS)横向被裁 → 元素不可见不可点、
+/// 截图显示不全,本轮根治。
+pub const DEFAULT_WINDOW_W: u32 = 1920;
+/// 全模式默认启动窗口高(1080p)。
+pub const DEFAULT_WINDOW_H: u32 = 1080;
+/// 视口自动扩展上限宽(2K = 2560×1440):内容超此宽度仍溢出时保持滚动 +
+/// full_page 截图既有路径,不再无限撑大。
+pub const VIEWPORT_FIT_MAX_W: u32 = 2560;
+/// 视口自动扩展上限高(2K)。
+pub const VIEWPORT_FIT_MAX_H: u32 = 1440;
+/// 溢出判定容差(px):亚像素布局/阴影圆角/1px 边框误差不触发扩展。
+pub(crate) const VIEWPORT_FIT_TOL: f64 = 2.0;
+
+// =================== 第 139 轮(2026-10-09):可见模式视口下限 720p ===================
+
+/// 页面视口最小宽(720p 的宽)。低于此值横向裁切风险大,现代后台/SaaS 常
+/// `min-width` 1280,视口不够宽会出现横向滚动条甚至元素点不到。
+pub const MIN_VIEWPORT_W: u32 = 1280;
+/// 页面视口最小高(720p 的高)。
+pub const MIN_VIEWPORT_H: u32 = 720;
+/// 有头模式窗口四周留白(px):避免窗口贴死屏幕边缘 / 挡住 Dock 与任务栏。
+pub const HEADED_SCREEN_MARGIN: u32 = 8;
+/// chrome 高度探测失败时的兜底估计(px):标签栏 + 地址栏 + 书签栏。
+pub const HEADED_CHROME_FALLBACK_H: u32 = 140;
+/// chrome 高度可信区间下界(px):低于此值说明 `outer/inner` 测量本身失真。
+pub const HEADED_CHROME_MIN_H: f64 = 40.0;
+/// chrome 高度可信区间上界(px):标签栏+地址栏+书签栏+标题栏实测在 80~200 之间,
+/// 超过 300 基本等同于「inner 报的是实现前默认值」而非真实 chrome。
+pub const HEADED_CHROME_MAX_H: f64 = 300.0;
+/// Chrome 窗口**布局实现前**的默认内容区尺寸(px)。
+///
+/// `HEADED_WINDOW_METRICS_JS` 在导航完成后立刻求值,但 macOS 上窗口尚未完成
+/// 布局实现:`outer` 已按 `--window-size` 报 1920×1080,`inner` 仍是默认的
+/// 800×600。实测(`llaew_20261012_105536.log`)两次探针**确定性复现**该形态,
+/// 导致 `chrome = 1080 - 600 = 480`(真值约 143px),进而把窗口无谓地从
+/// 1080 撑到 1200 —— 正是「窗口尺寸决策」要防的反面误调整。
+pub const CHROME_UNREALIZED_DEFAULT_W: f64 = 800.0;
+pub const CHROME_UNREALIZED_DEFAULT_H: f64 = 600.0;
+
+/// 默认启动窗口尺寸(第 125 轮:全模式统一 1080p)。
+pub fn default_window_size() -> (u32, u32) {
+    (DEFAULT_WINDOW_W, DEFAULT_WINDOW_H)
+}
+
+/// 单维度适配判定:内容维度 > 视口维度 + 容差 且仍有扩展空间时返回 Some(目标)。
+/// 只放大不缩小;当前已 ≥ cap 时维持原状(返回 None,交给滚动/full_page)。
+fn fit_dim(cur: f64, content: f64, cap: u32) -> Option<u32> {
+    if content <= cur + VIEWPORT_FIT_TOL {
+        return None;
+    }
+    let cur_i = cur.max(0.0).ceil() as u32;
+    if cur_i >= cap {
+        return None;
+    }
+    let target = content.ceil() as u32;
+    let target = target.clamp(cur_i + 1, cap);
+    if target > cur_i {
+        Some(target)
+    } else {
+        None
+    }
+}
+
+/// 视口自动扩展决策(纯函数,可单测):输入当前视口 (iw,ih) 与内容滚动尺寸
+/// (sw,sh),需要扩展返回 Some((target_w,target_h)),否则 None。
+pub fn viewport_fit_plan(
+    iw: f64,
+    ih: f64,
+    sw: f64,
+    sh: f64,
+    max_w: u32,
+    max_h: u32,
+) -> Option<(u32, u32)> {
+    match (fit_dim(iw, sw, max_w), fit_dim(ih, sh, max_h)) {
+        (Some(w), Some(h)) => Some((w, h)),
+        (Some(w), None) => Some((w, ih.max(0.0).ceil() as u32)),
+        (None, Some(h)) => Some((iw.max(0.0).ceil() as u32, h)),
+        (None, None) => None,
+    }
+}
+
+// =================== 第 175 轮:屏幕几何自洽(反检测) ===================
+
+/// 覆盖视口时**同尺寸声明屏幕**是否需要(纯函数,单测锁死)。
+///
+/// 背景(第 175 轮真机实测):`Emulation.setDeviceMetricsOverride` 若只带
+/// `width`/`height`,`screen.*` 保持 Chrome 的无头默认值 `800x600`,于是页面读到
+/// `screen.width(800) < window.outerWidth(1920)` —— **物理不可能**
+/// (真实显示器宽度永远 ≥ 窗口宽度),是一条零成本、零误伤的风控硬判据。
+/// chromiumoxide 0.9 的 `emulation.rs::init_commands` 正是只传 width/height。
+///
+/// 取值即本次覆盖的 width/height —— 不编造屏幕尺寸,只让「已知的窗口尺寸」与
+/// 「页面读到的屏幕尺寸」保持自洽(同 `browser_ns` 的保真原则)。
+pub fn screen_sync_needed(override_w: u32, override_h: u32) -> bool {
+    override_w > 0 && override_h > 0
+}
+
+/// 几何自洽探针(页面侧求值):返回 `screen` / `window` 实测与两条不自洽信号。
+///
+/// 供 `data.fingerprint` 自证用 —— 「屏幕几何不自洽」是本轮根治项,
+/// 体检层必须能看见它,否则回归了也没人知道。
+pub const GEOMETRY_PROBE_JS: &str = r#"JSON.stringify((() => {
+  try {
+    const sw = screen.width, sh = screen.height;
+    const ow = window.outerWidth || 0, oh = window.outerHeight || 0;
+    const iw = window.innerWidth || 0, ih = window.innerHeight || 0;
+    return {
+      screen: sw + 'x' + sh,
+      avail: (screen.availWidth || 0) + 'x' + (screen.availHeight || 0),
+      window_outer: ow + 'x' + oh,
+      window_inner: iw + 'x' + ih,
+      dpr: window.devicePixelRatio || 1,
+      // 物理不可能:窗口比屏幕还大
+      outer_gt_screen: ow > sw || oh > sh,
+      // 无头默认值残留(800x600 是 Chrome 未收到 screen 声明时的报值)
+      screen_is_headless_default: sw === 800 && sh === 600
+    };
+  } catch (e) { return null; }
+})())"#;
+
+/// 几何探针解析 → 体检可用的结构(缺测 fail-open 返回 `None`)。
+pub fn parse_geometry(raw: &str) -> Option<Value> {
+    serde_json::from_str::<Value>(raw.trim()).ok()
+}
+
+// =================== 有头模式窗口收边与视口下限(第 139 轮) ===================
+
+/// 由 `outer*/inner*` 实测推导 chrome 高度,**对失真测量做可信性判定**(第 156 轮)。
+///
+/// 为什么需要这一层:chrome 高度是 `headed_window_plan` 的视口下限换算输入
+/// (`floor_h = MIN_VIEWPORT_H + chrome_h`)。一旦实测值失真,窗口就会被反向撑大,
+/// 比「显示不全」更难察觉 —— 用户只看到窗口比预期高一截。
+///
+/// 返回**可信**的 chrome 高度;不可信时回退 [`HEADED_CHROME_FALLBACK_H`]
+/// (实测真值约 143px,与兜底常量 140 几乎一致)。
+///
+/// 判为不可信的两种形态:
+/// 1. `chrome_h` 落在 `[HEADED_CHROME_MIN_H, HEADED_CHROME_MAX_H]` 之外
+///    (负值 = 部分平台 `outer == inner`;过大 = inner 仍是实现前默认值);
+/// 2. `inner` 恰为 Chrome 实现前默认内容区 `(800, 600)` 且 `outer` 与之不等
+///    —— 这是 macOS 上**确定性复现**的失真特征,即使差值恰好落在可信区间内也判失真。
+pub fn plausible_chrome_height(
+    outer_w: f64,
+    outer_h: f64,
+    inner_w: f64,
+    inner_h: f64,
+) -> f64 {
+    let fallback = HEADED_CHROME_FALLBACK_H as f64;
+    let raw = outer_h - inner_h;
+    if !(raw > 0.0) || raw < HEADED_CHROME_MIN_H || raw > HEADED_CHROME_MAX_H {
+        return fallback;
+    }
+    let inner_is_default = (inner_w - CHROME_UNREALIZED_DEFAULT_W).abs() < 0.5
+        && (inner_h - CHROME_UNREALIZED_DEFAULT_H).abs() < 0.5;
+    let outer_differs = (outer_w - inner_w).abs() > 0.5 || (outer_h - inner_h).abs() > 0.5;
+    if inner_is_default && outer_differs {
+        return fallback;
+    }
+    raw
+}
+
+/// 有头模式窗口尺寸决策(纯函数,可单测)。
+///
+/// 输入:
+/// - `cur_w` / `cur_h`:当前**窗口外框**尺寸(CSS 像素,来自 `--window-size`);
+/// - `avail_w` / `avail_h`:屏幕**工作区**(来自 `window.screen.avail*`,已扣 Dock);
+/// - `chrome_h`:浏览器 chrome 高度(标签栏 + 地址栏 + 书签栏),
+///   由 `outerHeight - innerHeight` 实测;≤0 时按 [`HEADED_CHROME_FALLBACK_H`] 兜底;
+/// - `fill`(第 156 轮):`true` = 未显式指定窗口尺寸,按屏幕工作区**铺满**;
+///   `false` = 调用方显式指定了 `window` 参数,保持请求尺寸只做「不溢出」收边。
+///
+/// 返回 `Some((win_w, win_h))` 表示需要 `Browser.setWindowBounds` 调整;
+/// `None` 表示当前窗口已满足目标。
+///
+/// 决策规则(按序):
+/// 1. `avail` 任一维 ≤ 0(探测失败)→ `None`,不做任何猜测调整;
+/// 2. 上限 `cap = avail - 2 * HEADED_SCREEN_MARGIN`,保证窗口完整可见(用户反馈的
+///    「显示不全」根因:1920×1080 窗口硬塞进 1512×982 屏,右侧被挤出屏外);
+/// 3. 下限:窗口高要 ≥ `MIN_VIEWPORT_H + chrome_h`(否则页面视口不足 720p),
+///    宽要 ≥ `MIN_VIEWPORT_W`;屏幕实在给不出时以 `cap` 为准(如实退让,不硬撑);
+/// 4. 目标 = `(clamp(cur_w), clamp(cur_h))`,**小屏自动降到屏幕能给的**。
+///
+/// 第 156 轮 `fill=true` 的改动:第 4 步目标由「保持请求尺寸」改为
+/// **「屏幕给得更多就涨到 `cap`」**。根因(实测本机 macOS,主屏 U2790B
+/// `UI Looks like 3200×1800`):窗口硬编码 1920×1080,在 3200×1800 主屏上
+/// 只占 60% 宽 × 60% 高,用户看到的正是「网页没有铺满 Chrome 窗口」。
+/// 小屏方向的行为**完全不变**(仍按 cap 收缩),只是补上了大屏方向的对称行为。
+pub fn headed_window_plan(
+    cur_w: f64,
+    cur_h: f64,
+    avail_w: f64,
+    avail_h: f64,
+    chrome_h: f64,
+    _fill: bool,
+) -> Option<(u32, u32)> {
+    if !(avail_w > 0.0) || !(avail_h > 0.0) {
+        return None;
+    }
+    let m = HEADED_SCREEN_MARGIN as f64;
+    // cap:窗口外框最大可取值(留边)。
+    let cap_w = (avail_w - m * 2.0).floor().max(1.0);
+    let cap_h = (avail_h - m * 2.0).floor().max(1.0);
+    // chrome 兜底:实测为 0/负(部分平台 outer==inner)时按经验值补。
+    let chrome = if chrome_h > 0.0 {
+        chrome_h
+    } else {
+        HEADED_CHROME_FALLBACK_H as f64
+    };
+    // 视口下限换算成外框下限。
+    let floor_w = MIN_VIEWPORT_W as f64;
+    let floor_h = MIN_VIEWPORT_H as f64 + chrome;
+    // 下限与上限取交:屏幕给不出 720p 视口时,如实用 cap(视口不足但至少窗口全可见)。
+    let lo_w = floor_w.min(cap_w);
+    let lo_h = floor_h.min(cap_h);
+
+    // 目标:保持当前窗口尺寸(不铺满)。fill 参数保留用于语义标注,行为已一致。
+    // 第 158 轮(2026-10-12):fill=true 时不再铺满到 cap,改为保持当前窗口尺寸。
+    // 根因:用户实测 Agent 打开新页面总是尝试全屏(铺满),而用户可能手动调整过
+    // 窗口大小,铺满会覆盖用户偏好。保持 cur 让首次打开用默认 1080p,手动调整后
+    // 以用户尺寸为准。仍保留「不溢出」收边与「视口下限 720p」保障。
+    let want_w = if cur_w > 0.0 {
+        cur_w
+    } else {
+        DEFAULT_WINDOW_W as f64
+    };
+    let want_h = if cur_h > 0.0 {
+        cur_h
+    } else {
+        DEFAULT_WINDOW_H as f64
+    };
+    let target_w = want_w.clamp(lo_w, cap_w).floor().max(1.0);
+    let target_h = want_h.clamp(lo_h, cap_h).floor().max(1.0);
+
+    let changed = (target_w - cur_w).abs() > VIEWPORT_FIT_TOL
+        || (target_h - cur_h).abs() > VIEWPORT_FIT_TOL;
+    if changed {
+        Some((target_w as u32, target_h as u32))
+    } else {
+        None
+    }
+}
+
+/// 铺满率阈值:窗口外框占屏幕工作区的最小比例(取宽高较小者)。
+///
+/// 「铺满」是给用户的**可见承诺**,只下发 `setWindowBounds` 不等于真铺满 ——
+/// Chrome 可能自行 clamp(实测目标 1784 落 1769),也可能被窗口管理器约束。
+/// 低于此值即按回读的真实尺寸重试一次。0.97 留出工作区留边与取整余量。
+pub const FILL_RATIO_MIN: f64 = 0.97;
+
+/// 多窗口横向平铺计划(纯函数):给定屏幕工作区与 Agent 窗口数 n(≥2),
+/// 返回每窗口 `(left, top, width, height)` 的横向等分排布。
+///
+/// 背景(多窗口并行,双站同时工作):Chrome 的 occlusion tracking 会把被完全
+/// 遮挡的窗口标记 occluded 并对其渲染节流 —— 两个 1920×1080 窗口默认重叠
+/// 打开,后者实际停摆,与「多 Tab 后台挂起」同病。平铺让各窗口互不遮挡,
+/// 每窗口的激活页都保持 `visibilityState=visible`,真正同时活跃。
+/// 各窗口宽度按工作区等分(窗口数多时单窗视口会低于 `MIN_VIEWPORT_W`,
+/// 「同时工作」优先于「单窗 720p」,如实退让);纵向占满工作区。
+pub fn tile_window_plan(
+    avail_w: f64,
+    avail_h: f64,
+    avail_left: f64,
+    avail_top: f64,
+    count: usize,
+) -> Option<Vec<(i64, i64, i64, i64)>> {
+    if !(avail_w > 0.0) || !(avail_h > 0.0) || count < 2 {
+        return None;
+    }
+    let m = HEADED_SCREEN_MARGIN as f64;
+    let gap_total = m * (count as f64 + 1.0);
+    let w = ((avail_w - gap_total) / count as f64).floor().max(320.0);
+    let h = (avail_h - m * 2.0).floor().max(240.0);
+    let top = (avail_top + m).round() as i64;
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let left = (avail_left + m + (w + m) * i as f64).round() as i64;
+        out.push((left, top, w.round() as i64, h.round() as i64));
+    }
+    Some(out)
+}
+
+/// 铺满率 = `min(outer_w/avail_w, outer_h/avail_h)`;任一维探测失败返回 0。
+pub fn fill_ratio(outer_w: f64, outer_h: f64, avail_w: f64, avail_h: f64) -> f64 {
+    if !(outer_w > 0.0) || !(outer_h > 0.0) || !(avail_w > 0.0) || !(avail_h > 0.0) {
+        return 0.0;
+    }
+    (outer_w / avail_w).min(outer_h / avail_h)
+}
+
+// =================== 测量(CDP evaluate,returnByValue) ===================
+
+/// 视口/内容尺寸测量 JS(fit 与截图溢出提示共用)。
+pub(crate) const VIEWPORT_METRICS_JS: &str = r#"(() => {
+    const de = document.documentElement, b = document.body;
+    const sw = Math.max(de ? de.scrollWidth : 0, b ? b.scrollWidth : 0);
+    const sh = Math.max(de ? de.scrollHeight : 0, b ? b.scrollHeight : 0);
+    return {
+        innerWidth: window.innerWidth, innerHeight: window.innerHeight,
+        scrollWidth: sw, scrollHeight: sh,
+        devicePixelRatio: window.devicePixelRatio || 1,
+    };
+})()"#;
+
+/// 有头模式窗口/chrome/屏幕工作区测量 JS(第 139 轮)。
+///
+/// `screen.availWidth/availHeight` = 屏幕工作区(已扣 Dock/任务栏);
+/// `outerWidth/outerHeight` = 窗口外框;与 inner 的差即浏览器 chrome。
+pub(crate) const HEADED_WINDOW_METRICS_JS: &str = r#"(() => ({
+    availWidth: window.screen.availWidth, availHeight: window.screen.availHeight,
+    availLeft: window.screen.availLeft, availTop: window.screen.availTop,
+    outerWidth: window.outerWidth, outerHeight: window.outerHeight,
+    innerWidth: window.innerWidth, innerHeight: window.innerHeight,
+    devicePixelRatio: window.devicePixelRatio || 1,
+}))()"#;
+
+/// 读取页面视口 + 内容滚动尺寸(CDP evaluate,returnByValue)。
+pub(crate) async fn page_viewport_metrics(
+    page: &chromiumoxide::Page,
+) -> std::result::Result<Value, String> {
+    page.evaluate(VIEWPORT_METRICS_JS)
+        .await
+        .map_err(|e| format!("测量视口失败: {e}"))?
+        .value()
+        .cloned()
+        .ok_or_else(|| "测量视口失败: 返回为空".to_string())
+}
+
+/// 读取有头模式窗口指标(第 139 轮);失败返回 `Err` 由调用方 fail-open。
+pub(crate) async fn headed_window_metrics(
+    page: &chromiumoxide::Page,
+) -> std::result::Result<Value, String> {
+    page.evaluate(HEADED_WINDOW_METRICS_JS)
+        .await
+        .map_err(|e| format!("测量窗口失败: {e}"))?
+        .value()
+        .cloned()
+        .ok_or_else(|| "测量窗口失败: 返回为空".to_string())
+}
+
+// =================== 单测(纯函数,不触达浏览器) ===================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---------- 第 125 轮:内容溢出扩展 ----------
+
+    #[test]
+    fn default_window_is_1080p() {
+        assert_eq!(default_window_size(), (1920, 1080));
+        assert_eq!((DEFAULT_WINDOW_W, DEFAULT_WINDOW_H), (1920, 1080));
+    }
+
+    #[test]
+    fn viewport_fit_plan_no_overflow() {
+        assert_eq!(viewport_fit_plan(1920.0, 1080.0, 1920.0, 1080.0, 2560, 1440), None);
+        assert_eq!(viewport_fit_plan(1920.0, 1080.0, 1922.0, 1082.0, 2560, 1440), None);
+    }
+
+    #[test]
+    fn viewport_fit_plan_horizontal_clipped() {
+        assert_eq!(
+            viewport_fit_plan(1920.0, 1080.0, 2200.0, 1080.0, 2560, 1440),
+            Some((2200, 1080))
+        );
+    }
+
+    #[test]
+    fn viewport_fit_plan_vertical_short_content() {
+        assert_eq!(
+            viewport_fit_plan(1920.0, 1080.0, 1920.0, 1200.0, 2560, 1440),
+            Some((1920, 1200))
+        );
+    }
+
+    #[test]
+    fn viewport_fit_plan_clamps_to_2k_cap() {
+        assert_eq!(
+            viewport_fit_plan(1920.0, 1080.0, 4000.0, 5000.0, 2560, 1440),
+            Some((2560, 1440))
+        );
+        assert_eq!(
+            viewport_fit_plan(1920.0, 1080.0, 4000.0, 1080.0, 2560, 1440),
+            Some((2560, 1080))
+        );
+    }
+
+    #[test]
+    fn viewport_fit_plan_never_shrinks_or_exceeds_cap_when_larger() {
+        assert_eq!(viewport_fit_plan(3840.0, 1080.0, 4200.0, 1080.0, 2560, 1440), None);
+    }
+
+    // ---------- 第 139 轮:有头窗口收边与视口下限 ----------
+
+    /// 大屏(2560×1440 工作区):1920×1080 请求原样保留,viewport 已 ≥720p。
+    #[test]
+    fn headed_plan_keeps_1080p_on_large_screen() {
+        assert_eq!(
+            headed_window_plan(1920.0, 1080.0, 2560.0, 1440.0, 140.0, false),
+            None
+        );
+    }
+
+    /// 小屏(1440×900 工作区,典型 MacBook):窗口被收进屏幕,不再溢出屏幕外。
+    #[test]
+    fn headed_plan_shrinks_to_fit_small_screen() {
+        let plan = headed_window_plan(1920.0, 1080.0, 1440.0, 900.0, 140.0, false).expect("应触发收边");
+        let (w, h) = plan;
+        assert!(w as f64 <= 1440.0 - 2.0 * HEADED_SCREEN_MARGIN as f64, "宽必须留边:{w}");
+        assert!(h as f64 <= 900.0 - 2.0 * HEADED_SCREEN_MARGIN as f64, "高必须留边:{h}");
+        // 且视口仍 ≥ 720p(收边后仍达下限)。
+        assert!(h as f64 - 140.0 >= MIN_VIEWPORT_H as f64, "视口高度不足 720p:{h}");
+    }
+
+    /// 极小屏(1280×720 工作区):视口给不到 720p,如实退让到「窗口全可见」,
+    /// 绝不硬撑出屏外。
+    #[test]
+    fn headed_plan_degrades_gracefully_on_tiny_screen() {
+        let (w, h) = headed_window_plan(1920.0, 1080.0, 1280.0, 720.0, 140.0, false).expect("应收边");
+        assert_eq!(w as f64, 1280.0 - 2.0 * HEADED_SCREEN_MARGIN as f64);
+        assert_eq!(h as f64, 720.0 - 2.0 * HEADED_SCREEN_MARGIN as f64);
+    }
+
+    /// chrome 高度实测为 0/负时按经验值兜底,不让窗口莫名变小。
+    #[test]
+    fn headed_plan_falls_back_on_chrome_height() {
+        let (with, _) = headed_window_plan(1920.0, 1080.0, 1512.0, 982.0, 140.0, false).unwrap();
+        let (without, _) = headed_window_plan(1920.0, 1080.0, 1512.0, 982.0, 0.0, false).unwrap();
+        // chrome 兜底值(140)与实测(140)一致 → 决策相同。
+        assert_eq!(with, without);
+    }
+
+    /// 探测失败(avail ≤ 0)→ 不猜、不动。
+    #[test]
+    fn headed_plan_no_gui_metrics_is_noop() {
+        assert_eq!(headed_window_plan(1920.0, 1080.0, 0.0, 900.0, 140.0, false), None);
+        assert_eq!(headed_window_plan(1920.0, 1080.0, 1440.0, 0.0, 140.0, false), None);
+    }
+
+    /// 窗口太小(用户手动缩小)→ 抬回视口下限,不做无谓的像素级抖动。
+    #[test]
+    fn headed_plan_expands_to_viewport_floor() {
+        let (w, h) = headed_window_plan(800.0, 500.0, 2560.0, 1440.0, 140.0, false).expect("应抬高");
+        assert_eq!(w, MIN_VIEWPORT_W);
+        assert_eq!(h, MIN_VIEWPORT_H + 140);
+    }
+
+    /// 幂等:已在目标尺寸时返回 None(不重复 setWindowBounds)。
+    #[test]
+    fn headed_plan_is_idempotent() {
+        let first = headed_window_plan(1920.0, 1080.0, 1512.0, 982.0, 140.0, false).unwrap();
+        assert_eq!(headed_window_plan(first.0 as f64, first.1 as f64, 1512.0, 982.0, 140.0, false), None);
+    }
+
+    // =================== 第 156 轮:chrome 高度可信性判定 ===================
+
+    /// 回归实测(`llaew_20261012_105536.log`,macOS 确定性复现):
+    /// outer 已按 --window-size 报 1920×1080,inner 仍是布局实现前的默认值 800×600。
+    /// 裸减法得 chrome=480(真值约 143),把窗口反向从 1080 撑到 1200。
+    /// 判定后回退 140 → 窗口尺寸决策回到正确量级。
+    #[test]
+    fn plausible_chrome_rejects_unrealized_inner_default() {
+        let chrome = plausible_chrome_height(1920.0, 1080.0, 800.0, 600.0);
+        assert_eq!(chrome, HEADED_CHROME_FALLBACK_H as f64);
+        // 连带效果:窗口不再被无谓撑高(1080 落在 [860, cap] 内 → 不调整)。
+        assert_eq!(headed_window_plan(1920.0, 1080.0, 3200.0, 1800.0, chrome, false), None);
+    }
+
+    // =================== 第 158 轮:保持当前窗口尺寸(不铺满) ===================
+
+    /// 第 158 轮(2026-10-12):fill=true 时保持当前窗口尺寸,不再铺满到 cap。
+    /// 根因:用户实测 Agent 打开新页面总是尝试全屏,覆盖用户手动调整的窗口大小。
+    /// 保持 cur 让首次打开用默认 1080p,手动调整后以用户尺寸为准。
+    #[test]
+    fn headed_plan_keeps_current_size_on_large_screen() {
+        // 3200×1800 大屏上,1920×1080 窗口保持不变(不铺满)
+        assert_eq!(headed_window_plan(1920.0, 1080.0, 3200.0, 1800.0, 140.0, true), None);
+    }
+
+    /// 用户手动调整过的窗口大小被保持(以用户尺寸为准)。
+    #[test]
+    fn headed_plan_resizes_to_user_window_size() {
+        // 用户把窗口调到 1600×900,应保持该尺寸而非铺满或拉回 1080p
+        assert_eq!(headed_window_plan(1600.0, 900.0, 3200.0, 1800.0, 140.0, true), None);
+        assert_eq!(headed_window_plan(1600.0, 900.0, 3200.0, 1800.0, 140.0, false), None);
+    }
+
+    /// fill 参数保留用于语义标注,行为已一致(都保持当前尺寸)。
+    /// 第 158 轮:fill=true 时 1920×1080 在 3200×1800 屏幕上保持不变(返回 None)。
+    #[test]
+    fn headed_plan_fill_param_is_idempotent() {
+        assert_eq!(headed_window_plan(1920.0, 1080.0, 3200.0, 1800.0, 140.0, true), None);
+        assert_eq!(headed_window_plan(1920.0, 1080.0, 3200.0, 1800.0, 140.0, false), None);
+    }
+
+    /// 显式指定窗口尺寸时保持请求尺寸,只做「不溢出屏幕」收边。
+    #[test]
+    fn headed_plan_respects_explicit_window_size() {
+        assert_eq!(headed_window_plan(1400.0, 900.0, 3200.0, 1800.0, 140.0, false), None);
+        // 但显式尺寸若超出屏幕,仍要收边(小屏不溢出优先于保持意图)。
+        let (w, h) = headed_window_plan(1920.0, 1080.0, 1440.0, 900.0, 140.0, false).unwrap();
+        let m = HEADED_SCREEN_MARGIN as f64;
+        assert_eq!(w as f64, 1440.0 - m * 2.0);
+        assert_eq!(h as f64, 900.0 - m * 2.0);
+    }
+
+    /// 小屏方向不改变既有行为:窗口超出屏幕时如实收边到 cap。
+    #[test]
+    fn headed_plan_fill_still_respects_small_screen() {
+        let (w, h) = headed_window_plan(1920.0, 1080.0, 1280.0, 720.0, 140.0, true).unwrap();
+        let m = HEADED_SCREEN_MARGIN as f64;
+        assert_eq!(w as f64, 1280.0 - m * 2.0);
+        assert_eq!(h as f64, 720.0 - m * 2.0);
+    }
+
+    /// inner 恰为实现前默认值、且 outer 仅高度不同时也要判失真
+    /// (差值恰好落在可信区间内的形态,纯区间判定抓不到)。
+    #[test]
+    fn plausible_chrome_rejects_default_inner_within_range() {
+        // outer 830 - inner 600 = 230,落在 [40,300] 可信区间内。
+        assert_eq!(
+            plausible_chrome_height(800.0, 830.0, 800.0, 600.0),
+            HEADED_CHROME_FALLBACK_H as f64
+        );
+    }
+
+    /// 正常实现后的测量(真值 chrome≈143)原样透传,不被兜底覆盖。
+    #[test]
+    fn plausible_chrome_passes_real_measurement() {
+        assert_eq!(plausible_chrome_height(1920.0, 1200.0, 1920.0, 1057.0), 143.0);
+    }
+
+    /// outer == inner(部分平台无 chrome)与负值一律回退。
+    #[test]
+    fn plausible_chrome_falls_back_on_nonpositive() {
+        assert_eq!(
+            plausible_chrome_height(1920.0, 1080.0, 1920.0, 1080.0),
+            HEADED_CHROME_FALLBACK_H as f64
+        );
+        assert_eq!(
+            plausible_chrome_height(1920.0, 500.0, 1920.0, 900.0),
+            HEADED_CHROME_FALLBACK_H as f64
+        );
+    }
+
+    // =================== 第 175 轮:屏幕几何自洽 ===================
+
+    /// 真机实测(`verify.js`):`Emulation.setDeviceMetricsOverride` 只带 width/height
+    /// 时页面读到 `screen=800x600`(Chrome 无头默认值)而 `outer=1920x1080`,
+    /// `outer > screen` 是**物理不可能**(真实显示器宽度永远 ≥ 窗口宽度),
+    /// 属零成本零误伤的风控硬判据。补上 screen 声明后该信号消失。
+    #[test]
+    fn 屏幕几何自洽判据() {
+        assert!(screen_sync_needed(1920, 1080), "两档 headless 的 1080p 应补 screen 声明");
+        assert!(screen_sync_needed(2560, 1440), "2K 扩展档同样需要");
+        // 退化尺寸不触发(避免下发无意义的覆盖)
+        assert!(!screen_sync_needed(0, 1080));
+        assert!(!screen_sync_needed(1920, 0));
+    }
+
+    #[test]
+    fn 几何探针解析缺测fail_open() {
+        use serde_json::json;
+        let raw = r#"{"screen":"1920x1080","window_outer":"1920x1080","outer_gt_screen":false,"screen_is_headless_default":false}"#;
+        let g = parse_geometry(raw).expect("应解析成功");
+        assert_eq!(g["outer_gt_screen"], json!(false));
+        assert_eq!(g["screen"], json!("1920x1080"));
+        // 探测表达式故障 → None(fail-open,不告警)
+        assert!(parse_geometry("garbage").is_none());
+    }
+
+    #[test]
+    fn 几何探针脚本存在关键判据() {
+        assert!(GEOMETRY_PROBE_JS.contains("outer_gt_screen"));
+        assert!(GEOMETRY_PROBE_JS.contains("screen_is_headless_default"));
+        assert!(GEOMETRY_PROBE_JS.contains("outerWidth"));
+        assert!(GEOMETRY_PROBE_JS.contains("JSON.stringify"));
+    }
+
+    // =================== 铺满率复核 ===================
+
+    /// 铺满率取宽高中较小者(短板决定观感)。
+    #[test]
+    fn fill_ratio_takes_the_weaker_axis() {
+        // 探针实测:3184×1753 窗口落在 3200×1769 工作区
+        let r = fill_ratio(3184.0, 1753.0, 3200.0, 1769.0);
+        assert!((r - 1753.0 / 1769.0).abs() < 1e-9, "应取高度比例,实际 {r}");
+        assert!(r > FILL_RATIO_MIN, "铺满率 {r} 应高于阈值");
+    }
+
+    /// 任一维探测失败 → 0(不得当成「已铺满」放行复核重试的判断依据)。
+    #[test]
+    fn fill_ratio_zero_on_failed_probe() {
+        assert_eq!(fill_ratio(0.0, 1753.0, 3200.0, 1769.0), 0.0);
+        assert_eq!(fill_ratio(3184.0, 1753.0, 0.0, 1769.0), 0.0);
+        assert_eq!(fill_ratio(-1.0, 1753.0, 3200.0, 1769.0), 0.0);
+    }
+
+    /// 用户报障形态:窗口停在启动默认 1920×1080,大屏上只占约 60% —— 必须判为未铺满,
+    /// 触发复核重试。锁死「铺满」不是只下发 setWindowBounds 就完事。
+    #[test]
+    fn fill_ratio_detects_the_reported_symptom() {
+        let r = fill_ratio(1920.0, 1080.0, 3200.0, 1800.0);
+        assert!(r < FILL_RATIO_MIN, "1920×1080 在 3200×1800 上应判未铺满,实际 {r}");
+    }
+
+    // =================== 多窗口并行:横向平铺计划 ===================
+
+    /// 双窗口在 1920 工作区横向等分:互不遮挡、均在屏内、留边一致。
+    #[test]
+    fn tile_plan_two_windows_split_horizontally() {
+        let plan = tile_window_plan(1920.0, 1080.0, 0.0, 0.0, 2).expect("双窗应给出平铺计划");
+        assert_eq!(plan.len(), 2);
+        let m = HEADED_SCREEN_MARGIN as i64;
+        let (l1, t1, w1, h1) = plan[0];
+        let (l2, _t2, w2, _h2) = plan[1];
+        assert_eq!(l1, m);
+        assert_eq!(t1, m);
+        assert!(w1 > 0 && w2 > 0);
+        // 窗口等宽且第 2 窗紧挨第 1 窗右侧(留一条边距)。
+        assert_eq!(w1, w2);
+        assert_eq!(l2, l1 + w1 + m);
+        // 不超出工作区右缘。
+        assert!(l2 + w2 <= 1920 - m + 1, "第二窗溢出工作区:{l2}+{w2}");
+        // 纵向占满工作区(上下各留一条边距)。
+        assert_eq!(h1, 1080 - 2 * m);
+    }
+
+    /// 工作区原点非 0(副屏/多屏)时平铺以 availLeft/availTop 为基准。
+    #[test]
+    fn tile_plan_respects_workspace_origin() {
+        let plan = tile_window_plan(1440.0, 900.0, -1440.0, 100.0, 2).expect("应给出计划");
+        let m = HEADED_SCREEN_MARGIN as i64;
+        assert_eq!(plan[0].0, -1440 + m);
+        assert_eq!(plan[0].1, 100 + m);
+        assert!(plan[1].0 > plan[0].0);
+    }
+
+    /// 窗口数 <2 或工作区非法 → 不平铺(None),调用方保持现状。
+    #[test]
+    fn tile_plan_noop_on_single_window_or_bad_metrics() {
+        assert_eq!(tile_window_plan(1920.0, 1080.0, 0.0, 0.0, 1), None);
+        assert_eq!(tile_window_plan(1920.0, 1080.0, 0.0, 0.0, 0), None);
+        assert_eq!(tile_window_plan(0.0, 1080.0, 0.0, 0.0, 2), None);
+        assert_eq!(tile_window_plan(1920.0, -1.0, 0.0, 0.0, 2), None);
+    }
+
+    /// 极端挤迫(窗口数多到单窗逼近 320 下限)也不产出非法几何。
+    #[test]
+    fn tile_plan_degrades_gracefully_when_crowded() {
+        let plan = tile_window_plan(1280.0, 720.0, 0.0, 0.0, 3).expect("应给出计划");
+        assert_eq!(plan.len(), 3);
+        for (i, (l, t, w, h)) in plan.iter().enumerate() {
+            assert!(*w >= 320 && *h >= 240, "第 {i} 窗几何非法:{w}x{h}");
+            assert!(*l >= 0 && *t >= 0, "第 {i} 窗坐标非法:{l},{t}");
+        }
+    }
+}

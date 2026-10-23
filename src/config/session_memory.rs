@@ -172,7 +172,7 @@ fn row_to_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMemoryRow> 
         "reflection" => AgentRole::Reflection,
         // 2026-09-18 第 84 轮:WindowUse Agent 已删除(能力降级为
         // MCP_Window_Use 工具);存量库 role='windowuse' 历史行归并到 SubAgent。
-        // 2026-09-18 第 89 轮:Chromium-WebUse Agent 已删除(降级为 MCP_Web_Use
+        // 2026-09-18 第 89 轮:Chromium-WebUse Agent 已删除(降级为 MCP_Web_LsmAgentBrowser_Use
         // 工具);存量库 role='webuse' 历史行同样归并 SubAgent。
         "windowuse" | "webuse" => AgentRole::SubAgent,
         other => {

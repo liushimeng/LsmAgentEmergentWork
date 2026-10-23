@@ -32,7 +32,7 @@
 //! # 等待类调用透明化
 //!
 //! 有一类调用**天生**会被重复且输出恒定,重复它们是正确行为而非无进展:
-//! `MCP_Web_Use(control_action=wait)` / `MCP_Window_Use(action=wait)` /
+//! `MCP_Web_LsmAgentBrowser_Use(control_action=wait)` / `MCP_Window_Use(action=wait)` /
 //! 纯 `sleep N` 的 Bash / `SubAgent(action=result|history)`(轮询子 Agent 结果)。
 //! 这类调用经 [`wait_like`] 识别后**不计入也不打断**重复链(透明),
 //! 于是 `Read(x) → wait → Read(x) → wait → Read(x)` 仍能正确判为 3 次无进展。
@@ -231,7 +231,7 @@ fn args_brief(args: &Value) -> String {
 ///
 /// | 工具 | 命中条件 |
 /// |------|---------|
-/// | `MCP_Web_Use` | `action == "wait"` 或 `(params.)control_action == "wait"` |
+/// | `MCP_Web_LsmAgentBrowser_Use` | `action == "wait"` 或 `(params.)control_action == "wait"` |
 /// | `MCP_Window_Use` | `action == "wait"` 或 `(params.)control_action == "wait"` |
 /// | `Bash` | 命令是纯 `sleep N`(可带 `&&` 前后空白的整条只有 sleep) |
 /// | `SubAgent` | `action == "result"` / `"history"`(轮询子 Agent 运行结果) |
@@ -254,7 +254,7 @@ pub(crate) fn wait_like(tool: &str, args: &Value) -> bool {
         out
     };
     match tool {
-        "MCP_Web_Use" | "MCP_Window_Use" => strs_at("action")
+        "MCP_Web_LsmAgentBrowser_Use" | "MCP_Web_Chrome_Use" | "MCP_Window_Use" => strs_at("action")
             .iter()
             .chain(strs_at("control_action").iter())
             .any(|v| v == "wait"),
@@ -365,9 +365,9 @@ mod tests {
         // 轮询等待场景:同参数但结果在变 → 恒有进展,零误伤。
         let mut g = guard();
         let args = json!({"action": "inspect", "info": "elements"});
-        assert_eq!(g.observe("MCP_Web_Use", &args, false, "loading"), LoopVerdict::Progress);
-        assert_eq!(g.observe("MCP_Web_Use", &args, false, "loading."), LoopVerdict::Progress);
-        assert_eq!(g.observe("MCP_Web_Use", &args, false, "loaded"), LoopVerdict::Progress);
+        assert_eq!(g.observe("MCP_Web_LsmAgentBrowser_Use", &args, false, "loading"), LoopVerdict::Progress);
+        assert_eq!(g.observe("MCP_Web_LsmAgentBrowser_Use", &args, false, "loading."), LoopVerdict::Progress);
+        assert_eq!(g.observe("MCP_Web_LsmAgentBrowser_Use", &args, false, "loaded"), LoopVerdict::Progress);
         assert_eq!(g.max_repeats(), 1);
     }
 
@@ -457,8 +457,8 @@ mod tests {
         let args = json!({"file_path": "a.txt"});
         let wait = json!({"action": "control", "params": {"control_action": "wait"}});
         assert_eq!(g.observe("Read", &args, false, "x"), LoopVerdict::Progress);
-        assert_eq!(g.observe("MCP_Web_Use", &wait, false, "waited"), LoopVerdict::Progress);
-        assert_eq!(g.observe("MCP_Web_Use", &wait, false, "waited"), LoopVerdict::Progress);
+        assert_eq!(g.observe("MCP_Web_LsmAgentBrowser_Use", &wait, false, "waited"), LoopVerdict::Progress);
+        assert_eq!(g.observe("MCP_Web_LsmAgentBrowser_Use", &wait, false, "waited"), LoopVerdict::Progress);
         match g.observe("Read", &args, false, "x") {
             LoopVerdict::Nudge(_) => {}
             other => panic!("wait 应保持重复链不断,实得 {other:?}"),
@@ -468,7 +468,7 @@ mod tests {
     #[test]
     fn wait_like_matrix() {
         assert!(wait_like(
-            "MCP_Web_Use",
+            "MCP_Web_LsmAgentBrowser_Use",
             &json!({"action": "control", "params": {"control_action": "wait"}})
         ));
         assert!(wait_like("MCP_Window_Use", &json!({"action": "wait"})));
@@ -479,7 +479,7 @@ mod tests {
         // 反例
         assert!(!wait_like("Bash", &json!({"command": "sleep 5 && ls"})));
         assert!(!wait_like("Bash", &json!({"command": "ls"})));
-        assert!(!wait_like("MCP_Web_Use", &json!({"action": "inspect"})));
+        assert!(!wait_like("MCP_Web_LsmAgentBrowser_Use", &json!({"action": "inspect"})));
         assert!(!wait_like("SubAgent", &json!({"action": "launch"})));
         assert!(!wait_like("Read", &json!({"file_path": "a"})));
         assert!(!wait_like("Write", &json!({"file_path": "a"})));

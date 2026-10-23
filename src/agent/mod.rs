@@ -17,6 +17,7 @@ pub mod attachments;
 /// 设计见 `docs/自定义浏览器和V8引擎/`。
 pub mod browser;
 pub mod cancel;
+pub mod chrome_browser;
 pub mod compact;
 pub mod context;
 pub mod custom_agents;

@@ -1,18 +1,18 @@
 //! 网页取证纪律(第 131 轮)—— 禁止用 Bash 探测/抓取**任务目标站点**。
 //!
-//! 实测事故(`llaew_20261008_124929.log`):`MCP_Web_Use(action=open)` 返回
+//! 实测事故(`llaew_20261008_124929.log`):`MCP_Web_LsmAgentBrowser_Use(action=open)` 返回
 //! `code=2001 net::ERR_CONNECTION_RESET` 后,SubAgent-Work 自行「降级」成
 //! `curl / ping / nc / netstat / traceroute` 反复探同一台主机,28 次 Bash 对 8 次
-//! MCP_Web_Use,烧掉大半迭代预算,既没登录也没产出结论。
+//! MCP_Web_LsmAgentBrowser_Use,烧掉大半迭代预算,既没登录也没产出结论。
 //!
 //! 与既有两条纪律同源:
 //! - `prompt` 侧 `MCP_WEB_USE_PROMPT_SECTION` 第 10 条「反伪造红线」:禁止用 Bash
-//!   手写本应由 MCP_Web_Use 产出的截图/抓取证据(QC 会对账工具轨迹);
+//!   手写本应由 MCP_Web_LsmAgentBrowser_Use 产出的截图/抓取证据(QC 会对账工具轨迹);
 //! - `target_anchor` 第 128 轮范围约束(L3):浏览器显式 URL 动作越界返回 6001。
 //!
 //! 本模块是**运行时兜底**:提示词说了模型仍可能绕过(尤其在 open 连续失败、
 //! 迭代预算吃紧时),故对「命中网络取证命令 且 命令中的 host 落在任务锚点域内」
-//! 的 Bash 调用直接拒绝,并把 Agent 推回 MCP_Web_Use。
+//! 的 Bash 调用直接拒绝,并把 Agent 推回 MCP_Web_LsmAgentBrowser_Use。
 //!
 //! ## 口径(窄口径,避免误伤正常开发任务)
 //!
@@ -20,7 +20,7 @@
 //!
 //! 1. 开关 [`web_evidence_enabled`] 未关(默认开,与 `LAEW_TARGET_ANCHOR` 同构);
 //! 2. 工具调用是 `Bash`(其它工具不管);
-//! 3. 当前 Agent 工具面**含** `MCP_Web_Use` —— 不含就没有替代路径,拦了等于死路;
+//! 3. 当前 Agent 工具面**含** `MCP_Web_LsmAgentBrowser_Use` —— 不含就没有替代路径,拦了等于死路;
 //! 4. 命令行命中网络取证模式([`detect_network_evidence_command`]);
 //! 5. 命令行出现的 host 落在任务锚点域内([`hosts_in_command`] + [`TargetAnchor`])。
 //!
@@ -36,7 +36,7 @@ use crate::agent::safety::target_anchor::{
 /// 网络取证命令的程序名单(小写,按 token 边界匹配)。
 ///
 /// 刻意**不含** `python` / `node` 等通用解释器 —— 它们既能跑本地脚本也能发网络请求,
-/// 按名字拦会误伤大量正常开发任务;真正要治的是「拿 shell 网络工具顶替 MCP_Web_Use」。
+/// 按名字拦会误伤大量正常开发任务;真正要治的是「拿 shell 网络工具顶替 MCP_Web_LsmAgentBrowser_Use」。
 const NETWORK_EVIDENCE_BINARIES: &[&str] = &[
     "curl", "wget", "nc", "ncat", "netcat", "telnet", "ping", "ping6", "traceroute", "traceroute6",
     "tracepath", "arp", "nmap", "http", "https", "httpie", "httping", "dig", "nslookup", "host",
@@ -185,10 +185,11 @@ pub fn denial_text(v: &EvidenceViolation) -> String {
     format!(
         "[网页取证纪律] 禁止用 Bash 对任务目标站点做网络探测或抓取:命令涉及 {host}。\
          命令: {command}\n\
-         任务目标站点({allowed})的一切证据(DOM / 界面文字 / 截图 / 网络请求)只能来自 \
-         MCP_Web_Use —— Quality-Check 会与执行轨迹对账,Bash 抓来的内容无法核验。\n\
-         请改用 MCP_Web_Use:action=open 打开目标站点拿 page_id → action=inspect 读 DOM/文字 → \
-         action=control 做交互。若 open 返回 2001(连接失败)/3001(未装浏览器),\
+         任务目标站点({allowed})的一切证据(DOM / 界面文字 / 截图 / 网络请求)只能来自浏览器工具 \
+         MCP_Web_Chrome_Use(默认优先)或 MCP_Web_LsmAgentBrowser_Use(Chrome 被风控时)—— \
+         Quality-Check 会与执行轨迹对账,Bash 抓来的内容无法核验。\n\
+         请改用 MCP_Web_Chrome_Use:action=open 打开目标站点拿 page_id → action=inspect 读 DOM/文字 → \
+         action=control 做交互。若 open 返回 3001(未检测到浏览器)/导航失败,\
          说明目标不可达或环境缺失,**如实报告即可,不要改用 Bash 绕行、不要换站点替代**。",
         host = v.host,
         command = v.command,
@@ -316,7 +317,7 @@ mod tests {
         .expect("应被拦");
         assert_eq!(v.host, "10.0.0.9");
         assert_eq!(v.allowed_hosts, vec!["10.0.0.9".to_string()]);
-        assert!(denial_text(&v).contains("MCP_Web_Use"));
+        assert!(denial_text(&v).contains("MCP_Web_LsmAgentBrowser_Use"));
     }
 
     #[test]
@@ -342,7 +343,7 @@ mod tests {
             check_bash_against_web_evidence("curl http://10.0.0.9:8080/", None, true)
                 .is_none()
         );
-        // 无 MCP_Web_Use(没有替代路径,拦了就是死路)
+        // 无 MCP_Web_LsmAgentBrowser_Use(没有替代路径,拦了就是死路)
         assert!(
             check_bash_against_web_evidence("curl http://10.0.0.9:8080/", Some(&a), false)
                 .is_none()

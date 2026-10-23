@@ -102,7 +102,8 @@
 | 🗜️ **Compact Agent** | 压缩层：上下文接近上限时三档自动压缩 | 无工具 |
 | 🧩 **WorkFlow Agent** | 工作流编排层：超大型任务 Goal 状态机 + Squad 调度 | Bash / Read / Write |
 | 🪟 **WindowUse Agent** | 桌面操控层：Windows UIA / macOS AX 读写桌面软件窗口 | Read / Bash 白名单 / Window* |
-| 🌐 **WebUse（工具）** | 浏览器操控层：LsmAgentBrowser 进程内自研内核（HTTP(S) + DOM + 布局 + 软件渲染 + Boa JS）；网页浏览 / 信息收集 / 爬虫 / 登录后页面操作 / 截图 / DOM·Network·Console·localStorage 观察；`page_id` 多轮会话管理，派生标签页经 `spawned_page_id` 回传；全内存 Cookie/存储 | MCP_Web_Use |
+| 🌐 **WebUse-Chrome（工具）** | 浏览器操控层（Chrome/CDP，chromiumoxide 0.9，真 Chromium 渲染，headed 窗口支持人工介入，**日常默认优先**）：打开/读取/点击/输入/截图基础动作集 | MCP_Web_Chrome_Use |
+| 🌐 **WebUse（工具）** | 浏览器操控层：LsmAgentBrowser 进程内自研内核（HTTP(S) + DOM + 布局 + 软件渲染 + Boa JS）；网页浏览 / 信息收集 / 爬虫 / 登录后页面操作 / 截图 / DOM·Network·Console·localStorage 观察；`page_id` 多轮会话管理，派生标签页经 `spawned_page_id` 回传；全内存 Cookie/存储 | MCP_Web_LsmAgentBrowser_Use |
 
 ### 编排拓扑
 
@@ -274,7 +275,8 @@ LsmAgentEmergentWork/
 │   │   ├── system_prompt/   # SystemPrompt 组合与渲染 (mod / use_mcp_hint / skill_catalog)
 │   │   ├── tools/           # Tool trait + ToolRegistry + bash/read/write/edit/glob/grep/emit/todo/subagent/read_detect/bash_spill
 │   │   ├── tools/mcp_window_use/ # MCP_Window_Use 工具目录 (mod / query / open / inspect / vision / chat / explore / sequence / input_batch / tests)
-│   │   ├── tools/mcp_web_use/    # MCP_Web_Use 兼容层 (mod / control / inspect / visit_ledger / tests)
+│   │   ├── tools/mcp_chrome_use/ # MCP_Web_Chrome_Use 工具(Chrome/CDP 基础框架)
+│   │   ├── tools/mcp_web_lsm_browser_use/ # MCP_Web_LsmAgentBrowser_Use 兼容层 (mod / control / inspect / visit_ledger / tests)
 │   │   ├── tools/use_mcp/        # Use_MCP 工具目录 (通用 MCP 服务调用, mod / tests)
 │   │   ├── window/          # 窗口操控平台驱动 (mod / windows / windows_input / windows_ocr / macos_axui / macos_vision_ocr / control_action / fallback / macos_legacy/)
 │   │   ├── browser/         # LsmAgentBrowser 进程内内核 (mod / api / inspect / net / document / layout / render / js / storage / urlutil)

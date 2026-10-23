@@ -378,7 +378,7 @@ impl SubAgentRunner {
         // 早终止路径(RepeatedToolFailure / MaxIterationsExceeded)不再升级为 Error,
         // ★2026-09-17 第 75 轮:Runner 角色信息(SubAgent)。
         // ★2026-09-18 第 89 轮:执行器唯一化(Chromium-WebUse Agent 已删除,浏览器
-        // 操控由本 Runner 的 MCP_Web_Use 工具承担),trace.runner_role 恒为 SubAgent,
+        // 操控由本 Runner 的 MCP_Web_LsmAgentBrowser_Use 工具承担),trace.runner_role 恒为 SubAgent,
         // trace.intended_role 反映 WorkFlow 期望的角色(供 delegate_mismatch 对账)。
         let runner_role = Some(AgentRole::SubAgent);
         let intended_role = input.intended_role;
@@ -490,7 +490,7 @@ impl SubAgentRunner {
         };
 
         // ★ 2026-09-18 第 89 轮:浏览器真实页面文本出口兜底(自原 WebUseRunner
-        // 第 76/78/82 轮平移)。MCP_Web_Use 抓取的页面文本(inspect elements /
+        // 第 76/78/82 轮平移)。MCP_Web_LsmAgentBrowser_Use 抓取的页面文本(inspect elements /
         // control eval_js 的 tool_result 信封)在 LLM 终答常被「任务已完成,
         // 内容超过 N 字符」模板句吞掉;Runner 出口从 sub_session 反查最长一段
         // 可读文本(≥200 字符 + UI 占位文本过滤),作为最终产物追加。
@@ -569,7 +569,7 @@ fn runner_text_needs_fallback(text: &str) -> bool {
     }
     const KEYWORDS: &[&str] = &[
         "已打开", "已点击", "已输入", "已截图", "已抓取", "已采集", "已登录",
-        "已写入", "已生成", "page_id", "MCP_Web_Use", "action=open", "spawned_page_id",
+        "已写入", "已生成", "page_id", "MCP_Web_LsmAgentBrowser_Use", "action=open", "spawned_page_id",
         "已完成", "执行成功", "已保存", "成功完成",
     ];
     !KEYWORDS.iter().any(|k| text.contains(k))
@@ -729,7 +729,7 @@ pub fn build_existing_pages_hint_anchored(
             out.push_str(&format!("  - {}\n", format_page_line(id, url, title)));
         }
         out.push_str(
-            "网页类任务优先用 MCP_Web_Use 的 inspect/control 直接操作上述页面;\
+            "网页类任务优先用 MCP_Web_LsmAgentBrowser_Use 的 inspect/control 直接操作上述页面;\
              仅当任务需要其它网址或页面已失效(code=2000)时才 action=open 新开。",
         );
         return Some(out);
@@ -772,7 +772,7 @@ pub fn build_existing_pages_hint_anchored(
         );
     }
     out.push_str(
-        "网页类任务优先用 MCP_Web_Use 的 inspect/control 直接操作「✓」组页面;\
+        "网页类任务优先用 MCP_Web_LsmAgentBrowser_Use 的 inspect/control 直接操作「✓」组页面;\
          锚点站点没有存活页面时才 action=open 新开(且只能开锚点内的站点 —— \
          开锚点外站点会返回 code=6001 被阻断)。目标站点不可达时如实报告失败,\
          禁止改用其它站点替代。",
@@ -787,11 +787,11 @@ fn format_page_line(id: &str, url: &str, title: &str) -> String {
 }
 
 /// 从 sub_session 中提取「真实从浏览器抓到的可读文本」(原 WebUseRunner
-/// 第 76/78/82 轮能力平移;第 89 轮起解析 MCP_Web_Use 的 tool_result 信封,
+/// 第 76/78/82 轮能力平移;第 89 轮起解析 MCP_Web_LsmAgentBrowser_Use 的 tool_result 信封,
 /// 信封形态与原 Browser* 工具一致,解析逻辑零改动)。
 ///
 /// 业务背景:网页任务终答常输出模板句「任务已完成,AI回复已提取,内容超过 500 字符」,
-/// 把真实回复吞掉。Runner 出口必须把 MCP_Web_Use inspect/control 抓到的真实文本
+/// 把真实回复吞掉。Runner 出口必须把 MCP_Web_LsmAgentBrowser_Use inspect/control 抓到的真实文本
 /// 追加到 outcome.text,让 QC 与 TUI 看到原文。
 ///
 /// 提取策略:
@@ -1391,7 +1391,7 @@ mod tests {
         assert!(hint.contains("文心一言"));
         assert!(hint.contains("https://wenxin.baidu.com/"));
         assert!(hint.contains("(无标题)"), "空标题应有占位: {hint}");
-        assert!(hint.contains("MCP_Web_Use"), "应引导使用 MCP_Web_Use: {hint}");
+        assert!(hint.contains("MCP_Web_LsmAgentBrowser_Use"), "应引导使用 MCP_Web_LsmAgentBrowser_Use: {hint}");
     }
 
     #[test]

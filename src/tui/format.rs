@@ -942,9 +942,9 @@ pub(crate) fn tool_args_brief(tool: &str, args_json: &str) -> String {
             }
             brief
         }
-        // ★ 2026-09-18 第 89 轮:MCP_Web_Use 统一入口简报(原 Browser* 四分支合并)。
+        // ★ 2026-09-18 第 89 轮:MCP_Web_LsmAgentBrowser_Use 统一入口简报(原 Browser* 四分支合并)。
         // 突出「定位(page_id/url)+ 意图(action/act/info)」两要素。
-        "MCP_Web_Use" => {
+        "MCP_Web_LsmAgentBrowser_Use" | "MCP_Web_Chrome_Use" => {
             let action = extract_json_field(args_json, "action").unwrap_or_else(|| "?".into());
             let pid = extract_json_field(args_json, "page_id").unwrap_or_default();
             let mut brief = format!("action={}", clip_cols(&action, 16));
@@ -1133,33 +1133,33 @@ mod tool_args_brief_tests {
         assert!(brief.len() <= 81); // 80 + …
     }
 
-    // ========== 2026-09-18 第 89 轮:MCP_Web_Use 工具简报(原 Browser* 合并) ==========
+    // ========== 2026-09-18 第 89 轮:MCP_Web_LsmAgentBrowser_Use 工具简报(原 Browser* 合并) ==========
 
     #[test]
-    fn mcp_web_use_open_brief_extracts_url() {
+    fn mcp_web_lsm_browser_use_open_brief_extracts_url() {
         let json = r#"{"action":"open","url":"https://wenxin.baidu.com/","mode":"hidden"}"#;
-        let brief = tool_args_brief("MCP_Web_Use", json);
+        let brief = tool_args_brief("MCP_Web_LsmAgentBrowser_Use", json);
         assert!(
             brief.starts_with("action=open"),
-            "MCP_Web_Use open brief 应以 action=open 开头,实际: {brief}"
+            "MCP_Web_LsmAgentBrowser_Use open brief 应以 action=open 开头,实际: {brief}"
         );
         assert!(brief.contains("wenxin.baidu.com"));
     }
 
     #[test]
-    fn mcp_web_use_control_brief_combines_page_id_and_act() {
+    fn mcp_web_lsm_browser_use_control_brief_combines_page_id_and_act() {
         let json = r#"{"action":"control","page_id":"p_ab12cd34","control_action":"input_text","params":{"selector":"textarea","text":"你好"}}"#;
-        let brief = tool_args_brief("MCP_Web_Use", json);
+        let brief = tool_args_brief("MCP_Web_LsmAgentBrowser_Use", json);
         assert!(brief.contains("p_ab12cd34"), "应含 page_id: {brief}");
         assert!(brief.contains("act=input_text"), "应含 act: {brief}");
         assert!(!brief.contains("你好"), "params 正文不应刷屏: {brief}");
     }
 
     #[test]
-    fn mcp_web_use_inspect_brief_combines_page_id_and_info() {
+    fn mcp_web_lsm_browser_use_inspect_brief_combines_page_id_and_info() {
         let json =
             r#"{"action":"inspect","page_id":"p_ab12cd34","info":"elements","params":{"selector":"[class*=answer]"}}"#;
-        let brief = tool_args_brief("MCP_Web_Use", json);
+        let brief = tool_args_brief("MCP_Web_LsmAgentBrowser_Use", json);
         assert!(brief.contains("p_ab12cd34"));
         assert!(brief.contains("info=elements"));
     }

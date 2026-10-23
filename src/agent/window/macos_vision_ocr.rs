@@ -93,7 +93,7 @@ pub fn ocr_window(
     Ok(blocks)
 }
 
-/// 对 PNG 文件直接 OCR(第 99 轮:供 MCP_Web_Use 截图链路复用)。
+/// 对 PNG 文件直接 OCR(第 99 轮:供 MCP_Web_LsmAgentBrowser_Use 截图链路复用)。
 ///
 /// 与 [`ocr_window`] 的差异:输入已是磁盘上的 PNG(浏览器截图字节落盘),
 /// 不触碰 CGWindowListCreateImage —— **无需屏幕录制权限**;输出同为词块列表

@@ -1,6 +1,6 @@
 //! Plan Agent:规划层,为 hard 档任务生成 Markdown 方案。
 //!
-//! Plan 持有 Read / Glob / Grep / Bash(只读侦察)/ MCP_Web_Use / MCP_Window_Use
+//! Plan 持有 Read / Glob / Grep / Bash(只读侦察)/ MCP_Web_LsmAgentBrowser_Use / MCP_Window_Use
 //! 观察类工具 —— 规划前先探索(代码类任务读相关文件,网页/桌面类任务观察界面结构),
 //! 有充足事实依据后再成文;Write 仅允许写入 plans/ 目录,不修改源代码。
 //! 单元完成后,Markdown 落盘到 `plans/{session_id}-{seq}.md`。

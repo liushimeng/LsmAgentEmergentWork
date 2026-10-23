@@ -74,7 +74,7 @@
             "在豆包中输入查询并读取结果",
             "chat_log 含 [SEND] 行",
             "已在网页版完成",
-            "iter=8 tools=MCP_Web_Use",
+            "iter=8 tools=MCP_Web_LsmAgentBrowser_Use",
             Some("找到软件 豆包 , 输入信息,读取对话返回的结果,显示相关的对话信息"),
         );
         // 反降级规则必须包含桌面目标保真条款
@@ -82,7 +82,7 @@
         assert!(p.contains("不构成等效完成"), "{p}");
         // suggestion 层面禁止推荐网页版
         assert!(p.contains("禁止推荐「改用网页版"), "{p}");
-        assert!(p.contains("MCP_Web_Use"), "{p}");
+        assert!(p.contains("MCP_Web_LsmAgentBrowser_Use"), "{p}");
     }
 
     // ========== 第 128 轮:目标一致性硬门(禁止改派目标站点) ==========

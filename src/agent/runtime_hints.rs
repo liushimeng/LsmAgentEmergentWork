@@ -33,11 +33,11 @@ pub(crate) const THOUGHT_NUDGE_AT: usize = 2;
 /// 此前 `explore_budget` 耗尽文案写死浏览器语义(`inspect/screenshot/eval_js` →
 /// `input_text/click/wait`),纯代码/文件类执行单元读到的是**错误指令**。
 /// 由 [`crate::agent::profile::AgentProfile::hint_role`] 派生 —— 注意它**不是**纯看
-/// 工具面:`builtin_registry()` 无条件含 `MCP_Web_Use`,静态判会把所有代码单元误判成
+/// 工具面:`builtin_registry()` 无条件含 `MCP_Web_LsmAgentBrowser_Use`,静态判会把所有代码单元误判成
 /// UI 任务,故 `Ui` / `Execute` 的分叉看「本单元**实际调用过**什么工具」。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum HintRole {
-    /// 浏览器 / 桌面操控执行层(本单元实际调用过 MCP_Web_Use / MCP_Window_Use)。
+    /// 浏览器 / 桌面操控执行层(本单元实际调用过 MCP_Web_LsmAgentBrowser_Use / MCP_Window_Use)。
     #[default]
     Ui,
     /// 通用执行层(代码 / 文件 / 命令类单元)。

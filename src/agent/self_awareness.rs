@@ -51,7 +51,7 @@ pub const MAX_BATCH_TASKS: usize = 8;
 pub enum SpawnPolicy {
     /// 不注册 `SubAgent` 工具(QC / SessionContext / Debug / Compact / Compact 等)。
     Disabled,
-    /// 只能启动只读子 Agent(Yolo:入口层信息收集型工具面 Read/Glob/Grep/Bash/MCP_Web_Use,
+    /// 只能启动只读子 Agent(Yolo:入口层信息收集型工具面 Read/Glob/Grep/Bash/MCP_Web_LsmAgentBrowser_Use,
     /// 子 Agent 仍只读侦察,不得越权写盘)。
     ReadOnlyChildren,
     /// 可启动完整执行层子 Agent(Plan / Main-Work / SubAgent-Work / WorkFlow:
@@ -90,7 +90,8 @@ pub const EXECUTOR_TOOLS: &[&str] = &[
     "Glob",
     "Grep",
     "TodoWrite",
-    "MCP_Web_Use",
+    "MCP_Web_LsmAgentBrowser_Use",
+    "MCP_Web_Chrome_Use",
     "MCP_Window_Use",
 ];
 
@@ -185,12 +186,12 @@ impl SubAgentType {
         match self {
             Self::GeneralPurpose => EXECUTOR_TOOLS,
             Self::Explore | Self::CodeReviewer => READ_ONLY_TOOLS,
-            Self::Researcher => &["Read", "Glob", "Grep", "MCP_Web_Use"],
+            Self::Researcher => &["Read", "Glob", "Grep", "MCP_Web_LsmAgentBrowser_Use", "MCP_Web_Chrome_Use"],
             Self::Plan => &["Read", "Glob", "Grep", "Write"],
             // 2026-10-16(USA.gov 遍历实测):operator 第一产出常是采集/执行结果落盘,
             // 缺 Write 时被迫 Bash heredoc,Windows 长命令截断致多次断写补写白烧迭代
             // (4 个采集分片各损失 1~2 轮);补 Write,Bash 仍保留兜底。
-            Self::Operator => &["Bash", "Read", "Write", "MCP_Web_Use", "MCP_Window_Use"],
+            Self::Operator => &["Bash", "Read", "Write", "MCP_Web_LsmAgentBrowser_Use", "MCP_Web_Chrome_Use", "MCP_Window_Use"],
         }
     }
 

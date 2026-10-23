@@ -66,7 +66,7 @@ pub enum SpawnError {
 }
 
 impl SpawnError {
-    /// 统一信封 code(对齐 MCP_Window_Use / MCP_Web_Use 风格)。
+    /// 统一信封 code(对齐 MCP_Window_Use / MCP_Web_LsmAgentBrowser_Use 风格)。
     pub fn code(&self) -> u16 {
         match self {
             Self::InvalidArgs(_) => 1001,

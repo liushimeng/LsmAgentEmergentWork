@@ -966,11 +966,11 @@ mod dedup_tests {
     // 覆盖 Main-Work 编排层信息收集型工具面 + ReAct 编排循环 + LoopGuard 接入。
     // 详见 docs/Main-Work工具扩展与ReAct改造/01-设计与解决方案.md §6.1。
 
-    /// 第 122 轮:Main-Work 工具面含 MCP_Web_Use + 不持 Write/Edit。
+    /// 第 122 轮:Main-Work 工具面含 MCP_Web_LsmAgentBrowser_Use + 不持 Write/Edit。
     /// 工具注册表的最终位置在 `tools/mod.rs::main_work_registry`,本断言作为
     /// main_work 模块侧的双重校验。
     #[test]
-    fn main_work_registry_includes_mcp_web_use() {
+    fn main_work_registry_includes_mcp_web_lsm_browser_use() {
         // 通过 AgentProfile 派生(运行时真实路径)
         let names = AgentProfile::main_work_profile()
             .tools
@@ -979,8 +979,8 @@ mod dedup_tests {
             .map(|s| s.to_string())
             .collect::<Vec<_>>();
         assert!(
-            names.contains(&"MCP_Web_Use".to_string()),
-            "Main-Work 应持 MCP_Web_Use: {names:?}"
+            names.contains(&"MCP_Web_LsmAgentBrowser_Use".to_string()),
+            "Main-Work 应持 MCP_Web_LsmAgentBrowser_Use: {names:?}"
         );
         // 仍不持 Write / Edit
         assert!(!names.contains(&"Write".to_string()));
@@ -1006,14 +1006,14 @@ mod dedup_tests {
         );
     }
 
-    /// 第 122 轮:Main-Work 工具说明含 MCP_Web_Use。
+    /// 第 122 轮:Main-Work 工具说明含 MCP_Web_LsmAgentBrowser_Use。
     #[test]
-    fn main_work_tools_hint_mentions_mcp_web_use() {
+    fn main_work_tools_hint_mentions_mcp_web_lsm_browser_use() {
         let prompt = crate::agent::system_prompt::SystemPrompt::main_work()
             .render(crate::config::Protocol::Anthropic);
         assert!(
-            prompt.contains("MCP_Web_Use"),
-            "Main-Work tools_hint 应提及 MCP_Web_Use: 实际无"
+            prompt.contains("MCP_Web_LsmAgentBrowser_Use"),
+            "Main-Work tools_hint 应提及 MCP_Web_LsmAgentBrowser_Use: 实际无"
         );
         assert!(
             prompt.contains("连续工作模式"),
@@ -1039,7 +1039,7 @@ mod dedup_tests {
         // 工具面 sanity check
         let names = configured.profile.tools.names();
         assert!(names.contains(&"Bash"));
-        assert!(names.contains(&"MCP_Web_Use"));
+        assert!(names.contains(&"MCP_Web_LsmAgentBrowser_Use"));
     }
 
     /// 第 122 轮:MainWorkRunner 默认构造不抛错。
@@ -1282,7 +1282,7 @@ fn parse_workflow_plan_accepts_markdown_table() {
     let md = "## WorkFlow 拆解\n\n\
               | id | name | steps | depends_on |\n\
               | --- | --- | --- | --- |\n\
-              | wf-1 | 打开页面并抓取 | MCP_Web_Use(action=open) + inspect | 无 |\n\
+              | wf-1 | 打开页面并抓取 | MCP_Web_LsmAgentBrowser_Use(action=open) + inspect | 无 |\n\
               | wf-2 | 渲染表格并落盘 | Bash 写 Markdown | wf-1 |\n";
     let plan = parse_workflow_plan(md).expect("Markdown 编排表应能被解析");
     assert_eq!(plan.workflows.len(), 2, "应还原出 2 个单元: {plan:?}");
@@ -1305,7 +1305,7 @@ fn is_web_task_detects_web_and_local_tasks() {
     use crate::agent::main_work::is_web_task;
     // 网页:显式 URL / 工具名 / 关键词
     assert!(is_web_task(Some("抓取 https://36kr.com/ 的最新文章"), &[]));
-    assert!(is_web_task(Some("用 MCP_Web_Use 打开页面"), &[]));
+    assert!(is_web_task(Some("用 MCP_Web_LsmAgentBrowser_Use 打开页面"), &[]));
     assert!(is_web_task(None, &["浏览网页并保存内容".to_string()]));
     // 本地任务不应误判
     assert!(!is_web_task(Some("重构 src/agent/mod.rs 并跑 cargo test"), &[]));
@@ -1433,7 +1433,7 @@ fn parse_plan_markdown_supports_alphanumeric_id_wf1b() {
 
 ### WorkFlow 1:站点可达性与阻断定级
 - 步骤:
-  - [ ] 用 MCP_Web_Use 探测站点可达性
+  - [ ] 用 MCP_Web_LsmAgentBrowser_Use 探测站点可达性
 - 依赖:无
 - 验收标准:明确阻断定级
 

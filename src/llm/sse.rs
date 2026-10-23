@@ -677,7 +677,7 @@ mod tests {
         let mut sink = ParseSink::new();
         sink.feed(DeltaEvent::ToolCallStart {
             id: "c1".into(),
-            name: "MCP_Web_Use".into(),
+            name: "MCP_Web_LsmAgentBrowser_Use".into(),
         })
         .unwrap();
         let err = sink.finish().unwrap_err();
@@ -939,7 +939,7 @@ mod tests {
         assert_eq!(sanitize_tool_name("Read"), "Read");
         assert_eq!(sanitize_tool_name("Write"), "Write");
         assert_eq!(sanitize_tool_name("MCP_Window_Use"), "MCP_Window_Use");
-        assert_eq!(sanitize_tool_name("MCP_Web_Use"), "MCP_Web_Use");
+        assert_eq!(sanitize_tool_name("MCP_Web_LsmAgentBrowser_Use"), "MCP_Web_LsmAgentBrowser_Use");
         // 首尾空白应被剥离
         assert_eq!(sanitize_tool_name("  Bash  "), "Bash");
         assert_eq!(sanitize_tool_name("\nRead\n"), "Read");

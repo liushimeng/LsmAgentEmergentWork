@@ -1,9 +1,9 @@
-//! LsmAgentBrowser × MCP_Web_Use 端到端集成测试。
+//! LsmAgentBrowser × MCP_Web_LsmAgentBrowser_Use 端到端集成测试。
 //!
 //! 使用进程内 mock HTTP 服务(真实 TCP/HTTP,OS 分配端口),不依赖外网,
 //! 不启动任何外部浏览器,不使用 CDP。
 
-use lsm_agent::agent::tools::mcp_web_use::McpWebUseTool;
+use lsm_agent::agent::tools::mcp_web_lsm_browser_use::McpWebLsmBrowserUseTool;
 use lsm_agent::agent::tools::Tool;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -286,7 +286,7 @@ fn route(path: &str, with_headers: bool) -> (&'static str, String, Vec<(String, 
     }
 }
 
-async fn exec(tool: &McpWebUseTool, args: Value) -> Value {
+async fn exec(tool: &McpWebLsmBrowserUseTool, args: Value) -> Value {
     let text = tool.execute(args).await.unwrap();
     serde_json::from_str(&text).unwrap_or_else(|e| panic!("返回不是 JSON:{e}\n{text}"))
 }
@@ -302,7 +302,7 @@ fn allow_loopback() {
 async fn open_读取_点击链接_表单提交闭环() {
     allow_loopback();
     let base = start_site().await;
-    let tool = McpWebUseTool;
+    let tool = McpWebLsmBrowserUseTool;
 
     let open = exec(&tool, json!({"action": "open", "url": base, "mode": "hidden", "reuse": false})).await;
     assert_eq!(open["code"], 0, "{open}");
@@ -383,7 +383,7 @@ async fn open_读取_点击链接_表单提交闭环() {
 async fn sequence_连续执行与_stop_on_error() {
     allow_loopback();
     let base = start_site().await;
-    let tool = McpWebUseTool;
+    let tool = McpWebLsmBrowserUseTool;
     let open = exec(&tool, json!({"action": "open", "url": base, "mode": "hidden", "reuse": false})).await;
     let page_id = open["data"]["page_id"].as_str().unwrap().to_string();
 
@@ -430,7 +430,7 @@ async fn sequence_连续执行与_stop_on_error() {
 async fn explore_批量观测与截图落盘() {
     allow_loopback();
     let base = start_site().await;
-    let tool = McpWebUseTool;
+    let tool = McpWebLsmBrowserUseTool;
     let open = exec(&tool, json!({"action": "open", "url": base, "mode": "hidden", "reuse": false})).await;
     let page_id = open["data"]["page_id"].as_str().unwrap().to_string();
 
@@ -471,7 +471,7 @@ async fn explore_批量观测与截图落盘() {
 #[tokio::test]
 async fn 失效_page_id_返回_2000() {
     allow_loopback();
-    let tool = McpWebUseTool;
+    let tool = McpWebLsmBrowserUseTool;
     let v = exec(
         &tool,
         json!({"action": "inspect", "page_id": "p_deadbeef", "info": "title"}),
@@ -486,7 +486,7 @@ async fn 失效_page_id_返回_2000() {
 async fn js渲染_内联脚本正文可读() {
     allow_loopback();
     let base = start_site().await;
-    let tool = McpWebUseTool;
+    let tool = McpWebLsmBrowserUseTool;
     let open = exec(
         &tool,
         json!({"action": "open", "url": format!("{base}/js-inline"), "mode": "hidden", "reuse": false}),
@@ -511,7 +511,7 @@ async fn js渲染_内联脚本正文可读() {
 async fn js渲染_外链脚本执行() {
     allow_loopback();
     let base = start_site().await;
-    let tool = McpWebUseTool;
+    let tool = McpWebLsmBrowserUseTool;
     let open = exec(
         &tool,
         json!({"action": "open", "url": format!("{base}/js-external"), "mode": "hidden", "reuse": false}),
@@ -537,7 +537,7 @@ async fn js渲染_外链脚本执行() {
 async fn js渲染_fetch_取数后渲染() {
     allow_loopback();
     let base = start_site().await;
-    let tool = McpWebUseTool;
+    let tool = McpWebLsmBrowserUseTool;
     let open = exec(
         &tool,
         json!({"action": "open", "url": format!("{base}/js-fetch"), "mode": "hidden", "reuse": false}),
@@ -562,7 +562,7 @@ async fn js渲染_fetch_取数后渲染() {
 async fn js渲染_定时器延迟后可读() {
     allow_loopback();
     let base = start_site().await;
-    let tool = McpWebUseTool;
+    let tool = McpWebLsmBrowserUseTool;
     let open = exec(
         &tool,
         json!({"action": "open", "url": format!("{base}/js-timer"), "mode": "hidden", "reuse": false}),
@@ -588,7 +588,7 @@ async fn js渲染_定时器延迟后可读() {
 async fn js交互_click监听阻止默认导航() {
     allow_loopback();
     let base = start_site().await;
-    let tool = McpWebUseTool;
+    let tool = McpWebLsmBrowserUseTool;
     let open = exec(
         &tool,
         json!({"action": "open", "url": format!("{base}/js-click"), "mode": "hidden", "reuse": false}),
@@ -631,7 +631,7 @@ async fn js交互_click监听阻止默认导航() {
 async fn 外链样式加载与计算样式可观测() {
     allow_loopback();
     let base = start_site().await;
-    let tool = McpWebUseTool;
+    let tool = McpWebLsmBrowserUseTool;
     let open = exec(
         &tool,
         json!({"action": "open", "url": format!("{base}/css-page"), "mode": "hidden", "reuse": false}),
@@ -717,7 +717,7 @@ async fn 外链样式加载与计算样式可观测() {
 async fn js渲染_元素几何属性可读_定宽容器() {
     allow_loopback();
     let base = start_site().await;
-    let tool = McpWebUseTool;
+    let tool = McpWebLsmBrowserUseTool;
     let open = exec(
         &tool,
         json!({"action": "open", "url": format!("{base}/js-geometry"), "mode": "hidden", "reuse": false}),
@@ -749,7 +749,7 @@ async fn js渲染_元素几何属性可读_定宽容器() {
 async fn eval_js_全局跨调用保留() {
     allow_loopback();
     let base = start_site().await;
-    let tool = McpWebUseTool;
+    let tool = McpWebLsmBrowserUseTool;
     let open = exec(
         &tool,
         json!({"action": "open", "url": format!("{base}/js-inline"), "mode": "hidden", "reuse": false}),
@@ -782,7 +782,7 @@ async fn eval_js_全局跨调用保留() {
 async fn 图片子资源加载_解码_参与布局与渲染() {
     allow_loopback();
     let base = start_site().await;
-    let tool = McpWebUseTool;
+    let tool = McpWebLsmBrowserUseTool;
     let open = exec(
         &tool,
         json!({"action": "open", "url": format!("{base}/image-page"), "mode": "hidden", "reuse": false}),
@@ -853,7 +853,7 @@ async fn 图片子资源加载_解码_参与布局与渲染() {
 async fn 强缓存_二次导航命中缓存() {
     allow_loopback();
     let base = start_site_with_headers().await;
-    let tool = McpWebUseTool;
+    let tool = McpWebLsmBrowserUseTool;
 
     let open = exec(&tool, json!({"action": "open", "url": format!("{base}/cached-page"), "mode": "hidden", "reuse": false})).await;
     assert_eq!(open["code"], 0, "{open}");
@@ -883,7 +883,7 @@ async fn 强缓存_二次导航命中缓存() {
 async fn csp_script_src_拦截内联脚本() {
     allow_loopback();
     let base = start_site_with_headers().await;
-    let tool = McpWebUseTool;
+    let tool = McpWebLsmBrowserUseTool;
 
     // script-src 'self'：内联脚本被拒。
     let open = exec(&tool, json!({"action": "open", "url": format!("{base}/csp-inline"), "mode": "hidden", "reuse": false})).await;
@@ -955,7 +955,7 @@ async fn start_cors_api(with_cors: bool) -> String {
 async fn cors_跨域fetch_无头拒绝_有头放行() {
     allow_loopback();
     let base = start_site_with_headers().await;
-    let tool = McpWebUseTool;
+    let tool = McpWebLsmBrowserUseTool;
 
     let api_no_cors = start_cors_api(false).await;
     let api_cors = start_cors_api(true).await;
@@ -992,7 +992,7 @@ async fn cors_跨域fetch_无头拒绝_有头放行() {
 async fn wait_元素状态与文本条件() {
     allow_loopback();
     let base = start_site().await;
-    let tool = McpWebUseTool;
+    let tool = McpWebLsmBrowserUseTool;
     let open = exec(
         &tool,
         json!({"action": "open", "url": format!("{base}/wait-page"), "mode": "hidden", "reuse": false}),
@@ -1045,7 +1045,7 @@ async fn wait_元素状态与文本条件() {
 async fn wait_js条件与网络静默() {
     allow_loopback();
     let base = start_site().await;
-    let tool = McpWebUseTool;
+    let tool = McpWebLsmBrowserUseTool;
     let open = exec(
         &tool,
         json!({"action": "open", "url": format!("{base}/wait-page"), "mode": "hidden", "reuse": false}),

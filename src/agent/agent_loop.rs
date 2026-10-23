@@ -192,7 +192,7 @@ impl Agent {
         // ★ 第 82 轮 P1-3(第 89 轮单工具化):浏览器失败学习 —— 同一 (tool, selector)
         // 连续失败 ≥2 次时,自动在 error_summary 追加换姿势提示(scroll_into_view /
         // wait / 换 selector / eval_js),避免 LLM 在 16 次迭代里用同一 selector 反复重试。
-        // 用 HashMap 维护累计计数;selector 从 MCP_Web_Use 的 args.params.selector
+        // 用 HashMap 维护累计计数;selector 从 MCP_Web_LsmAgentBrowser_Use 的 args.params.selector
         // 字段提取(兼容顶层 args.selector),非浏览器工具不参与。
         use std::collections::HashMap;
         let mut browser_failure_counts: HashMap<(String, String), u32> = HashMap::new();
@@ -834,9 +834,12 @@ impl Agent {
                     (exec.output, exec.is_error, exec.error_summary);
                 // ★ 第 82 轮 P1-3(第 89 轮单工具化):浏览器失败学习 —— 同一 (tool, selector)
                 // 连续失败 ≥2 次时,在 error_summary 追加换姿势提示,避免 LLM 死磕同 selector。
-                // 适用工具:MCP_Web_Use(从 args.params.selector / args.selector 提 key);
+                // 适用工具:MCP_Web_LsmAgentBrowser_Use(从 args.params.selector / args.selector 提 key);
                 // 非浏览器工具不参与。失败计数实时递增,成功调用同一 key 不重置(简化)。
-                if is_error && name.as_str() == "MCP_Web_Use" {
+                if is_error
+                    && (name.as_str() == "MCP_Web_LsmAgentBrowser_Use"
+                        || name.as_str() == "MCP_Web_Chrome_Use")
+                {
                     let sel_key = args
                         .get("params")
                         .and_then(|p| p.get("selector"))
@@ -849,7 +852,7 @@ impl Agent {
                     *count += 1;
                     if *count >= 2 {
                         let hint = format!(
-                            " [提示:已连续失败 {} 次,建议:1) scroll_into_view 2) MCP_Web_Use(control_action=wait) 等 500ms 3) 换 selector 或加 nth=N 4) eval_js 直接触发]",
+                            " [提示:已连续失败 {} 次,建议:1) scroll_into_view 2) MCP_Web_LsmAgentBrowser_Use(control_action=wait) 等 500ms 3) 换 selector 或加 nth=N 4) eval_js 直接触发]",
                             *count
                         );
                         error_summary.push_str(&hint);
@@ -988,23 +991,23 @@ impl Agent {
                     }
                 }
                 trace.doom_loop_repeats = loop_guard.max_repeats();
-                // 2026-09-17 第 74 轮(第 89 轮单工具化):MCP_Web_Use post-open 引导
+                // 2026-09-17 第 74 轮(第 89 轮单工具化):MCP_Web_LsmAgentBrowser_Use post-open 引导
                 // (放在 push 之前,这样可以借用 output 不需要 clone)。action=open 成功
                 // 返回的 next_steps 是关键指引(4 步最常见动作),注入 LLM 上下文作为
                 // user message,显著降低「多次迭代 tool_calls=0」类失败模式的概率。
-                let web_open_hint = if name == "MCP_Web_Use"
+                let web_open_hint = if name == "MCP_Web_LsmAgentBrowser_Use"
                     && !is_error
                     && args.get("action").and_then(|v| v.as_str()) == Some("open")
                 {
                     if let Some(page_id) =
-                        crate::agent::tools::mcp_web_use::extract_page_id_from_text(&output)
+                        crate::agent::tools::mcp_web_lsm_browser_use::extract_page_id_from_text(&output)
                     {
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&output) {
                             v.get("data")
                                 .and_then(|d| d.get("next_steps"))
                                 .map(|next_steps| {
                                     format!(
-                                        "【MCP_Web_Use 浏览器启动后续步骤引导】\n\
+                                        "【MCP_Web_LsmAgentBrowser_Use 浏览器启动后续步骤引导】\n\
                                          action=open 成功 → page_id={page_id}。\n\
                                          严格按以下 4 步执行(next_steps 已为你准备好 selector_hint):\n\
                                          {next_steps}\n\
@@ -1149,15 +1152,18 @@ impl Agent {
             // 注:completion.text 与 completion.tool_calls 在前面循环已被消费,
             // 这里通过本轮迭代开始时记录的 snapshot 判断。
             //
-            // 第 103 轮:MCP_Web_Use(浏览器)与 MCP_Window_Use(桌面窗口)任务天然需要
+            // 第 103 轮:MCP_Web_LsmAgentBrowser_Use(浏览器)与 MCP_Window_Use(桌面窗口)任务天然需要
             // 多轮 tool_use(open→inspect→control)才能产出最终结果。若本轮有浏览器/窗口
             // 工具调用且返回 code=0(成功获取到页面数据/窗口信息),视为"有效产出轮",不纳入
             // 无文本收敛计数,避免合法的多步浏览器任务被提前终止。
             let browser_tool_productive = if this_round_text_empty && this_round_had_tool_calls {
-                // 检查最近工具调用中是否有成功的 MCP_Web_Use / MCP_Window_Use
+                // 检查最近工具调用中是否有成功的 MCP_Web_LsmAgentBrowser_Use / MCP_Window_Use
                 // 浏览器/窗口任务天然多轮 tool_use,成功调用即视为有效产出
                 recent_tool_history.iter().rev().take(3).any(|(tool, _args, err)| {
-                    !err && (tool == "MCP_Web_Use" || tool == "MCP_Window_Use")
+                    !err
+                        && (tool == "MCP_Web_LsmAgentBrowser_Use"
+                            || tool == "MCP_Web_Chrome_Use"
+                            || tool == "MCP_Window_Use")
                 })
             } else {
                 false

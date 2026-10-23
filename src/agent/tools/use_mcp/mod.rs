@@ -3,10 +3,10 @@
 //! 由 MCP 客户端(`src/mcp/`,JSON-RPC 2.0 over stdio / Streamable HTTP)连接外部
 //! MCP server,发现工具(tools/list)、调用工具(tools/call)、读取资源(resources/list、
 //! resources/read)—— 把 MCP 生态的外部服务能力接入 laew 工具面。
-//! 命名说明:与 `MCP_Web_Use` / `MCP_Window_Use`(MCP 风格命名的**本地驱动封装**,
+//! 命名说明:与 `MCP_Web_LsmAgentBrowser_Use` / `MCP_Window_Use`(MCP 风格命名的**本地驱动封装**,
 //! 不实现 MCP 协议)刻意区分 —— `Use_MCP` 才是真正讲 MCP 协议的通用服务调用入口。
 //!
-//! - 单工具 + `action` 枚举分发(对齐 `MCP_Web_Use` / `MCP_Window_Use` 全家惯例),
+//! - 单工具 + `action` 枚举分发(对齐 `MCP_Web_LsmAgentBrowser_Use` / `MCP_Window_Use` 全家惯例),
 //!   由持有该工具的 Agent(SubAgent-Work / Main-Work)在多轮循环中反复调用;
 //! - server 接入记录在 SQLite `mcp_servers`(`laew mcp add` 维护),**LLM 不可新增 server**,
 //!   只能调用已配置 server 暴露的工具(信任边界,见设计 §7);

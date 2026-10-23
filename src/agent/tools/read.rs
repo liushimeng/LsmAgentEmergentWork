@@ -44,7 +44,7 @@ impl Tool for ReadTool {
            limit 默认 2000 行,最大 4000;单行超长截断到 4000 字符并标注。\n\
          - 图片文件(PNG/JPEG/GIF/WebP/BMP,≤5MB):返回元信息标记块(路径/类型/大小/\n\
            base64 指纹前缀)。**模型无法经 Read 获得图像视觉内容** —— 视觉判读请用\n\
-           MCP_Web_Use 的 screenshot(ocr=true) 或 inspect(info=ocr)(第 146 轮)。\n\
+           MCP_Web_LsmAgentBrowser_Use 的 screenshot(ocr=true) 或 inspect(info=ocr)(第 146 轮)。\n\
          - PDF 文件(≤10MB):返回元信息 + 抽取提示(可用 Bash 调用 pdftotext)。\n\
          - 其他二进制:给出友好提示而非崩溃。"
     }
@@ -196,7 +196,7 @@ fn read_image(path: &Path, file_size: usize, class: read_detect::FileClass) -> R
         "{header}\n\
          (图片内容不注入文本上下文 —— Read 通道无法让模型获得图像视觉内容,\n\
          base64 仅保留指纹前缀 {IMAGE_B64_FINGERPRINT_CHARS} 字符供文件对账:{fingerprint}…)\n\
-         视觉判读请改用:MCP_Web_Use control(screenshot, ocr=true) / inspect(info=ocr);\n\
+         视觉判读请改用:MCP_Web_LsmAgentBrowser_Use control(screenshot, ocr=true) / inspect(info=ocr);\n\
          截图证据的核验以落盘台账/DOM 文本为准。\n\
          <<<END_LAEW:FILE>>>"
     ))
@@ -699,8 +699,8 @@ mod tests {
             "默认应返回存根(含指纹前缀说明),实际: {out}"
         );
         assert!(
-            out.contains("MCP_Web_Use"),
-            "存根应指引改用 MCP_Web_Use 视觉通道,实际: {out}"
+            out.contains("MCP_Web_LsmAgentBrowser_Use"),
+            "存根应指引改用 MCP_Web_LsmAgentBrowser_Use 视觉通道,实际: {out}"
         );
         assert!(
             out.chars().count() < 1500,

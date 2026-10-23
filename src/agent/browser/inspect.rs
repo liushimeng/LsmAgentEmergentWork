@@ -1,4 +1,4 @@
-//! 页面观测:`MCP_Web_Use(inspect, info=...)` 的内核实现。
+//! 页面观测:`MCP_Web_LsmAgentBrowser_Use(inspect, info=...)` 的内核实现。
 //!
 //! 直接读取进程内 DOM/布局/网络台账,不经过任何外部浏览器协议。
 

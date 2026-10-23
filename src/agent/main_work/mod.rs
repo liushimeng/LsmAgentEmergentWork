@@ -68,7 +68,7 @@ impl MainWorkRunner {
         session_id: Option<std::sync::Arc<String>>,
     ) -> Self {
         // 2026-09-23 第 122 轮:Main-Work 编排层 ReAct 化 + 信息收集型工具面
-        // (MCP_Web_Use + Bash + Read / Glob / Grep + TodoWrite)。
+        // (MCP_Web_LsmAgentBrowser_Use + Bash + Read / Glob / Grep + TodoWrite)。
         // 编排本身是「思考轮」,8 轮 LLM 迭代足够覆盖
         // TaskFocus(1 轮) + 前提验证(2~3 轮) + 拆解 + emit(1 轮)。
         // explore_budget=2:第 1~2 轮属「TaskFocus + 首批前提验证」(探索期);
@@ -165,7 +165,7 @@ impl MainWorkRunner {
         // 2026-09-19 第93轮: 第(3)条修正 —— 长等待正确载体是 run_sequence(单步≤30s)/chat_loop,
         // input_batch wait ≤5s 仅限步骤间节奏(实测 SubAgent 按旧指引 input_batch 20×30s wait 第 1 步即败);
         // 新增第(4)条 —— 首响应直接输出 JSON,禁止先探索(实测浪费 36s 一次 LLM 往返)。
-        prompt.push_str(&format!("【Main-Work 任务编排 · 第128轮】六条绝对关键约束(1)「目标」是 Yolo 摘要可能丢动词,用户原始输入第一性;(2)acceptance 必须覆盖原始每条编号与关键动词(聊天/发送/保存/截图/打开/查找/启动/键入/枚举/关闭);(3)长时任务用 chat_loop / run_sequence wait(单步≤30s)编排节奏,严禁 Bash sleep 循环;input_batch wait ≤5s 仅限步骤间节奏微调;(4)首次响应直接输出 JSON 编排,禁止先调用 Read/Bash 探索——任务所需信息已全部在本提示中;(5)独立桌面软件目标(含豆包/Doubao)必须锚定 MCP_Window_Use,禁止改写为 MCP_Web_Use/网页任务;(6)**禁止拆出「澄清/询问用户/等待用户回复/需用户确认」类流程单元** —— WorkFlow 单元在 DAG 里无法暂停等待用户输入,这类单元只会让执行层用 Bash echo 假装提问、QC 判通过、下游单元在没有目标的情况下继续乱跑(系统已对此做确定性阻断校验,拆了会被秒级打回重拆)。信息不足时:输出 0 个 workflows,在 summary 里写明「需用户澄清:<具体缺什么>」,由编排器回到用户;**目标站点/路径/应用名缺失时尤其不得让任何单元去「自行选一个」——可以失败,不可以乱跑**。(7)用户原始输入里显式给出的目标标识(URL/域名/文件路径/应用名)必须**逐字**进入对应 wf 的 steps 与 acceptance,不得抽象成「目标网站」「该文件」等指代——执行层拿不到原文时就只能猜。\n"));
+        prompt.push_str(&format!("【Main-Work 任务编排 · 第128轮】六条绝对关键约束(1)「目标」是 Yolo 摘要可能丢动词,用户原始输入第一性;(2)acceptance 必须覆盖原始每条编号与关键动词(聊天/发送/保存/截图/打开/查找/启动/键入/枚举/关闭);(3)长时任务用 chat_loop / run_sequence wait(单步≤30s)编排节奏,严禁 Bash sleep 循环;input_batch wait ≤5s 仅限步骤间节奏微调;(4)首次响应直接输出 JSON 编排,禁止先调用 Read/Bash 探索——任务所需信息已全部在本提示中;(5)独立桌面软件目标(含豆包/Doubao)必须锚定 MCP_Window_Use,禁止改写为 MCP_Web_LsmAgentBrowser_Use/网页任务;(6)**禁止拆出「澄清/询问用户/等待用户回复/需用户确认」类流程单元** —— WorkFlow 单元在 DAG 里无法暂停等待用户输入,这类单元只会让执行层用 Bash echo 假装提问、QC 判通过、下游单元在没有目标的情况下继续乱跑(系统已对此做确定性阻断校验,拆了会被秒级打回重拆)。信息不足时:输出 0 个 workflows,在 summary 里写明「需用户澄清:<具体缺什么>」,由编排器回到用户;**目标站点/路径/应用名缺失时尤其不得让任何单元去「自行选一个」——可以失败,不可以乱跑**。(7)用户原始输入里显式给出的目标标识(URL/域名/文件路径/应用名)必须**逐字**进入对应 wf 的 steps 与 acceptance,不得抽象成「目标网站」「该文件」等指代——执行层拿不到原文时就只能猜。\n"));
         if let Some(orig) = original_prompt.filter(|s| !s.trim().is_empty()) {
             prompt.push_str(&format!("第一性事实 · 用户原始输入(必读):\n{orig}\n"));
         }
@@ -236,7 +236,7 @@ impl MainWorkRunner {
              约束:\n\
              - id/name/steps/acceptance/delegate_to 必填;branches/loops/depends_on/summary 可省略。\n\
              - max_iterations: 可选整数 4~32;长时多轮聊天(>5 分钟或 >10 轮)/ 长时保活 / 含 5+ 步骤的复杂单元建议显式设置(如 24 或 32),避免 SubAgent 跑满 16 次迭代上限半途而废。\n\
-             - pre_explore: 可选布尔;第 119 轮起支持。**凡是涉及网页/浏览器操作(MCP_Web_Use)\n\
+             - pre_explore: 可选布尔;第 119 轮起支持。**凡是涉及网页/浏览器操作(MCP_Web_LsmAgentBrowser_Use)\n\
                的 WorkFlow 必须置 true**(登录、表单、进入子页面、抓取菜单/组织树等);\n\
                Runner 会在 SubAgent 系统提示词尾部注入「先 explore 一次拿全页面状态,再 batch 一次\n\
                提交全部 control + 验证步骤」的强约束,避免链式单步 round-trip。\n\
@@ -246,7 +246,7 @@ impl MainWorkRunner {
                (枚举窗口、遍历控件、点击按钮、向窗口输入/读取文本)由 SubAgent-Work 的\n\
                MCP_Window_Use 工具承担(macOS / Windows);网页/浏览器操作类任务(打开网址、\n\
                浏览网页、网页登录、点击/输入/滚动页面、网页截图、抓取页面信息、爬虫采集、\n\
-               查看 Console/Network/DOM)由 SubAgent-Work 的 MCP_Web_Use 工具承担\n\
+               查看 Console/Network/DOM)由 SubAgent-Work 的 MCP_Web_LsmAgentBrowser_Use 工具承担\n\
                (LsmAgentBrowser 进程内自研内核,全平台)—— 两类任务照常描述步骤即可,不需要特殊 delegate 值。\n\
              - 同一桌面应用的连续 UI 操作链(打开/激活 → 等待窗口 → 搜索 → 选择会话 → 输入 → 校验 →\n\
                发送/提交)必须合并为一个 subagent WorkFlow,不要按每个按钮拆成多个串行单元;\n\
@@ -299,7 +299,7 @@ impl MainWorkRunner {
                path=\"/\" 即对整窗可见文本断言(微信 4.x 推荐);**纯 wait 保活不是任何操作的完成证据**\n\
                —— 交互类任务 acceptance 必须锚定 UI 动作产物(chat_log [SEND]/OCR 文本/读取值),\n\
                不得仅锚定「进程存活/时间差」。\n\
-             - 浏览器操控流程引用 MCP_Web_Use 时(2026-09-18 第 89 轮),steps 中只允许使用\n\
+             - 浏览器操控流程引用 MCP_Web_LsmAgentBrowser_Use 时(2026-09-18 第 89 轮),steps 中只允许使用\n\
                以下合法 action:open / list / close / control / inspect;control 内层动作用\n\
                control_action(click/input_text/wait/navigate/screenshot/eval_js 等),inspect\n\
                观察维度用 info(console/network/elements/dom/localstorage 等);禁止臆造\n\
@@ -387,7 +387,7 @@ impl MainWorkRunner {
                             delegate_to: AgentRole::SubAgent,
                             max_iterations: Some(8),
                             original_prompt: original_prompt.map(str::to_string),
-                            pre_explore: false, // 窗口探索任务用 MCP_Window_Use, 非 MCP_Web_Use
+                            pre_explore: false, // 窗口探索任务用 MCP_Window_Use, 非 MCP_Web_LsmAgentBrowser_Use
                         },
                         WorkFlowSpec {
                             id: "wf-2".into(),
@@ -469,7 +469,7 @@ impl MainWorkRunner {
         // Main-Work JSON 解析失败时构造的单 WorkFlow 兜底不会经过
         // `parse_workflow_plan → infer_delegate_to_for_plan`(那是 JSON 路径),
         // 这里手动调用一次,保证「打开网址 + 输入框」等浏览器类任务被归一到 SubAgent
-        // (第 89 轮:浏览器操控由 SubAgent-Work 的 MCP_Web_Use 工具承担)。
+        // (第 89 轮:浏览器操控由 SubAgent-Work 的 MCP_Web_LsmAgentBrowser_Use 工具承担)。
         // 成功路径 `infer_delegate_to_for_plan` 已在 parse.rs 中调用,本调用幂等。
         infer_delegate_to_for_plan(&mut plan);
 
@@ -552,11 +552,11 @@ fn plan_units_desc(plan: &WorkFlowPlan) -> String {
 /// 任务是否属于「网页/浏览器操作」类(决定降级兜底要不要开 `pre_explore`)。
 ///
 /// 纯函数,可单测。判据取自用户原文与 Yolo 分解步骤:显式 `http(s)://` URL、
-/// `MCP_Web_Use` 工具名、或一批网页语义关键词。刻意**不**用「出现 www」这类
+/// `MCP_Web_LsmAgentBrowser_Use` 工具名、或一批网页语义关键词。刻意**不**用「出现 www」这类
 /// 弱信号,避免把本地任务误判成网页任务而多注入一段无关提示词。
 pub(crate) fn is_web_task(original_prompt: Option<&str>, decomposition: &[String]) -> bool {
     const WEB_KEYWORDS: &[&str] = &[
-        "mcp_web_use", "网页", "网站", "浏览器", "网址", "链接", "首页", "抓取",
+        "mcp_web_lsm_browser_use", "网页", "网站", "浏览器", "网址", "链接", "首页", "抓取",
         "爬取", "采集", "页面", "html", "http://", "https://", ".com", ".cn", ".net",
     ];
     let hit = |s: &str| {

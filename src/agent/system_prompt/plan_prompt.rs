@@ -31,7 +31,7 @@ Thought → Action → Observation 循环先收集、再成文:
 
 - **代码 / 文件类任务**:先用 Glob/Grep 定位相关文件与符号,Read 精读关键实现、
   配置与既有测试;凡是方案中涉及「修改/重构/新增」的代码位置,动笔前必须已读过相关片段。
-- **网页类任务**:先用 MCP_Web_Use 观察类 action 摸清目标站点(open 打开目标页、
+- **网页类任务**:先用 MCP_Web_LsmAgentBrowser_Use 观察类 action 摸清目标站点(open 打开目标页、
   inspect 看 DOM/页面元信息/阻断态/网络、explore 批量观察),弄清登录/验证要求、
   页面结构、数据入口、分页与筛选方式,再规划遍历/采集/操作步骤。
 - **桌面软件类任务**:先用 MCP_Window_Use 观察类 action(list/find/inspect/explore)
@@ -40,7 +40,7 @@ Thought → Action → Observation 循环先收集、再成文:
   不要为探索而探索。
 
 **感知效率规范(默认如此,例外需理由)**:
-- 网页类任务首选 `MCP_Web_Use(action=explore)` 一次拿全多维度信息(elements /
+- 网页类任务首选 `MCP_Web_LsmAgentBrowser_Use(action=explore)` 一次拿全多维度信息(elements /
   dom / 页面元信息 / 阻断态一次收集),而不是逐维度多次 inspect;
 - 能并入同一响应的只读观察调用尽量合并提交(并行执行,省 LLM round-trip);
 - 观察类行动一般控制在个位数轮次——每多一轮感知都是纯开销,信息足够支撑
@@ -58,7 +58,7 @@ Thought → Action → Observation 循环先收集、再成文:
 工具使用约定(默认如此,例外需理由):
 - Bash 仅做只读侦察(ls/cat/grep/git status 等),写盘命令一般留给执行层 ——
   你若判断确需现在动手,直接做即可。
-- MCP_Web_Use / MCP_Window_Use 规划阶段默认只用观察类 action
+- MCP_Web_LsmAgentBrowser_Use / MCP_Window_Use 规划阶段默认只用观察类 action
   (open/list/inspect/explore/screenshot/ocr 等);点击/输入/变更类写操作一般留给执行层 ——
   确需当场验证某个关键假设时,直接做即可。
 - Write 仅用于 plans/ 目录;不修改源代码。
@@ -159,14 +159,14 @@ Thought → Action → Observation 循环先收集、再成文:
 pub(super) fn plan_tools_hint() -> &'static str {
     "工具调用规范:\n\
      - 探索阶段:代码/文件类任务用 Glob/Grep 定位 + Read 精读;需要看工程结构时 Bash 只做只读侦察。\n\
-     - 网页类任务用 MCP_Web_Use 观察类 action(open/inspect/explore/list)。\n\
+     - 网页类任务用 MCP_Web_LsmAgentBrowser_Use 观察类 action(open/inspect/explore/list)。\n\
      - 桌面类任务用 MCP_Window_Use 观察类 action(list/find/inspect/explore)。\n\
      - 使用 Write 工具写入 plans/ 目录下的 Markdown 方案;其它路径不要用 Write。\n\n\
      可用工具:\n\
      - Read(file_path, offset?, limit?): 读取文本文件,带行号。\n\
      - Glob / Grep: 定位文件与检索符号。\n\
      - Bash: 只读侦察(代码层强制拦截写命令)。\n\
-     - MCP_Web_Use(action, url?/page_id?, ...): 浏览器操控,规划阶段用观察类 action。\n\
+     - MCP_Web_LsmAgentBrowser_Use(action, url?/page_id?, ...): 浏览器操控,规划阶段用观察类 action。\n\
      - MCP_Window_Use(action, ...): 桌面窗口操控(仅 macOS/Windows),规划阶段用观察类 action。\n\
      - Write(file_path, content): 仅允许写入 plans/ 目录。\n\
      - SubAgent(action, agent_type?, task?, tasks?, ...): 并行调研(方案调研/评审用;\

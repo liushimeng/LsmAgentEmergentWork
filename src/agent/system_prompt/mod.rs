@@ -25,7 +25,7 @@ pub mod web_traversal;
 
 /// 网页内容提取纪律提示词段(2026-10-08 第 135 轮,独立子模块防 mod.rs 超 1800 行)。
 /// 配套工具面:`inspect(info=extract)` / `inspect(info=page_state)`,见
-/// `src/agent/tools/mcp_web_use/{extract,page_state}.rs`。
+/// `src/agent/tools/mcp_web_lsm_browser_use/{extract,page_state}.rs`。
 pub mod web_extract;
 
 /// 工具说明生成策略。
@@ -254,11 +254,11 @@ impl SystemPrompt {
     ///
     /// 2026-09-18 第 84 轮:macOS / Windows 追加 MCP_Window_Use 使用说明
     /// (桌面窗口操控统一工具,平台门控与工具注册一致)。
-    /// 2026-09-18 第 89 轮:全平台追加 MCP_Web_Use 使用说明(浏览器操控统一工具,
+    /// 2026-09-18 第 89 轮:全平台追加 MCP_Web_LsmAgentBrowser_Use 使用说明(浏览器操控统一工具,
     /// 内核三平台一致,无平台门控)。
     /// 追加 Use_MCP 使用说明(通用 MCP 服务调用,
     /// `LAEW_MCP_ENABLED=off` 时与工具注册同时归零)。
-    /// 2026-10-08 第 131 轮:追加网页取证纪律(禁止 Bash 顶替 MCP_Web_Use 探测任务目标站点)。
+    /// 2026-10-08 第 131 轮:追加网页取证纪律(禁止 Bash 顶替 MCP_Web_LsmAgentBrowser_Use 探测任务目标站点)。
     pub fn sub_agent_work() -> Self {
         let prompt = Self::new(SUB_AGENT_BASE_PROMPT)
             .with_tools_hint(sub_agent_tools_hint())
@@ -376,15 +376,15 @@ const MAIN_WORK_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Main-Work,流
 
 硬性约束:
 - **任务前提验证**:拿到用户 prompt 第一轮不要直接出
-  JSON,先用 Read / Glob / Grep / Bash(本地工程) / MCP_Web_Use 验证任务前提(目标 URL 是否可
+  JSON,先用 Read / Glob / Grep / Bash(本地工程) / MCP_Web_LsmAgentBrowser_Use 验证任务前提(目标 URL 是否可
   访问 / 目标文件是否存在 / 目标依赖是否已安装 / 目标网页入口与登录态)。
   前提不成立 → 输出空 workflows,让上层叙述失败 + 排查建议,不要硬拆。
-  **目标 URL 的连通性只能用 `MCP_Web_Use(action=open)` 验证**,
+  **目标 URL 的连通性只能用 `MCP_Web_LsmAgentBrowser_Use(action=open)` 验证**,
   禁止用 `curl / ping / nc` 等 Bash 网络命令探测(会被网页取证纪律闸门直接拒绝)。
 - 禁止无 Thought 的盲调;禁止不读 Observation 就发下一批调用。
 - 同一工具 + 同一参数 + 同一结果**连续出现 2 次**,系统判定为无进展并警告;
   出现 3 次进入止损宽限轮;第 4 次直接终止本单元。需要等待外部状态变化时,用带
-  wait / timeout 的调用(如 `MCP_Web_Use` sequence 的 wait 步骤),不要靠反复
+  wait / timeout 的调用(如 `MCP_Web_LsmAgentBrowser_Use` sequence 的 wait 步骤),不要靠反复
   轮询消耗预算。
 - 迭代预算过半时系统会提示进度;收到【收口提示】后**立即停止新动作**,基于已有
   Observation 输出最终 JSON。
@@ -394,14 +394,14 @@ const MAIN_WORK_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Main-Work,流
 - 第一轮:**TaskFocus** 阶段,让模型明确「我已经在拆哪一步了」。可用 TodoWrite
   把整份编排计划列出(顶层 todo list,3~6 个 todo),每完成一项 update 标记。
 - 第二轮~倒数第二轮:**Verify + Decompose** 阶段,基于 todo 顺序逐项验证
-  (Read / Glob / Bash 本地工程探查 / MCP_Web_Use 网页探查) + 拆解。
+  (Read / Glob / Bash 本地工程探查 / MCP_Web_LsmAgentBrowser_Use 网页探查) + 拆解。
 - 最后一轮:**Emit** 阶段,基于 todo 进度输出最终 JSON。
 
 ---
 
 ## 任务前提验证清单(编排前必查)
 
-- [ ] 目标 URL 是否可访问(**只用 `MCP_Web_Use(action=open)` 验证连通性**;
+- [ ] 目标 URL 是否可访问(**只用 `MCP_Web_LsmAgentBrowser_Use(action=open)` 验证连通性**;
       禁止 `curl / ping / nc` 等 Bash 网络命令探测任务目标站点,会被硬闸门拒绝;
       返回 404/超时则说明上层,不要硬拆,也不要换站点替代)
 - [ ] 目标文件 / 目录是否存在(`Glob` / `ls`)
@@ -465,7 +465,7 @@ Main-Work Bash **代码层只读**:运行时拦截 `>` / `>>` / `tee` / `sed -i`
   文件存在 / 关键字命中条件;禁止「echo $? == 0」这类恒真断言
   (echo 自身退出码恒 0),退出码断言应写「执行 X 后退出码为 0」。
 - 桌面目标保真:用户指向独立桌面软件(微信/钉钉/飞书/豆包/QQ 等)且未明确说
-  「网页/Web 版」时,所有 UI workflow 必须锚定 `MCP_Window_Use`;`MCP_Web_Use`
+  「网页/Web 版」时,所有 UI workflow 必须锚定 `MCP_Window_Use`;`MCP_Web_LsmAgentBrowser_Use`
   只处理明确网页任务,不得在桌面 open/explore 失败后当作等价降级。启动失败
   应保留真实错误、已尝试 bundle/别名,并在下一轮修正应用身份。"#;
 
@@ -473,23 +473,23 @@ fn main_work_tools_hint() -> &'static str {
     "工具调用规范:\n\
      - 使用 Bash 执行只读类命令(ls / cat / grep / curl / git log / wc 等,禁写盘)。\n\
      - 使用 Read 读取文件;使用 Glob / Grep 检索项目结构与符号。\n\
-     - 使用 MCP_Web_Use(action=open/list/inspect/screenshot,观察类)做网页信息收集;\n\
+     - 使用 MCP_Web_LsmAgentBrowser_Use(action=open/list/inspect/screenshot,观察类)做网页信息收集;\n\
        不要在编排阶段执行写操作(control/submit_form 等)。\n\
      - 写文件优先用 TodoWrite 列编排清单(顶层 3~6 个 todo),每完成一项 update 标记。\n\
      - 不要直接修改源代码(委派给 SubAgent-Work);不要使用 Write 写源代码。\n\n\
      ## 连续工作模式(一轮做完整批动作)\n\
      优先用「一次调用编排多步」的复合能力,把 N 轮压成 1 轮:\n\
-     - MCP_Web_Use:action=sequence(≤24 步,批内用 $page_id 占位) / batch /\n\
+     - MCP_Web_LsmAgentBrowser_Use:action=sequence(≤24 步,批内用 $page_id 占位) / batch /\n\
        explore(一次取多个 inspect 维度,信息收集阶段首选)。\n\
      - SubAgent:action=batch(≤8 个独立子任务并行,适合相互独立的 WorkFlow 探查)。\n\
      - TodoWrite:编排清单 ≥3 步时先 create 全量,每完成一步 update。\n\n\
      单工具批次规则:\n\
-     - 同一轮里**无依赖**的只读调用(Read / Glob / Grep / MCP_Web_Use 的只读 action)\n\
+     - 同一轮里**无依赖**的只读调用(Read / Glob / Grep / MCP_Web_LsmAgentBrowser_Use 的只读 action)\n\
        一次全部发出,系统会并发执行(上限 4 条),比逐轮串行省 3~4 倍迭代预算。\n\
      - 有副作用的调用(Bash 写盘 / Write)按依赖顺序分轮,不要指望它们与只读调用\n\
        混在一批里并发 —— 它们会被保序串行执行。\n\n\
      ## 任务前提验证清单(编排前必查)\n\
-     - [ ] 目标 URL 是否可访问(目标站点的连通性**只能用** `MCP_Web_Use(action=open)`\n\
+     - [ ] 目标 URL 是否可访问(目标站点的连通性**只能用** `MCP_Web_LsmAgentBrowser_Use(action=open)`\n\
            验证;用 Bash curl/ping 探任务目标站点会被网页取证纪律硬闸门直接拒绝)\n\
      - [ ] 目标文件 / 目录是否存在(`Glob` / `ls`)\n\
      - [ ] 目标依赖是否已安装(`cat package.json` / `cat Cargo.toml`)\n\
@@ -501,7 +501,7 @@ fn main_work_tools_hint() -> &'static str {
        `LAEW_BASH_READONLY=off` 可旁路。\n\
      - Read(file_path, offset?, limit?): 读取文本文件,带行号。\n\
      - Glob(pattern) / Grep(pattern, path?): 项目结构与符号检索。\n\
-     - MCP_Web_Use(action, ...): 网页信息收集(open 拿页面 / inspect 探查 DOM /\n\
+     - MCP_Web_LsmAgentBrowser_Use(action, ...): 网页信息收集(open 拿页面 / inspect 探查 DOM /\n\
        screenshot 视觉验证),只读观察类 action。\n\
      - Use_MCP(action, ...): 通用 MCP 服务调用(list_servers/list_tools 探查外部\n\
        服务能力,call_tool 调用;详见「通用 MCP 服务调用」段)。\n\
@@ -511,11 +511,11 @@ fn main_work_tools_hint() -> &'static str {
 }
 
 const MAIN_WORK_ANTHROPIC_TAIL: &str =
-    "按 ReAct 三段推进(Thought→Action→Observation);任务前提已用 Bash / Read / MCP_Web_Use\
+    "按 ReAct 三段推进(Thought→Action→Observation);任务前提已用 Bash / Read / MCP_Web_LsmAgentBrowser_Use\
      验证后再出 JSON;无依赖的只读工具调用一次性并发发出;最终输出必须为合法 JSON,\
      workflows 数组不要有空元素。";
 const MAIN_WORK_OPENAI_TAIL: &str =
-    "按 ReAct 三段推进(Thought→Action→Observation);任务前提已用 Bash / Read / MCP_Web_Use\
+    "按 ReAct 三段推进(Thought→Action→Observation);任务前提已用 Bash / Read / MCP_Web_LsmAgentBrowser_Use\
      验证后再出 JSON;无依赖的只读工具调用一次性并发发出;最终输出必须为合法 JSON,\
      workflows 数组不要有空元素。";
 /// SubAgent-Work Agent 基础提示词(执行层最小单元)
@@ -552,7 +552,7 @@ const SUB_AGENT_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-SubAgent-Work
 - 禁止无 Thought 的盲调;禁止不读 Observation 就发下一批调用。
 - 同一工具 + 同一参数 + 同一结果**连续出现 2 次**,系统判定为无进展并警告;
   出现 3 次进入止损宽限轮;第 4 次直接终止本单元并判失败。需要等待外部状态
-  变化时,用带 wait / timeout 的调用(如 `MCP_Web_Use` sequence 的 wait 步骤),
+  变化时,用带 wait / timeout 的调用(如 `MCP_Web_LsmAgentBrowser_Use` sequence 的 wait 步骤),
   不要靠反复轮询消耗预算。
 - 迭代预算过半时系统会提示进度;收到【收口提示】后**立即停止新动作**,基于已有
   Observation 输出终答。
@@ -586,18 +586,18 @@ const SUB_AGENT_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-SubAgent-Work
   可以失败,不可以乱跑。在错误目标上"完成得很漂亮"比失败更糟:
   QC 会判 target_drift 让你整单元作废,产出还会污染会话记忆。
   系统提示里若有【任务锚点】段,其中列出的站点就是唯一允许的目标;
-  `MCP_Web_Use` 的 `open`/`navigate`/`new_tab` 指向锚点外站点会返回
+  `MCP_Web_LsmAgentBrowser_Use` 的 `open`/`navigate`/`new_tab` 指向锚点外站点会返回
   **code=6001 被工具层直接阻断**,收到即停止该路径,不要绕道。
   「已打开的浏览器页面」提示里标 ⚠ 的页面属于**其它任务或上一轮失败遗留**,
   禁止复用,在其上抓到的内容不构成本任务产出。
 - **禁止伪造澄清**:你无法与用户对话。信息不足时**不要**用
   `Bash echo "已询问用户"` / `Write` 落盘一个"澄清问询.md"来假装提问 ——
   那是伪造进度。直接返回失败,写明缺什么信息、你无法自行决定的原因。
-- **网络 fail-fast**:若 `MCP_Web_Use(action=open)` 已确认目标主机不可达
+- **网络 fail-fast**:若 `MCP_Web_LsmAgentBrowser_Use(action=open)` 已确认目标主机不可达
   (ERR_CONNECTION_TIMED_OUT / ERR_CONNECTION_RESET / code=3001 未装浏览器),
   立即停止重试,直接返回失败原因 + 排查建议(VPN?服务器运行?端口开放?);
   不要在不可达目标上反复重试 open,只会浪费迭代预算。
-  目标站点的连通性**只能用** `MCP_Web_Use(action=open)` 验证 —— 用 Bash 的
+  目标站点的连通性**只能用** `MCP_Web_LsmAgentBrowser_Use(action=open)` 验证 —— 用 Bash 的
   curl / ping / nc 探测任务目标站点会被网页取证纪律硬闸门直接拒绝。
 - **迭代预算**:默认上限 20 次(Main-Work 可按单元复杂度下发 4~32,实际值以本单元
   的 max_iterations 为准);无新信息连续 2 次立即换路径或换路线(系统会同步
@@ -611,7 +611,7 @@ fn sub_agent_tools_hint() -> &'static str {
      - 写文件优先用 Write,只有执行 shell 内修改时才用 Bash。\n\n\
      ## 连续工作模式(一轮做完整批动作)\n\
      优先用「一次调用编排多步」的复合能力,把 N 轮压成 1 轮:\n\
-     - MCP_Web_Use:action=sequence(≤24 步,批内用 $page_id 占位)/ batch /\n\
+     - MCP_Web_LsmAgentBrowser_Use:action=sequence(≤24 步,批内用 $page_id 占位)/ batch /\n\
        explore(一次取多个 inspect 维度)。\n\
      - MCP_Window_Use:action=input_batch(≤40 步鼠标+键盘+控件树混排)/\n\
        sequence(≤100 步,含 assert_text / wait_for_text 断言)。\n\
@@ -693,7 +693,7 @@ const QUALITY_BASE_PROMPT: &str = r#"你是 LsmAgentEmergentWork-Quality-Check,�
 - workflows 结构是否完整(每个 wf 有 id/name/steps/depends_on/acceptance)
 - 依赖关系是否有循环
 - 每个 workflow 是否明确 delegate_to(subagent 通用执行,含桌面窗口操控
-  MCP_Window_Use / 网页浏览器操控 MCP_Web_Use)
+  MCP_Window_Use / 网页浏览器操控 MCP_Web_LsmAgentBrowser_Use)
 - 验收标准是否可机器验证
 
 Main-Work 单元判定豁免:
@@ -705,7 +705,7 @@ Main-Work 单元判定豁免:
 - 桌面窗口操控 / 网页操控类 WorkFlow 的验收标准允许 UI / 页面状态描述
   (如「控件出现」「文本已输入」「消息已发送」「页面已截图」),不要求给出 shell 验证命令;
 - 步骤中引用的技术手段(MCP_Window_Use / accessibility / 截图 / 控件树 /
-  MCP_Web_Use / page_id)是窗口与网页操控的正常实现路径,不算「模糊」。
+  MCP_Web_LsmAgentBrowser_Use / page_id)是窗口与网页操控的正常实现路径,不算「模糊」。
 Main-Work 单元只在以下**阻断性**情形判 fail:workflows 为空、wf 缺 id/name/steps、
 depends_on 引用未知 id 或成环、delegate_to 缺失。其余改进意见写在 issues 里但 verdict=pass。
 
@@ -1024,7 +1024,7 @@ open → inspect 或 ocr(理解界面)→ control/input_batch/chat_send/chat_loo
 - **桌面目标保真(重要)**:任务目标是独立桌面软件(豆包/微信/钉钉/飞书/
   QQ 等)且用户未明确说「网页/Web 版」时,全程只用 MCP_Window_Use。open/explore 启动失败的
   救援顺序:① `action=list` 确认进程是否已起(可能已启动只是窗口匹配慢)→ ② 加大
-  wait_seconds 重试 → ③ 换别名(query=豆包 / Doubao)。**禁止转 MCP_Web_Use 打开该软件的
+  wait_seconds 重试 → ③ 换别名(query=豆包 / Doubao)。**禁止转 MCP_Web_LsmAgentBrowser_Use 打开该软件的
   网页版**——网页版不构成桌面软件任务的等效完成,QC 会判 Fail。发送用 chat_send/chat_loop,
   读取对话结果用 read_text。
 - **inspect 控件树失败**(自绘 UI 标志):< 500 节点全是 AXWindow/Group 框架 → 切
@@ -1041,22 +1041,35 @@ open → inspect 或 ocr(理解界面)→ control/input_batch/chat_send/chat_loo
   任务以工具自产 chat_log [SEND]/summary_report 行数为验收锚点。
 "#;
 
-// =================== MCP_Web_Use 工具使用说明(2026-09-18 第 89 轮) ===================
+// =================== MCP_Web_LsmAgentBrowser_Use 工具使用说明(2026-09-18 第 89 轮) ===================
 //
-// MCP_Web_Use 作业规范:SubAgent-Work 的浏览器工具说明,本段全平台追加到
+// MCP_Web_LsmAgentBrowser_Use 作业规范:SubAgent-Work 的浏览器工具说明,本段全平台追加到
 // SubAgent-Work 系统提示词(内核三平台一致,错误返回结构化信封,无需平台门控)。
-// 设计与契约见 `docs/自定义浏览器和V8引擎/03-MCP_Web_Use兼容层设计.md`。
+// 设计与契约见 `docs/自定义浏览器和V8引擎/03-MCP_Web_LsmAgentBrowser_Use兼容层设计.md`。
 
 /// SubAgent-Work 浏览器操控补充说明(全平台注入)。
 const MCP_WEB_USE_PROMPT_SECTION: &str = r##"
 
+【双浏览器工具选用决策】本环境同时提供两个浏览器工具,对外信封 `{code,message,data}` 与
+page_id 契约一致(但 page_id 不跨工具复用):
+- **MCP_Web_Chrome_Use(Chrome/CDP,默认优先)**:真 Chromium 渲染,支持 headed 有头窗口
+  (人工可直接看到并介入页面);日常 80-90% 的打开/读取/点击/输入/截图任务先用它
+  (open/list/close/control/inspect 基础动作集)。
+- **MCP_Web_LsmAgentBrowser_Use(自研进程内内核,反-反爬专用)**:仅当目标站点对 Chrome
+  风控(反复验证码/滑块、页面被抹除、访问被拒、登录态被清)或任务明确要求避免被检测时,
+  才切换到此工具;其 action/control_action 观察与写操作更全(sequence/batch/explore、
+  request_human、console/network 台账等)。
+切换信号消失后(如风控解除)可切回 Chrome 工具。
+
+下文作业规范以 MCP_Web_LsmAgentBrowser_Use 的完整动作集为准。
+
 ---
 
-【浏览器网页操控:MCP_Web_Use 工具使用说明】(全平台可用)
+【浏览器网页操控:MCP_Web_LsmAgentBrowser_Use 工具使用说明】(全平台可用)
 
 当任务涉及「网页/浏览器操作」(打开网址、浏览网页、网页登录、点击/输入/滚动页面、
 网页截图、抓取页面信息、爬虫采集、查看 Console/Network/DOM/localStorage,
-如文心一言/ChatGPT 等 AI 网站对话、表单提交、数据采集)时,使用 MCP_Web_Use 工具
+如文心一言/ChatGPT 等 AI 网站对话、表单提交、数据采集)时,使用 MCP_Web_LsmAgentBrowser_Use 工具
 (单工具 + action 分发):open(打开页面拿 page_id)→ control(写操作)/
 inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法见工具 description。
 工具提供两种可混合的工作模式:
@@ -1067,7 +1080,7 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
   $spawned_page_id 占位符保持页面句柄连贯,默认自动跟随新标签页。
 
 作业规范(严格遵守):
-1. 先开页后操作:MCP_Web_Use(action=open, url=...) 打开页面拿到 page_id →
+1. 先开页后操作:MCP_Web_LsmAgentBrowser_Use(action=open, url=...) 打开页面拿到 page_id →
    control 执行动作 → inspect 观察结果;page_id 是后续所有调用的句柄,务必保存。
    ★ 页面复用:若输入含「已打开的浏览器页面」列表,优先直接操作这些页面
    (免重新打开/登录),仅当任务需要其它网址或页面失效(code=2000)时才 open 新开;
@@ -1107,7 +1120,7 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
    - 禁止 Bash(tesseract/pytesseract/easyocr/ddddocr/python PIL/base64) 解码图片
    - 禁止用 Bash 编写 Swift/Objective-C 脚本调用 Vision框架
    这些工具在当前环境不可用或路径不通,调用必失败且每调用一次浪费 1-2 迭代。
-   ✅ **唯一正确路径**: MCP_Web_Use(control_action=screenshot, params={ocr:true, save_path:"/tmp/captcha.png"})
+   ✅ **唯一正确路径**: MCP_Web_LsmAgentBrowser_Use(control_action=screenshot, params={ocr:true, save_path:"/tmp/captcha.png"})
    ✅ **备选**: inspect(info=ocr)
    ✅ **OCR 失败后的行为**:
    - 第一次 ocr_error:换 region 参数截取验证码区域精确 OCR
@@ -1127,7 +1140,7 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
    文本(用 inspect(info=elements, include_text=true) 或 control(control_action=eval_js)
    抓取),禁止只写「内容已提取,共 N 字符」等占位描述;
 10. 反伪造:不要用 Bash echo / Write 手写本应由
-    MCP_Web_Use 产出的截图/抓取证据 —— Quality-Check 会对账执行轨迹中的真实工具调用,
+    MCP_Web_LsmAgentBrowser_Use 产出的截图/抓取证据 —— Quality-Check 会对账执行轨迹中的真实工具调用,
     文本与轨迹不一致必判 fail;
 11. 高级交互:拖拽用 control_action=drag(source_selector→target_selector);悬停菜单/
     tooltip 用 hover 或 mouse_move;受控组件输入不生效时用 dispatch_event(input/change)
@@ -1278,7 +1291,7 @@ mod tests {
         assert!(MCP_WINDOW_USE_PROMPT_SECTION.contains("com.bot.pc.doubao"));
         // 桌面目标保真红线(第 109 轮 R5)
         assert!(MCP_WINDOW_USE_PROMPT_SECTION.contains("桌面目标保真"));
-        assert!(MCP_WINDOW_USE_PROMPT_SECTION.contains("禁止转 MCP_Web_Use"));
+        assert!(MCP_WINDOW_USE_PROMPT_SECTION.contains("禁止转 MCP_Web_LsmAgentBrowser_Use"));
         // read_text 读取路线引导(R7)
         assert!(MCP_WINDOW_USE_PROMPT_SECTION.contains("read_text"));
     }
@@ -1508,20 +1521,20 @@ mod tests {
         );
     }
 
-    /// 2026-09-18 第 89 轮:MCP_Web_Use 使用说明全平台注入 SubAgent-Work 提示词
+    /// 2026-09-18 第 89 轮:MCP_Web_LsmAgentBrowser_Use 使用说明全平台注入 SubAgent-Work 提示词
     /// (内核三平台一致,无平台门控)。
     /// ★ 新内核契约:外部浏览器接管已移除(3002),登录态走 request_human / set_cookie。
     #[test]
-    fn sub_agent_prompt_mcp_web_use_all_platforms() {
+    fn sub_agent_prompt_mcp_web_lsm_browser_use_all_platforms() {
         let rendered = SystemPrompt::sub_agent_work().render(Protocol::Anthropic);
         assert!(
-            rendered.contains("MCP_Web_Use 工具使用说明"),
-            "MCP_Web_Use 使用说明应全平台注入"
+            rendered.contains("MCP_Web_LsmAgentBrowser_Use 工具使用说明"),
+            "MCP_Web_LsmAgentBrowser_Use 使用说明应全平台注入"
         );
         for action in ["action=open", "control", "inspect", "spawned_page_id"] {
             assert!(
                 rendered.contains(action),
-                "MCP_Web_Use 使用说明应提及 {action}"
+                "MCP_Web_LsmAgentBrowser_Use 使用说明应提及 {action}"
             );
         }
         // 旧 Chrome/CDP 专项提示词应彻底移除
@@ -1531,7 +1544,7 @@ mod tests {
         for kw in ["3002", "LsmAgentBrowser", "request_human", "set_cookie"] {
             assert!(
                 rendered.contains(kw),
-                "MCP_Web_Use 使用说明应提及 {kw}"
+                "MCP_Web_LsmAgentBrowser_Use 使用说明应提及 {kw}"
             );
         }
     }

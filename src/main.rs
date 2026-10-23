@@ -638,7 +638,7 @@ async fn run_one_shot(
     // 第 131 轮:人工介入(HITL)在单轮模式的可见性。
     //
     // 修复前的实测缺口:`-p` / `-f` 全程不碰 HumanAssistHub,于是 macOS/Windows 上
-    // `MCP_Web_Use(control_action=request_human)` 会**照常弹出桌面弹窗**并把应答回填给
+    // `MCP_Web_LsmAgentBrowser_Use(control_action=request_human)` 会**照常弹出桌面弹窗**并把应答回填给
     // 工具(任务正常完成),但终端一个字都不打印 —— 用户盯着 stdout 只看到「卡住了」,
     // 完全不知道有个人工介入请求在等他。
     //
@@ -714,6 +714,7 @@ async fn run_one_shot(
             // (os error 232;CrashReport/crash_report_20261016_123408_737423.md)。
             lsm_agent::shutdown::terminal_restore_sync();
             lsm_agent::agent::browser::BrowserManager::global().shutdown().await;
+            lsm_agent::agent::chrome_browser::ChromeManager::global().close_all();
             lsm_agent::agent::human_assist::HumanAssistHub::global().cancel_pending();
             // 第 186 轮:区分两种取消来源 —— Ctrl-C(用户中断)与 HITL 弹窗里人工
             // 点「取消任务」。后者是**有人明确喊停**,报「用户中断」会把责任与
@@ -742,6 +743,7 @@ async fn run_one_shot(
     let _ = stage_printer.await;
     // 第 78 轮:任务正常完成后,清理浏览器子进程(避免长驻会话浏览器泄漏)。
     lsm_agent::agent::browser::BrowserManager::global().shutdown().await;
+    lsm_agent::agent::chrome_browser::ChromeManager::global().close_all();
 
     // debug 模式:任务结束后生成 Debug 报告(用未装饰的 llm 驱动 Debug Agent,避免自我采集递归)
     if let Some(collector) = collector {

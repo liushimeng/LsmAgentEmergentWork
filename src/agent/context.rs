@@ -15,8 +15,8 @@ use crate::llm::{ChatMessage, ContentBlock};
 
 /// 8 个 Agent 角色(2026-09-18 第 84 轮:删除 WindowUse,窗口操控能力降级为
 /// SubAgent-Work 的 MCP_Window_Use 工具;第 89 轮:删除 Chromium-WebUse,
-/// 浏览器操控能力降级为 SubAgent-Work 的 MCP_Web_Use 工具,
-/// 见 docs/MCP_Web_Use/01-设计与解决方案.md)。
+/// 浏览器操控能力降级为 SubAgent-Work 的 MCP_Web_LsmAgentBrowser_Use 工具,
+/// 见 docs/MCP_Web_LsmAgentBrowser_Use/01-设计与解决方案.md)。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentRole {
@@ -73,7 +73,7 @@ impl From<&str> for AgentRole {
             "compact" => Self::Compact,
             // 2026-09-18 第 84 轮:WindowUse Agent 已删除,存量序列化值归并 SubAgent。
             "windowuse" => Self::SubAgent,
-            // 2026-09-18 第 89 轮:Chromium-WebUse Agent 已删除(降级为 MCP_Web_Use 工具),
+            // 2026-09-18 第 89 轮:Chromium-WebUse Agent 已删除(降级为 MCP_Web_LsmAgentBrowser_Use 工具),
             // 存量序列化值归并 SubAgent。
             "webuse" => Self::SubAgent,
             "workflow" => Self::WorkFlow,
