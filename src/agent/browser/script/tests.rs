@@ -1023,3 +1023,20 @@ fn 标准_dom_构造器与事件子类齐备() {
     assert_eq!(v["mk_mouse"], "mousedown/12/true", "{v}");
     assert_eq!(v["mk_key"], "Enter/13", "KeyboardEvent 应按 key 回填 keyCode:{v}");
 }
+
+#[test]
+fn document_nodeType_为9_使Sizzle类选择器引擎可用() {
+    // 百度地图等站点用 jQuery 风格选择器引擎(Sizzle/Tangram);其入口即
+    // `context = context || document; if (nodeType !== 1 && nodeType !== 9) return []`。
+    // 快照桥 document 缺 nodeType → 引擎恒返回空集 → 全部 widget 静默不渲染。
+    let handle = JsHandle::spawn();
+    let reply = eval_on(&handle, "document.nodeType", PAGE, "https://a.test/");
+    assert_eq!(reply.outcome.value, "9");
+    let guard = eval_on(
+        &handle,
+        "var n = document.nodeType; (n !== 1 && n !== 9) ? 'empty' : 'ok'",
+        PAGE,
+        "https://a.test/",
+    );
+    assert_eq!(guard.outcome.value, "ok", "Sizzle 守卫必须放行 document");
+}

@@ -332,6 +332,7 @@ const PRELUDE_BODY: &str = r##"
   }
 
   var document = {
+    nodeType: 9,
     readyState: "complete",
     visibilityState: "visible",
     hidden: false,

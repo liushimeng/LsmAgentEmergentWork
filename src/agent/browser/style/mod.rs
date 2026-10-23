@@ -652,6 +652,57 @@ fn strip_comments(css: &str) -> String {
     out
 }
 
+/// 归一化 CSS 属性名:camelCase → kebab-case(`backgroundImage` → `background-image`)。
+///
+/// 站点(尤其百度地图)大量通过 JS `el.style.backgroundImage = ...` 写内联样式,
+/// 序列化回 HTML 后属性名保留 camelCase;不归一化则 `backgroundimage` 匹配不到
+/// `background-image`,背景图/对齐/层叠全部丢失。`--*` 自定义属性保持原样
+/// (按 CSS 规范自定义属性区分大小写)。
+fn normalize_property_key(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return String::new();
+    }
+    if raw.starts_with("--") {
+        return raw.to_ascii_lowercase();
+    }
+    // 厂商前缀:`Webkit*`/`Moz*`/`MS*`/`O*` → `-webkit-`/`-moz-`/`-ms-`/`-o-`
+    // (CSSOM 里 `style.MSTouchAction` 对应 `-ms-touch-action`;站点常写 `MSTouchAction`)。
+    for (js, css) in [
+        ("Webkit", "-webkit-"),
+        ("Moz", "-moz-"),
+        ("MS", "-ms-"),
+        ("O", "-o-"),
+    ] {
+        if raw.len() > js.len()
+            && raw.starts_with(js)
+            && raw.as_bytes()[js.len()].is_ascii_uppercase()
+        {
+            return format!("{}{}", css, kebab_case(&raw[js.len()..]));
+        }
+    }
+    kebab_case(raw)
+}
+
+/// camelCase → kebab-case(`backgroundImage` → `background-image`)。
+fn kebab_case(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = String::with_capacity(raw.len() + 4);
+    for (i, &b) in bytes.iter().enumerate() {
+        if b.is_ascii_uppercase() {
+            // 前一个字符是小写字母/数字时才插入 '-'(`backgroundImage` → `background-image`;
+            // 段首大写不插,`TouchAction` → `touch-action`)。
+            if i > 0 && (bytes[i - 1].is_ascii_lowercase() || bytes[i - 1].is_ascii_digit()) {
+                out.push('-');
+            }
+            out.push(b.to_ascii_lowercase() as char);
+        } else {
+            out.push(b as char);
+        }
+    }
+    out
+}
+
 /// 解析声明块;支持 `!important`、括号/字符串内的 `;`/`:`。
 pub fn parse_declarations(input: &str) -> Vec<Decl> {
     let mut out = Vec::new();
@@ -663,7 +714,7 @@ pub fn parse_declarations(input: &str) -> Vec<Decl> {
         let Some(pos) = find_top_level_colon(item) else {
             continue;
         };
-        let key = item[..pos].trim().to_ascii_lowercase();
+        let key = normalize_property_key(&item[..pos]);
         if key.is_empty() {
             continue;
         }

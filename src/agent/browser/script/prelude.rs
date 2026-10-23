@@ -1056,6 +1056,7 @@ function __parseHtml(html) {
 
 // ---------- document ----------
 var document = {
+  nodeType: 9,
   readyState: "loading",
   visibilityState: "visible",
   hidden: false,

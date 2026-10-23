@@ -411,3 +411,32 @@ fn 表单控件_ua_默认描边() {
     assert!(t.border_drawn[0], "input 默认边框可绘制");
     assert_eq!(t.background, Some([255, 255, 255]));
 }
+
+#[test]
+fn 内联样式_camelCase归一化为kebab() {
+    // 站点经 JS `el.style.backgroundImage = ...` 写内联样式,序列化后属性名是
+    // camelCase;归一化后必须落到 `background-image`,否则背景图整层丢失。
+    let (doc, engine) = doc_engine(
+        "<body><div id=t style='position:relative;backgroundImage:url(/bg.png);textAlign:center;zIndex:9;width:1264px;height:720px'></div></body>",
+        1280.0,
+    );
+    let t = style_of(&doc, &engine, "#t");
+    assert_eq!(t.pos.position, "relative");
+    assert_eq!(t.pos.z_index, 9, "zIndex 归一化为 z-index");
+    assert_eq!(t.text_align, "center");
+    assert_eq!(t.width, Some(1264.0));
+    assert_eq!(t.height, Some(720.0));
+    assert!(t.background_image.is_some(), "backgroundImage 归一化后应生效");
+}
+
+#[test]
+fn 属性名归一化_覆盖驼峰与自定义属性() {
+    use crate::agent::browser::style::normalize_property_key as norm;
+    assert_eq!(norm("backgroundImage"), "background-image");
+    assert_eq!(norm("textAlign"), "text-align");
+    assert_eq!(norm("zIndex"), "z-index");
+    assert_eq!(norm("MSTouchAction"), "-ms-touch-action");
+    assert_eq!(norm("WebkitTransition"), "-webkit-transition");
+    assert_eq!(norm("position"), "position");
+    assert_eq!(norm("--MainColor"), "--maincolor", "自定义属性仅小写化");
+}
