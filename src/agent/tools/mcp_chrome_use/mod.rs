@@ -109,8 +109,23 @@ impl McpChromeUseTool {
     fn page_of(page_id: &str) -> Result<std::sync::Arc<chromiumoxide::Page>> {
         Self::mgr()
             .get_page(page_id)
-            .ok_or_else(|| crate::error::AgentError::ToolExecution { tool: "MCP_Web_Chrome_Use".into(), reason: format!("page_not_found:{page_id}")})
+            .ok_or_else(|| crate::error::AgentError::ToolExecution { tool: "MCP_Web_Chrome_Use".into(), reason: page_missing_message(page_id)})
     }
+}
+
+/// 2004 诊断文案:跨工具 page_id 误用给出可操作指引(实测 QC 曾建议把 Chrome
+/// 的 c_ page_id 传给 Lsm 工具 explore,确定性陷阱,工具层直接点破)。
+fn page_missing_message(page_id: &str) -> String {
+    if let Some(rest) = page_id.strip_prefix("p_") {
+        if rest.chars().all(|c| c.is_ascii_hexdigit()) {
+            return format!(
+                "页面不存在:{page_id} 属于 MCP_Web_LsmAgentBrowser_Use 的注册表\
+                 (两浏览器工具页面注册表独立,page_id 不跨工具复用)。\
+                 请用 action=open 重新打开页面,或 action=list 查看本工具存活页面"
+            );
+        }
+    }
+    format!("页面不存在(可能已关闭或从未打开):{page_id};用 action=list 查看本工具存活页面")
 }
 
 #[async_trait]
@@ -122,9 +137,12 @@ impl Tool for McpChromeUseTool {
     fn description(&self) -> &str {
         "浏览器网页操控工具(Chrome/CDP,真 Chromium 渲染,双浏览器架构中默认优先使用)。\
 支持 headed 有头窗口(人工可直接看到并介入页面)与 hidden 无头模式(LAEW_CHROME_MODE)。\
-action=open 打开页面拿 page_id;list 列出页面;control 执行写操作(navigate/click/type/\
-eval_js/screenshot/scroll/wait/back/forward/reload);inspect 观测页面(url/title/text/html/\
-screenshot);close 释放页面(page_id=all 全关并回收 Chrome 进程)。\
+action=open 打开页面拿 page_id;list 列出页面;control 执行写操作(navigate/click/type|input_text/\
+eval_js/screenshot/scroll/wait/back/forward/reload);inspect 观测页面(url/title/text/html/screenshot);\
+close 释放页面(page_id=all 全关并回收 Chrome 进程)。\
+★ screenshot 务必给 params.save_path 落盘(只回路径+尺寸);不传才会回 base64。\
+★ wait 支持 selector 就绪判定(params.selector+timeout_ms)。\
+page_id 仅本工具内有效,不跨工具复用。\
 当目标站点对 Chrome 风控(反复验证码/页面抹除/访问被拒)时,改用 MCP_Web_LsmAgentBrowser_Use。\
 返回统一信封 {code,message,data};6001=任务锚点越界,3001=未检测到浏览器。"
     }
@@ -144,7 +162,7 @@ screenshot);close 释放页面(page_id=all 全关并回收 Chrome 进程)。\
                 "control_action": {
                     "type": "string",
                     "enum": [
-                        "navigate", "click", "type", "eval_js",
+                        "navigate", "click", "type", "input_text", "eval_js",
                         "screenshot", "scroll", "wait",
                         "back", "forward", "reload"
                     ]
@@ -158,11 +176,13 @@ screenshot);close 释放页面(page_id=all 全关并回收 Chrome 进程)。\
                     "description": "control/inspect 动作参数",
                     "properties": {
                         "url": { "type": "string" },
-                        "selector": { "type": "string", "description": "click/type/scroll(CSS)" },
-                        "text": { "type": "string", "description": "type 的输入文本" },
+                        "selector": { "type": "string", "description": "click/type/input_text/scroll/wait(CSS);wait 时为就绪判定目标" },
+                        "text": { "type": "string", "description": "type/input_text 的输入文本" },
                         "script": { "type": "string", "description": "eval_js 的 JS 表达式/语句" },
                         "y": { "type": "integer", "description": "scroll 像素(正向下)" },
-                        "ms": { "type": "integer", "description": "wait 毫秒(上限 30000)" }
+                        "ms": { "type": "integer", "description": "wait 固定等待毫秒(上限 30000)" },
+                        "timeout_ms": { "type": "integer", "description": "wait(selector=...) 就绪判定超时,默认 10000,上限 30000" },
+                        "save_path": { "type": "string", "description": "screenshot 落盘路径(.png);给了就只回路径+尺寸,绝不回 base64(防上下文爆炸)" }
                     }
                 }
             }
@@ -207,6 +227,7 @@ async fn run_open(args: Value) -> Result<String> {
                 "title": title,
                 "engine": "chrome",
                 "mode": if mgr.mode().is_headed() { "headed" } else { "hidden" },
+                "tool_hint": "page_id 仅 MCP_Web_Chrome_Use 内有效;另一浏览器工具的 page_id 不跨工具复用",
             }),
         ),
         Err(e) => {
@@ -257,10 +278,10 @@ async fn run_control(args: Value) -> Result<String> {
     };
     let page = match McpChromeUseTool::page_of(&page_id) {
         Ok(p) => p,
-        Err(_) => {
+        Err(e) => {
             return envelope(
                 CODE_PAGE_NOT_FOUND,
-                "页面不存在",
+                &e.to_string(),
                 json!({"page_id": page_id, "control_action": control_action}),
             )
         }
@@ -289,10 +310,12 @@ async fn run_control(args: Value) -> Result<String> {
                 .map(|hit| json!({"selector": sel, "hit": hit}))
                 .map_err(|e| (CODE_EXEC_FAILED, e.to_string()))
         }
-        "type" => {
+        // input_text 与 type 同义(对齐 Lsm 版命名,实测模型对 type 可发现性差,
+        // 曾绕行 eval_js 手搓键盘事件)。
+        "type" | "input_text" => {
             let (Some(sel), text) = (str_arg(p, "selector"), p.get("text").and_then(Value::as_str).unwrap_or(""))
             else {
-                return envelope(CODE_PARAM_ERROR, "type 缺少 params.selector", json!({}));
+                return envelope(CODE_PARAM_ERROR, "type/input_text 缺少 params.selector", json!({}));
             };
             chrome_browser::type_text(&page, sel, text)
                 .await
@@ -307,10 +330,18 @@ async fn run_control(args: Value) -> Result<String> {
                 .await
                 .map_err(|e| (CODE_EXEC_FAILED, e.to_string()))
         }
-        "screenshot" => chrome_browser::screenshot_base64(&page)
-            .await
-            .map(|b64| json!({"format": "png", "image_base64": b64}))
-            .map_err(|e| (CODE_EXEC_FAILED, e.to_string())),
+        // screenshot:优先 save_path 落盘(信封只回元数据,防 base64 爆上下文);
+        // 不传 save_path 时保持 base64 内联(兼容旧行为)。
+        "screenshot" => match str_arg(p, "save_path") {
+            Some(path) => chrome_browser::screenshot_to_file(&page, path)
+                .await
+                .map(|(path, bytes, w, h)| json!({"format": "png", "path": path, "bytes": bytes, "width": w, "height": h}))
+                .map_err(|e| (CODE_EXEC_FAILED, e.to_string())),
+            None => chrome_browser::screenshot_base64(&page)
+                .await
+                .map(|b64| json!({"format": "png", "image_base64": b64}))
+                .map_err(|e| (CODE_EXEC_FAILED, e.to_string())),
+        },
         "scroll" => {
             let y = i64_arg(p, "y").unwrap_or(0);
             chrome_browser::scroll(&page, y, str_arg(p, "selector"))
@@ -318,10 +349,20 @@ async fn run_control(args: Value) -> Result<String> {
                 .map(|_| json!({"scrolled": true}))
                 .map_err(|e| (CODE_EXEC_FAILED, e.to_string()))
         }
-        "wait" => {
-            chrome_browser::wait(i64_arg(p, "ms").unwrap_or(500).max(0) as u64).await;
-            Ok(json!({"waited_ms": i64_arg(p, "ms").unwrap_or(500).max(0)}))
-        }
+        // wait:固定毫秒,或 selector 就绪判定(params.selector + timeout_ms,上限 30s)。
+        "wait" => match str_arg(p, "selector") {
+            Some(sel) => {
+                let timeout_ms = i64_arg(p, "timeout_ms").unwrap_or(10_000).max(0) as u64;
+                chrome_browser::wait_for_selector(&page, sel, timeout_ms)
+                    .await
+                    .map(|hit| json!({"selector": sel, "visible": hit, "timeout_ms": timeout_ms.min(30_000)}))
+                    .map_err(|e| (CODE_EXEC_FAILED, e.to_string()))
+            }
+            None => {
+                chrome_browser::wait(i64_arg(p, "ms").unwrap_or(500).max(0) as u64).await;
+                Ok(json!({"waited_ms": i64_arg(p, "ms").unwrap_or(500).max(0)}))
+            }
+        },
         "back" => chrome_browser::eval_js(&page, "history.back(); true")
             .await
             .map_err(|e| (CODE_EXEC_FAILED, e.to_string())),
@@ -351,7 +392,7 @@ async fn run_inspect(args: Value) -> Result<String> {
     };
     let page = match McpChromeUseTool::page_of(&page_id) {
         Ok(p) => p,
-        Err(_) => return envelope(CODE_PAGE_NOT_FOUND, "页面不存在", json!({"page_id": page_id})),
+        Err(e) => return envelope(CODE_PAGE_NOT_FOUND, &e.to_string(), json!({"page_id": page_id})),
     };
 
     let result: std::result::Result<Value, (i32, String)> = match info.as_str() {
@@ -367,10 +408,16 @@ async fn run_inspect(args: Value) -> Result<String> {
             .await
             .map(|h| json!({"html": h}))
             .map_err(|e| (CODE_EXEC_FAILED, e.to_string())),
-        "screenshot" => chrome_browser::screenshot_base64(&page)
-            .await
-            .map(|b64| json!({"format": "png", "image_base64": b64}))
-            .map_err(|e| (CODE_EXEC_FAILED, e.to_string())),
+        "screenshot" => match str_arg(params_of(&args), "save_path") {
+            Some(path) => chrome_browser::screenshot_to_file(&page, path)
+                .await
+                .map(|(path, bytes, w, h)| json!({"format": "png", "path": path, "bytes": bytes, "width": w, "height": h}))
+                .map_err(|e| (CODE_EXEC_FAILED, e.to_string())),
+            None => chrome_browser::screenshot_base64(&page)
+                .await
+                .map(|b64| json!({"format": "png", "image_base64": b64}))
+                .map_err(|e| (CODE_EXEC_FAILED, e.to_string())),
+        },
         other => return envelope(CODE_PARAM_ERROR, "未知 info(基础框架)", json!({"info": other})),
     };
 

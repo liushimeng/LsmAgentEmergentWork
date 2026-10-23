@@ -163,6 +163,17 @@ enum Cmd {
         /// 窗口初始标题。
         title: String,
     },
+
+    /// 内部隐藏子命令:MCP_Web_Chrome_Use 的 Chrome 子进程进程外守护。
+    /// 主进程 stdin pipe 关闭(即主进程退出)后回收 Chrome 主进程与一次性 profile。
+    /// 禁止手工调用。
+    #[command(name = "__browser-watchdog", hide = true)]
+    BrowserWatchdog {
+        /// Chrome 主进程 pid。
+        browser_pid: u32,
+        /// 一次性 user-data-dir 路径。
+        user_data_dir: std::path::PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1102,6 +1113,19 @@ async fn main() -> Result<()> {
         std::process::exit(code);
     }
 
+    // Chrome 子进程 watchdog:主进程 pipe EOF 即回收 Chrome 主进程与 profile。
+    // 直接在既有 tokio runtime 内 await(不得再嵌套 runtime),不进入业务启动路径。
+    if let Some(Cmd::BrowserWatchdog {
+        browser_pid,
+        user_data_dir,
+    }) = &cli.cmd
+    {
+        lsm_agent::agent::chrome_browser::watchdog::run(*browser_pid, user_data_dir)
+            .await
+            .map_err(|e| anyhow::anyhow!("watchdog 运行失败: {e}"))?;
+        std::process::exit(0);
+    }
+
     // TUI 模式下 INFO 级日志会与对话内容交错打印,造成视觉混乱 + 闪烁。
     // 单轮 / -debug / provider 子命令场景不受影响,沿用 RUST_LOG 默认行为。
     // 关联报告: 2026-09-09_07 F-007-1
@@ -1214,6 +1238,9 @@ async fn main() -> Result<()> {
             // 已在 main 初始化前返回；此分支仅为穷尽性匹配。
             Some(Cmd::HitlDialog { .. }) => unreachable!("hitl-dialog returned before setup"),
             Some(Cmd::BrowserView { .. }) => unreachable!("browser-view returned before setup"),
+            Some(Cmd::BrowserWatchdog { .. }) => {
+                unreachable!("browser-watchdog returned before setup")
+            }
             None => {
                 // 纯函数斜杠命令前置检测(/diff 等不依赖 LLM 的命令在 -p 模式也可直接执行)
                 if let Some(prompt) = &cli.prompt {

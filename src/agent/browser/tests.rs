@@ -490,3 +490,18 @@ async fn canvas_区域_渲染出显式占位说明() {
     assert!(b.w > 100.0 && b.h > 100.0, "canvas 盒尺寸异常:{b:?}");
     mgr.shutdown().await;
 }
+
+#[test]
+fn page_not_found_对_chrome_page_id_给出跨工具诊断() {
+    let e = EngineError::page_not_found("c_00000000");
+    assert_eq!(e.code, 2000);
+    assert!(
+        e.message.contains("MCP_Web_Chrome_Use"),
+        "应点破跨工具误用: {}",
+        e.message
+    );
+    assert!(e.message.contains("不跨工具"), "msg={}", e.message);
+    // 本工具自己的未知 page_id 保持原通用文案。
+    let e2 = EngineError::page_not_found("p_deadbeef");
+    assert_eq!(e2.message, "page_id 无效或页面已关闭");
+}

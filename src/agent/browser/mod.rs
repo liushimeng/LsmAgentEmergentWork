@@ -283,6 +283,19 @@ impl EngineError {
     }
 
     pub fn page_not_found(page_id: &str) -> Self {
+        // 跨工具 page_id 误用诊断(实测 QC 曾建议把 Chrome 的 c_ page_id 传给本工具):
+        // 两浏览器工具页面注册表独立,直接点破比干巴巴的「无效」省一轮试错。
+        if let Some(rest) = page_id.strip_prefix("c_") {
+            if rest.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Self::new(
+                    2000,
+                    "页面不存在:该 page_id 属于 MCP_Web_Chrome_Use 的注册表\
+                     (两浏览器工具页面注册表独立,page_id 不跨工具复用)。\
+                     请用 action=open 重新打开页面,或 action=list 查看本工具存活页面",
+                )
+                .with_data(json!({"page_id": page_id, "cross_tool_page_id": true}));
+            }
+        }
         Self::new(2000, "page_id 无效或页面已关闭").with_data(json!({"page_id": page_id}))
     }
 

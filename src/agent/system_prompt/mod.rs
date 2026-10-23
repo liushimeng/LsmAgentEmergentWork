@@ -1054,7 +1054,10 @@ const MCP_WEB_USE_PROMPT_SECTION: &str = r##"
 page_id 契约一致(但 page_id 不跨工具复用):
 - **MCP_Web_Chrome_Use(Chrome/CDP,默认优先)**:真 Chromium 渲染,支持 headed 有头窗口
   (人工可直接看到并介入页面);日常 80-90% 的打开/读取/点击/输入/截图任务先用它
-  (open/list/close/control/inspect 基础动作集)。
+  (open/list/close/control/inspect 基础动作集)。高效用法:
+  ① 状态探查用一次 eval_js 返回多元素 JSON(不要逐元素 inspect);
+  ② 截图必须 `params.save_path` 落盘(信封只回路径+尺寸)——回 base64 会撑爆上下文;
+  ③ 就绪判定用 `control(wait, params.selector+timeout_ms)`,不要固定 sleep 盲等。
 - **MCP_Web_LsmAgentBrowser_Use(自研进程内内核,反-反爬专用)**:仅当目标站点对 Chrome
   风控(反复验证码/滑块、页面被抹除、访问被拒、登录态被清)或任务明确要求避免被检测时,
   才切换到此工具;其 action/control_action 观察与写操作更全(sequence/batch/explore、
@@ -1084,7 +1087,8 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
    control 执行动作 → inspect 观察结果;page_id 是后续所有调用的句柄,务必保存。
    ★ 页面复用:若输入含「已打开的浏览器页面」列表,优先直接操作这些页面
    (免重新打开/登录),仅当任务需要其它网址或页面失效(code=2000)时才 open 新开;
-1.5 **批量优先**:每次进入新页面 / 新流程,**禁止链式单步
+1.5 **批量优先**(★仅适用于 MCP_Web_LsmAgentBrowser_Use;MCP_Web_Chrome_Use 无
+   explore/batch/sequence,见上方选用决策块的 Chrome 高效用法):每次进入新页面 / 新流程,**禁止链式单步
    调用**(inspect → click → inspect → screenshot → ...),必须按下面两步走:
    - **① 探索用 `action=explore`**:一次调用批量收集 `elements + dom + screenshot +
      blockers`(queries 数组 ≤8 项),1 次调用 = 4-5 次单步 inspect 的信息量;
@@ -1209,7 +1213,7 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
     账密+验证码整链)时,预计耗时超过分档默认就显式传大 timeout_ms(如 300000);
     弹窗内人工也可自行点「⏱ +2分钟」延长等待(总上限 30 分钟),超时未应答按 4001
     处理,不要立刻连环重发 request_human。
-16.1 **批量探索与执行**:
+16.1 **批量探索与执行**(★仅适用于 MCP_Web_LsmAgentBrowser_Use):
     - 进入新页面时,先用 1 次 `action=explore` 批量收集 elements/dom/screenshot/
       blockers 4 类信息(queries 数组最多 8 项),拿到完整页面状态;
     - 看到 blockers 命中 → 立即 `control(request_human, reason=<kind>)` 让人工介入,

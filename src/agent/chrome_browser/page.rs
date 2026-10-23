@@ -58,6 +58,9 @@ pub async fn eval_js(page: &Page, script: &str) -> Result<Value> {
 }
 
 /// 全页 PNG 截图,返回 base64(与 Lsm 版 `inspect(screenshot)` 信封对齐)。
+///
+/// CDP 的 `Page.captureScreenshot` 返回的 `data` **本身已是 base64 字符串**,
+/// 直接透传(不可再二次编码,否则落盘得到的不是 PNG)。
 pub async fn screenshot_base64(page: &Page) -> Result<String> {
     use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotParams;
     let resp = tokio::time::timeout(
@@ -67,10 +70,9 @@ pub async fn screenshot_base64(page: &Page) -> Result<String> {
     .await
     .map_err(|_| timeout_err("screenshot", CDP_BOUND_SECS))?
     .map_err(|e| err("screenshot", e))?;
-    Ok(base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        resp.result.data,
-    ))
+    // `Binary` 是 base64 文本 newtype(其内部 String 即 base64 文本)。
+    let b64: &str = AsRef::<str>::as_ref(&resp.result.data);
+    Ok(b64.to_string())
 }
 
 /// 按 CSS 选择器点击(JS 通道:存在性检查 + click),返回是否命中元素。
@@ -125,6 +127,63 @@ pub async fn scroll(page: &Page, y: i64, selector: Option<&str>) -> Result<()> {
     };
     eval_js(page, &js).await?;
     Ok(())
+}
+
+/// 全页 PNG 截图落盘:返回 `(路径, 字节数, 宽, 高)`。
+///
+/// 信封只回元数据不回 base64 —— 实测(2026-10-23 双浏览器工具测试)单张 PNG
+/// base64 约 1.7MB 直进消息流,30+ 轮后 LLM 调用 >120s 网关超时,
+/// Reflection 根因:「截图的大体积二进制回包滞留上下文后,推理失去前进锚点」。
+pub async fn screenshot_to_file(page: &Page, path: &str) -> Result<(String, usize, u32, u32)> {
+    let b64 = screenshot_base64(page).await?;
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64.trim())
+        .map_err(|e| err("screenshot 解码", e))?;
+    let (w, h) = png_size(&bytes).unwrap_or((0, 0));
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
+    std::fs::write(path, &bytes)
+        .map_err(|e| err("screenshot 落盘", e))?;
+    Ok((path.to_string(), bytes.len(), w, h))
+}
+
+/// 从 PNG 字节解析 IHDR 宽高(8B 签名 + 4B 长度 + 4B "IHDR" 之后)。
+pub fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 24 || &bytes[12..16] != b"IHDR" {
+        return None;
+    }
+    let w = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let h = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+    Some((w, h))
+}
+
+/// 就绪判定:轮询选择器直到元素可见(上限 timeout_ms,上限 30s)。
+/// 返回是否在超时前命中。
+pub async fn wait_for_selector(page: &Page, selector: &str, timeout_ms: u64) -> Result<bool> {
+    let budget = Duration::from_millis(timeout_ms.min(30_000).max(200));
+    let start = std::time::Instant::now();
+    let js = format!(
+        r#"(function() {{
+            var el = document.querySelector({sel});
+            if (!el) return false;
+            var r = el.getBoundingClientRect();
+            var s = getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+        }})()"#,
+        sel = serde_json::to_string(selector).unwrap_or_default()
+    );
+    loop {
+        let v = eval_js(page, &js).await?;
+        if v.as_bool().unwrap_or(false) {
+            return Ok(true);
+        }
+        if start.elapsed() >= budget {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 /// 等待固定毫秒(页面 settle 用)。

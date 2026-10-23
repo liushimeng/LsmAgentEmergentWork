@@ -22,6 +22,40 @@ fn schema_含五个基础_action() {
         .collect::<Vec<_>>();
     assert_eq!(enums, vec!["open", "list", "close", "control", "inspect"]);
     assert!(schema["required"].as_array().unwrap().contains(&json!("action")));
+    // control_action 含 input_text 别名(对齐 Lsm 版命名)。
+    let c_enums = schema["properties"]["control_action"]["enum"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(c_enums.contains(&"input_text"));
+    assert!(c_enums.contains(&"type"));
+    // params 含 save_path / timeout_ms。
+    let props = &schema["properties"]["params"]["properties"];
+    assert!(props.get("save_path").is_some());
+    assert!(props.get("timeout_ms").is_some());
+}
+
+#[test]
+fn page_missing_message_识别跨工具_page_id() {
+    let m = page_missing_message("p_00000001");
+    assert!(m.contains("MCP_Web_Chrome_Use") || m.contains("LsmAgentBrowser"), "m={m}");
+    assert!(m.contains("不跨工具"), "m={m}");
+    // 本工具自己的未知 id 走通用文案。
+    let m2 = page_missing_message("c_00ff00ff");
+    assert!(m2.contains("页面不存在"), "m2={m2}");
+}
+
+#[test]
+fn png_size_解析_IHDR() {
+    let mut png = vec![0u8; 24];
+    png[0..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+    png[12..16].copy_from_slice(b"IHDR");
+    png[16..20].copy_from_slice(&1920u32.to_be_bytes());
+    png[20..24].copy_from_slice(&1080u32.to_be_bytes());
+    assert_eq!(crate::agent::chrome_browser::png_size(&png), Some((1920, 1080)));
+    assert_eq!(crate::agent::chrome_browser::png_size(&[0u8; 10]), None);
 }
 
 #[tokio::test]

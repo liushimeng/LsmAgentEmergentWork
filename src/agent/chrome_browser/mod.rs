@@ -25,6 +25,7 @@ use crate::error::{AgentError, Result};
 mod page;
 #[cfg(test)]
 mod tests;
+pub mod watchdog;
 
 pub use page::*;
 
@@ -172,6 +173,8 @@ struct BrowserHolder {
     _task: tokio::task::JoinHandle<()>,
     /// 一次性 user-data-dir(进程退出时清理)。
     user_data_dir: PathBuf,
+    /// 进程外 watchdog(主进程被强杀时负责回收 Chrome;正常收口时自行退出)。
+    watchdog: Option<std::process::Child>,
 }
 
 impl BrowserHolder {
@@ -187,6 +190,10 @@ impl BrowserHolder {
             }
         }
         let _ = std::fs::remove_dir_all(&self.user_data_dir);
+        // watchdog 观察 Chrome 退出即自行返回;这里只做一次非阻塞回收。
+        if let Some(mut wd) = self.watchdog.take() {
+            let _ = wd.try_wait();
+        }
     }
 }
 
@@ -278,7 +285,7 @@ impl ChromeManager {
             .map_err(|e| AgentError::ToolExecution { tool: "chrome_browser".into(), reason: format!("Chrome 启动配置失败: {e}")})?;
 
         let launch_timeout = Duration::from_secs(30);
-        let (browser, mut handler) = tokio::time::timeout(
+        let (mut browser, mut handler) = tokio::time::timeout(
             launch_timeout,
             chromiumoxide::Browser::launch(config),
         )
@@ -298,10 +305,21 @@ impl ChromeManager {
         });
 
         let mut holder = self.holder.lock().map_err(lock_err)?;
+        // 进程外 watchdog:主进程被 SIGKILL/强杀时,watchdog 依据 stdin pipe EOF
+        // 回收 Chrome 主进程与一次性 profile(实测孤儿 Chrome 占用 100MB+/个)。
+        let browser_pid = browser.get_mut_child().and_then(|c| c.as_mut_inner().id());
+        let watchdog = browser_pid.and_then(|pid| watchdog::spawn_watchdog(pid, &dir));
+        if watchdog.is_none() {
+            tracing::warn!(
+                browser_pid,
+                "Chrome watchdog 启动失败(主进程被强杀时可能残留 Chrome 进程)"
+            );
+        }
         *holder = Some(BrowserHolder {
             browser: Arc::new(browser),
             _task: task,
             user_data_dir: dir,
+            watchdog,
         });
         Ok(holder.as_ref().unwrap().browser.clone())
     }

@@ -40,8 +40,10 @@ Thought → Action → Observation 循环先收集、再成文:
   不要为探索而探索。
 
 **感知效率规范(默认如此,例外需理由)**:
-- 网页类任务首选 `MCP_Web_LsmAgentBrowser_Use(action=explore)` 一次拿全多维度信息(elements /
-  dom / 页面元信息 / 阻断态一次收集),而不是逐维度多次 inspect;
+- 网页类任务按双浏览器工具选用决策(`docs/双浏览器工具架构/`)选工具:用
+  `MCP_Web_LsmAgentBrowser_Use` 时首选 `action=explore` 一次拿全多维度信息(elements /
+  dom / 页面元信息 / 阻断态一次收集),而不是逐维度多次 inspect;用 `MCP_Web_Chrome_Use`
+  时用一次 `eval_js` 返回多元素 JSON 达到同等效果;
 - 能并入同一响应的只读观察调用尽量合并提交(并行执行,省 LLM round-trip);
 - 观察类行动一般控制在个位数轮次——每多一轮感知都是纯开销,信息足够支撑
   方案判断即收口成文。
