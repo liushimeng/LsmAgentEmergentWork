@@ -10,7 +10,7 @@
 use tiny_skia::{Pixmap, PremultipliedColorU8};
 
 use super::super::images::{DecodedImage, ImageStore};
-use super::super::style::{CornerRadius, GradientKind, GradientSpec};
+use super::super::style::{Affine, CornerRadius, GradientKind, GradientSpec};
 use super::blur::{blur_mask, half_width_for, MAX_MASK_PIXELS};
 use super::display::{BgFill, DisplayItem, DisplayKind};
 use super::FontSet;
@@ -55,6 +55,64 @@ fn scissor_for(item: &DisplayItem, scroll_y: f64, pw: i64, ph: i64) -> Scissor {
         sc = sc.intersect_rect(cx, cy - scroll_y, cw, ch);
     }
     sc
+}
+
+/// 画布像素 → 项**局部(页坐标)**映射(阶段六第二步:CSS 2D transform 逆映射)。
+///
+/// 无变换时退化为恒等 + 滚动偏移(`local = (px+0.5, py+0.5+scroll_y)`),
+/// 与重构前「画布坐标 == 页坐标 - scroll_y」逐像素等价。
+struct Mapper<'a> {
+    inv: Option<Affine>,
+    scroll_y: f64,
+    item: &'a DisplayItem,
+}
+
+impl<'a> Mapper<'a> {
+    fn new(item: &'a DisplayItem, scroll_y: f64) -> Self {
+        Self {
+            inv: item.transform.and_then(|t| t.invert()),
+            scroll_y,
+            item,
+        }
+    }
+
+    /// 画布像素中心 → 页坐标局部点。
+    #[inline]
+    fn local(&self, px: i64, py: i64) -> (f64, f64) {
+        let x = px as f64 + 0.5;
+        let y = py as f64 + 0.5 + self.scroll_y;
+        match self.inv {
+            None => (x, y),
+            Some(m) => (m.a * x + m.c * y + m.e, m.b * x + m.d * y + m.f),
+        }
+    }
+
+    /// 局部盒变换后的画布 AABB(x0, y0, w, h)。无变换时 = `(x, y-scroll_y, w, h)`。
+    fn canvas_aabb(&self, x: f64, y: f64, w: f64, h: f64) -> (f64, f64, f64, f64) {
+        let Some(t) = self.item.transform else {
+            return (x, y - self.scroll_y, w, h);
+        };
+        let corners = [
+            t.apply(x, y),
+            t.apply(x + w, y),
+            t.apply(x, y + h),
+            t.apply(x + w, y + h),
+        ];
+        let (mut x0, mut y0, mut x1, mut y1) = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for (cx, cy) in corners {
+            x0 = x0.min(cx);
+            x1 = x1.max(cx);
+            y0 = y0.min(cy);
+            y1 = y1.max(cy);
+        }
+        (x0, y0 - self.scroll_y, (x1 - x0).max(0.0), (y1 - y0).max(0.0))
+    }
+
+    /// 局部盒 → 画布 scissor(与视口/项 clip 取交)。
+    fn scissor_of(&self, sc: &Scissor, x: f64, y: f64, w: f64, h: f64) -> Scissor {
+        let (ax, ay, aw, ah) = self.canvas_aabb(x, y, w, h);
+        sc.intersect_rect(ax, ay, aw, ah)
+    }
 }
 
 /// 四角半径解析:百分比按 `min(w,h)/2` 求解,长度钳制到 `min(w,h)/2`。
@@ -146,23 +204,22 @@ pub(crate) fn rasterize(
         if item.opacity <= 0.0 {
             continue;
         }
-        let top = item.y - scroll_y;
-        // 便宜剔除:整项(含阴影扩张)在画布外。
-        let (ex0, ey0, ex1, ey1) = match &item.kind {
-            DisplayKind::Shadow { blur, spread, .. } => (
-                item.x - blur - spread - 8.0,
-                top - blur - spread - 8.0,
-                item.x + item.w + blur + spread + 8.0,
-                top + item.h + blur + spread + 8.0,
-            ),
-            DisplayKind::Text { size, .. } => (
-                item.x,
-                top,
-                item.x + 4096.0,
-                top + size * 2.5,
-            ),
-            _ => (item.x, top, item.x + item.w, top + item.h),
+        let mapper = Mapper::new(item, scroll_y);
+        // 局部盒:文本类按内容宽度(字形逐字绘制,盒宽取文本宽)。
+        let (bx, by, bw, bh) = match &item.kind {
+            DisplayKind::Text { text, size, .. }
+            | DisplayKind::TextShadow { text, size, .. } => {
+                (item.x, item.y, font.text_width(text, *size), *size * 2.0)
+            }
+            _ => (item.x, item.y, item.w, item.h),
         };
+        let (ax, ay, aw, ah) = mapper.canvas_aabb(bx, by, bw, bh);
+        // 便宜剔除:整项(含阴影扩张)在画布外。
+        let pad = match &item.kind {
+            DisplayKind::Shadow { blur, spread, .. } => *blur + *spread + 8.0,
+            _ => 0.0,
+        };
+        let (ex0, ey0, ex1, ey1) = (ax - pad, ay - pad, ax + aw + pad, ay + ah + pad);
         if ex1 < 0.0 || ex0 > pw as f64 || ey1 < 0.0 || ey0 > ph as f64 {
             continue;
         }
@@ -172,10 +229,10 @@ pub(crate) fn rasterize(
         }
         match &item.kind {
             DisplayKind::Background { fill } => {
-                draw_background(pixmap, &sc, item, top, fill);
+                draw_background(pixmap, &sc, &mapper, item, fill);
             }
             DisplayKind::Border { widths, colors } => {
-                draw_border(pixmap, &sc, item, top, widths, colors);
+                draw_border(pixmap, &sc, &mapper, item, widths, colors);
             }
             DisplayKind::Shadow {
                 dx,
@@ -184,7 +241,7 @@ pub(crate) fn rasterize(
                 spread,
                 color,
             } => {
-                draw_shadow(pixmap, &sc, item, top, *dx, *dy, *blur, *spread, *color);
+                draw_shadow(pixmap, &sc, &mapper, item, *dx, *dy, *blur, *spread, *color);
             }
             DisplayKind::Image {
                 src,
@@ -193,7 +250,7 @@ pub(crate) fn rasterize(
                 off_y,
             } => {
                 if let Some(img) = images.get(src) {
-                    draw_image(pixmap, &sc, img, item, top, fit, *off_x, *off_y);
+                    draw_image(pixmap, &sc, &mapper, img, item, fit, *off_x, *off_y);
                 }
             }
             DisplayKind::Text {
@@ -202,24 +259,32 @@ pub(crate) fn rasterize(
                 color,
                 bold,
             } => {
-                draw_text(font, pixmap, &sc, text, item.x, top, *size, *color, *bold, item.opacity);
+                draw_text(
+                    font, pixmap, &sc, &mapper, text, item.x, item.y, *size, *color, *bold,
+                    item.opacity, None,
+                );
+            }
+            DisplayKind::TextShadow {
+                text,
+                size,
+                color,
+                blur,
+            } => {
+                draw_text(
+                    font, pixmap, &sc, &mapper, text, item.x, item.y, *size, *color, false,
+                    item.opacity, Some(*blur),
+                );
             }
             DisplayKind::CanvasNote { pale } => {
-                draw_canvas_note(font, pixmap, &sc, item, top, *pale);
+                draw_canvas_note(font, pixmap, &sc, &mapper, item, *pale);
             }
         }
     }
 }
 
-/// 背景填充:纯色圆角矩形或渐变(渐变按像素求值,支持圆角与裁剪)。
-fn draw_background(
-    pixmap: &mut Pixmap,
-    sc: &Scissor,
-    item: &DisplayItem,
-    top: f64,
-    fill: &BgFill,
-) {
-    let rect = sc.intersect_rect(item.x, top, item.w, item.h);
+/// 背景填充:纯色圆角矩形或渐变(渐变按像素求值,支持圆角、裁剪与 transform)。
+fn draw_background(pixmap: &mut Pixmap, sc: &Scissor, mapper: &Mapper, item: &DisplayItem, fill: &BgFill) {
+    let rect = mapper.scissor_of(sc, item.x, item.y, item.w, item.h);
     if rect.empty() {
         return;
     }
@@ -231,15 +296,8 @@ fn draw_background(
             let a = (item.opacity * 255.0).round().clamp(0.0, 255.0) as u8;
             for py in rect.y0..rect.y1 {
                 for px in rect.x0..rect.x1 {
-                    if inside_rounded(
-                        px as f64 + 0.5,
-                        py as f64 + 0.5,
-                        item.x,
-                        top,
-                        item.w,
-                        item.h,
-                        &radius,
-                    ) {
+                    let (lx, ly) = mapper.local(px, py);
+                    if inside_rounded(lx, ly, item.x, item.y, item.w, item.h, &radius) {
                         blend_pixel(pixels, w, px, py, rgb[0], rgb[1], rgb[2], a);
                     }
                 }
@@ -248,12 +306,11 @@ fn draw_background(
         BgFill::Gradient(spec) => {
             for py in rect.y0..rect.y1 {
                 for px in rect.x0..rect.x1 {
-                    let cx = px as f64 + 0.5;
-                    let cy = py as f64 + 0.5;
-                    if !inside_rounded(cx, cy, item.x, top, item.w, item.h, &radius) {
+                    let (lx, ly) = mapper.local(px, py);
+                    if !inside_rounded(lx, ly, item.x, item.y, item.w, item.h, &radius) {
                         continue;
                     }
-                    let t = gradient_t(spec, cx, cy, item.x, top, item.w, item.h);
+                    let t = gradient_t(spec, lx, ly, item.x, item.y, item.w, item.h);
                     let (rgb, alpha) = gradient_color_at(spec, t);
                     let a = (alpha as f64 * item.opacity).round().clamp(0.0, 255.0) as u8;
                     blend_pixel(pixels, w, px, py, rgb[0], rgb[1], rgb[2], a);
@@ -268,13 +325,13 @@ fn draw_background(
 fn draw_border(
     pixmap: &mut Pixmap,
     sc: &Scissor,
+    mapper: &Mapper,
     item: &DisplayItem,
-    top: f64,
     widths: &[f64; 4],
     colors: &[([u8; 3], u8); 4],
 ) {
     let outer_r = resolve_radius(&item.radius, item.w, item.h);
-    let rect = sc.intersect_rect(item.x, top, item.w, item.h);
+    let rect = mapper.scissor_of(sc, item.x, item.y, item.w, item.h);
     if rect.empty() {
         return;
     }
@@ -284,28 +341,28 @@ fn draw_border(
     let inners: [(f64, f64, f64, f64, [f64; 4]); 4] = [
         (
             item.x,
-            top + widths[0],
+            item.y + widths[0],
             item.w,
             (item.h - widths[0]).max(0.0),
             shrink(outer_r, widths[0]),
         ),
         (
             item.x + widths[1],
-            top,
+            item.y,
             (item.w - widths[1]).max(0.0),
             item.h,
             shrink(outer_r, widths[1]),
         ),
         (
             item.x,
-            top,
+            item.y,
             item.w,
             (item.h - widths[2]).max(0.0),
             shrink(outer_r, widths[2]),
         ),
         (
             item.x + widths[3],
-            top,
+            item.y,
             (item.w - widths[3]).max(0.0),
             item.h,
             shrink(outer_r, widths[3]),
@@ -313,9 +370,8 @@ fn draw_border(
     ];
     for py in rect.y0..rect.y1 {
         for px in rect.x0..rect.x1 {
-            let cx = px as f64 + 0.5;
-            let cy = py as f64 + 0.5;
-            if !inside_rounded(cx, cy, item.x, top, item.w, item.h, &outer_r) {
+            let (cx, cy) = mapper.local(px, py);
+            if !inside_rounded(cx, cy, item.x, item.y, item.w, item.h, &outer_r) {
                 continue;
             }
             for side in [3usize, 2, 1, 0] {
@@ -351,8 +407,8 @@ fn shrink(r: [f64; 4], width: f64) -> [f64; 4] {
 fn draw_shadow(
     pixmap: &mut Pixmap,
     sc: &Scissor,
+    mapper: &Mapper,
     item: &DisplayItem,
-    top: f64,
     dx: f64,
     dy: f64,
     blur: f64,
@@ -362,7 +418,7 @@ fn draw_shadow(
     let sw = item.w + spread * 2.0;
     let sh = item.h + spread * 2.0;
     let sx = item.x + dx - spread;
-    let sy = top + dy - spread;
+    let sy = item.y + dy - spread;
     let outer_r = resolve_radius(&item.radius, item.w, item.h);
     let s_radius = [
         (outer_r[0] + spread).max(0.0),
@@ -372,33 +428,28 @@ fn draw_shadow(
     ];
     let (rgb, ca) = color;
     if blur <= 0.5 {
-        // 实心近似:与旧渲染器一致(偏移+扩散实心矩形),带圆角与透明度。
-        let solid = DisplayItem {
-            kind: DisplayKind::Background {
-                fill: BgFill::Solid(rgb),
-            },
-            x: sx,
-            y: sy,
-            w: sw,
-            h: sh,
-            radius: [
-                CornerRadius::Px(s_radius[0]),
-                CornerRadius::Px(s_radius[1]),
-                CornerRadius::Px(s_radius[2]),
-                CornerRadius::Px(s_radius[3]),
-            ],
-            z: 0,
-            seq: 0,
-            opacity: item.opacity * ca as f64 / 255.0,
-            clip: None,
-        };
-        draw_background(pixmap, sc, &solid, sy, &BgFill::Solid(rgb));
+        // 实心近似:偏移+扩散实心圆角矩形,带透明度(局部坐标 + transform)。
+        let rect = mapper.scissor_of(sc, sx, sy, sw, sh);
+        if rect.empty() {
+            return;
+        }
+        let w = pixmap.width() as i64;
+        let pixels = pixmap.pixels_mut();
+        let a = (ca as f64 * item.opacity).round().clamp(0.0, 255.0) as u8;
+        for py in rect.y0..rect.y1 {
+            for px in rect.x0..rect.x1 {
+                let (lx, ly) = mapper.local(px, py);
+                if inside_rounded(lx, ly, sx, sy, sw, sh, &s_radius) {
+                    blend_pixel(pixels, w, px, py, rgb[0], rgb[1], rgb[2], a);
+                }
+            }
+        }
         return;
     }
     let sigma = blur / 2.0;
     let hw = half_width_for(sigma);
     let pad = hw as f64 * 3.0 + 2.0;
-    let bounds = sc.intersect_rect(sx - pad, sy - pad, sw + pad * 2.0, sh + pad * 2.0);
+    let bounds = mapper.scissor_of(sc, sx - pad, sy - pad, sw + pad * 2.0, sh + pad * 2.0);
     if bounds.empty() {
         return;
     }
@@ -411,9 +462,10 @@ fn draw_shadow(
     }
     let mut mask = vec![0u8; mw * mh];
     for (i, cell) in mask.iter_mut().enumerate() {
-        let mx = bounds.x0 as f64 + (i % mw) as f64 + 0.5;
-        let my = bounds.y0 as f64 + (i / mw) as f64 + 0.5;
-        if inside_rounded(mx, my, sx, sy, sw, sh, &s_radius) {
+        let px = bounds.x0 + (i % mw) as i64;
+        let py = bounds.y0 + (i / mw) as i64;
+        let (lx, ly) = mapper.local(px, py);
+        if inside_rounded(lx, ly, sx, sy, sw, sh, &s_radius) {
             *cell = 255;
         }
     }
@@ -504,42 +556,53 @@ fn gradient_color_at(spec: &GradientSpec, t: f64) -> ([u8; 3], u8) {
     stops[stops.len() - 1].color
 }
 
-/// 文本绘制:字形 coverage 混合 + scissor + 组透明度;无字体画占位条。
+/// 文本绘制:字形 coverage 混合 + scissor + 组透明度 + transform;无字体画占位条。
+///
+/// `shadow_blur = Some(b)` 时走「字形覆盖蒙版 → 三趟盒式模糊 → 着色混合」
+/// (text-shadow 模糊);`None` 逐字形直接混合。
+#[allow(clippy::too_many_arguments)]
 fn draw_text(
     font: &FontSet,
     pixmap: &mut Pixmap,
     sc: &Scissor,
+    mapper: &Mapper,
     text: &str,
     x: f64,
-    top: f64,
+    y: f64,
     size: f64,
     color: [u8; 3],
     bold: bool,
     opacity: f64,
+    shadow_blur: Option<f64>,
 ) {
     let size_f = size as f32;
-    let baseline = top as f32 + size_f;
+    let baseline = y as f32 + size_f;
     let mut pen_x = x as f32;
-    let (w, h) = (pixmap.width() as i64, pixmap.height() as i64);
+    let w = pixmap.width() as i64;
     let pixels = pixmap.pixels_mut();
     if !font.has_font() {
         // 无字体:占位色条,宽度反映文本长度(与旧行为一致)。
         let tw = (text.chars().count() as f32 * size_f * 0.5).min(w as f32);
         let a = (255.0 * opacity).round().clamp(0.0, 255.0) as u8;
-        for py in (sc.y0)..(sc.y1) {
-            for px in (sc.x0)..(sc.x1) {
-                let cx = px as f64 + 0.5;
-                let cy = py as f64 + 0.5;
-                if cx >= x
-                    && cx <= x + tw as f64
-                    && cy >= top + size * 0.4
-                    && cy <= top + size * 0.4 + (size * 0.35).max(2.0)
+        for py in sc.y0..sc.y1 {
+            for px in sc.x0..sc.x1 {
+                let (lx, ly) = mapper.local(px, py);
+                if lx >= x
+                    && lx <= x + tw as f64
+                    && ly >= y + size * 0.4
+                    && ly <= y + size * 0.4 + (size * 0.35).max(2.0)
                 {
                     blend_pixel(pixels, w, px, py, color[0], color[1], color[2], a);
                 }
             }
         }
         return;
+    }
+    if let Some(b) = shadow_blur {
+        if b > 0.5 {
+            draw_text_blurred(font, pixmap, sc, mapper, text, x, y, size, color, bold, opacity, b);
+            return;
+        }
     }
     for ch in text.chars() {
         if ch == '\n' || ch == '\r' {
@@ -551,12 +614,13 @@ fn draw_text(
         if metrics.width > 0 && metrics.height > 0 {
             let gx = pen_x + metrics.xmin as f32;
             let gy = baseline - metrics.height as f32 - metrics.ymin as f32;
-            blend_glyph_scissored(
-                pixels, w, h, sc, gx, gy, metrics.width, metrics.height, &bitmap, color, opacity,
+            blend_glyph_mapped(
+                pixels, w, sc, mapper, gx, gy, metrics.width, metrics.height, &bitmap, color,
+                opacity,
             );
             if bold {
-                blend_glyph_scissored(
-                    pixels, w, h, sc, gx + 1.0, gy, metrics.width, metrics.height, &bitmap,
+                blend_glyph_mapped(
+                    pixels, w, sc, mapper, gx + 1.0, gy, metrics.width, metrics.height, &bitmap,
                     color, opacity,
                 );
             }
@@ -565,13 +629,13 @@ fn draw_text(
     }
 }
 
-/// 字形混合(scissor 版):coverage × 组透明度。
+/// 字形混合(transform 版):画布像素反算局部坐标取 coverage × 组透明度。
 #[allow(clippy::too_many_arguments)]
-fn blend_glyph_scissored(
+fn blend_glyph_mapped(
     pixels: &mut [PremultipliedColorU8],
     pw: i64,
-    ph: i64,
     sc: &Scissor,
+    mapper: &Mapper,
     x: f32,
     y: f32,
     w: usize,
@@ -580,24 +644,119 @@ fn blend_glyph_scissored(
     color: [u8; 3],
     opacity: f64,
 ) {
-    let base_x = x.round() as i64;
-    let base_y = y.round() as i64;
-    for row in 0..h as i64 {
-        let py = base_y + row;
-        if py < sc.y0 || py >= sc.y1 || py < 0 || py >= ph {
-            continue;
-        }
-        for col in 0..w as i64 {
-            let px = base_x + col;
-            if px < sc.x0 || px >= sc.x1 || px < 0 || px >= pw {
+    let bounds = mapper.scissor_of(sc, x as f64, y as f64, w as f64, h as f64);
+    for py in bounds.y0..bounds.y1 {
+        for px in bounds.x0..bounds.x1 {
+            let (lx, ly) = mapper.local(px, py);
+            let col = (lx - x as f64).round() as isize;
+            let row = (ly - y as f64).round() as isize;
+            if row < 0 || row >= h as isize || col < 0 || col >= w as isize {
                 continue;
             }
-            let coverage = bitmap[(row * w as i64 + col) as usize];
+            let coverage = bitmap[(row * w as isize + col) as usize];
             if coverage == 0 {
                 continue;
             }
             let a = (coverage as f64 * opacity).round().clamp(0.0, 255.0) as u8;
             blend_pixel(pixels, pw, px, py, color[0], color[1], color[2], a);
+        }
+    }
+}
+
+/// `text-shadow` 模糊:字形覆盖蒙版 → 三趟盒式模糊 → 按阴影色着色混合。
+#[allow(clippy::too_many_arguments)]
+fn draw_text_blurred(
+    font: &FontSet,
+    pixmap: &mut Pixmap,
+    sc: &Scissor,
+    mapper: &Mapper,
+    text: &str,
+    x: f64,
+    y: f64,
+    size: f64,
+    color: [u8; 3],
+    bold: bool,
+    opacity: f64,
+    blur: f64,
+) {
+    let size_f = size as f32;
+    let baseline = y as f32 + size_f;
+    let tw = font.text_width(text, size);
+    let bounds = mapper.scissor_of(sc, x, y, tw, size * 2.0);
+    if bounds.empty() {
+        return;
+    }
+    let mw = (bounds.x1 - bounds.x0) as usize;
+    let mh = (bounds.y1 - bounds.y0) as usize;
+    if mw == 0 || mh == 0 || mw * mh > MAX_MASK_PIXELS {
+        return;
+    }
+    let mut mask = vec![0u8; mw * mh];
+    let mut pen_x = x as f32;
+    for ch in text.chars() {
+        if ch == '\n' || ch == '\r' {
+            continue;
+        }
+        let Some((metrics, bitmap)) = font.rasterize_glyph(ch, size_f) else {
+            continue;
+        };
+        if metrics.width > 0 && metrics.height > 0 {
+            let gx = pen_x + metrics.xmin as f32;
+            let gy = baseline - metrics.height as f32 - metrics.ymin as f32;
+            fill_glyph_mask(&mut mask, mw, &bounds, mapper, gx, gy, metrics.width, metrics.height, &bitmap);
+            if bold {
+                fill_glyph_mask(
+                    &mut mask, mw, &bounds, mapper, gx + 1.0, gy, metrics.width,
+                    metrics.height, &bitmap,
+                );
+            }
+        }
+        pen_x += metrics.advance_width;
+    }
+    blur_mask(&mut mask, mw, mh, blur / 2.0);
+    let w = pixmap.width() as i64;
+    let pixels = pixmap.pixels_mut();
+    for (i, cov) in mask.iter().enumerate() {
+        if *cov == 0 {
+            continue;
+        }
+        let px = bounds.x0 + (i % mw) as i64;
+        let py = bounds.y0 + (i / mw) as i64;
+        let a = (*cov as f64 * opacity).round().clamp(0.0, 255.0) as u8;
+        blend_pixel(pixels, w, px, py, color[0], color[1], color[2], a);
+    }
+}
+
+/// 把单个字形的 coverage 写入蒙版(重叠取 max)。
+#[allow(clippy::too_many_arguments)]
+fn fill_glyph_mask(
+    mask: &mut [u8],
+    mw: usize,
+    bounds: &Scissor,
+    mapper: &Mapper,
+    x: f32,
+    y: f32,
+    w: usize,
+    h: usize,
+    bitmap: &[u8],
+) {
+    let gb = mapper.scissor_of(bounds, x as f64, y as f64, w as f64, h as f64);
+    for py in gb.y0..gb.y1 {
+        for px in gb.x0..gb.x1 {
+            let (lx, ly) = mapper.local(px, py);
+            let col = (lx - x as f64).round() as isize;
+            let row = (ly - y as f64).round() as isize;
+            if row < 0 || row >= h as isize || col < 0 || col >= w as isize {
+                continue;
+            }
+            let coverage = bitmap[(row * w as isize + col) as usize];
+            if coverage == 0 {
+                continue;
+            }
+            let idx = ((py - bounds.y0) * mw as i64 + (px - bounds.x0)) as usize;
+            if coverage > mask[idx] {
+                mask[idx] = coverage;
+            }
         }
     }
 }
@@ -660,9 +819,9 @@ fn sample_bilinear(img: &DecodedImage, x: f64, y: f64) -> [u8; 4] {
 fn draw_image(
     pixmap: &mut Pixmap,
     sc: &Scissor,
+    mapper: &Mapper,
     img: &DecodedImage,
     item: &DisplayItem,
-    top: f64,
     fit: &str,
     off_x: f64,
     off_y: f64,
@@ -674,9 +833,9 @@ fn draw_image(
     }
     let (ox, oy, dw, dh) = fit_rect(fit, nw, nh, item.w, item.h);
     let dx = item.x + ox + off_x;
-    let dy = top + oy + off_y;
+    let dy = item.y + oy + off_y;
     // 绘制区 = scissor ∩ 目标盒(目标盒即裁剪区,与 cover/none 语义一致)。
-    let bounds = sc.intersect_rect(item.x, top, item.w, item.h);
+    let bounds = mapper.scissor_of(sc, item.x, item.y, item.w, item.h);
     if bounds.empty() {
         return;
     }
@@ -685,8 +844,9 @@ fn draw_image(
     let pixels = pixmap.pixels_mut();
     for py in bounds.y0.max(0)..bounds.y1.min(height) {
         for pxi in bounds.x0.max(0)..bounds.x1.min(width) {
-            let u = (pxi as f64 + 0.5 - dx) / dw;
-            let v = (py as f64 + 0.5 - dy) / dh;
+            let (lx, ly) = mapper.local(pxi, py);
+            let u = (lx - dx) / dw;
+            let v = (ly - dy) / dh;
             let c = sample_bilinear(img, u * nw - 0.5, v * nh - 0.5);
             let a = (c[3] as f64 * item.opacity).round().clamp(0.0, 255.0) as u8;
             if a == 0 {
@@ -699,33 +859,34 @@ fn draw_image(
 
 // ============ canvas 占位说明块 ============
 
-/// canvas 区域:淡底(可选) + 虚线边框 + 居中说明文字(与旧渲染一致)。
+/// canvas 区域:淡底(可选) + 虚线边框 + 居中说明文字(与旧渲染一致,支持 transform)。
 fn draw_canvas_note(
     font: &FontSet,
     pixmap: &mut Pixmap,
     sc: &Scissor,
+    mapper: &Mapper,
     item: &DisplayItem,
-    top: f64,
     pale: bool,
 ) {
-    let (bx, by, bw, bh) = (item.x, top, item.w, item.h);
+    let (bx, by, bw, bh) = (item.x, item.y, item.w, item.h);
     if bw < 48.0 || bh < 28.0 {
         return;
     }
-    let bounds = sc.intersect_rect(bx, by, bw, bh);
+    let bounds = mapper.scissor_of(sc, bx, by, bw, bh);
     if bounds.empty() {
         return;
     }
     let pw = pixmap.width() as i64;
     let ph = pixmap.height() as i64;
     let pixels = pixmap.pixels_mut();
-    let inside = |x: f64, y: f64| {
-        x >= bx && x <= bx + bw && y >= by && y <= by + bh
-    };
+    let inside = |x: f64, y: f64| x >= bx && x <= bx + bw && y >= by && y <= by + bh;
     if pale {
         for py in bounds.y0.max(0)..bounds.y1.min(ph) {
             for px in bounds.x0.max(0)..bounds.x1.min(pw) {
-                blend_pixel(pixels, pw, px, py, 236, 238, 242, 255);
+                let (lx, ly) = mapper.local(px, py);
+                if inside(lx, ly) {
+                    blend_pixel(pixels, pw, px, py, 236, 238, 242, 255);
+                }
             }
         }
     }
@@ -735,15 +896,15 @@ fn draw_canvas_note(
     let mut px = bx;
     while px < bx + bw {
         let seg = dash.min(bx + bw - px);
-        fill_seg(pixels, pw, ph, &bounds, px, by, seg, 1.0, edge, inside);
-        fill_seg(pixels, pw, ph, &bounds, px, by + bh - 1.0, seg, 1.0, edge, inside);
+        fill_seg_mapped(pixels, pw, ph, &bounds, mapper, px, by, seg, 1.0, edge, inside);
+        fill_seg_mapped(pixels, pw, ph, &bounds, mapper, px, by + bh - 1.0, seg, 1.0, edge, inside);
         px += dash * 2.0;
     }
     let mut py = by;
     while py < by + bh {
         let seg = dash.min(by + bh - py);
-        fill_seg(pixels, pw, ph, &bounds, bx, py, 1.0, seg, edge, inside);
-        fill_seg(pixels, pw, ph, &bounds, bx + bw - 1.0, py, 1.0, seg, edge, inside);
+        fill_seg_mapped(pixels, pw, ph, &bounds, mapper, bx, py, 1.0, seg, edge, inside);
+        fill_seg_mapped(pixels, pw, ph, &bounds, mapper, bx + bw - 1.0, py, 1.0, seg, edge, inside);
         py += dash * 2.0;
     }
     // 居中说明文字(宽度不足时只留短句)。
@@ -758,6 +919,7 @@ fn draw_canvas_note(
         font,
         pixmap,
         &bounds,
+        mapper,
         label,
         tx,
         ty,
@@ -765,16 +927,18 @@ fn draw_canvas_note(
         [120, 128, 138],
         false,
         1.0,
+        None,
     );
 }
 
-/// 虚线小段填充(段内逐像素,越界由 bounds 与画布共同钳制)。
+/// 虚线小段填充(transform 版:画布像素反算局部坐标判定,越界由 bounds 与画布钳制)。
 #[allow(clippy::too_many_arguments)]
-fn fill_seg(
+fn fill_seg_mapped(
     pixels: &mut [PremultipliedColorU8],
     pw: i64,
     ph: i64,
     bounds: &Scissor,
+    mapper: &Mapper,
     x: f64,
     y: f64,
     w: f64,
@@ -788,7 +952,8 @@ fn fill_seg(
     let y1 = (y + h).ceil() as i64;
     for py in y0.max(bounds.y0).max(0)..y1.min(bounds.y1).min(ph) {
         for px in x0.max(bounds.x0).max(0)..x1.min(bounds.x1).min(pw) {
-            if inside(px as f64 + 0.5, py as f64 + 0.5) {
+            let (lx, ly) = mapper.local(px, py);
+            if inside(lx, ly) {
                 blend_pixel(pixels, pw, px, py, color[0], color[1], color[2], 255);
             }
         }

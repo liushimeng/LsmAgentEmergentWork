@@ -6,6 +6,7 @@
 
 pub mod gradient;
 pub mod selector;
+pub mod transform;
 pub mod values;
 
 #[cfg(test)]
@@ -16,6 +17,8 @@ use std::collections::BTreeMap;
 use kuchikiki::NodeRef;
 
 pub use gradient::{GradientKind, GradientSpec, GradientStop};
+pub use transform::{Affine, Length, Transform2D, TransformOrigin};
+pub use values::BgLayer;
 pub use values::BorderColor;
 pub use values::BoxShadow;
 pub use values::ComputedStyle;
@@ -23,6 +26,7 @@ pub use values::CornerRadius;
 pub use values::FlexWrap;
 pub use values::GridFlow;
 pub use values::GridLine;
+pub use values::TextShadow;
 pub use values::TrackSize;
 use values::ValueCtx;
 

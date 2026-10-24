@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use super::super::layout::{BorderDraw, Layout, PaintBox, ShadowDraw, TextLine};
-use super::super::style::{CornerRadius, GradientSpec};
+use super::super::style::{Affine, CornerRadius, GradientSpec};
 
 /// 裁剪矩形(页坐标 x/y/w/h)。
 pub type ClipRect = (f64, f64, f64, f64);
@@ -48,13 +48,22 @@ pub enum DisplayKind {
         color: [u8; 3],
         bold: bool,
     },
+    /// `text-shadow` 单层(阶段六第二步):几何同文本行,颜色为阴影色,
+    /// `rank` 排在 `Text` 之前绘制(文本本体盖在其上)。
+    TextShadow {
+        text: String,
+        size: f64,
+        color: [u8; 3],
+        blur: f64,
+    },
     /// canvas 区域占位说明块(内核未实现 2D/WebGL 像素渲染)。
     /// `pale`:元素自身无背景时先铺淡底(与旧渲染一致)。
     CanvasNote { pale: bool },
 }
 
-/// 绘制项。`x/y/w/h` 为页坐标 border box;`opacity` 已含祖先组透明度乘积;
-/// `clip` 已含祖先 `overflow:hidden` 链交集(页坐标)。
+/// 绘制项。`x/y/w/h` 为**局部**(页坐标)border box;`opacity` 已含祖先组透明度乘积;
+/// `clip` 已含祖先 `overflow:hidden` 链交集(页坐标);`transform` 为局部→页坐标仿射
+/// (CSS 2D transform,已含祖先链合成),`None` = 恒等。
 #[derive(Debug, Clone)]
 pub struct DisplayItem {
     pub kind: DisplayKind,
@@ -67,6 +76,7 @@ pub struct DisplayItem {
     pub seq: u64,
     pub opacity: f64,
     pub clip: Option<ClipRect>,
+    pub transform: Option<Affine>,
 }
 
 impl DisplayItem {
@@ -79,17 +89,37 @@ impl DisplayItem {
             DisplayKind::Border { .. } => 2,
             DisplayKind::CanvasNote { .. } => 3,
             DisplayKind::Image { .. } => 4,
-            DisplayKind::Text { .. } => 5,
+            DisplayKind::TextShadow { .. } => 5,
+            DisplayKind::Text { .. } => 6,
         }
     }
 
+    /// 前乘合成祖先变换:`self.transform = outer ∘ self.transform`。
+    ///
+    /// 用于 `apply_group` 对子树整体施加元素自身 transform(子项可能已带自身变换)。
+    pub fn compose_transform(&mut self, outer: Affine) {
+        self.transform = Some(match self.transform {
+            Some(inner) => outer.compose(&inner),
+            None => outer,
+        });
+    }
+
     /// 片段平移:几何与裁剪矩形一并移动。
+    ///
+    /// 带变换时须**共轭**变换(`T' = translate(d) ∘ T ∘ translate(-d)`),
+    /// 使变换原点随几何一起平移 —— 否则 `transform-origin` 会相对盒偏移
+    /// (片段平移用于 flex/grid 条目内容、absolute 内容、relative 偏移)。
     pub fn translate(&mut self, dx: f64, dy: f64) {
         self.x += dx;
         self.y += dy;
         if let Some(c) = &mut self.clip {
             c.0 += dx;
             c.1 += dy;
+        }
+        if let Some(t) = self.transform {
+            let conj = Affine::translate(dx, dy)
+                .compose(&t.compose(&Affine::translate(-dx, -dy)));
+            self.transform = Some(conj);
         }
     }
 
@@ -154,6 +184,7 @@ pub fn build_legacy(layout: &Layout) -> Vec<DisplayItem> {
                 seq: next.get(),
                 opacity: 1.0,
                 clip: None,
+                transform: None,
             });
         }
     }
@@ -180,6 +211,7 @@ pub fn build_legacy(layout: &Layout) -> Vec<DisplayItem> {
             seq: next.get(),
             opacity: 1.0,
             clip: None,
+            transform: None,
         });
     }
     for p in &layout.paints {
@@ -227,6 +259,7 @@ fn shadow_item(s: &ShadowDraw, seq: u64) -> DisplayItem {
         seq,
         opacity: 1.0,
         clip: None,
+        transform: None,
     }
 }
 
@@ -245,6 +278,7 @@ fn border_item(b: &BorderDraw, seq: u64) -> DisplayItem {
         seq,
         opacity: 1.0,
         clip: None,
+        transform: None,
     }
 }
 
@@ -265,6 +299,7 @@ fn image_item(p: &PaintBox, seq: u64) -> DisplayItem {
         seq,
         opacity: 1.0,
         clip: None,
+        transform: None,
     }
 }
 
@@ -285,5 +320,6 @@ fn text_item(l: &TextLine, seq: u64) -> DisplayItem {
         seq,
         opacity: 1.0,
         clip: None,
+        transform: None,
     }
 }

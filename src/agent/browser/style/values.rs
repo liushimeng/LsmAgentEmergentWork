@@ -7,8 +7,26 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use super::gradient::{parse_gradient, GradientSpec};
+use super::transform::{parse_transform, parse_transform_origin, Transform2D, TransformOrigin};
 
 pub type Rgb = [u8; 3];
+
+/// `text-shadow` 单层(阶段六第二步)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextShadow {
+    pub dx: f64,
+    pub dy: f64,
+    pub blur: f64,
+    /// `None` = currentColor(布局期代入文字色)。
+    pub color: Option<([u8; 3], u8)>,
+}
+
+/// `background-image` 单背景层(阶段六第二步,按声明序自顶向下)。
+#[derive(Debug, Clone, PartialEq)]
+pub enum BgLayer {
+    Image(String),
+    Gradient(Arc<GradientSpec>),
+}
 
 /// 单角圆角半径:长度或百分比(百分比按 `min(w,h)/2` 求解,光栅化期归一)。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -67,11 +85,9 @@ pub struct ComputedStyle {
     pub grid_item: GridItemStyle,
     /// `object-fit`(阶段三第三步):替换元素内容在盒内的填充方式。
     pub object_fit: String,
-    /// `background-image` 的 URL 原文(阶段三第三步;未解析为绝对地址)。
-    pub background_image: Option<String>,
-    /// `background-image` 的渐变(阶段六第一步);与 `background_image` 互斥,
-    /// `background` 简写与长写法都可能命中。`Arc` 共享避免级联克隆整表色标。
-    pub background_gradient: Option<Arc<GradientSpec>>,
+    /// `background-image` 背景层(阶段六第二步,按声明序自顶向下);`url()` 与
+    /// `gradient()` 混排保序,`background` 简写与长写法都可能命中。
+    pub background_layers: Vec<BgLayer>,
     /// `background-position`(精灵图定位;None = 默认 0 0)。
     pub background_position: Option<BackgroundPosition>,
     /// `background-size`:"auto"(默认,按固有尺寸) | "cover" | "contain"。
@@ -86,6 +102,12 @@ pub struct ComputedStyle {
     /// `box-shadow` 外阴影层(内阴影/inset 不在此列,解析期丢弃)。
     /// `blur` 自阶段六起真实生效(三趟盒式模糊近似高斯)。
     pub box_shadow: Vec<BoxShadow>,
+    /// `text-shadow` 阴影层(阶段六第二步),按声明序绘制(先声明在下)。
+    pub text_shadow: Vec<TextShadow>,
+    /// CSS 2D `transform`(阶段六第二步);`None` = 无变换。
+    pub transform: Option<Transform2D>,
+    /// `transform-origin`(阶段六第二步),布局期按盒尺寸求解,默认 `50% 50%`。
+    pub transform_origin: TransformOrigin,
     /// 圆角半径(top-left / top-right / bottom-right / bottom-left)。
     pub border_radius: [CornerRadius; 4],
     /// `overflow:hidden|clip|scroll|auto` 归一为内容裁剪开关(非继承)。
@@ -362,14 +384,16 @@ impl Default for ComputedStyle {
             grid: GridContainerStyle::default(),
             grid_item: GridItemStyle::default(),
             object_fit: "fill".to_string(),
-            background_image: None,
-            background_gradient: None,
+            background_layers: Vec::new(),
             background_position: None,
             background_size: "auto".to_string(),
             border_widths: [0.0; 4],
             border_drawn: [false; 4],
             border_colors: [BorderColor::CurrentColor; 4],
             box_shadow: Vec::new(),
+            text_shadow: Vec::new(),
+            transform: None,
+            transform_origin: TransformOrigin::default(),
             border_radius: [CornerRadius::Px(0.0); 4],
             overflow_clip: false,
             extra: BTreeMap::new(),
@@ -517,14 +541,21 @@ impl ComputedStyle {
         out.insert("object-fit".into(), self.object_fit.clone());
         out.insert(
             "background-image".into(),
-            if let Some(g) = &self.background_gradient {
-                g.raw.clone()
-            } else if let Some(u) = &self.background_image {
-                format!("url({u})")
-            } else {
+            if self.background_layers.is_empty() {
                 "none".to_string()
+            } else {
+                self.background_layers
+                    .iter()
+                    .map(|l| match l {
+                        BgLayer::Image(u) => format!("url({u})"),
+                        BgLayer::Gradient(g) => g.raw.clone(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
             },
         );
+        // `transform` / `transform-origin` 的解析值含盒尺寸相关量(百分比),
+        // 无法在样式层解析为标量,故不进 `to_map`(观测走 DOM 的 inline style 原文)。
         out.insert("background-size".into(), self.background_size.clone());
         out.insert("border-radius".into(), self.border_radius_text());
         out.insert(
@@ -789,44 +820,47 @@ pub fn apply_declaration(
             // 此前只取颜色、**丢掉 url(...) 与位置**,而绝大多数 Web UI 的
             // 图标/按钮/精灵图都用简写写背景图 —— 结果整页 UI 渲染成空白
             // (实测百度地图:搜索框、路线按钮全是背景图精灵,截图一片白)。
-            let tokens = split_bg_tokens(value);
-            let mut url: Option<String> = None;
-            let mut gradient: Option<Arc<GradientSpec>> = None;
+            // 多背景层:按顶层逗号切层,逐层收集 url()/gradient();位置/尺寸/颜色
+            // 按整值收集(简写的位置/尺寸常只作用于单层,此处取首见,近似)。
+            let mut layers: Vec<BgLayer> = Vec::new();
             let mut pos_tokens: Vec<String> = Vec::new();
             let mut size: Option<String> = None;
             let mut color_token: Option<String> = None;
-            for t in &tokens {
-                let low = t.to_ascii_lowercase();
-                if low.starts_with("url(") {
-                    url = parse_css_url(t);
-                    continue;
-                }
-                if let Some(g) = parse_gradient(t) {
-                    gradient = Some(Arc::new(g));
-                    continue;
-                }
-                if low == "cover" || low == "contain" {
-                    size = Some(low);
-                    continue;
-                }
-                if low == "auto" {
-                    size = Some("auto".to_string());
-                    continue;
-                }
-                if is_background_position_token(&low) {
-                    pos_tokens.push(t.clone());
-                    continue;
-                }
-                if BG_IGNORED_TOKENS.contains(&low.as_str()) {
-                    continue;
-                }
-                if parse_color(t).is_some() {
-                    color_token = Some(t.clone());
+            for seg in split_top_level(value) {
+                for t in split_bg_tokens(&seg) {
+                    let low = t.to_ascii_lowercase();
+                    if low.starts_with("url(") {
+                        if let Some(u) = parse_css_url(&t) {
+                            layers.push(BgLayer::Image(u));
+                        }
+                        continue;
+                    }
+                    if let Some(g) = parse_gradient(&t) {
+                        layers.push(BgLayer::Gradient(Arc::new(g)));
+                        continue;
+                    }
+                    if low == "cover" || low == "contain" {
+                        size = Some(low);
+                        continue;
+                    }
+                    if low == "auto" {
+                        size = Some("auto".to_string());
+                        continue;
+                    }
+                    if is_background_position_token(&low) {
+                        pos_tokens.push(t.clone());
+                        continue;
+                    }
+                    if BG_IGNORED_TOKENS.contains(&low.as_str()) {
+                        continue;
+                    }
+                    if parse_color(&t).is_some() {
+                        color_token = Some(t.clone());
+                    }
                 }
             }
             // 简写会重置 background-image / position / size(规范语义)。
-            st.background_image = url;
-            st.background_gradient = gradient;
+            st.background_layers = layers;
             st.background_size = size.unwrap_or_else(|| "auto".to_string());
             st.background_position = if pos_tokens.is_empty() {
                 None
@@ -1137,9 +1171,7 @@ pub fn apply_declaration(
         "grid-row-start" => st.grid_item.row_start = parse_grid_line(value),
         "grid-row-end" => st.grid_item.row_end = parse_grid_line(value),
         "background-image" => {
-            // url() 走图片缓存;渐变走 `background_gradient`;多背景只取首层。
-            st.background_image = parse_css_url(value);
-            st.background_gradient = parse_first_gradient(value);
+            st.background_layers = parse_bg_layers(value);
         }
         "object-fit" => {
             let v = value.trim().to_ascii_lowercase();
@@ -1233,6 +1265,15 @@ pub fn apply_declaration(
         "box-shadow" => {
             st.box_shadow = parse_box_shadow(value);
         }
+        "text-shadow" => {
+            st.text_shadow = parse_text_shadow(value);
+        }
+        "transform" => {
+            st.transform = parse_transform(value);
+        }
+        "transform-origin" => {
+            st.transform_origin = parse_transform_origin(value, st.font_size, ctx);
+        }
         "border-radius" | "-webkit-border-radius" => {
             st.border_radius = parse_border_radius(value, st.font_size, ctx);
         }
@@ -1253,7 +1294,6 @@ pub fn apply_declaration(
         | "word-spacing"
         | "list-style"
         | "list-style-type"
-        | "transform"
         | "transition" => {
             st.extra.insert(key, value.to_string());
         }
@@ -1340,13 +1380,14 @@ fn apply_initial(st: &mut ComputedStyle, key: &str, root: &ComputedStyle) {
         },
         "background" | "background-color" => st.background = None,
         "object-fit" => st.object_fit = "fill".to_string(),
-        "background-image" => {
-            st.background_image = None;
-            st.background_gradient = None;
-        }
+        "background-image" => st.background_layers.clear(),
         "background-position" => st.background_position = None,
         "background-size" => st.background_size = "auto".to_string(),
         "opacity" => st.opacity = 1.0,
+        "box-shadow" => st.box_shadow.clear(),
+        "text-shadow" => st.text_shadow.clear(),
+        "transform" => st.transform = None,
+        "transform-origin" => st.transform_origin = TransformOrigin::default(),
         "border-radius" | "-webkit-border-radius" => st.border_radius = [CornerRadius::Px(0.0); 4],
         "overflow" | "overflow-x" | "overflow-y" => st.overflow_clip = false,
         _ => {}
@@ -1588,17 +1629,82 @@ fn parse_border_radius(value: &str, font_size: f64, ctx: &ValueCtx) -> [CornerRa
     [parse_one(a), parse_one(b), parse_one(c), parse_one(d)]
 }
 
-/// `background-image` 长写法里的首个渐变(多背景只取首层;非渐变返回 None)。
+/// `background-image` 多背景层解析:按**顶层**逗号切层,逐层识别 `url()` 与
+/// `gradient()`,保持声明序(自顶向下)。
 ///
-/// 注意不可按逗号切分再逐段解析——渐变函数参数自带逗号(`linear-gradient(
-/// to right, a, b)`),必须整值交给 `parse_gradient`(它做的是顶层括号感知
-/// 切分);多背景层(`url(..), linear-gradient(..)`)按首层规则直接放弃。
-fn parse_first_gradient(value: &str) -> Option<Arc<GradientSpec>> {
-    let t = value.trim();
-    if t.is_empty() || t.eq_ignore_ascii_case("none") {
-        return None;
+/// 注意不可对整值直接按逗号切——渐变函数参数自带逗号
+/// (`linear-gradient(to right, a, b)`);`split_top_level` 做括号感知切分,
+/// 每层再逐 token 识别。
+fn parse_bg_layers(value: &str) -> Vec<BgLayer> {
+    let mut out = Vec::new();
+    for seg in split_top_level(value) {
+        for t in split_bg_tokens(&seg) {
+            let low = t.to_ascii_lowercase();
+            if low.starts_with("url(") {
+                if let Some(u) = parse_css_url(&t) {
+                    out.push(BgLayer::Image(u));
+                }
+            } else if let Some(g) = parse_gradient(&t) {
+                out.push(BgLayer::Gradient(Arc::new(g)));
+            }
+        }
     }
-    parse_gradient(t).map(Arc::new)
+    out
+}
+
+/// `text-shadow` 解析:逐层取 `offset-x offset-y [blur] [color]`,层间按
+/// **括号外**逗号切分;颜色缺省为 currentColor(`None`),`transparent` 层丢弃。
+pub fn parse_text_shadow(value: &str) -> Vec<TextShadow> {
+    let mut out = Vec::new();
+    let mut layers: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0i32;
+    for ch in value.chars() {
+        match ch {
+            '(' => {
+                depth += 1;
+                cur.push(ch);
+            }
+            ')' => {
+                depth -= 1;
+                cur.push(ch);
+            }
+            ',' if depth <= 0 => layers.push(std::mem::take(&mut cur)),
+            c => cur.push(c),
+        }
+    }
+    layers.push(cur);
+    for layer in &layers {
+        let toks = split_ws_tokens(layer);
+        let mut lens = Vec::new();
+        let mut color: Option<([u8; 3], u8)> = None;
+        let mut color_seen = false;
+        for tok in &toks {
+            if !color_seen {
+                if let Some(c) = parse_color(tok) {
+                    color = c;
+                    color_seen = true;
+                    continue;
+                }
+            }
+            if let Some(l) = parse_length(tok, 16.0, &ValueCtx::default()) {
+                lens.push(l);
+            }
+        }
+        if color_seen && color.is_none() {
+            continue; // transparent 阴影不可见
+        }
+        if lens.len() < 2 {
+            continue; // 少于 dx/dy,非法层
+        }
+        out.push(TextShadow {
+            dx: lens[0],
+            dy: lens[1],
+            blur: lens.get(2).copied().unwrap_or(0.0),
+            color,
+        });
+    }
+    out
 }
 
 fn normalize_display(value: &str) -> String {

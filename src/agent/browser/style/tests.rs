@@ -269,7 +269,10 @@ fn object_fit_与_背景图_可见于计算样式() {
     );
     let t = style_of(&doc, &engine, "#t");
     assert_eq!(t.object_fit, "cover");
-    assert_eq!(t.background_image.as_deref(), Some("/a.png"));
+    assert_eq!(
+        t.background_layers,
+        vec![super::values::BgLayer::Image("/a.png".to_string())]
+    );
     let map = t.to_map();
     assert_eq!(map.get("object-fit").unwrap(), "cover");
     assert_eq!(map.get("background-image").unwrap(), "url(/a.png)");
@@ -285,7 +288,10 @@ fn background_简写解析出图片_位置_与颜色() {
         1280.0,
     );
     let t = style_of(&doc, &engine, "#t");
-    assert_eq!(t.background_image.as_deref(), Some("/a.png"));
+    assert_eq!(
+        t.background_layers,
+        vec![super::values::BgLayer::Image("/a.png".to_string())]
+    );
     let pos = t.background_position.expect("应解析出 background-position");
     assert_eq!(pos.x, super::values::BackgroundPos::Px(-15.0));
     assert_eq!(pos.y, super::values::BackgroundPos::Px(-136.0));
@@ -315,7 +321,7 @@ fn 背景图_none_与_非法_object_fit_回落默认值() {
         1280.0,
     );
     let t = style_of(&doc, &engine, "#t");
-    assert!(t.background_image.is_none());
+    assert!(t.background_layers.is_empty());
     assert_eq!(t.object_fit, "fill");
 }
 
@@ -426,7 +432,12 @@ fn 内联样式_camelCase归一化为kebab() {
     assert_eq!(t.text_align, "center");
     assert_eq!(t.width, Some(1264.0));
     assert_eq!(t.height, Some(720.0));
-    assert!(t.background_image.is_some(), "backgroundImage 归一化后应生效");
+    assert!(
+        t.background_layers
+            .iter()
+            .any(|l| matches!(l, super::values::BgLayer::Image(u) if u == "/bg.png")),
+        "backgroundImage 归一化后应生效"
+    );
 }
 
 #[test]
@@ -489,10 +500,12 @@ fn 溢出关键字归一为裁剪开关() {
 #[test]
 fn 背景长写法渐变生效() {
     let t = inline_style("background-image:linear-gradient(to right, #ff0000, #0000ff)");
-    assert!(t.background_gradient.is_some(), "渐变应入 background_gradient");
-    assert!(t.background_image.is_none(), "渐变不占用 url 字段");
+    assert!(
+        matches!(t.background_layers.first(), Some(super::values::BgLayer::Gradient(_))),
+        "渐变应入 background_layers"
+    );
     let t = inline_style("background-image:none");
-    assert!(t.background_gradient.is_none());
+    assert!(t.background_layers.is_empty());
 }
 
 #[test]

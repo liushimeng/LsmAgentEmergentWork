@@ -19,7 +19,7 @@ use super::document::{self, Document};
 use super::images::ImageSizes;
 use super::render::display::{self, BgFill, DisplayItem, DisplayKind};
 use super::render::FontSet;
-use super::style::{BorderColor, ComputedStyle, MediaCtx, StyleEngine};
+use super::style::{Affine, BgLayer, BorderColor, ComputedStyle, MediaCtx, StyleEngine, TextShadow};
 use super::urlutil;
 
 /// 测量宽度的"无穷大":超过任何真实换行阈值,用于 max-content 度量。
@@ -429,7 +429,16 @@ impl<'a> LayoutCtx<'a> {
         self.display.len()
     }
 
-    /// flex/grid 容器收尾(阶段六):组效果回补 → 自身视觉发射 → 背景图显示项。
+    /// 元素自身变换(页坐标,含 transform-origin);无 transform 返回 `None`。
+    ///
+    /// 变换只影响「画」,不改占位几何;子树项的祖先链合成由 `apply_group` 回补
+    /// (元素盒高在子代布局完成后才定,故用回补而非变换栈)。
+    fn own_transform(&self, style: &ComputedStyle, x: f64, y: f64, w: f64, h: f64) -> Option<Affine> {
+        let t = style.transform.as_ref()?;
+        Some(t.resolve_with_origin(x, y, w, h, style.transform_origin))
+    }
+
+    /// flex/grid 容器收尾(阶段六):组效果回补 → 自身视觉发射(含多层背景图)。
     /// 与块级路径的「回补先于自身发射」次序一致。
     pub(crate) fn finish_container(
         &mut self,
@@ -441,13 +450,9 @@ impl<'a> LayoutCtx<'a> {
         y: f64,
         w: f64,
         h: f64,
-        bg_paint: Option<PaintBox>,
     ) {
         self.apply_group(mark, style, x, y, w, h);
         self.emit_element(seq, style, tag, x, y, w, h);
-        if let Some(p) = &bg_paint {
-            self.emit_image(p, style.opacity);
-        }
     }
 
     /// 元素视觉发射器(阶段六):按 shadow→背景(色/渐变)→边框→canvas 占位
@@ -468,6 +473,7 @@ impl<'a> LayoutCtx<'a> {
         if !visible {
             return;
         }
+        let tf = self.own_transform(style, x, y, w, h);
         let base = |kind| DisplayItem {
             kind,
             x,
@@ -479,6 +485,7 @@ impl<'a> LayoutCtx<'a> {
             seq,
             opacity: style.opacity,
             clip: None,
+            transform: tf,
         };
         for layer in &style.box_shadow {
             self.display.push(base(DisplayKind::Shadow {
@@ -489,16 +496,28 @@ impl<'a> LayoutCtx<'a> {
                 color: layer.color.unwrap_or((style.color, 255)),
             }));
         }
+        // 背景:色在最下,其上为各背景层。CSS 首层在最上 → **逆序发射**
+        // (先发射者先画、被后画者覆盖),故声明序的最后一层先画、首层最后画。
         if let Some(bg) = style.background {
             self.display.push(base(DisplayKind::Background {
                 fill: BgFill::Solid(bg),
             }));
         }
-        if let Some(g) = &style.background_gradient {
-            // 背景色在渐变之下(CSS 语义):同 seq 同 rank,发射序即绘制序。
-            self.display.push(base(DisplayKind::Background {
-                fill: BgFill::Gradient(g.clone()),
-            }));
+        for layer in style.background_layers.iter().rev() {
+            match layer {
+                BgLayer::Gradient(g) => {
+                    self.display.push(base(DisplayKind::Background {
+                        fill: BgFill::Gradient(g.clone()),
+                    }));
+                }
+                BgLayer::Image(u) => {
+                    // 图片层需图片缓存定固有尺寸;未加载则跳过。
+                    if let Some(paint) = self.bg_paint_for_url(style, u, x, y, w, h) {
+                        self.push_paint(paint.clone());
+                        self.emit_image(&paint, style.opacity, tf);
+                    }
+                }
+            }
         }
         if style
             .border_widths
@@ -518,8 +537,9 @@ impl<'a> LayoutCtx<'a> {
         }
     }
 
-    /// 图像显示项发射(与平铺 `PaintBox` 并行;`opacity` 为所属元素自身透明度)。
-    pub(crate) fn emit_image(&mut self, paint: &PaintBox, opacity: f64) {
+    /// 图像显示项发射(与平铺 `PaintBox` 并行;`opacity` 为所属元素自身透明度,
+    /// `transform` 为所属元素自身变换)。
+    pub(crate) fn emit_image(&mut self, paint: &PaintBox, opacity: f64, transform: Option<Affine>) {
         if !paint.visible {
             return;
         }
@@ -540,16 +560,48 @@ impl<'a> LayoutCtx<'a> {
             seq,
             opacity,
             clip: None,
+            transform,
         });
     }
 
     /// 文本行显示项发射(flush 时调用,seq 取当下 → 文本按 flush 时机
     /// 与前后块级兄弟正确分层)。
-    pub(crate) fn emit_text(&mut self, line: &TextLine) {
+    ///
+    /// `transform` 为行内元素自身变换(行内文本在父级 flush,变换栈里没有它);
+    /// `shadows` 为行内样式携带的 text-shadow 层。
+    pub(crate) fn emit_text(
+        &mut self,
+        line: &TextLine,
+        transform: Option<Affine>,
+        shadows: &[TextShadow],
+    ) {
         if !line.visible {
             return;
         }
         let seq = self.next_seq();
+        // 阴影层(先声明在下):每层一个 TextShadow 项,排在本体之前绘制。
+        // 颜色 alpha 折进项透明度(与组透明度回补乘法复合)。
+        for sh in shadows {
+            let (rgb, ca) = sh.color.unwrap_or((line.color, 255));
+            self.display.push(DisplayItem {
+                kind: DisplayKind::TextShadow {
+                    text: line.text.clone(),
+                    size: line.size,
+                    color: rgb,
+                    blur: sh.blur,
+                },
+                x: line.x + sh.dx,
+                y: line.y + sh.dy,
+                w: 0.0,
+                h: 0.0,
+                radius: [super::style::CornerRadius::Px(0.0); 4],
+                z: 0,
+                seq,
+                opacity: ca as f64 / 255.0,
+                clip: None,
+                transform,
+            });
+        }
         self.display.push(DisplayItem {
             kind: DisplayKind::Text {
                 text: line.text.clone(),
@@ -566,11 +618,12 @@ impl<'a> LayoutCtx<'a> {
             seq,
             opacity: 1.0,
             clip: None,
+            transform,
         });
     }
 
-    /// 组效果回补(阶段六):对子树显示项应用 `opacity < 1` 乘法与
-    /// `overflow:hidden` padding 盒裁剪。`mark` 须在子树发射前记录;
+    /// 组效果回补(阶段六):对子树显示项应用 `transform` 前乘、`opacity < 1`
+    /// 乘法与 `overflow:hidden` padding 盒裁剪。`mark` 须在子树发射前记录;
     /// 自身视觉项在调用**之后**发射,天然免于自身裁剪/二次透明。
     pub(crate) fn apply_group(
         &mut self,
@@ -581,6 +634,13 @@ impl<'a> LayoutCtx<'a> {
         w: f64,
         h: f64,
     ) {
+        // CSS 2D transform(阶段六第二步):子树整体随元素变换(前乘合成)。
+        // 元素自身视觉项在下方 `emit_element` 里取自身变换,祖先链由外层回补叠加。
+        if let Some(m) = self.own_transform(style, x, y, w, h) {
+            for it in &mut self.display[mark..] {
+                it.compose_transform(m);
+            }
+        }
         if style.opacity < 1.0 {
             let op = style.opacity;
             for it in &mut self.display[mark..] {
@@ -719,21 +779,21 @@ impl<'a> LayoutCtx<'a> {
         (w.max(0.0), h.max(0.0), src)
     }
 
-    /// 背景图绘制指令(`background-image: url(...)`)。
+    /// 单个图片背景层(`background-image: url(...)`)的绘制指令。
     ///
     /// `background-size` 缺省为 `auto` → 按**固有尺寸**绘制(精灵图语义:
     /// 一张大图按 `background-position` 偏移取一块),而非拉伸铺满;
     /// `background-position` 按 CSS 公式解析成像素偏移:
     /// `offset = (盒尺寸 - 图尺寸) * 百分比`,长度值直接取用。
-    pub(crate) fn background_paint(
+    pub(crate) fn bg_paint_for_url(
         &self,
         style: &ComputedStyle,
+        raw: &str,
         x: f64,
         y: f64,
         w: f64,
         h: f64,
     ) -> Option<PaintBox> {
-        let raw = style.background_image.as_ref()?;
         let src = urlutil::resolve(&self.base_url, raw)?;
         let (nw, nh) = self.images.natural(&src).unwrap_or((w.max(1.0), h.max(1.0)));
         let size = style.background_size.as_str();
@@ -871,7 +931,9 @@ impl<'a> LayoutCtx<'a> {
             if let Some(text) = child.as_text() {
                 let raw = text.borrow();
                 if !raw.trim().is_empty() {
-                    buf.push_styled(&raw, current, self.text_base);
+                    // 块级文本:变换由本块 `apply_group` 回补,run 不带变换;
+                    // text-shadow 随 run 带到 flush(块级文本无行内样式承载)。
+                    buf.push_styled(&raw, current, self.text_base, None, current.text_shadow.clone());
                 }
                 continue;
             }
@@ -943,7 +1005,8 @@ impl<'a> LayoutCtx<'a> {
                         off_x: 0.0,
                         off_y: 0.0,
                     };
-                    self.emit_image(&paint, style.opacity);
+                    let img_tf = self.own_transform(&style, bx + dx, by + dy, iw, ih);
+                    self.emit_image(&paint, style.opacity, img_tf);
                     self.paints.push(paint);
                 }
                 self.y = by + ih + style.margin_bottom.max(0.0);
@@ -1033,50 +1096,47 @@ impl<'a> LayoutCtx<'a> {
                     visible: style_visible(&style),
                     z_index: style.pos.z_index,
                 });
-                // 阶段三第三步:背景图(绘制在元素背景色之上、文字之下)。
-                let bg_paint = self.background_paint(&style, bx, start_y, bw, box_h);
-                if let Some(paint) = &bg_paint {
-                    self.push_paint(paint.clone());
-                }
                 // 边框/外阴影绘制指令(不占几何;relative 偏移需同步平移)。
                 push_border_and_shadow(self, &style, bx, start_y, bw, box_h);
-                // 阶段六:子树组效果回补(先于自身视觉发射 → 自身不裁剪/不二次透明)。
-                self.apply_group(mark_display, &style, bx, start_y, bw, box_h);
-                let tag = document::tag_name(&child);
-                self.emit_element(seq, &style, &tag, bx, start_y, bw, box_h);
-                if let Some(paint) = &bg_paint {
-                    self.emit_image(paint, style.opacity);
-                }
-                // 阶段三:relative/sticky 整体偏移(不影响占位)。
-                if matches!(style.pos.position.as_str(), "relative" | "sticky") {
-                    let dx = style.pos.left.unwrap_or(0.0) - style.pos.right.unwrap_or(0.0);
-                    let dy = style.pos.top.unwrap_or(0.0) - style.pos.bottom.unwrap_or(0.0);
-                    if dx != 0.0 || dy != 0.0 {
-                        for l in &mut self.lines[mark_lines..] {
-                            l.x += dx;
-                            l.y += dy;
-                        }
-                        for b in &mut self.boxes[mark_boxes..] {
-                            b.x += dx;
-                            b.y += dy;
-                        }
-                        for bd in &mut self.borders[mark_borders..] {
-                            bd.x += dx;
-                            bd.y += dy;
-                        }
-                        for s in &mut self.shadows[mark_shadows..] {
-                            s.x += dx;
-                            s.y += dy;
-                        }
-                        for it in &mut self.display[mark_display..] {
-                            it.translate(dx, dy);
-                        }
+                // 阶段三:relative/sticky 整体偏移(不影响占位):先平移子树几何,
+                // 再以**偏移后**盒矩形做组回补与自身发射 —— 变换原点随之正确。
+                let (rdx, rdy) = if matches!(style.pos.position.as_str(), "relative" | "sticky") {
+                    (
+                        style.pos.left.unwrap_or(0.0) - style.pos.right.unwrap_or(0.0),
+                        style.pos.top.unwrap_or(0.0) - style.pos.bottom.unwrap_or(0.0),
+                    )
+                } else {
+                    (0.0, 0.0)
+                };
+                if rdx != 0.0 || rdy != 0.0 {
+                    for l in &mut self.lines[mark_lines..] {
+                        l.x += rdx;
+                        l.y += rdy;
+                    }
+                    for b in &mut self.boxes[mark_boxes..] {
+                        b.x += rdx;
+                        b.y += rdy;
+                    }
+                    for bd in &mut self.borders[mark_borders..] {
+                        bd.x += rdx;
+                        bd.y += rdy;
+                    }
+                    for s in &mut self.shadows[mark_shadows..] {
+                        s.x += rdx;
+                        s.y += rdy;
+                    }
+                    for it in &mut self.display[mark_display..] {
+                        it.translate(rdx, rdy);
                     }
                 }
+                // 阶段六:子树组效果回补(先于自身视觉发射 → 自身不裁剪/不二次透明)。
+                self.apply_group(mark_display, &style, bx + rdx, start_y + rdy, bw, box_h);
+                let tag = document::tag_name(&child);
+                self.emit_element(seq, &style, &tag, bx + rdx, start_y + rdy, bw, box_h);
                 continue;
             }
-            // 行内元素:递归收集文本,保留自身样式。
-            self.collect_inline(&child, &style, buf, depth + 1, x, width);
+            // 行内元素:递归收集文本,保留自身样式(祖先链无行内变换)。
+            self.collect_inline(&child, &style, buf, depth + 1, x, width, None);
         }
         if !deferred.is_empty() {
             position::layout_deferred(self, deferred, cb, depth);
@@ -1129,10 +1189,14 @@ impl<'a> LayoutCtx<'a> {
         depth: usize,
         line_x: f64,
         avail_w: f64,
+        inherited_tf: Option<Affine>,
     ) {
         if depth > 40 || buf.chars > 200_000 {
             return;
         }
+        // 行内元素自身变换(与祖先链合成):行内文本在父级 flush,变换栈里没有它,
+        // 故把变换随 run 带到 flush 时应用(块级文本由 apply_group 回补)。
+        let mut tf = inherited_tf;
         // 行内元素自身建盒。此前只有"块级盒的直接行内子节点"才拿到盒子,
         // 导致 `<div><input></div>` 这类结构完全取不到几何(inspect 的 rect 恒 0×0)。
         if self.inline_box_worthy(node, style) {
@@ -1140,6 +1204,12 @@ impl<'a> LayoutCtx<'a> {
             let (dx, dy) = relative_offset(style);
             let bx = line_x + style.margin_left + style.padding_left + dx;
             let by = self.y + dy;
+            if let Some(m) = self.own_transform(style, bx, by, w, h) {
+                tf = Some(match tf {
+                    Some(anc) => m.compose(&anc),
+                    None => m,
+                });
+            }
             // 阶段六:显示项发射(行内元素视觉,边框/阴影/背景/渐变全量)。
             let seq = self.next_seq();
             self.boxes.push(ElementBox {
@@ -1162,7 +1232,7 @@ impl<'a> LayoutCtx<'a> {
             if let Some(text) = child.as_text() {
                 let raw = text.borrow();
                 if !raw.trim().is_empty() {
-                    buf.push_styled(&raw, style, self.text_base);
+                    buf.push_styled(&raw, style, self.text_base, tf, style.text_shadow.clone());
                 }
                 continue;
             }
@@ -1212,7 +1282,12 @@ impl<'a> LayoutCtx<'a> {
                         off_x: 0.0,
                         off_y: 0.0,
                     };
-                    self.emit_image(&paint, child_style.opacity);
+                    let img_tf = match (self.own_transform(&child_style, ix, iy, iw, ih), tf) {
+                        (Some(m), Some(anc)) => Some(m.compose(&anc)),
+                        (Some(m), None) => Some(m),
+                        (None, anc) => anc,
+                    };
+                    self.emit_image(&paint, child_style.opacity, img_tf);
                     self.paints.push(paint);
                 }
                 buf.reserve_height(ih);
@@ -1220,7 +1295,7 @@ impl<'a> LayoutCtx<'a> {
             }
             // 交互类行内元素的矩形由 `collect_inline` 入口统一建盒(元素自身),
             // 此处只负责继续收集其子树文本。
-            self.collect_inline(&child, &child_style, buf, depth + 1, line_x, avail_w);
+            self.collect_inline(&child, &child_style, buf, depth + 1, line_x, avail_w, tf);
         }
     }
 
@@ -1305,7 +1380,7 @@ impl<'a> LayoutCtx<'a> {
             visible: run.visible,
         };
         // 阶段六:文本显示项(flush 时取新 seq → 与前后块级兄弟正确分层)。
-        self.emit_text(&line);
+        self.emit_text(&line, run.transform, &run.text_shadow);
         self.lines.push(line);
         self.y += line_height;
     }
@@ -1328,10 +1403,21 @@ struct InlineRun {
     align: String,
     wrap: bool,
     preserve: bool,
+    /// 行内元素自身变换(块级文本为 `None`,由 `apply_group` 回补)。
+    transform: Option<Affine>,
+    /// 行内样式携带的 text-shadow 层。
+    text_shadow: Vec<TextShadow>,
 }
 
 impl InlineBuf {
-    pub(crate) fn push_styled(&mut self, text: &str, st: &ComputedStyle, x_base: f64) {
+    pub(crate) fn push_styled(
+        &mut self,
+        text: &str,
+        st: &ComputedStyle,
+        x_base: f64,
+        transform: Option<Affine>,
+        text_shadow: Vec<TextShadow>,
+    ) {
         self.chars += text.chars().count();
         let size = st.font_size;
         let bold = st.font_weight >= 600;
@@ -1348,6 +1434,8 @@ impl InlineBuf {
                 && last.align == st.text_align
                 && last.wrap == wrap
                 && last.preserve == preserve
+                && last.transform == transform
+                && last.text_shadow == text_shadow
             {
                 last.text.push_str(text);
                 return;
@@ -1368,6 +1456,8 @@ impl InlineBuf {
             align: st.text_align.clone(),
             wrap,
             preserve,
+            transform,
+            text_shadow,
         });
     }
 
@@ -1399,6 +1489,8 @@ impl InlineBuf {
             align: "left".to_string(),
             wrap: false,
             preserve: false,
+            transform: None,
+            text_shadow: Vec::new(),
         });
     }
 }

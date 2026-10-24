@@ -332,3 +332,152 @@ fn 文本渲染_无字体占位条不崩() {
     // 无字体环境:整图仍可解码(占位条或空白均可,不 panic 即可)。
     assert_eq!(img.width(), 200);
 }
+
+// ============ 阶段六第二步:transform / text-shadow / 多背景层 ============
+
+#[test]
+fn transform_平移_整体偏移() {
+    // 盒 (8,8)-(108,108) 平移 (50,20) → (58,28)-(158,128)。
+    let img = render_html(
+        "<body><div style='width:100px;height:100px;background:#000000;transform:translate(50px,20px)'></div></body>",
+        300,
+        300,
+    );
+    let inside = pixel(&img, 60, 30);
+    assert!(inside[0] < 50, "平移后盒内应黑:{inside:?}");
+    let outside = pixel(&img, 10, 10);
+    assert!(outside[0] > 200, "原位置应白:{outside:?}");
+}
+
+#[test]
+fn transform_旋转45度_角外为白() {
+    // 绕盒中心 (58,58) 旋转 45°:原四角落在菱形之外。
+    let img = render_html(
+        "<body><div style='width:100px;height:100px;background:#000000;transform:rotate(45deg)'></div></body>",
+        300,
+        300,
+    );
+    let center = pixel(&img, 58, 58);
+    assert!(center[0] < 50, "旋转后中心应黑:{center:?}");
+    let axis = pixel(&img, 58, 120);
+    assert!(axis[0] < 50, "旋转后竖直轴上应黑:{axis:?}");
+    let corner = pixel(&img, 108, 108);
+    assert!(corner[0] > 200, "原角外应白:{corner:?}");
+}
+
+#[test]
+fn transform_缩放_尺寸放大() {
+    // scale(2) 绕中心 (58,58):盒放大到 200×200 → (-42,-42)-(158,158)。
+    let img = render_html(
+        "<body><div style='width:100px;height:100px;background:#000000;transform:scale(2)'></div></body>",
+        300,
+        300,
+    );
+    let inside = pixel(&img, 150, 150);
+    assert!(inside[0] < 50, "放大后应黑:{inside:?}");
+    let outside = pixel(&img, 170, 170);
+    assert!(outside[0] > 200, "放大后仍应白:{outside:?}");
+}
+
+#[test]
+fn transform_origin_绕右下角旋转() {
+    // origin right bottom (108,108) + rotate(90deg) → 盒映射到 (108,8)-(208,108)。
+    let img = render_html(
+        "<body><div style='width:100px;height:100px;background:#000000;transform:rotate(90deg);transform-origin:right bottom'></div></body>",
+        300,
+        300,
+    );
+    let inside = pixel(&img, 150, 50);
+    assert!(inside[0] < 50, "绕右下角旋转后应黑:{inside:?}");
+    let outside = pixel(&img, 50, 50);
+    assert!(outside[0] > 200, "原位置应白:{outside:?}");
+}
+
+#[test]
+fn transform_嵌套_祖先链合成() {
+    // 父 translate(20px,0) + 子 translate(30px,0) → 子盒右移 50px。
+    let img = render_html(
+        "<body><div style='transform:translate(20px,0)'><div style='width:60px;height:60px;background:#000000;transform:translate(30px,0)'></div></div></body>",
+        300,
+        300,
+    );
+    let inside = pixel(&img, 100, 30);
+    assert!(inside[0] < 50, "嵌套平移合成后应黑:{inside:?}");
+    let outside = pixel(&img, 30, 30);
+    assert!(outside[0] > 200, "合成前位置应白:{outside:?}");
+}
+
+#[test]
+fn text_shadow_阴影色可见() {
+    let doc = Document::parse(
+        "<body><p style='color:#000000;text-shadow:4px 4px 0 #ff0000'>MMMM</p></body>",
+        "https://a.test/",
+    );
+    let font = FontSet::load();
+    let l = layout::compute(&doc, 300.0, &font);
+    let pm = font
+        .render_pixmap(&l, 300, 300, 0.0, false, &ImageStore::new())
+        .unwrap();
+    let img = decode(&pm);
+    let red = img
+        .pixels()
+        .filter(|p| p.0[0] > 200 && p.0[1] < 60 && p.0[2] < 60)
+        .count();
+    assert!(red > 0, "text-shadow 应出现红色阴影像素");
+}
+
+#[test]
+fn text_shadow_模糊_边缘半透明() {
+    let doc = Document::parse(
+        "<body><p style='color:#000000;text-shadow:6px 6px 8px rgba(255,0,0,0.6)'>MMMM</p></body>",
+        "https://a.test/",
+    );
+    let font = FontSet::load();
+    let l = layout::compute(&doc, 300.0, &font);
+    let pm = font
+        .render_pixmap(&l, 300, 300, 0.0, false, &ImageStore::new())
+        .unwrap();
+    let img = decode(&pm);
+    // 阴影区应出现红色分量明显高于绿/蓝的像素。
+    let shadowed = img
+        .pixels()
+        .filter(|p| {
+            let (r, g, b) = (p.0[0] as i32, p.0[1] as i32, p.0[2] as i32);
+            r > 120 && r > g + 40 && r > b + 40
+        })
+        .count();
+    assert!(shadowed > 0, "模糊 text-shadow 应出现红色像素");
+}
+
+#[test]
+fn 多背景层_首层在上() {
+    let red_top = render_html(
+        "<body><div style='width:100px;height:100px;background-image:linear-gradient(to right, #ff0000, #ff0000),linear-gradient(to right, #0000ff, #0000ff)'></div></body>",
+        300,
+        300,
+    );
+    let p = pixel(&red_top, 50, 50);
+    assert!(p[0] > 200 && p[2] < 60, "首层(红)应在上:{p:?}");
+    let blue_top = render_html(
+        "<body><div style='width:100px;height:100px;background-image:linear-gradient(to right, #0000ff, #0000ff),linear-gradient(to right, #ff0000, #ff0000)'></div></body>",
+        300,
+        300,
+    );
+    let p = pixel(&blue_top, 50, 50);
+    assert!(p[2] > 200 && p[0] < 60, "首层(蓝)应在上:{p:?}");
+}
+
+
+#[test]
+fn transform_flex条目_整体随变换() {
+    // flex 条目 translate(40px,0):条目盒 (8,8)-(108,108) → 绘制在 (48,8)-(148,108)。
+    let img = render_html(
+        "<body><div style='display:flex'><div style='width:100px;height:100px;background:#0000ff;transform:translate(40px,0)'></div></div></body>",
+        300,
+        300,
+    );
+    let inside = pixel(&img, 60, 50);
+    assert!(inside[2] > 200 && inside[0] < 60, "flex 条目平移后应蓝:{inside:?}");
+    let outside = pixel(&img, 20, 50);
+    assert!(outside[0] > 200, "平移前应白:{outside:?}");
+}

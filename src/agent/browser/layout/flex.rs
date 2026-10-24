@@ -153,14 +153,9 @@ pub(crate) fn layout_container(
         layout_content(ctx, node, content_x, inner_w, style, depth + 1, cb);
     let box_h = (ctx.cursor_y() - start_y + content_h).max(1.0);
     ctx.set_box_height(box_idx, box_h);
-    // 阶段三第三步:容器背景图。
-    let bg_paint = ctx.background_paint(style, bx, start_y, bw, box_h);
-    if let Some(paint) = &bg_paint {
-        ctx.push_paint(paint.clone());
-    }
-    // 阶段六:组效果回补 + 自身视觉发射(修复 flex 容器边框/阴影缺口)。
+    // 阶段六:组效果回补 + 自身视觉发射(含多层背景图,修复 flex 容器边框/阴影缺口)。
     let tag = document::tag_name(node);
-    ctx.finish_container(seq, dmark, style, &tag, bx, start_y, bw, box_h, bg_paint);
+    ctx.finish_container(seq, dmark, style, &tag, bx, start_y, bw, box_h);
     ctx.advance_y(content_h + style.padding_bottom + style.margin_bottom.max(2.0));
 }
 
@@ -700,7 +695,8 @@ fn emit_item(ctx: &mut LayoutCtx, item: &mut Item, x: f64, y: f64, row: bool, de
             off_x: 0.0,
             off_y: 0.0,
         };
-        ctx.emit_image(&paint, cs.opacity);
+        let item_tf = ctx.own_transform(&cs, x, y, iw, ih);
+        ctx.emit_image(&paint, cs.opacity, item_tf);
         ctx.push_paint(paint);
         return;
     }

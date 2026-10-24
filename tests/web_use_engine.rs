@@ -118,7 +118,8 @@ fn route(path: &str, with_headers: bool) -> (&'static str, String, Vec<(String, 
             vec![],
         )
     } else if path == "/visual-page" {
-        // 阶段六富视觉页:渐变横幅 + 圆角卡片 + 模糊阴影 + 溢出裁剪。
+        // 阶段六富视觉页:渐变横幅 + 圆角卡片 + 模糊阴影 + 溢出裁剪;
+        // 阶段六第二步:CSS 2D transform / text-shadow / 多背景层。
         (
             "200 OK",
             "<!doctype html><html><head><title>富视觉页</title></head><body style='margin:0'>\
@@ -126,6 +127,9 @@ fn route(path: &str, with_headers: bool) -> (&'static str, String, Vec<(String, 
              <div id='card' style='width:120px;height:80px;background:#000000;border-radius:20px;margin-top:20px;box-shadow:6px 6px 14px #333333'></div>\
              <div id='clip' style='width:60px;height:30px;overflow:hidden;background:#ffffff;margin-top:20px'>\
              <div style='width:120px;height:60px;background:#00ff00'></div></div>\
+             <div id='tf' style='width:80px;height:80px;background:#0000ff;margin-top:20px;transform:translate(100px,0)'></div>\
+             <div id='ml' style='width:100px;height:50px;margin-top:20px;background-image:linear-gradient(to right, #ff0000, #ff0000),linear-gradient(to right, #0000ff, #0000ff)'></div>\
+             <p id='ts' style='margin-top:20px;color:#000000;text-shadow:3px 3px 0 #ff00ff'>阴影文本</p>\
              </body></html>"
                 .to_string(),
             vec![],
@@ -1164,6 +1168,27 @@ async fn 富视觉页面_渐变圆角阴影与溢出裁剪截图() {
         shadow_px[0] > 20 && shadow_px[0] < 235,
         "模糊阴影区应半透明:{shadow_px:?}"
     );
+    // 阶段六第二步:CSS 2D transform —— tf 盒 (8,238)-(88,318) 平移 (100,0)
+    // → 绘制在 (108,238)-(188,318)。
+    let tf_inside = px(120, 260);
+    assert!(
+        tf_inside[2] > 200 && tf_inside[0] < 60,
+        "transform 平移后应蓝:{tf_inside:?}"
+    );
+    let tf_outside = px(20, 260);
+    assert!(
+        tf_outside[0] > 200 && tf_outside[2] > 200,
+        "transform 原位置应白:{tf_outside:?}"
+    );
+    // 多背景层:首层(红)在上 → ml 盒 (8,338)-(108,388) 应红。
+    let ml = px(50, 360);
+    assert!(ml[0] > 200 && ml[2] < 60, "多背景层首层应在上(红):{ml:?}");
+    // text-shadow:应出现品红阴影像素。
+    let magenta = img
+        .pixels()
+        .filter(|p| p.0[0] > 200 && p.0[2] > 200 && p.0[1] < 60)
+        .count();
+    assert!(magenta > 0, "text-shadow 应出现品红阴影像素");
     let _ = std::fs::remove_dir_all(&dir);
 
     exec(&tool, json!({"action": "close", "page_id": page_id})).await;
