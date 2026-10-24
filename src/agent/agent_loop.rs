@@ -233,11 +233,25 @@ impl Agent {
             // 后续 system 拼接时追加「进入执行期」提示到 LLM 上下文,引导 LLM 收敛
             // 到 input_text/click/wait 等写操作,减少 inspect/screenshot/eval_js 重复探查。
             // 预算 = 0 关闭该机制(等同旧行为,见 Agent::with_explore_budget)。
-            if self.explore_budget > 0 && iter == self.explore_budget {
+            // 2026-10-24:UI 单元(实际动过浏览器/桌面工具)每步写操作都需 inspect
+            // 验证现场,公式预算 n/4 过紧(实测第 4 轮就催收口,登录态/路线入口
+            // 未探明即被判 Fail)。UI 角色放宽到 max(公式预算, n/2)。
+            let explore_budget_eff = if self.explore_budget > 0 {
+                let base = self.explore_budget;
+                match self.profile.hint_role(&trace) {
+                    crate::agent::runtime_hints::HintRole::Ui => {
+                        base.max(self.max_iterations.div_ceil(2))
+                    }
+                    _ => base,
+                }
+            } else {
+                0
+            };
+            if explore_budget_eff > 0 && iter == explore_budget_eff {
                 trace.explore_budget_exhausted = true;
                 debug!(
                     iteration = iter,
-                    explore_budget = self.explore_budget,
+                    explore_budget = explore_budget_eff,
                     "explore_budget 耗尽,进入执行期提示"
                 );
             }

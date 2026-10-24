@@ -174,8 +174,9 @@ pub(crate) fn build_runtime_hints_with(ctx: &RuntimeHintCtx<'_>) -> String {
 fn explore_exhausted_text(role: HintRole) -> Option<&'static str> {
     match role {
         HintRole::Ui => Some(
-            "已进入执行期(explore_budget 耗尽)。剩余迭代请专注于 input_text / click / wait 等 \
-             写操作,禁止再开新 inspect / screenshot / eval_js 探查(除非 click 后验证)。\
+            "已进入执行期(explore_budget 耗尽)。剩余迭代请**优先**推进 input_text / click / wait \
+             等写操作;inspect / screenshot / eval_js 仅用于**验证刚做的写操作**或确认关键状态\
+             (如登录态、结果面板是否出现),不要开新的大范围探查。\
              验证码/阻断请立即 control(request_human, reason=...) 让人工介入。",
         ),
         HintRole::Execute => Some(

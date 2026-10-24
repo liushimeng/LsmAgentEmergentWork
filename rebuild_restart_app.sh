@@ -114,8 +114,12 @@ if [[ "$FORCE" -eq 1 ]]; then
 fi
 
 # 2) 编译
-echo "[rebuild] cargo build --$PROFILE  日志: $LOG_FILE"
-cargo build --"$PROFILE" 2>&1 | tee "$LOG_FILE"
+# 2026-10-24: cargo build 不认 `--debug`(debug 是默认档,传了直接报
+# unexpected argument);只有 release 档需要 `--release` 旗标。
+CARGO_PROFILE_ARGS=()
+[[ "$PROFILE" == "release" ]] && CARGO_PROFILE_ARGS=(--release)
+echo "[rebuild] cargo build ${CARGO_PROFILE_ARGS[*]:-}  日志: $LOG_FILE"
+cargo build ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"} 2>&1 | tee "$LOG_FILE"
 
 # 3) 拷贝到工程根目录
 install_bin
@@ -134,7 +138,7 @@ if [[ -z "$ACTUAL" || "$ACTUAL" != "$EXPECT" ]]; then
   echo "[rebuild] ⚠️  产物版本异常: ./laew 报告 git ${ACTUAL:-<空>},当前 HEAD 是 $EXPECT" >&2
   echo "[rebuild] 触发强制重编(touch build.rs 穿透 cargo 增量缓存)" >&2
   touch build.rs
-  cargo build --"$PROFILE" 2>&1 | tee -a "$LOG_FILE"
+  cargo build ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"} 2>&1 | tee -a "$LOG_FILE"
   install_bin
   ACTUAL="$(bin_hash)"
   if [[ -z "$ACTUAL" || "$ACTUAL" != "$EXPECT" ]]; then

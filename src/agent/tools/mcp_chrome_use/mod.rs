@@ -126,6 +126,16 @@ pub(super) fn i64_arg(args: &Value, key: &str) -> Option<i64> {
     })
 }
 
+/// eval_js 的脚本参数解析:按 `script → expression → function → js → code`
+/// 顺序取首个非空值(与 Lsm 版 `browser/api.rs` 别名集对齐)。
+/// 2026-10-24 实测:模型按 Lsm 习惯传 `expression`,Chrome 侧只认 `script`
+/// 时直接 1001,浪费整轮;双工具架构下参数命名必须互通。
+pub(super) fn eval_script_arg<'a>(params: &'a Value) -> Option<&'a str> {
+    ["script", "expression", "function", "js", "code"]
+        .iter()
+        .find_map(|k| str_arg(params, k))
+}
+
 /// 任务锚点:目标站外导航阻断(与 Lsm 版 6001 契约一致)。
 pub(super) fn target_anchor_guard(url: &str) -> Option<Result<String>> {
     let v = crate::agent::safety::check_open_against_target_anchor(url)?;
@@ -229,6 +239,31 @@ impl McpChromeUseTool {
     }
 }
 
+/// 页面句柄解析(带存活页清单的诊断文案)。
+///
+/// 2026-10-24 实测:`action=list` 列出 c_00000001 后 7 秒该页即失效,
+/// 模型拿旧 page_id 调用只回干巴巴 2004,还要再花一轮 list 才能改道。
+/// 失效/不存在时在报文里**直接内联当前存活页**,省掉那次往返。
+async fn resolve_page(page_id: &str) -> Result<std::sync::Arc<chromiumoxide::Page>> {
+    match McpChromeUseTool::mgr().get_page(page_id) {
+        Some(p) => Ok(p),
+        None => {
+            let live = McpChromeUseTool::mgr().list_pages().await;
+            let live_desc: Vec<serde_json::Value> = live
+                .iter()
+                .take(8)
+                .map(|(id, url)| {
+                    serde_json::json!({"page_id": id, "url": crate::agent::web_activity::clip_chars(url, 80)})
+                })
+                .collect();
+            Err(crate::error::AgentError::ToolExecution {
+                tool: "MCP_Web_Chrome_Use".into(),
+                reason: format!("{};当前存活页:{}", page_missing_message(page_id), serde_json::to_string(&live_desc).unwrap_or_default()),
+            })
+        }
+    }
+}
+
 /// 2004 诊断文案:跨工具 page_id 误用给出可操作指引(实测 QC 曾建议把 Chrome
 /// 的 c_ page_id 传给 Lsm 工具 explore,确定性陷阱,工具层直接点破)。
 fn page_missing_message(page_id: &str) -> String {
@@ -317,7 +352,7 @@ page_id 仅本工具内有效,不跨工具复用。\
                     "enum": [
                         "navigate", "click", "click_text", "type", "input_text",
                         "key_press", "eval_js", "screenshot", "scroll", "wait",
-                        "back", "forward", "reload"
+                        "back", "forward", "reload", "request_human"
                     ]
                 },
                 "info": {
@@ -335,7 +370,7 @@ page_id 仅本工具内有效,不跨工具复用。\
                         "key": { "type": "string", "description": "key_press 的键名:Enter/Tab/Escape/ArrowDown/ArrowUp/ArrowLeft/ArrowRight/Backspace/Delete/Space 或单字符" },
                         "max_chars": { "type": "integer", "description": "inspect(text|html) 输出上限(默认 20000,范围 1000-200000)" },
                         "max": { "type": "integer", "description": "inspect(elements) 最多返回多少个元素(默认 80,范围 1-200)" },
-                        "script": { "type": "string", "description": "eval_js 的 JS 表达式/语句" },
+                        "script": { "type": "string", "description": "eval_js 的 JS 表达式/语句;别名 expression/function/js/code 等效" },
                         "y": { "type": "integer", "description": "scroll 像素(正向下)" },
                         "ms": { "type": "integer", "description": "wait 固定等待毫秒(上限 30000)" },
                         "timeout_ms": { "type": "integer", "description": "wait(selector=...) 就绪判定超时,默认 10000,上限 30000" },
@@ -459,13 +494,69 @@ async fn run_close(args: Value) -> Result<String> {
 // ===================== control =====================
 
 async fn run_control(args: Value) -> Result<String> {
-    let Some(page_id) = str_arg(&args, "page_id").map(str::to_string) else {
-        return envelope(CODE_PARAM_ERROR, "control 缺少 page_id", json!({}));
-    };
     let Some(control_action) = str_arg(&args, "control_action").map(str::to_string) else {
         return envelope(CODE_PARAM_ERROR, "control 缺少 control_action", json!({}));
     };
-    let page = match McpChromeUseTool::page_of(&page_id) {
+    let p = params_of(&args);
+    // request_human:人工介入桥接(登录/验证码/核验),不强制 page_id——
+    // 无页可解锁时走任务级提问,与 Lsm 版语义一致(2026-10-24 实测补齐:
+    // Chrome 侧缺此动作,登录墙时模型只能硬写「未登录」结论)。
+    if control_action == "request_human" {
+        let reason = str_arg(p, "reason")
+            .or_else(|| str_arg(&args, "reason"))
+            .unwrap_or("custom");
+        let message = str_arg(p, "message")
+            .or_else(|| str_arg(&args, "message"))
+            .map(str::to_string);
+        let options: Vec<String> = p
+            .get("options")
+            .or_else(|| args.get("options"))
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .take(8)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let multi_select = p
+            .get("multi_select")
+            .or_else(|| args.get("multi_select"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let timeout_ms = i64_arg(p, "timeout_ms")
+            .or_else(|| i64_arg(&args, "timeout_ms"))
+            .unwrap_or(0)
+            .max(0) as u64;
+        let page_id = str_arg(&args, "page_id").unwrap_or("").to_string();
+        // 有页时带上当前 URL 作为上下文(便于人工判断现场),无页走任务级。
+        let url = if page_id.is_empty() {
+            String::new()
+        } else {
+            match McpChromeUseTool::page_of(&page_id) {
+                Ok(pg) => chrome_browser::url_and_title(&pg).await.0,
+                Err(_) => String::new(),
+            }
+        };
+        let image_path = str_arg(p, "image_path").unwrap_or("");
+        let (code, message, data) = crate::agent::human_assist::request_human_action(
+            reason,
+            message.as_deref(),
+            options,
+            &url,
+            &page_id,
+            timeout_ms,
+            image_path,
+            multi_select,
+        )
+        .await;
+        return envelope(code, &message, data);
+    }
+    let Some(page_id) = str_arg(&args, "page_id").map(str::to_string) else {
+        return envelope(CODE_PARAM_ERROR, "control 缺少 page_id", json!({}));
+    };
+    let page = match resolve_page(&page_id).await {
         Ok(p) => p,
         Err(e) => {
             return envelope(
@@ -475,7 +566,6 @@ async fn run_control(args: Value) -> Result<String> {
             )
         }
     };
-    let p = params_of(&args);
 
     let result: std::result::Result<Value, (i32, String)> = match control_action.as_str() {
         "navigate" => {
@@ -529,9 +619,16 @@ async fn run_control(args: Value) -> Result<String> {
                 .await
                 .map_err(|e| (CODE_EXEC_FAILED, e.to_string()))
         }
+        // eval_js:参数别名与 Lsm 版对齐(script/expression/function/js/code)。
+        // 实测(2026-10-24)模型按 Lsm 习惯传 params.expression,Chrome 侧只认
+        // script 时直接 1001,浪费整轮;双工具架构下参数命名必须互通。
         "eval_js" => {
-            let Some(script) = str_arg(p, "script") else {
-                return envelope(CODE_PARAM_ERROR, "eval_js 缺少 params.script", json!({}));
+            let Some(script) = eval_script_arg(p) else {
+                return envelope(
+                    CODE_PARAM_ERROR,
+                    "eval_js 缺少 params.script(别名 expression/function/js/code 亦可)",
+                    json!({}),
+                );
             };
             chrome_browser::eval_js(&page, script)
                 .await
@@ -560,19 +657,32 @@ async fn run_control(args: Value) -> Result<String> {
                 .map_err(|e| (CODE_EXEC_FAILED, e.to_string()))
         }
         // wait:固定毫秒,或 selector 就绪判定(params.selector + timeout_ms,上限 30s)。
-        "wait" => match str_arg(p, "selector") {
-            Some(sel) => {
-                let timeout_ms = i64_arg(p, "timeout_ms").unwrap_or(10_000).max(0) as u64;
-                chrome_browser::wait_for_selector(&page, sel, timeout_ms)
-                    .await
-                    .map(|hit| json!({"selector": sel, "visible": hit, "timeout_ms": timeout_ms.min(30_000)}))
-                    .map_err(|e| (CODE_EXEC_FAILED, e.to_string()))
+        // 复合语义(2026-10-24 实测定稿):两者同给时**先 wait(ms) 再 wait_for_selector**
+        // ——模型常写 `{ms:3000, selector:..., timeout_ms:15000}` 表达「先 settle 再等就绪」,
+        // 旧实现 selector 分支静默吞掉 ms,语义不符。信封回显实际采用的模式。
+        "wait" => {
+            let ms = i64_arg(p, "ms").unwrap_or(0).max(0) as u64;
+            match str_arg(p, "selector") {
+                Some(sel) => {
+                    if ms > 0 {
+                        chrome_browser::wait(ms).await;
+                    }
+                    let timeout_ms = i64_arg(p, "timeout_ms").unwrap_or(10_000).max(0) as u64;
+                    chrome_browser::wait_for_selector(&page, sel, timeout_ms)
+                        .await
+                        .map(|hit| {
+                            json!({"selector": sel, "visible": hit, "timeout_ms": timeout_ms.min(30_000),
+                                   "settled_ms": ms, "mode": if ms > 0 { "settle_then_selector" } else { "selector" }})
+                        })
+                        .map_err(|e| (CODE_EXEC_FAILED, e.to_string()))
+                }
+                None => {
+                    let ms = if ms > 0 { ms } else { 500 };
+                    chrome_browser::wait(ms).await;
+                    Ok(json!({"waited_ms": ms, "mode": "fixed"}))
+                }
             }
-            None => {
-                chrome_browser::wait(i64_arg(p, "ms").unwrap_or(500).max(0) as u64).await;
-                Ok(json!({"waited_ms": i64_arg(p, "ms").unwrap_or(500).max(0)}))
-            }
-        },
+        }
         "back" => chrome_browser::eval_js(&page, "history.back(); true")
             .await
             .map_err(|e| (CODE_EXEC_FAILED, e.to_string())),
@@ -605,7 +715,7 @@ async fn run_inspect(args: Value) -> Result<String> {
     let Some(info) = str_arg(&args, "info").map(str::to_string) else {
         return envelope(CODE_PARAM_ERROR, "inspect 缺少 info", json!({}));
     };
-    let page = match McpChromeUseTool::page_of(&page_id) {
+    let page = match resolve_page(&page_id).await {
         Ok(p) => p,
         Err(e) => return envelope(CODE_PAGE_NOT_FOUND, &e.to_string(), json!({"page_id": page_id})),
     };
@@ -635,7 +745,9 @@ async fn run_inspect(args: Value) -> Result<String> {
     };
 
     match result {
-        Ok(data) => envelope(0, "ok", json!({"page_id": page_id, "data": data})),
+        // 信封形状与 control 对齐:顶层语义键统一 `result`;`data` 保留一版
+        // 兼容字段(旧提示词/文档写的是 data.data 路径),后续版本可移除。
+        Ok(data) => envelope(0, "ok", json!({"page_id": page_id, "result": data, "data": data})),
         Err((_, msg)) if evict_if_dead(&page_id, &msg) => envelope(
             CODE_PAGE_NOT_FOUND,
             &dead_page_message(&page_id, &msg),

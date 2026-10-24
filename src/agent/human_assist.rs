@@ -750,6 +750,122 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// 人工介入 reason 白名单(两浏览器工具的 `control(request_human)` 共用)。
+pub const HUMAN_REASONS: &[&str] = &[
+    "captcha",
+    "sms",
+    "qr_login",
+    "login",
+    "real_name",
+    "two_factor",
+    "oauth",
+    "manual_verify",
+    "custom",
+];
+
+/// 工具侧 `control(request_human)` 的统一实现(Chrome / Lsm 两工具共用)。
+///
+/// 返回 `(code, message, data)` 三元组,由各工具包进自己的 JSON 信封 ——
+/// 避免 HITL 语义(reason 白名单 / 超时分档 / 取消置旗)在两工具间漂移。
+/// 2026-10-24 百度地图实测:Chrome 工具缺 `request_human`,登录墙时模型
+/// 只能硬写「未登录」结论;抽公共层后两工具能力面一致。
+pub async fn request_human_action(
+    reason_raw: &str,
+    message: Option<&str>,
+    options: Vec<String>,
+    url: &str,
+    page_id: &str,
+    timeout_ms: u64,
+    image_path: &str,
+    multi_select: bool,
+) -> (i32, String, serde_json::Value) {
+    use serde_json::json;
+    let reason = reason_raw.trim().to_ascii_lowercase();
+    if !HUMAN_REASONS.contains(&reason.as_str()) {
+        return (
+            1001,
+            "request_human reason 非法".into(),
+            json!({"reason": reason, "allowed": HUMAN_REASONS}),
+        );
+    }
+    let message = message
+        .map(str::to_string)
+        .unwrap_or_else(|| default_message(&reason).to_string());
+    let default_timeout = match reason.as_str() {
+        "captcha" | "sms" | "two_factor" => 120_000,
+        _ => 300_000,
+    };
+    let timeout_ms = if timeout_ms == 0 { default_timeout } else { timeout_ms };
+    let hub = HumanAssistHub::global();
+    let outcome = hub
+        .request(
+            &reason,
+            &message,
+            options,
+            url,
+            page_id,
+            timeout_ms,
+            image_path,
+            true,
+            multi_select,
+            None,
+        )
+        .await;
+    match outcome {
+        HumanAssistOutcome::Answered { text, via } => {
+            let next_hint = if text.chars().all(|c| c.is_ascii_digit() || c.is_whitespace()) {
+                "看起来是验证码/数字码:用 control(input_text) 填入对应输入框并提交"
+            } else {
+                "人工已完成或给出了补充说明:继续 inspect 验证现场后再决定下一步"
+            };
+            (
+                0,
+                "ok".into(),
+                json!({
+                    "reason": reason,
+                    "kind_label": kind_label(&reason),
+                    "human_response": text,
+                    "assist_channel": via.as_str(),
+                    "origin": "llm",
+                    "next_hint": next_hint,
+                }),
+            )
+        }
+        HumanAssistOutcome::Timeout { via } => (
+            4001,
+            "人工介入等待超时".into(),
+            json!({
+                "reason": reason,
+                "kind_label": kind_label(&reason),
+                "assist_channel": via.as_str(),
+                "hint": "可重试 request_human,或如实告知用户改在交互模式重试;严禁伪造结果。",
+            }),
+        ),
+        HumanAssistOutcome::Cancelled { via } => {
+            crate::agent::human_cancel::set(&reason);
+            (
+                4002,
+                "人工取消任务".into(),
+                json!({
+                    "reason": reason,
+                    "human_cancelled": true,
+                    "assist_channel": via.as_str(),
+                    "next_hint": "立即停止本任务,不要重试或改用其它通道。",
+                }),
+            )
+        }
+        HumanAssistOutcome::Unavailable => (
+            4001,
+            "人工介入通道不可用".into(),
+            json!({
+                "reason": reason,
+                "kind_label": kind_label(&reason),
+                "hint": "桌面弹窗与 TUI 均不可用;请如实告知用户改在交互模式(-p 之外)重试。",
+            }),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -779,6 +895,25 @@ mod tests {
             clamp_human_assist_timeout_ms(u64::MAX),
             MAX_HUMAN_ASSIST_TIMEOUT_MS
         );
+    }
+
+    /// request_human_action 非法 reason 立即 1001,不触达 Hub(两浏览器工具共用入口)。
+    #[tokio::test]
+    async fn request_human_action_非法_reason_返_1001() {
+        let (code, msg, data) = request_human_action(
+            "not_a_reason",
+            None,
+            vec![],
+            "",
+            "",
+            0,
+            "",
+            false,
+        )
+        .await;
+        assert_eq!(code, 1001);
+        assert!(msg.contains("reason"), "报文应点破 reason 非法: {msg}");
+        assert!(data.get("allowed").is_some(), "应给出白名单: {data}");
     }
 
     #[tokio::test]

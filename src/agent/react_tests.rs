@@ -582,6 +582,12 @@ fn runtime_hints_explore_text_is_role_specific() {
     // D5 根因:UI 文案发给代码任务是错误指令 → 现在按角色分叉
     let ui = build(HintRole::Ui);
     assert!(ui.contains("click") && ui.contains("inspect"), "UI 角色应保留浏览器文案");
+    // 2026-10-24:硬禁令会让 UI 单元未探明登录态/入口即收口 → 软化为「优先写、
+    // 验证类 inspect 允许」,不再出现「禁止再开」措辞。
+    assert!(
+        !ui.contains("禁止"),
+        "UI 文案应软化为优先级措辞而非禁令,实际: {ui}"
+    );
     let exec = build(HintRole::Execute);
     assert!(
         exec.contains("Write") && exec.contains("Bash"),

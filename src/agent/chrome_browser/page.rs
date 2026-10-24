@@ -445,9 +445,16 @@ pub async fn key_press(page: &Page, key: &str, selector: Option<&str>) -> Result
 
 /// 读取选择器命中的第一个元素文本(可选:文档无匹配返回 None)。
 pub async fn element_text(page: &Page, selector: &str) -> Result<Option<String>> {
+    // 表单控件(INPUT/TEXTAREA/SELECT)的文本是 value 而非 innerText ——
+    // 2026-10-24 回归实测:`inspect(text, selector=.route-start-input)` 读
+    // innerText 恒为空,模型无法核对「输入是否写进去」。
     let js = format!(
         r#"(function(){{ var el=null; try {{ el=document.querySelector({sel}); }} catch(e) {{ return null; }}
-            if (!el) return null; return String(el.innerText || el.textContent || ''); }})()"#,
+            if (!el) return null;
+            var tag = String(el.tagName || '').toUpperCase();
+            if (tag === 'INPUT' || tag === 'TEXTAREA') return String(el.value || '');
+            if (tag === 'SELECT') {{ try {{ return String(el.options[el.selectedIndex] ? el.options[el.selectedIndex].text : ''); }} catch(e) {{ return ''; }} }}
+            return String(el.innerText || el.textContent || ''); }})()"#,
         sel = serde_json::to_string(selector).unwrap_or_default()
     );
     let v = eval_js(page, &js).await?;
@@ -467,6 +474,10 @@ pub async fn element_html(page: &Page, selector: &str) -> Result<Option<String>>
 
 /// 按 CSS 选择器输入文本(聚焦 + 原生 setter 赋值 + input/change 事件),
 /// 返回是否命中元素。
+///
+/// **这是降级路径**:JS setter + 合成 `Event('input')` 对只认可信输入流的
+/// 重 JS 站点(实测百度地图路线输入框)不生效——DOM value 读得回、应用层
+/// 认为没输入,搜索永远无结果。首选 [`type_text_real`] 的 CDP 真实输入通道。
 pub async fn type_text(page: &Page, selector: &str, text: &str) -> Result<bool> {
     let js = format!(
         r#"(function() {{
@@ -490,13 +501,88 @@ pub async fn type_text(page: &Page, selector: &str, text: &str) -> Result<bool> 
     Ok(v.as_bool().unwrap_or(false))
 }
 
+/// 按 CSS 选择器走 **CDP 真实输入通道** 键入文本,返回是否命中元素。
+///
+/// 流程:滚动入视野 → 聚焦并清空旧值 → `Input.insertText` 整段插入
+/// (IME 语义,产生可信 beforeinput/input,重 JS 站点输入模型可感知)→
+/// 逐字符补发 `keyDown/keyUp`(带 `text`),让 keydown/keyup 监听
+/// (联想下拉、快捷键)与真实键入一致。**不自动回车**:提交时机由模型用
+/// `key_press(Enter)` 显式决定,避免误选联想项/误提交表单。
+/// 任一步骤失败返回 `false`,由调用方降级到 [`type_text`] 的 JS setter 路线。
+///
+/// 背景(2026-10-24 百度地图实测):`type_text` 的 setter+合成 input 让
+/// `.route-start-input` 显示有字、`hit:true`,但百度地图内部输入模型未更新,
+/// 路线搜索 43 次探测 `hasMinute=false`,页面停在「请选择准确的起点」歧义态。
+pub async fn type_text_real(page: &Page, selector: &str, text: &str) -> Result<bool> {
+    use chromiumoxide::cdp::browser_protocol::input::{
+        DispatchKeyEventParams, DispatchKeyEventType, InsertTextParams,
+    };
+    // 聚焦 + 清空旧值 + 预置滚动(元素不存在时尽早 false)。
+    let focus_js = format!(
+        r#"(function() {{
+            var el = document.querySelector({sel});
+            if (!el) return false;
+            el.scrollIntoView({{block:'center'}});
+            el.focus();
+            var proto = el instanceof HTMLTextAreaElement
+                ? HTMLTextAreaElement.prototype
+                : HTMLInputElement.prototype;
+            var setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+            setter.call(el, '');
+            el.dispatchEvent(new Event('input', {{bubbles:true}}));
+            return document.activeElement === el;
+        }})()"#,
+        sel = serde_json::to_string(selector).unwrap_or_default()
+    );
+    let v = eval_js(page, &focus_js).await?;
+    if !v.as_bool().unwrap_or(false) {
+        return Ok(false);
+    }
+    // 整段真实插入(可信 beforeinput/input,站点输入模型可感知)。
+    tokio::time::timeout(
+        Duration::from_secs(CDP_BOUND_SECS),
+        page.execute(InsertTextParams::new(text)),
+    )
+    .await
+    .map_err(|_| timeout_err("type_text_real(insertText)", CDP_BOUND_SECS))?
+    .map_err(|e| err("type_text_real(insertText)", e))?;
+    // 逐字符补发 keyDown/keyUp:keydown/keyup 监听(联想、快捷键)只认真实
+    // 键盘事件;insertText 不产生这两类事件。**用 rawKeyDown(不带 text)**:
+    // 带 text 的 keyDown 会再插一次字符(2026-10-24 回归实测 value 翻倍)。
+    // 长文本截到 64 字符封顶,防止异常长粘贴把 CDP 打成 O(n) 风暴。
+    for ch in text.chars().take(64) {
+        let ch_s = ch.to_string();
+        for ev in [DispatchKeyEventType::RawKeyDown, DispatchKeyEventType::KeyUp] {
+            let p = DispatchKeyEventParams::builder()
+                .r#type(ev)
+                .key(ch_s.clone())
+                .code(String::new())
+                .windows_virtual_key_code(0)
+                .native_virtual_key_code(0)
+                .build()
+                .map_err(|e| err("type_text_real(char)", e))?;
+            tokio::time::timeout(Duration::from_secs(CDP_BOUND_SECS), page.execute(p))
+                .await
+                .map_err(|_| timeout_err("type_text_real(char)", CDP_BOUND_SECS))?
+                .map_err(|e| err("type_text_real(char)", e))?;
+        }
+    }
+    Ok(true)
+}
+
 /// 按选择器输入文本;未命中时回可见输入框候选,便于模型改选正确 selector。
 ///
 /// 实测模型会猜 `#route-inputstart`,而真实节点是 `input.route-start-input`
 /// (无 id)。只回 `{hit:false}` 会迫使模型继续盲猜或改用 eval_js。
+///
+/// 输入通道:先 [`type_text_real`](CDP 真实输入,重 JS 站点可感知),
+/// 失败降级 [`type_text`](JS setter);信封回 `mode` 标明实际走的通道。
 pub async fn type_text_ex(page: &Page, selector: &str, text: &str) -> Result<Value> {
+    if type_text_real(page, selector, text).await.unwrap_or(false) {
+        return Ok(serde_json::json!({"selector": selector, "hit": true, "mode": "cdp_insert_text"}));
+    }
     if type_text(page, selector, text).await? {
-        return Ok(serde_json::json!({"selector": selector, "hit": true}));
+        return Ok(serde_json::json!({"selector": selector, "hit": true, "mode": "js_setter"}));
     }
     let listed = visible_elements(page, None, None, 200).await?;
     let candidates: Vec<Value> = listed

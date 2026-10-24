@@ -391,7 +391,8 @@ impl AgentProfile {
     /// 1. 有 `emit_tool` → 结构化结论出口角色:`defer_emit_force` 开 = [`HintRole::Gather`]
     ///    (Yolo 信息收集),否则 = [`HintRole::Judge`](Quality-Check 判定)
     /// 2. 工具面为空 → [`HintRole::Judge`](SessionContext / Debug / Compact,纯文本生成)
-    /// 3. `trace.tool_call_log` 出现过 `MCP_Web_LsmAgentBrowser_Use` / `MCP_Window_Use` → [`HintRole::Ui`]
+    /// 3. `trace.tool_call_log` 出现过 `MCP_Web_LsmAgentBrowser_Use` /
+    ///    `MCP_Web_Chrome_Use` / `MCP_Window_Use` → [`HintRole::Ui`]
     /// 4. 其余 → [`HintRole::Execute`](Plan / Main-Work / SubAgent-Work / WorkFlow /
     ///    动态子 Agent 的纯代码文件类单元)
     ///

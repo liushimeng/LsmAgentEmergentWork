@@ -3,6 +3,10 @@
 use super::*;
 use crate::agent::tools::Tool;
 
+/// 环境变量互斥:`LAEW_CHROME_USE` 是进程全局量,改开关的用例必须与
+/// 读开关的用例串行(否则并行下 4030 污染 1001 断言,实测已翻车)。
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn 工具名与常量一致() {
     let tool = McpChromeUseTool;
@@ -121,6 +125,7 @@ fn png_size_解析_IHDR() {
 
 #[tokio::test]
 async fn 缺少_action_返_1001() {
+    let _g = ENV_LOCK.lock().unwrap();
     let tool = McpChromeUseTool;
     let out = tool.execute(json!({})).await.unwrap();
     let v: Value = serde_json::from_str(&out).unwrap();
@@ -129,6 +134,7 @@ async fn 缺少_action_返_1001() {
 
 #[tokio::test]
 async fn 关闭开关返回_4030() {
+    let _g = ENV_LOCK.lock().unwrap();
     std::env::set_var("LAEW_CHROME_USE", "off");
     let tool = McpChromeUseTool;
     let out = tool.execute(json!({"action": "list"})).await.unwrap();
@@ -139,6 +145,7 @@ async fn 关闭开关返回_4030() {
 
 #[tokio::test]
 async fn 未知_action_返_1001() {
+    let _g = ENV_LOCK.lock().unwrap();
     let tool = McpChromeUseTool;
     let out = tool.execute(json!({"action": "fly"})).await.unwrap();
     let v: Value = serde_json::from_str(&out).unwrap();
@@ -148,6 +155,7 @@ async fn 未知_action_返_1001() {
 
 #[tokio::test]
 async fn close_未知_page_返_2004() {
+    let _g = ENV_LOCK.lock().unwrap();
     let tool = McpChromeUseTool;
     let out = tool
         .execute(json!({"action": "close", "page_id": "c_deadbeef"}))
@@ -171,4 +179,48 @@ fn i64_arg_兼容字符串数字() {
     assert_eq!(i64_arg(&json!({"y": "-42"}), "y"), Some(-42));
     assert_eq!(i64_arg(&json!({"y": "x"}), "y"), None);
     assert_eq!(i64_arg(&json!({}), "y"), None);
+}
+
+#[test]
+fn eval_script_arg_别名与_lsm_对齐() {
+    // 2026-10-24 实测:模型按 Lsm 习惯传 expression,Chrome 旧实现直接 1001。
+    assert_eq!(eval_script_arg(&json!({"expression": "1+1"})), Some("1+1"));
+    assert_eq!(eval_script_arg(&json!({"script": "2+2"})), Some("2+2"));
+    assert_eq!(eval_script_arg(&json!({"js": "3+3"})), Some("3+3"));
+    assert_eq!(eval_script_arg(&json!({"code": "4+4"})), Some("4+4"));
+    assert_eq!(eval_script_arg(&json!({"function": "5+5"})), Some("5+5"));
+    // script 优先于后置别名。
+    assert_eq!(
+        eval_script_arg(&json!({"expression": "e", "script": "s"})),
+        Some("s")
+    );
+    // 空串视同未给。
+    assert_eq!(eval_script_arg(&json!({"script": "", "expression": "e"})), Some("e"));
+    assert_eq!(eval_script_arg(&json!({})), None);
+}
+
+#[test]
+fn schema_含_request_human_与_eval_js_别名说明() {
+    let schema = McpChromeUseTool.parameters();
+    let c_enums = schema["properties"]["control_action"]["enum"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect::<Vec<_>>();
+    // 2026-10-24 实测:登录墙时模型调 request_human 被枚举拒绝,HITL 断路。
+    assert!(c_enums.contains(&"request_human"));
+    let script_desc = schema["properties"]["params"]["properties"]["script"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(script_desc.contains("expression"), "script 描述应声明别名: {script_desc}");
+}
+
+#[test]
+fn human_reasons_白名单包含登录与验证码() {
+    use crate::agent::human_assist::HUMAN_REASONS;
+    assert!(HUMAN_REASONS.contains(&"login"));
+    assert!(HUMAN_REASONS.contains(&"captcha"));
+    assert!(HUMAN_REASONS.contains(&"qr_login"));
+    assert!(HUMAN_REASONS.contains(&"custom"));
 }
