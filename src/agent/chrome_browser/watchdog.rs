@@ -109,7 +109,7 @@ pub fn terminate_process(pid: u32) {
 #[cfg(windows)]
 pub fn terminate_process(pid: u32) {
     use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{CloseHandle as _, OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+    use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
     unsafe {
         if let Ok(handle) = OpenProcess(PROCESS_TERMINATE, false, pid) {
             let _ = TerminateProcess(handle, 1);

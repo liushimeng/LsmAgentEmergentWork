@@ -113,7 +113,7 @@ pub fn detect_browser() -> Option<PathBuf> {
                 return Some(PathBuf::from(c));
             }
         }
-        &[]
+        v
     };
 
     #[cfg(target_os = "linux")]
