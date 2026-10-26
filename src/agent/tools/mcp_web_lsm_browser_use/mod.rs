@@ -179,6 +179,9 @@ page_state/blockers/screenshot/ocr 等);close 释放页面;sequence/batch 连续
 explore 一次做 ≤8 个观测。\
 wait 是就绪判定原语:可给 selector+state(visible/hidden/attached/detached)、text(元素文本包含)、\
 js(页面表达式为真)、network_idle(网络静默毫秒),多条件取「与」,超时返回 2002。\
+★ 搜地址/填地点时,input_text 建议带 params.submit=true:输入后自动回车,\
+把「联想下拉里的规范 POI」提交出去;只输入不回车,站点会用原始文本做地理编码,\
+结果页直接报「未找到相关地点」(实测百度地图路线规划)。\
 返回统一信封 {code,message,data}。"
     }
 

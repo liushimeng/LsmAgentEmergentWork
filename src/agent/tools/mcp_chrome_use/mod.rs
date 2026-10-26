@@ -371,6 +371,9 @@ close 释放页面(page_id=all 全关并回收 Chrome 进程)。\
 重 JS 站点只认可信事件流;另有 hover / double_click / right_click。\
 ★ type/input_text 走**真实输入通道**(CDP insertText + 逐字符 keyDown,站点输入模型可感知);\
 联想/快捷键/回车提交用 key_press(params.key=Enter|Tab|ArrowDown|Escape...;可带 params.selector 先聚焦)。\
+★ **搜地址/填地点时,type/input_text 建议带 params.submit=true**:输入后自动回车,\
+把「联想下拉里的规范 POI」提交出去;只输入不回车,站点会用原始文本做地理编码,\
+结果页直接报「未找到相关地点」(实测百度地图路线规划)。\
 ★ 选择器未命中会回 candidates(可见输入框 selector/placeholder),按候选改选。\
 ★ screenshot 务必给 params.save_path 落盘(只回路径+尺寸);不传才会回 base64。\
 ★ **要「全景/整页」截图就加 params.full_page=true**(按整页高度裁剪,视口截图看不到视口外内容)。\
@@ -418,6 +421,8 @@ page_id 仅本工具内有效,不跨工具复用。\
                         "page_id": { "type": "string", "description": "页面句柄(等价于顶层 page_id)" },
                         "url": { "type": "string" },
                         "selector": { "type": "string", "description": "click/click_text/click_real/hover/double_click/right_click/type/input_text/key_press/scroll/wait(CSS);wait 时为就绪判定目标;inspect 时限定取哪个子树" },
+                        "submit": { "type": "boolean", "description": "type/input_text 专用:输入后自动回车(提交表单 / 选中联想下拉第一项)。搜地址类场景建议开启——只输入不回车,站点会用原始文本做地理编码,报「未找到相关地点」" },
+                        "pick_suggestion": { "type": "boolean", "description": "submit 的同义参数(输入后回车选中联想项)" },
                         "text": { "type": "string", "description": "type/input_text 的输入文本;click_text 时为要点击的可见文字;wait 时为「等元素文本包含该串」" },
                         "exact": { "type": "boolean", "description": "click_text 是否要求文本完全相等(默认 false=包含匹配)" },
                         "mode": { "type": "string", "enum": ["js", "real"], "description": "click/click_text 的点击通道:js=JS 合成 el.click()(默认);real=CDP 真实鼠标事件(isTrusted=true,重 JS 站点更可靠)" },
@@ -743,14 +748,39 @@ async fn run_control(args: Value) -> Result<String> {
         }
         // input_text 与 type 同义(对齐 Lsm 版命名,实测模型对 type 可发现性差,
         // 曾绕行 eval_js 手搓键盘事件)。
-        "type" | "input_text" => {
+                "type" | "input_text" => {
             let (Some(sel), text) = (str_arg(p, "selector"), p.get("text").and_then(Value::as_str).unwrap_or(""))
             else {
                 return envelope(CODE_PARAM_ERROR, "type/input_text 缺少 params.selector", json!({}));
             };
-            chrome_browser::type_text_ex(&page, sel, text)
-                .await
-                .map_err(|e| (CODE_EXEC_FAILED, e.to_string()))
+            // params.submit=true:输入后**回车**。
+            // 站点搜索框输入后通常弹「联想下拉」,回车才会把下拉里的规范 POI
+            // 提交出去;只 type 不回车,站点会用**原始文本**做地理编码,
+            // 结果就是「未找到相关地点」(实测百度地图路线规划:2026-10-26)。
+            // 无下拉时回车等价于提交表单,同样符合预期。
+            let submit = p.get("submit").and_then(Value::as_bool).unwrap_or(false)
+                || p.get("pick_suggestion").and_then(Value::as_bool).unwrap_or(false);
+            async {
+                let typed = chrome_browser::type_text_ex(&page, sel, text)
+                    .await
+                    .map_err(|e| (CODE_EXEC_FAILED, e.to_string()))?;
+                if !submit {
+                    return Ok(typed);
+                }
+                let pressed = chrome_browser::key_press(&page, "Enter", None)
+                    .await
+                    .map_err(|e| (CODE_EXEC_FAILED, e.to_string()))?;
+                let mut out = typed.as_object().cloned().unwrap_or_default();
+                out.insert("submitted".to_string(), json!(true));
+                out.insert("submit_key".to_string(), json!("Enter"));
+                if let Some(extra) = pressed.as_object() {
+                    for (k, v) in extra {
+                        out.entry(k.clone()).or_insert(v.clone());
+                    }
+                }
+                Ok(Value::Object(out))
+            }
+            .await
         }
         // eval_js:参数别名与 Lsm 版对齐(script/expression/function/js/code)。
         // 实测(2026-10-24)模型按 Lsm 习惯传 params.expression,Chrome 侧只认

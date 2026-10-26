@@ -266,3 +266,17 @@ fn description_点明真实鼠标与整页截图() {
     assert!(d.contains("真实输入通道"), "description 缺真实输入通道说明");
     assert!(d.contains("state"), "description 缺就绪判定 state 说明");
 }
+
+/// 搜地址场景:输入后必须能「回车提交/选中联想项」。
+/// 实测(2026-10-26 百度地图路线规划):只 type 不回车,站点用原始文本做
+/// 地理编码,结果页直接报「未找到相关地点」,整条路线规划做不下去。
+#[test]
+fn schema_含_submit_参数_且_description_点明用法() {
+    let schema = McpChromeUseTool.parameters();
+    let props = &schema["properties"]["params"]["properties"];
+    assert!(props.get("submit").is_some(), "缺 submit(输入后回车)");
+    assert!(props.get("pick_suggestion").is_some(), "缺 pick_suggestion(submit 同义参数)");
+    let d = McpChromeUseTool.description();
+    assert!(d.contains("submit"), "description 缺 submit 用法说明");
+    assert!(d.contains("未找到相关地点"), "description 应点明「只输入不回车」的后果");
+}

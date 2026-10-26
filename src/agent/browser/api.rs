@@ -475,7 +475,26 @@ pub async fn control(
         "double_click" => act_click_kind(mgr, pid, params, "double").await,
         "hover" => act_hover(mgr, pid, params).await,
         "mouse_move" => act_mouse_move(mgr, pid, params).await,
-        "input_text" | "human_input" => act_input(mgr, pid, params).await,
+        "input_text" | "human_input" => {
+            let out = act_input(mgr, pid, params).await?;
+            // params.submit=true:输入后回车(与 Chrome 侧同名同义)。
+            // 站点搜索框输入后通常弹「联想下拉」,回车才会把下拉里的规范 POI
+            // 提交出去;只输入不回车,站点会用**原始文本**做地理编码,
+            // 结果就是「未找到相关地点」(实测百度地图路线规划:2026-10-26)。
+            let submit = params.get("submit").and_then(Value::as_bool).unwrap_or(false)
+                || params.get("pick_suggestion").and_then(Value::as_bool).unwrap_or(false);
+            if !submit {
+                return Ok(out);
+            }
+            let mut key_params = params.clone();
+            key_params["key"] = json!("Enter");
+            let pressed = act_key_press(mgr, pid, &key_params, top).await?;
+            let mut o = out.as_object().cloned().unwrap_or_default();
+            o.insert("submitted".into(), json!(true));
+            o.insert("submit_key".into(), json!("Enter"));
+            o.insert("key_result".into(), pressed);
+            Ok(Value::Object(o))
+        }
         "clear_input" => act_clear(mgr, pid, params).await,
         "select_option" => act_select_option(mgr, pid, params).await,
         "select_dropdown" => act_select_dropdown(mgr, pid, params).await,
