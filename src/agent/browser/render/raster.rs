@@ -204,7 +204,11 @@ pub(crate) fn rasterize(
         if item.opacity <= 0.0 {
             continue;
         }
-        let mapper = Mapper::new(item, scroll_y);
+        // `position: fixed`:盒坐标以**视口**为原点(布局层对 fixed 取包含块
+        // (0,0,vw,vh)),与普通项的页面原点不同系 —— 这里必须把滚动量归零,
+        // 否则固定控件会随页面滚动平移(地图缩放控件/工具栏一滚就跑位)。
+        let item_scroll = if item.fixed { 0.0 } else { scroll_y };
+        let mapper = Mapper::new(item, item_scroll);
         // 局部盒:文本类按内容宽度(字形逐字绘制,盒宽取文本宽)。
         let (bx, by, bw, bh) = match &item.kind {
             DisplayKind::Text { text, size, .. }
@@ -223,7 +227,7 @@ pub(crate) fn rasterize(
         if ex1 < 0.0 || ex0 > pw as f64 || ey1 < 0.0 || ey0 > ph as f64 {
             continue;
         }
-        let sc = scissor_for(item, scroll_y, pw, ph);
+        let sc = scissor_for(item, item_scroll, pw, ph);
         if sc.empty() {
             continue;
         }

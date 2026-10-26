@@ -42,6 +42,33 @@ var __lsmUidSeq = 0;
 var __lsmFlushDepth = 0;
 // 变更序号:观察者只应看到登记之后的变更(seq 守卫)。
 var __lsmMutSeq = 0;
+// ---------- 动态节点几何回填表 ----------
+// 站点地图/路线面板的容器由 JS 建出(document.createElement + 设尺寸 + appendChild),
+// 这些节点不在服务端 HTML 里,旧实现把 clientWidth/offsetWidth 写死为 0,
+// 地图读到 0×0 就不装载(实测百度地图停在骨架态:0 个 canvas、body 下只剩一个薄盒)。
+// 宿主其实**已经**把这些节点重新解析进 DOM 并参与布局,几何就在快照的 rect 里;
+// 这里按 `data-lsm-id` 把几何认回 JS 侧的动态节点,纯 JS 侧闭环,宿主零改动。
+//   __lsmDynGeom[key] = {x,y,w,h}
+//   __lsmDynById[key]  = 动态节点对象(供事件派发按 key 反查)
+var __lsmDynGeom = {};
+var __lsmDynById = {};
+function __lsmDynKey(el) {
+  if (!el) return null;
+  if (el.__lsmUid != null) return "d" + el.__lsmUid;
+  return null;
+}
+function __lsmDynGeo(el) {
+  var k = __lsmDynKey(el);
+  var g = k && __lsmDynGeom[k];
+  if (g && typeof g.w === "number") return g;
+  // 未挂载(宿主还没 layout 到)按 display:none 语义取 0。
+  return { x: 0, y: 0, w: 0, h: 0 };
+}
+function __lsmDynRect(el) {
+  var g = __lsmDynGeo(el);
+  return { x: g.x, y: g.y, top: g.y, left: g.x,
+           right: g.x + g.w, bottom: g.y + g.h, width: g.w, height: g.h };
+}
 
 var MAX_ACTIONS = 4096;
 var MAX_CONSOLE = 2048;
@@ -122,6 +149,28 @@ function __lsmRefresh(nodes, meta) {
     diff = __lsmDiffSnap(__lsmPrevSnap, nextIdx);
     __lsmPrevSnap = nextIdx;
   }
+  // 动态节点几何回填 + 收养:快照里带 `data-lsm-id` 的节点,就是上一轮 JS 建出来
+  // 的那批。把 rect 还给它,并把动态对象绑到快照节点上 —— 之后宿主点击落在该
+  // 快照节点时,注册在动态对象上的监听也能收到(见 __fire 的 dynChain)。
+  for (var di = 0; di < next.length; di++) {
+    var dn = next[di];
+    var dk = dn && dn.attrs ? dn.attrs["data-lsm-id"] : null;
+    if (!dk) continue;
+    if (dn.rect && typeof dn.rect.length === "number" && dn.rect.length >= 4) {
+      __lsmDynGeom[dk] = {
+        x: Math.round(Number(dn.rect[0]) || 0),
+        y: Math.round(Number(dn.rect[1]) || 0),
+        w: Math.max(0, Math.round(Number(dn.rect[2]) || 0)),
+        h: Math.max(0, Math.round(Number(dn.rect[3]) || 0))
+      };
+    }
+    var dyn = __lsmDynById[dk];
+    if (dyn) {
+      dyn.__lsm_node = dn;
+      dyn.__lsm_idx = dn.i;
+      dyn.__detached = false;
+    }
+  }
   __lsmNodes = next;
   __lsmMeta = meta || {};
   __lsmLocal = {};
@@ -178,6 +227,11 @@ function __serEl(el) {
   var tag = String(el.__tag || el.tagName || "div").toLowerCase();
   var attrs = el.__attrs || {};
   var out = "<" + tag;
+  // `data-lsm-id` 是动态节点回认宿主布局几何的钥匙:宿主解析后按属性保留
+  // (common_attrs 全量收 data-*),下一轮快照带 rect 回来,JS 侧据此回填
+  // clientWidth/offsetWidth(见 __lsmRefresh)。快照节点没有 __lsmUid,不发。
+  var dk = __lsmDynKey(el);
+  if (dk && !attrs["data-lsm-id"]) out += ' data-lsm-id="' + __escAttr(dk) + '"';
   for (var k in attrs) {
     if (!Object.prototype.hasOwnProperty.call(attrs, k)) continue;
     out += " " + k + '="' + __escAttr(attrs[k]) + '"';
@@ -673,11 +727,8 @@ function __newEl(tag) {
     id: "",
     style: __mkStyle(function () { return el.__attrs.style || ""; }, function (css) { el.__attrs.style = css; }),
     dataset: {},
-    // 未挂载元素几何全 0(真实浏览器 display:none 语义)。
-    clientWidth: 0, clientHeight: 0,
-    offsetWidth: 0, offsetHeight: 0,
-    scrollWidth: 0, scrollHeight: 0,
-    offsetLeft: 0, offsetTop: 0,
+    // 几何属性不用字面量:改由下方 def() 装成 getter,按 `__lsmDynGeom` 实时读取
+    // (宿主已把动态子树纳入布局,见 __lsmDynGeo 注释)。
     clientLeft: 0, clientTop: 0,
     children: [],
     childNodes: [],
@@ -693,12 +744,14 @@ function __newEl(tag) {
     },
     appendChild: function (c) {
       this.__kids.push(c);
+      if (c && c.__tag) c.__parentDyn = el;
       try { __lsmRegisterScriptLoad(c); } catch (e) {}
       __lsmRec("childList", el, { addedNodes: c ? [c] : [] });
       return c;
     },
     insertBefore: function (c) {
       this.__kids.push(c);
+      if (c && c.__tag) c.__parentDyn = el;
       try { __lsmRegisterScriptLoad(c); } catch (e) {}
       __lsmRec("childList", el, { addedNodes: c ? [c] : [] });
       return c;
@@ -722,6 +775,7 @@ function __newEl(tag) {
       var kids = Array.prototype.slice.call(arguments);
       for (var i = 0; i < kids.length; i++) {
         this.__kids.push(kids[i]);
+        if (kids[i] && kids[i].__tag) kids[i].__parentDyn = el;
         try { __lsmRegisterScriptLoad(kids[i]); } catch (e) {}
         __lsmRec("childList", el, { addedNodes: [kids[i]] });
       }
@@ -730,6 +784,7 @@ function __newEl(tag) {
       var kids = Array.prototype.slice.call(arguments);
       for (var i = kids.length - 1; i >= 0; i--) {
         this.__kids.unshift(kids[i]);
+        if (kids[i] && kids[i].__tag) kids[i].__parentDyn = el;
         try { __lsmRegisterScriptLoad(kids[i]); } catch (e) {}
         __lsmRec("childList", el, { addedNodes: [kids[i]] });
       }
@@ -743,12 +798,27 @@ function __newEl(tag) {
         __lsmRec("childList", el, { addedNodes: [kids[i]] });
       }
     },
-    remove: function () {},
-    addEventListener: function () {},
+    remove: function () {
+      var p = el.__parentDyn;
+      if (p && p.__kids) {
+        var i = p.__kids.indexOf(el);
+        if (i >= 0) p.__kids.splice(i, 1);
+      }
+      __lsmRec("childList", p || el, { removedNodes: [el] });
+    },
+    // 动态节点也要能绑事件:站点「建模板 → cloneNode → 挂载」出来的控件
+    // (百度地图路线面板 .route-button)依赖这里的监听,空实现等于按钮点了没反应。
+    addEventListener: function (type, fn) {
+      if (typeof fn !== "function") return;
+      __lsmListeners.push({ node: el, type: String(type), fn: fn });
+    },
     removeEventListener: function () {},
-    click: function () {},
-    focus: function () {},
-    blur: function () {},
+    click: function () {
+      __fireDyn(el, "click");
+      __push({ type: "click", selector: "@dyn:" + __lsmDynKey(el) });
+    },
+    focus: function () { __fireDyn(el, "focus"); },
+    blur: function () { __fireDyn(el, "blur"); },
     // 深拷贝:属性 / innerHTML 原文 / 子树都带走(旧实现返回空元素,
     // 站点「建模板 → cloneNode → 挂载」模式克隆出的控件是空壳)。
     cloneNode: function (deep) {
@@ -769,11 +839,26 @@ function __newEl(tag) {
     },
     querySelector: function () { return null; },
     querySelectorAll: function () { return []; },
-    getBoundingClientRect: function () { return { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 }; }
+    getBoundingClientRect: function () { return __lsmDynRect(el); }
   };
   function def(name, getter, setter) {
     try { Object.defineProperty(el, name, { get: getter, set: setter, configurable: true, enumerable: true }); } catch (e) {}
   }
+  // 几何 getter:宿主已把动态子树重新解析进 DOM 并参与布局,rect 随每轮快照回填。
+  // 站点读到的尺寸因此与截图里画出来的盒子一致(地图才能按真实容器尺寸装载)。
+  def("clientWidth", function () { return __lsmDynGeo(el).w; });
+  def("clientHeight", function () { return __lsmDynGeo(el).h; });
+  def("offsetWidth", function () { return __lsmDynGeo(el).w; });
+  def("offsetHeight", function () { return __lsmDynGeo(el).h; });
+  def("scrollWidth", function () { return __lsmDynGeo(el).w; });
+  def("scrollHeight", function () { return __lsmDynGeo(el).h; });
+  def("offsetLeft", function () { return __lsmDynGeo(el).x; });
+  def("offsetTop", function () { return __lsmDynGeo(el).y; });
+  // 登记到动态节点表:序列化时据此发 `data-lsm-id`,事件派发也按它反查。
+  var __key = __lsmDynKey(el);
+  if (__key) __lsmDynById[__key] = el;
+  // 记录动态父节点(remove() 与事件冒泡链需要)。
+  el.__parentDyn = null;
   // 反射属性:站点用 `document.createElement("script").src = url` 动态插脚本,
   // 属性必须真正落到 __attrs 上,否则序列化出来的标签是空的,宿主取不到脚本。
   ["src", "href", "type", "rel", "media", "title", "alt", "charset", "name", "value",
@@ -1616,29 +1701,77 @@ function __mkEvent(type) {
     stopImmediatePropagation: function () { this.propagationStopped = true; }
   };
 }
+// 动态子树冒泡链:目标快照节点若被动态对象收养,把它的动态父链一并纳入,
+// 这样「注册在动态节点上的监听」在宿主点击命中其子树时也能跑到。
+function __dynChainOf(node) {
+  var out = [];
+  var dk = node && node.attrs ? node.attrs["data-lsm-id"] : null;
+  var cur = dk ? __lsmDynById[dk] : null;
+  var guard = 0;
+  while (cur && guard++ < 64) {
+    out.push(cur);
+    cur = cur.__parentDyn || null;
+  }
+  return out;
+}
 function __fire(sel, type) {
   var node = __lsmFindBySel(sel);
   if (!node) return { handled: false, defaultPrevented: false };
   var chain = __ancestorChain(node.i);
+  var dynChain = __dynChainOf(node);
   var handled = false, prevented = false;
   for (var i = 0; i < __lsmListeners.length; i++) {
     var L = __lsmListeners[i];
     if (L.type !== String(type)) continue;
     var targetIdx = -1;
-    if (L.sel === "@document" || L.sel === "@window") {
+    if (L.node) {
+      // 动态节点监听:按对象同一性在动态链上找(0 = 目标本身,-3 仅作哨兵)。
+      for (var j = 0; j < dynChain.length; j++) {
+        if (dynChain[j] === L.node) { targetIdx = -3; break; }
+      }
+    } else if (L.sel === "@document" || L.sel === "@window") {
       targetIdx = -2;
     } else {
-      for (var j = 0; j < chain.length; j++) {
-        var n2 = __lsmNodes[chain[j]];
-        if (n2 && __lsmMatchSel(chain[j], L.sel)) { targetIdx = chain[j]; break; }
+      for (var j2 = 0; j2 < chain.length; j2++) {
+        var n2 = __lsmNodes[chain[j2]];
+        if (n2 && __lsmMatchSel(chain[j2], L.sel)) { targetIdx = chain[j2]; break; }
       }
     }
     if (targetIdx === -1) continue;
     var ev = __mkEvent(type);
     ev.target = __mk(node);
-    ev.currentTarget = targetIdx === -2 ? document : __mk(__lsmNodes[targetIdx]);
+    ev.currentTarget = targetIdx === -2 ? document
+      : (targetIdx === -3 ? L.node : __mk(__lsmNodes[targetIdx]));
     handled = true;
     try { L.fn(ev); } catch (e) { __cerror("listener " + type + ": " + String((e && e.stack) || e)); }
+    if (ev.defaultPrevented) prevented = true;
+    if (ev.propagationStopped) break;
+  }
+  return { handled: handled, defaultPrevented: prevented };
+}
+// 动态节点自身触发(el.click() 等):沿动态父链冒泡,只跑动态监听。
+function __fireDyn(target, type) {
+  if (!target) return { handled: false, defaultPrevented: false };
+  var chain = [];
+  var cur = target, guard = 0;
+  while (cur && guard++ < 64) {
+    chain.push(cur);
+    cur = cur.__parentDyn || null;
+  }
+  var handled = false, prevented = false;
+  for (var i = 0; i < __lsmListeners.length; i++) {
+    var L = __lsmListeners[i];
+    if (L.type !== String(type) || !L.node) continue;
+    var idx = -1;
+    for (var j = 0; j < chain.length; j++) {
+      if (chain[j] === L.node) { idx = j; break; }
+    }
+    if (idx === -1) continue;
+    var ev = __mkEvent(type);
+    ev.target = target;
+    ev.currentTarget = L.node;
+    handled = true;
+    try { L.fn(ev); } catch (e) { __cerror("dyn listener " + type + ": " + String((e && e.stack) || e)); }
     if (ev.defaultPrevented) prevented = true;
     if (ev.propagationStopped) break;
   }

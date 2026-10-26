@@ -77,6 +77,10 @@ pub struct DisplayItem {
     pub opacity: f64,
     pub clip: Option<ClipRect>,
     pub transform: Option<Affine>,
+    /// `position: fixed` 子树的标记:其盒坐标以**视口**为原点(布局层
+    /// `position.rs` 对 fixed 取包含块 (0,0,vw,vh)),而普通项以页面为原点。
+    /// 光栅化时滚动量 `scroll_y` 只对后者生效 —— 否则固定控件会随页面滚动平移。
+    pub fixed: bool,
 }
 
 impl DisplayItem {
@@ -185,6 +189,7 @@ pub fn build_legacy(layout: &Layout) -> Vec<DisplayItem> {
                 opacity: 1.0,
                 clip: None,
                 transform: None,
+                fixed: false,
             });
         }
     }
@@ -212,6 +217,7 @@ pub fn build_legacy(layout: &Layout) -> Vec<DisplayItem> {
             opacity: 1.0,
             clip: None,
             transform: None,
+            fixed: false,
         });
     }
     for p in &layout.paints {
@@ -260,6 +266,7 @@ fn shadow_item(s: &ShadowDraw, seq: u64) -> DisplayItem {
         opacity: 1.0,
         clip: None,
         transform: None,
+        fixed: false,
     }
 }
 
@@ -279,6 +286,7 @@ fn border_item(b: &BorderDraw, seq: u64) -> DisplayItem {
         opacity: 1.0,
         clip: None,
         transform: None,
+        fixed: false,
     }
 }
 
@@ -300,6 +308,7 @@ fn image_item(p: &PaintBox, seq: u64) -> DisplayItem {
         opacity: 1.0,
         clip: None,
         transform: None,
+        fixed: false,
     }
 }
 
@@ -321,5 +330,6 @@ fn text_item(l: &TextLine, seq: u64) -> DisplayItem {
         opacity: 1.0,
         clip: None,
         transform: None,
+        fixed: false,
     }
 }

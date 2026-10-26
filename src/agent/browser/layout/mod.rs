@@ -216,6 +216,8 @@ pub fn compute_full(
         images,
         base_url: doc.base_url.clone(),
         y: 8.0,
+        z_floor: 0,
+        fixed_depth: 0,
     };
     let body = doc
         .root()
@@ -416,6 +418,14 @@ pub(crate) struct LayoutCtx<'a> {
     /// 页面 URL(相对图片地址解析基准)。
     base_url: String,
     y: f64,
+    /// 祖先链 z-index 下限(层叠上下文近似):父级 z-index 创建层叠上下文后,
+    /// 整个子树都应在兄弟节点之上,故子项取 `max(自身 z, 本下限)`。
+    /// 不传播的话,父 z:9999 的整棵子树会被一个兄弟节点 z:1 压住(实测百度地图
+    /// 的 #platform/#mask/瓦片层/控件层层叠全乱)。
+    z_floor: i64,
+    /// `position: fixed` 子树深度:>0 时发射的项带 `fixed` 标记,
+    /// 光栅化侧据此跳过滚动偏移(固定控件不得随页面滚动平移)。
+    fixed_depth: usize,
 }
 
 impl<'a> LayoutCtx<'a> {
@@ -475,6 +485,10 @@ impl<'a> LayoutCtx<'a> {
             return;
         }
         let tf = self.own_transform(style, x, y, w, h);
+        // 层叠上下文近似:自身 z 不得低于祖先链下限(见 z_floor 注释)。
+        // 两者都先取到局部量:闭包会借用 self,而 push 需要 &mut self。
+        let z = style.pos.z_index.max(self.z_floor);
+        let is_fixed = self.fixed_depth > 0;
         let base = |kind| DisplayItem {
             kind,
             x,
@@ -482,11 +496,12 @@ impl<'a> LayoutCtx<'a> {
             w,
             h,
             radius: style.border_radius,
-            z: style.pos.z_index,
+            z,
             seq,
             opacity: style.opacity,
             clip: None,
             transform: tf,
+            fixed: is_fixed,
         };
         for layer in &style.box_shadow {
             self.display.push(base(DisplayKind::Shadow {
@@ -562,6 +577,7 @@ impl<'a> LayoutCtx<'a> {
             opacity,
             clip: None,
             transform,
+            fixed: self.fixed_depth > 0,
         });
     }
 
@@ -601,6 +617,7 @@ impl<'a> LayoutCtx<'a> {
                 opacity: ca as f64 / 255.0,
                 clip: None,
                 transform,
+                fixed: self.fixed_depth > 0,
             });
         }
         self.display.push(DisplayItem {
@@ -620,6 +637,7 @@ impl<'a> LayoutCtx<'a> {
             opacity: 1.0,
             clip: None,
             transform,
+            fixed: self.fixed_depth > 0,
         });
     }
 
@@ -657,6 +675,14 @@ impl<'a> LayoutCtx<'a> {
             );
             for it in &mut self.display[mark..] {
                 it.intersect_clip(rect);
+            }
+        }
+        // z-index 下传(层叠上下文近似):父级 z 高于子级时,整个子树都要抬到父级之上,
+        // 否则子项会按自身 z 排到无关兄弟之下(地图的层叠面板即如此)。
+        let zf = style.pos.z_index.max(self.z_floor);
+        for it in &mut self.display[mark..] {
+            if it.z < zf {
+                it.z = zf;
             }
         }
     }

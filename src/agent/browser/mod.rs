@@ -1479,9 +1479,14 @@ impl LsmBrowserManager {
     pub(crate) fn screenshot_locked(&self, tab: &TabState, params: &Value) -> EngineResult<Value> {
         let full_page = params.get("full_page").and_then(Value::as_bool).unwrap_or(false);
         let ocr = params.get("ocr").and_then(Value::as_bool).unwrap_or(false);
-        if ocr {
-            // OCR 语义 = "截图里能看到的文字":优先取布局产出的文本行;
-            // 布局无文本(内容被 display:none 剪枝或由 JS 生成)时回退到 DOM 文本。
+        // OCR 语义 = "截图里能看到的文字":优先取布局产出的文本行;
+        // 布局无文本(内容被 display:none 剪枝或由 JS 生成)时回退到 DOM 文本。
+        //
+        // ★ 这里**只算不算返回**:`ocr=true` 是「顺带给我文字」,不是「只给我文字」。
+        // 旧实现在此处直接 return,PNG 分支被整段跳过 —— 调用方拿到 code:0 却
+        // 找不到文件(实测:Agent 落盘全景截图后靠 `ls` 复核才发现文件不存在,
+        // 直接判死 wf-2)。渲染与落盘必须照走,OCR 结果事后并入返回。
+        let ocr_block = if ocr {
             let layout_text = tab
                 .layout
                 .lines
@@ -1498,14 +1503,16 @@ impl LsmBrowserManager {
                 (layout_text, "lsm_layout_text")
             };
             let blocks: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-            return Ok(json!({
+            Some(json!({
                 "ocr_text": text,
                 "ocr_block_count": blocks.len(),
                 "ocr_source": source,
                 "note": "阶段一 OCR 返回内核可见文本;真实像素 OCR 在阶段五接入。\
                          ocr_source=dom_text 表示布局层没有可见文本(内容被 display:none 剪枝或由页面脚本生成)",
-            }));
-        }
+            }))
+        } else {
+            None
+        };
         // 阶段四第二步：clip 区域截图（文档坐标；full_page=false 时 y 相对视口）。
         let clip = params.get("clip").and_then(Value::as_object).map(|c| {
             (
@@ -1515,13 +1522,16 @@ impl LsmBrowserManager {
                 c.get("height").and_then(Value::as_f64).unwrap_or(0.0),
             )
         });
+        // 整页截图的画布高 = page_height(整篇文档),此时若仍减 tab.scroll_y,
+        // 文档内容会整体上移、顶部被切、底部留白(视口截图才需要减)。
+        let scroll_y = if full_page { 0.0 } else { tab.scroll_y };
         let pixmap = self
             .font
             .render_pixmap(
                 &tab.layout,
                 tab.viewport.width,
                 tab.viewport.height,
-                tab.scroll_y,
+                scroll_y,
                 full_page,
                 &tab.images,
             )
@@ -1589,6 +1599,14 @@ impl LsmBrowserManager {
         if params.get("return_base64").and_then(Value::as_bool).unwrap_or(false) {
             use base64::Engine as _;
             data["image_base64"] = json!(base64::engine::general_purpose::STANDARD.encode(&png));
+        }
+        // OCR 与落盘并存:调用方一次调用既拿到文件也拿到文字。
+        if let Some(extra) = ocr_block {
+            if let (Some(dst), Some(src)) = (data.as_object_mut(), extra.as_object()) {
+                for (k, v) in src {
+                    dst.insert(k.clone(), v.clone());
+                }
+            }
         }
         Ok(data)
     }

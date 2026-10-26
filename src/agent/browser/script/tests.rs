@@ -1040,3 +1040,129 @@ fn document_nodeType_为9_使Sizzle类选择器引擎可用() {
     );
     assert_eq!(guard.outcome.value, "ok", "Sizzle 守卫必须放行 document");
 }
+
+// ===================== 动态节点几何回填 / 事件绑定(第 N 轮) =====================
+// 站点地图与路线面板的容器由 JS 建出(document.createElement + 设尺寸 + appendChild)。
+// 旧实现把 clientWidth/offsetWidth 写死 0、getBoundingClientRect 恒零、
+// addEventListener 空实现 —— 地图读到 0×0 不装载、面板按钮点了没反应。
+// 宿主其实已把这些节点重新解析进 DOM 并参与布局,几何就在快照 rect 里。
+
+const DYN_STAGE_PAGE: &str = "<html><body><p>stage</p></body></html>";
+
+#[test]
+fn 动态元素几何由宿主快照回填() {
+    let handle = JsHandle::spawn();
+    // 第一轮:建出动态节点并挂载。当轮宿主还没布局,几何按 display:none 语义取 0。
+    let r1 = eval_on(
+        &handle,
+        r#"(function(){
+          var d = document.createElement('div');
+          d.id = 'dyn';
+          d.style.cssText = 'width:300px;height:200px';
+          document.body.appendChild(d);
+          window.__dyn = d;
+          return JSON.stringify({cw: d.clientWidth, ow: d.offsetWidth,
+                                 rect: d.getBoundingClientRect()});
+        })()"#,
+        DYN_STAGE_PAGE,
+        "https://a.test/",
+    );
+    assert!(r1.outcome.ok, "{r1:?}");
+    let v1: serde_json::Value = serde_json::from_str(&r1.outcome.value).unwrap();
+    assert_eq!(v1["cw"], 0, "未挂载/未布局应为 0:{v1}");
+    assert_eq!(v1["rect"]["width"], 0, "未布局时 rect 应为 0:{v1}");
+
+    // 第二轮:宿主把带 data-lsm-id 的子树解析并布局后,同一批动态对象应读到真实几何。
+    let hosted = "<html><body><p>stage</p><div id=\"dyn\" data-lsm-id=\"d1\" \
+                  style=\"width:300px;height:200px\"></div></body></html>";
+    let r2 = eval_on_with_rects(
+        &handle,
+        r#"JSON.stringify((function(){
+          var d = window.__dyn;
+          return {cw: d.clientWidth, ch: d.clientHeight, ow: d.offsetWidth, oh: d.offsetHeight,
+                  left: d.offsetLeft, top: d.offsetTop, rect: d.getBoundingClientRect()};
+        })())"#,
+        hosted,
+        "https://a.test/",
+    );
+    assert!(r2.outcome.ok, "{r2:?}");
+    let v2: serde_json::Value = serde_json::from_str(&r2.outcome.value).unwrap();
+    assert_eq!(v2["cw"], 300, "clientWidth 应回填:{v2}");
+    assert_eq!(v2["ch"], 200, "clientHeight 应回填:{v2}");
+    assert_eq!(v2["ow"], 300, "offsetWidth 应回填:{v2}");
+    assert_eq!(v2["oh"], 200, "offsetHeight 应回填:{v2}");
+    assert_eq!(v2["rect"]["width"], 300, "getBoundingClientRect 应回填:{v2}");
+    assert_eq!(v2["rect"]["height"], 200, "getBoundingClientRect 应回填:{v2}");
+}
+
+#[test]
+fn 动态元素事件监听可触发() {
+    let handle = JsHandle::spawn();
+    let setup = eval_on(
+        &handle,
+        r#"(function(){
+          window.__hits = [];
+          var d = document.createElement('div');
+          d.id = 'dynbtn';
+          d.addEventListener('click', function () { window.__hits.push('hit'); });
+          document.body.appendChild(d);
+          window.__dyn = d;
+          return 'ok';
+        })()"#,
+        DYN_STAGE_PAGE,
+        "https://a.test/",
+    );
+    assert_eq!(setup.outcome.value, "ok", "{setup:?}");
+
+    // 宿主点击落在该子树(快照节点带 data-lsm-id)→ 注册在动态对象上的监听必须跑到。
+    let hosted = "<html><body><p>stage</p><div id=\"dynbtn\" data-lsm-id=\"d1\"></div></body></html>";
+    let doc = Document::parse(hosted, "https://a.test/");
+    let nodes = doc.snapshot_nodes();
+    let e = env("https://a.test/");
+    let reply = handle
+        .request(|tx| JsRequest::Dispatch {
+            selector: "#dynbtn".to_string(),
+            event: "click".to_string(),
+            env: e,
+            nodes,
+            reply: tx,
+        })
+        .expect("JS 线程请求失败");
+    assert!(reply.outcome.ok, "dispatch 应成功:{reply:?}");
+
+    // Dispatch 走 eval_quiet,返回值不落 outcome.value —— 断言真实副作用。
+    let hits = eval_on(
+        &handle,
+        "JSON.stringify(window.__hits)",
+        DYN_STAGE_PAGE,
+        "https://a.test/",
+    );
+    assert_eq!(hits.outcome.value, "[\"hit\"]", "监听回调应已执行:{hits:?}");
+}
+
+#[test]
+fn 动态元素序列化携带节点键() {
+    // `data-lsm-id` 是动态节点回认宿主布局几何的钥匙,缺它宿主对不回。
+    let handle = JsHandle::spawn();
+    let r = eval_on(
+        &handle,
+        r#"(function(){
+          var d = document.createElement('div');
+          d.id = 'k';
+          d.className = 'box';
+          document.body.appendChild(d);
+          var s = '';
+          try { s = __serEl(d); } catch (e) { s = 'ERR:' + e; }
+          return s;
+        })()"#,
+        DYN_STAGE_PAGE,
+        "https://a.test/",
+    );
+    assert!(
+        r.outcome.value.contains("data-lsm-id=\"d"),
+        "序列化必须带 data-lsm-id: {}",
+        r.outcome.value
+    );
+    assert!(r.outcome.value.contains("id=\"k\""), "原有属性不得丢失:{}", r.outcome.value);
+    assert!(r.outcome.value.contains("class=\"box\""), "原有属性不得丢失:{}", r.outcome.value);
+}

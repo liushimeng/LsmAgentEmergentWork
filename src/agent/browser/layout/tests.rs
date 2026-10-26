@@ -1219,3 +1219,59 @@ fn 表单_密码值按圆点掩码() {
     assert!(!layout.lines.iter().any(|l| l.text.contains("abc")));
 }
 
+
+// ===================== z-index 下传 / position:fixed 标记(第 N 轮) =====================
+// 层叠上下文近似:父级 z-index 创建层叠上下文后,整个子树都应在兄弟节点之上。
+// 旧实现只把自身 z 写进显示项 → 父 z:50 的整棵子树会被兄弟 z:1 压住
+// (实测百度地图 #platform/#mask/瓦片层/控件层层叠全乱)。
+
+#[test]
+fn z_index_沿祖先链下传给子树() {
+    let doc = Document::parse(
+        "<body style='margin:0'>\
+           <div id='parent' style='position:relative;z-index:50;background:#eee'>\
+             <div id='child' style='position:relative'><p>inner</p></div>\
+           </div>\
+           <div id='sibling' style='position:relative;z-index:1;background:#ddd'><p>sib</p></div>\
+         </body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let zs = layout.display.iter().map(|i| (i.x, i.y, i.z, i.w)).collect::<Vec<_>>();
+    // parent 区(首行):背景盒 + 文本项的 z 都必须 ≥ 50(祖先下限)。
+    let parent_items: Vec<_> = layout.display.iter().filter(|it| it.y < 40.0).collect();
+    assert!(!parent_items.is_empty(), "父区应有绘制项:{zs:?}");
+    assert!(
+        parent_items.iter().all(|it| it.z >= 50),
+        "父级 z-index:50 应下传到子树全部项:{zs:?}"
+    );
+    // 兄弟区(次行):自身 z=1 生效。
+    let sib_items: Vec<_> = layout.display.iter().filter(|it| it.y >= 40.0).collect();
+    assert!(!sib_items.is_empty(), "兄弟区应有绘制项:{zs:?}");
+    assert!(
+        sib_items.iter().all(|it| it.z == 1),
+        "兄弟 z-index:1 应保持:{zs:?}"
+    );
+}
+
+#[test]
+fn position_fixed_子树带标记() {
+    // fixed 盒坐标以视口为原点,光栅化必须跳过滚动偏移,否则固定控件随页面滚动平移。
+    let doc = Document::parse(
+        "<body style='margin:0'>\
+           <div id='norm'><p>normal</p></div>\
+           <div id='fx' style='position:fixed;top:10px;left:10px;width:100px;height:50px;background:#f00'></div>\
+         </body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let fx = layout.display.iter().map(|i| (i.x, i.y, i.w, i.h, i.fixed)).collect::<Vec<_>>();
+    assert!(
+        layout.display.iter().any(|it| it.fixed && it.w >= 100.0 && it.h >= 50.0),
+        "fixed 盒应带 fixed 标记:{fx:?}"
+    );
+    assert!(
+        layout.display.iter().any(|it| !it.fixed),
+        "普通流元素不应带 fixed 标记:{fx:?}"
+    );
+}

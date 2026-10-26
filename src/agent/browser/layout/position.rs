@@ -95,6 +95,11 @@ fn layout_abs(
     // 内容片段按最终宽度重排并平移注入。
     let mut frag = ctx.measure_content(node, content_w, style, depth);
     translate(&mut frag, bx + pad_l, by + pad_t);
+    // fixed 子树整体标记:其盒坐标以视口为原点(上方包含块取 (0,0,vw,vh)),
+    // 与普通项的页面原点不同系,光栅化侧据此跳过滚动偏移。
+    if fixed {
+        ctx.fixed_depth += 1;
+    }
     // 阶段六:定位元素视觉发射(修复 absolute/fixed 边框/阴影/渐变缺口);
     // 自身视觉先于子树标记,子树组效果回补。
     let seq = ctx.next_seq();
@@ -114,4 +119,7 @@ fn layout_abs(
     let mark = ctx.display_len();
     super::append(ctx, frag);
     ctx.apply_group(mark, style, bx, by, bw, bh);
+    if fixed {
+        ctx.fixed_depth -= 1;
+    }
 }

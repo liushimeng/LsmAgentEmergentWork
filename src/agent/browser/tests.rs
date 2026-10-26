@@ -505,3 +505,41 @@ fn page_not_found_对_chrome_page_id_给出跨工具诊断() {
     let e2 = EngineError::page_not_found("p_deadbeef");
     assert_eq!(e2.message, "page_id 无效或页面已关闭");
 }
+
+#[tokio::test]
+async fn 截图ocr参数不吞掉落盘() {
+    // `ocr:true` 是「顺带给我文字」,不是「只给文字」。旧实现在此分支提前 return,
+    // PNG 永不写盘却返回 code:0 —— Agent 以为落盘成功,靠 Bash ls 才发现文件不存在
+    // (实测百度地图任务 wf-2 即被此坑判死)。必须既落盘又回 OCR 文本。
+    let mgr = LsmBrowserManager::new();
+    let html = "<html><head><title>O</title></head><body style='margin:0'>\
+               <p style='font-size:20px'>hello ocr</p></body></html>";
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(html.as_bytes());
+    let url = format!("data:text/html;base64,{b64}");
+    let out = mgr
+        .new_page(&url, BrowserMode::Hidden, None, Some(800), Some(500), false, true, 10_000)
+        .await
+        .unwrap();
+    let path = std::env::temp_dir().join(format!("laew_ocr_test_{}.png", std::process::id()));
+    let shot = mgr
+        .screenshot(
+            &out.page_id,
+            &serde_json::json!({"save_path": path.to_string_lossy(), "ocr": true}),
+        )
+        .await
+        .unwrap();
+    // 1) 文件必须真的存在且非空
+    let bytes = std::fs::read(&path).unwrap_or_else(|_| panic!("ocr=true 时截图文件必须落盘:{path:?}"));
+    assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "应为 PNG:{path:?}");
+    assert!(bytes.len() > 500, "PNG 不应为空壳:{}B", bytes.len());
+    let _ = std::fs::remove_file(&path);
+    // 2) 返回里落盘信息与 OCR 文本并存
+    assert!(shot["save_path"].as_str().is_some(), "应回 save_path:{shot}");
+    assert!(shot["byte_size"].as_u64().unwrap_or(0) > 0, "应回 byte_size:{shot}");
+    assert!(
+        shot["ocr_text"].as_str().is_some(),
+        "应回 ocr_text(两件事都做):{shot}"
+    );
+    mgr.shutdown().await;
+}
