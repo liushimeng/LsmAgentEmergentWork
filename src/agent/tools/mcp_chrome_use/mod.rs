@@ -11,10 +11,22 @@
 //! `4030` 工具被 `LAEW_CHROME_USE=off` 关闭 / `6001` 任务锚点越界。
 //!
 //! 基础框架 action 集:`open` / `list` / `close` / `control`(navigate/click/click_text/
-//! type|input_text/key_press/eval_js/screenshot/scroll/wait/back/forward/reload) /
+//! type|input_text/key_press/eval_js/screenshot/scroll/wait/back/forward/reload/
+//! click_real/hover/double_click/right_click) /
 //! `inspect`(url/title/text/html/elements/screenshot)。`inspect(elements)` 是元素
 //! 发现原语(可见可交互元素 + 稳定 selector),`type` 未命中回输入框候选,避免
 //! 模型盲猜 CSS 选择器。高级动作(HITL/sequence/explore 等)按设计文档分阶段补齐。
+//!
+//! 2026-10-26 实测补齐(百度地图公共交通路线任务,见 `docs/MCP_Web_Chrome_Use/45-…`):
+//! - **真实鼠标通道** `click_real`/`hover`/`double_click`/`right_click`
+//!   与 `click`/`click_text` 的 `params.mode="real"`(CDP `Input.dispatchMouseEvent`,
+//!   isTrusted=true)。此前点击一律 JS `el.click()` 合成事件,与已根治的 G1
+//!   (键盘只认可信事件流)同类 —— 重 JS 站点可能「点了但没反应」。
+//! - **整页截图** `params.full_page=true`(captureBeyondViewport + cssContentSize 裁剪),
+//!   对齐 Lsm 版同名参数;此前只有视口截图,「全景截图」诉求无法满足。
+//! - **就绪判定原语对齐** `wait` 支持 `state`(visible|hidden|attached|detached)/
+//!   `text`/`js`,多条件取「与」,替代固定 sleep 盲等。
+//! - **page_id 健壮化** 顶层/`params` 双位置取值;缺失且唯一存活页时自动选中。
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -264,6 +276,39 @@ async fn resolve_page(page_id: &str) -> Result<std::sync::Arc<chromiumoxide::Pag
     }
 }
 
+/// 页面句柄解析(**不**做存活校验):顶层 / `params` 双位置取值,
+/// 缺失时按「唯一存活页」自动选中。
+///
+/// 2026-10-26 实测:第二执行单元漏传 page_id,工具直接 1001,白费一整轮
+/// LLM 往返(本轮单次往返均 ~12s)。单页任务里 page_id 是**纯冗余参数**,
+/// 强制必填只制造失败面。
+/// 返回 `(page_id, 是否自动选中)`;无存活页或多页歧义时返回错误(多页附存活页清单)。
+async fn resolve_page_id(args: &Value) -> std::result::Result<(String, bool), String> {
+    let p = params_of(args);
+    if let Some(id) = str_arg(args, "page_id").or_else(|| str_arg(p, "page_id")) {
+        return Ok((id.to_string(), false));
+    }
+    let live = McpChromeUseTool::mgr().list_pages().await;
+    match live.len() {
+        1 => Ok((live[0].0.clone(), true)),
+        0 => Err("缺少 page_id,且当前没有存活页面;请先 action=open 打开页面".to_string()),
+        _ => {
+            let desc: Vec<serde_json::Value> = live
+                .iter()
+                .take(8)
+                .map(|(id, url)| {
+                    serde_json::json!({"page_id": id, "url": crate::agent::web_activity::clip_chars(url, 80)})
+                })
+                .collect();
+            Err(format!(
+                "缺少 page_id(当前有 {} 个存活页面,请指定其一);存活页:{}",
+                live.len(),
+                serde_json::to_string(&desc).unwrap_or_default()
+            ))
+        }
+    }
+}
+
 /// 2004 诊断文案:跨工具 page_id 误用给出可操作指引(实测 QC 曾建议把 Chrome
 /// 的 c_ page_id 传给 Lsm 工具 explore,确定性陷阱,工具层直接点破)。
 fn page_missing_message(page_id: &str) -> String {
@@ -321,13 +366,19 @@ close 释放页面(page_id=all 全关并回收 Chrome 进程)。\
 (每项含可直接回传的 selector/tag/id/class/placeholder/text),再 click/type;不要盲猜 CSS。\
 ★ 纯文字按钮(「选为终点」「查询」「公交」等)优先 click_text(params.text=可见文字,可加 params.selector 限定作用域);\
 只命中 tooltip 时会自动点相邻图标按钮。\
-★ type/input_text 选择器未命中会回 candidates(可见输入框 selector/placeholder),按候选改选。\
-★ 联想/快捷键/回车提交用 key_press(params.key=Enter|Tab|ArrowDown|Escape...;可带 params.selector 先聚焦),\
-它发送真实 CDP 键盘事件;type 只做赋值+input/change。\
+★ **点击默认走 JS 合成事件;若点了页面没反应,改用真实鼠标通道**:control_action=click_real\
+(或 click/click_text 加 params.mode=\"real\")——真实 CDP 鼠标事件(isTrusted=true),\
+重 JS 站点只认可信事件流;另有 hover / double_click / right_click。\
+★ type/input_text 走**真实输入通道**(CDP insertText + 逐字符 keyDown,站点输入模型可感知);\
+联想/快捷键/回车提交用 key_press(params.key=Enter|Tab|ArrowDown|Escape...;可带 params.selector 先聚焦)。\
+★ 选择器未命中会回 candidates(可见输入框 selector/placeholder),按候选改选。\
 ★ screenshot 务必给 params.save_path 落盘(只回路径+尺寸);不传才会回 base64。\
+★ **要「全景/整页」截图就加 params.full_page=true**(按整页高度裁剪,视口截图看不到视口外内容)。\
 ★ inspect(html|text) 可用 params.selector 只取目标子树,默认 20000 字符截断(params.max_chars 可调),\
 避免整页 HTML 撑爆上下文。\
-★ wait 支持 selector 就绪判定(params.selector+timeout_ms)。\
+★ wait 是就绪判定原语:params.selector + params.state(visible|hidden|attached|detached)/\
+params.text(元素文本包含)/params.js(页面表达式为真),多条件取「与」;可与 params.ms 同给(先 settle 再等就绪)。\
+★ page_id 可省略:当前只有一个存活页时自动选中(信封回 page_id_auto=true);多页时须指定。\
 page_id 仅本工具内有效,不跨工具复用。\
 当目标站点对 Chrome 风控(反复验证码/页面抹除/访问被拒)时,改用 MCP_Web_LsmAgentBrowser_Use。\
 返回统一信封 {code,message,data};6001=任务锚点越界,3001=未检测到浏览器。"
@@ -346,13 +397,14 @@ page_id 仅本工具内有效,不跨工具复用。\
                     "enum": ["open", "list", "close", "control", "inspect"]
                 },
                 "url": { "type": "string", "description": "open 的目标网址;control(navigate) 亦可顶层直传" },
-                "page_id": { "type": "string", "description": "close/control/inspect 必填;close 可为 all" },
+                "page_id": { "type": "string", "description": "close/control/inspect 的页面句柄(close 可为 all);control/inspect 可省略——只有一个存活页时自动选中;也接受写在 params.page_id" },
                 "control_action": {
                     "type": "string",
                     "enum": [
                         "navigate", "click", "click_text", "type", "input_text",
                         "key_press", "eval_js", "screenshot", "scroll", "wait",
-                        "back", "forward", "reload", "request_human"
+                        "back", "forward", "reload", "request_human",
+                        "click_real", "hover", "double_click", "right_click"
                     ]
                 },
                 "info": {
@@ -363,17 +415,22 @@ page_id 仅本工具内有效,不跨工具复用。\
                     "type": "object",
                     "description": "control/inspect 动作参数",
                     "properties": {
+                        "page_id": { "type": "string", "description": "页面句柄(等价于顶层 page_id)" },
                         "url": { "type": "string" },
-                        "selector": { "type": "string", "description": "click/click_text/type/input_text/key_press/scroll/wait(CSS);wait 时为就绪判定目标;inspect 时限定取哪个子树" },
-                        "text": { "type": "string", "description": "type/input_text 的输入文本;click_text 时为要点击的可见文字" },
+                        "selector": { "type": "string", "description": "click/click_text/click_real/hover/double_click/right_click/type/input_text/key_press/scroll/wait(CSS);wait 时为就绪判定目标;inspect 时限定取哪个子树" },
+                        "text": { "type": "string", "description": "type/input_text 的输入文本;click_text 时为要点击的可见文字;wait 时为「等元素文本包含该串」" },
                         "exact": { "type": "boolean", "description": "click_text 是否要求文本完全相等(默认 false=包含匹配)" },
+                        "mode": { "type": "string", "enum": ["js", "real"], "description": "click/click_text 的点击通道:js=JS 合成 el.click()(默认);real=CDP 真实鼠标事件(isTrusted=true,重 JS 站点更可靠)" },
                         "key": { "type": "string", "description": "key_press 的键名:Enter/Tab/Escape/ArrowDown/ArrowUp/ArrowLeft/ArrowRight/Backspace/Delete/Space 或单字符" },
                         "max_chars": { "type": "integer", "description": "inspect(text|html) 输出上限(默认 20000,范围 1000-200000)" },
                         "max": { "type": "integer", "description": "inspect(elements) 最多返回多少个元素(默认 80,范围 1-200)" },
                         "script": { "type": "string", "description": "eval_js 的 JS 表达式/语句;别名 expression/function/js/code 等效" },
+                        "js": { "type": "string", "description": "wait 的就绪判定条件:页面上下文表达式求值为真(如 window.__ready===1)" },
+                        "state": { "type": "string", "enum": ["visible", "hidden", "attached", "detached"], "description": "wait 的元素状态判定(默认 visible);与 selector 同用" },
                         "y": { "type": "integer", "description": "scroll 像素(正向下)" },
-                        "ms": { "type": "integer", "description": "wait 固定等待毫秒(上限 30000)" },
-                        "timeout_ms": { "type": "integer", "description": "wait(selector=...) 就绪判定超时,默认 10000,上限 30000" },
+                        "ms": { "type": "integer", "description": "wait 固定等待毫秒(上限 30000);与就绪判定条件同给时先 settle 再等就绪" },
+                        "timeout_ms": { "type": "integer", "description": "wait 就绪判定超时,默认 10000,上限 120000" },
+                        "full_page": { "type": "boolean", "description": "screenshot 是否取整页(按整页高度裁剪,视口外内容也进图);对齐 Lsm 版同名参数" },
                         "save_path": { "type": "string", "description": "screenshot 落盘路径(.png);给了就只回路径+尺寸,绝不回 base64(防上下文爆炸)" }
                     }
                 }
@@ -529,7 +586,10 @@ async fn run_control(args: Value) -> Result<String> {
             .or_else(|| i64_arg(&args, "timeout_ms"))
             .unwrap_or(0)
             .max(0) as u64;
-        let page_id = str_arg(&args, "page_id").unwrap_or("").to_string();
+        let page_id = str_arg(&args, "page_id")
+            .or_else(|| str_arg(p, "page_id"))
+            .unwrap_or("")
+            .to_string();
         // 有页时带上当前 URL 作为上下文(便于人工判断现场),无页走任务级。
         let url = if page_id.is_empty() {
             String::new()
@@ -553,8 +613,17 @@ async fn run_control(args: Value) -> Result<String> {
         .await;
         return envelope(code, &message, data);
     }
-    let Some(page_id) = str_arg(&args, "page_id").map(str::to_string) else {
-        return envelope(CODE_PARAM_ERROR, "control 缺少 page_id", json!({}));
+    // 页面句柄:顶层 / params 双位置取值;缺失时唯一存活页自动选中(2026-10-26 实测
+    // 漏传 page_id 曾白费一整轮 LLM 往返)。
+    let (page_id, page_auto) = match resolve_page_id(&args).await {
+        Ok(v) => v,
+        Err(msg) => {
+            return envelope(
+                CODE_PARAM_ERROR,
+                &msg,
+                json!({"control_action": control_action}),
+            )
+        }
     };
     let page = match resolve_page(&page_id).await {
         Ok(p) => p,
@@ -584,20 +653,84 @@ async fn run_control(args: Value) -> Result<String> {
             let Some(sel) = str_arg(p, "selector") else {
                 return envelope(CODE_PARAM_ERROR, "click 缺少 params.selector", json!({}));
             };
-            chrome_browser::click(&page, sel)
+            let mode = str_arg(p, "mode").unwrap_or("js");
+            if mode.eq_ignore_ascii_case("real") {
+                chrome_browser::click_real(&page, sel)
+                    .await
+                    .map_err(|e| (CODE_EXEC_FAILED, e.to_string()))
+            } else {
+                chrome_browser::click(&page, sel)
+                    .await
+                    .map(|hit| json!({"selector": sel, "hit": hit, "mode": "js_click"}))
+                    .map_err(|e| (CODE_EXEC_FAILED, e.to_string()))
+            }
+        }
+        // 真实鼠标左键单击(CDP Input.dispatchMouseEvent,isTrusted=true)。
+        // 与真实键盘通道(type_text_real)配套:重 JS 站点只认可信事件流,
+        // JS el.click() 可能「点了但没反应」(2026-10-26 实测归纳)。
+        "click_real" => {
+            let Some(sel) = str_arg(p, "selector") else {
+                return envelope(CODE_PARAM_ERROR, "click_real 缺少 params.selector", json!({}));
+            };
+            chrome_browser::click_real(&page, sel)
                 .await
-                .map(|hit| json!({"selector": sel, "hit": hit}))
+                .map_err(|e| (CODE_EXEC_FAILED, e.to_string()))
+        }
+        // 真实鼠标悬停(触发 tooltip / 懒加载菜单),对齐 Lsm 版 control(hover)。
+        "hover" => {
+            let Some(sel) = str_arg(p, "selector") else {
+                return envelope(CODE_PARAM_ERROR, "hover 缺少 params.selector", json!({}));
+            };
+            chrome_browser::hover_real(&page, sel)
+                .await
+                .map_err(|e| (CODE_EXEC_FAILED, e.to_string()))
+        }
+        // 真实鼠标双击 / 右键,对齐 Lsm 版 control(double_click|right_click)。
+        "double_click" | "right_click" => {
+            let Some(sel) = str_arg(p, "selector") else {
+                return envelope(
+                    CODE_PARAM_ERROR,
+                    &format!("{control_action} 缺少 params.selector"),
+                    json!({}),
+                );
+            };
+            let kind = if control_action == "right_click" { "right" } else { "double" };
+            chrome_browser::click_kind_real(&page, sel, kind)
+                .await
                 .map_err(|e| (CODE_EXEC_FAILED, e.to_string()))
         }
         // 按可见文字点击:现代站点纯文本按钮无稳定选择器(「选为终点」)。
+        // `params.mode="real"` 时 JS 只定位元素(回传视口中心坐标),
+        // 由 Rust 派发 CDP 真实鼠标事件。
         "click_text" => {
             let Some(text) = str_arg(p, "text") else {
                 return envelope(CODE_PARAM_ERROR, "click_text 缺少 params.text", json!({}));
             };
             let exact = p.get("exact").and_then(Value::as_bool).unwrap_or(false);
-            chrome_browser::click_text(&page, text, str_arg(p, "selector"), exact)
+            let mode = str_arg(p, "mode").unwrap_or("js");
+            let located = match chrome_browser::click_text(&page, text, str_arg(p, "selector"), exact, mode)
                 .await
-                .map_err(|e| (CODE_EXEC_FAILED, e.to_string()))
+            {
+                Ok(v) => v,
+                Err(e) => return envelope(CODE_EXEC_FAILED, &e.to_string(), json!({})),
+            };
+            // real 模式:JS 只定位元素(回传视口中心坐标),点击交由 CDP 真实鼠标事件。
+            let hit = located.get("hit").and_then(Value::as_bool).unwrap_or(false);
+            let x = located.get("x").and_then(Value::as_f64);
+            let y = located.get("y").and_then(Value::as_f64);
+            match (hit, x, y) {
+                (true, Some(x), Some(y)) if mode.eq_ignore_ascii_case("real") => {
+                    if let Err(e) = chrome_browser::click_at(&page, x, y).await {
+                        return envelope(CODE_EXEC_FAILED, &e.to_string(), json!({}));
+                    }
+                    let mut out = located;
+                    if let Some(o) = out.as_object_mut() {
+                        o.insert("mode".into(), json!("cdp_mouse"));
+                    }
+                    Ok(out)
+                }
+                _ => Ok(located),
+            }
         }
         // 真实键盘事件:联想/快捷键/Enter 提交走 CDP Input.dispatchKeyEvent。
         "key_press" => {
@@ -636,16 +769,32 @@ async fn run_control(args: Value) -> Result<String> {
         }
         // screenshot:优先 save_path 落盘(信封只回元数据,防 base64 爆上下文);
         // 不传 save_path 时保持 base64 内联(兼容旧行为)。两条告知栏拍前避让。
+        // `params.full_page=true` 取**整页**(captureBeyondViewport + cssContentSize 裁剪),
+        // 对齐 Lsm 版同名参数(2026-10-26 实测:用户要「全景截图」,此前只能拍视口)。
         "screenshot" => with_bars_suspended(&page, async {
+            let full_page = p.get("full_page").and_then(Value::as_bool).unwrap_or(false);
             match str_arg(p, "save_path") {
-                Some(path) => chrome_browser::screenshot_to_file(&page, path)
-                    .await
-                    .map(|(path, bytes, w, h)| json!({"format": "png", "path": path, "bytes": bytes, "width": w, "height": h}))
-                    .map_err(|e| (CODE_EXEC_FAILED, e.to_string())),
-                None => chrome_browser::screenshot_base64(&page)
-                    .await
-                    .map(|b64| json!({"format": "png", "image_base64": b64}))
-                    .map_err(|e| (CODE_EXEC_FAILED, e.to_string())),
+                Some(path) => {
+                    let shot = if full_page {
+                        chrome_browser::screenshot_full_page_to_file(&page, path).await
+                    } else {
+                        chrome_browser::screenshot_to_file(&page, path).await
+                    };
+                    shot.map(|(path, bytes, w, h)| {
+                        json!({"format": "png", "path": path, "bytes": bytes, "width": w, "height": h,
+                               "full_page": full_page})
+                    })
+                    .map_err(|e| (CODE_EXEC_FAILED, e.to_string()))
+                }
+                None => {
+                    let shot = if full_page {
+                        chrome_browser::screenshot_full_page_base64(&page).await
+                    } else {
+                        chrome_browser::screenshot_base64(&page).await
+                    };
+                    shot.map(|b64| json!({"format": "png", "image_base64": b64, "full_page": full_page}))
+                        .map_err(|e| (CODE_EXEC_FAILED, e.to_string()))
+                }
             }
         })
         .await,
@@ -656,30 +805,42 @@ async fn run_control(args: Value) -> Result<String> {
                 .map(|_| json!({"scrolled": true}))
                 .map_err(|e| (CODE_EXEC_FAILED, e.to_string()))
         }
-        // wait:固定毫秒,或 selector 就绪判定(params.selector + timeout_ms,上限 30s)。
-        // 复合语义(2026-10-24 实测定稿):两者同给时**先 wait(ms) 再 wait_for_selector**
-        // ——模型常写 `{ms:3000, selector:..., timeout_ms:15000}` 表达「先 settle 再等就绪」,
-        // 旧实现 selector 分支静默吞掉 ms,语义不符。信封回显实际采用的模式。
+        // wait:固定毫秒,或**就绪判定原语**(对齐 Lsm 版 control(wait)):
+        //   selector + state(visible|hidden|attached|detached)
+        //   selector + text(元素文本包含目标串)
+        //   js(页面上下文表达式为真)
+        // 多条件取「与」;两者同给 ms 与判定条件时**先 wait(ms) 再等就绪**
+        // (2026-10-24 实测定稿:模型常写 `{ms:3000, selector:..., timeout_ms:15000}`
+        //  表达「先 settle 再等就绪」,旧实现 selector 分支静默吞掉 ms)。
         "wait" => {
             let ms = i64_arg(p, "ms").unwrap_or(0).max(0) as u64;
-            match str_arg(p, "selector") {
-                Some(sel) => {
-                    if ms > 0 {
-                        chrome_browser::wait(ms).await;
-                    }
-                    let timeout_ms = i64_arg(p, "timeout_ms").unwrap_or(10_000).max(0) as u64;
-                    chrome_browser::wait_for_selector(&page, sel, timeout_ms)
-                        .await
-                        .map(|hit| {
-                            json!({"selector": sel, "visible": hit, "timeout_ms": timeout_ms.min(30_000),
-                                   "settled_ms": ms, "mode": if ms > 0 { "settle_then_selector" } else { "selector" }})
-                        })
-                        .map_err(|e| (CODE_EXEC_FAILED, e.to_string()))
-                }
-                None => {
-                    let ms = if ms > 0 { ms } else { 500 };
+            let selector = str_arg(p, "selector");
+            let state = str_arg(p, "state").unwrap_or("visible");
+            let text_cond = str_arg(p, "text");
+            let js_cond = str_arg(p, "js");
+            if selector.is_none() && js_cond.is_none() {
+                let ms = if ms > 0 { ms } else { 500 };
+                chrome_browser::wait(ms).await;
+                Ok(json!({"waited_ms": ms, "mode": "fixed"}))
+            } else {
+                if ms > 0 {
                     chrome_browser::wait(ms).await;
-                    Ok(json!({"waited_ms": ms, "mode": "fixed"}))
+                }
+                let timeout_ms = i64_arg(p, "timeout_ms").unwrap_or(10_000).max(0) as u64;
+                let base_mode = if selector.is_none() {
+                    "js"
+                } else if text_cond.is_some() {
+                    "text"
+                } else {
+                    "selector"
+                };
+                match chrome_browser::wait_until(&page, selector, state, text_cond, js_cond, timeout_ms)
+                    .await
+                {
+                    Ok(hit) => Ok(json!({"selector": selector, "state": state, "text": text_cond, "js": js_cond,
+                                         "visible": hit, "timeout_ms": timeout_ms.min(120_000), "settled_ms": ms,
+                                         "mode": if ms > 0 { format!("settle_then_{base_mode}") } else { base_mode.to_string() }})),
+                    Err(e) => Err((CODE_EXEC_FAILED, e.to_string())),
                 }
             }
         }
@@ -696,7 +857,7 @@ async fn run_control(args: Value) -> Result<String> {
     };
 
     match result {
-        Ok(data) => envelope(0, "ok", json!({"page_id": page_id, "control_action": control_action, "result": data})),
+        Ok(data) => envelope(0, "ok", json!({"page_id": page_id, "page_id_auto": page_auto, "control_action": control_action, "result": data})),
         Err((_, msg)) if evict_if_dead(&page_id, &msg) => envelope(
             CODE_PAGE_NOT_FOUND,
             &dead_page_message(&page_id, &msg),
@@ -709,11 +870,13 @@ async fn run_control(args: Value) -> Result<String> {
 // ===================== inspect =====================
 
 async fn run_inspect(args: Value) -> Result<String> {
-    let Some(page_id) = str_arg(&args, "page_id").map(str::to_string) else {
-        return envelope(CODE_PARAM_ERROR, "inspect 缺少 page_id", json!({}));
-    };
     let Some(info) = str_arg(&args, "info").map(str::to_string) else {
         return envelope(CODE_PARAM_ERROR, "inspect 缺少 info", json!({}));
+    };
+    // 页面句柄:顶层 / params 双位置取值;缺失时唯一存活页自动选中。
+    let (page_id, page_auto) = match resolve_page_id(&args).await {
+        Ok(v) => v,
+        Err(msg) => return envelope(CODE_PARAM_ERROR, &msg, json!({"info": info})),
     };
     let page = match resolve_page(&page_id).await {
         Ok(p) => p,
@@ -728,16 +891,32 @@ async fn run_inspect(args: Value) -> Result<String> {
         "text" => inspect_text(&page, params_of(&args)).await,
         "html" => inspect_html(&page, params_of(&args)).await,
         "elements" => inspect_elements(&page, params_of(&args)).await,
+        // screenshot:与 control(screenshot) 同参(full_page / save_path)。
         "screenshot" => with_bars_suspended(&page, async {
-            match str_arg(params_of(&args), "save_path") {
-                Some(path) => chrome_browser::screenshot_to_file(&page, path)
-                    .await
-                    .map(|(path, bytes, w, h)| json!({"format": "png", "path": path, "bytes": bytes, "width": w, "height": h}))
-                    .map_err(|e| (CODE_EXEC_FAILED, e.to_string())),
-                None => chrome_browser::screenshot_base64(&page)
-                    .await
-                    .map(|b64| json!({"format": "png", "image_base64": b64}))
-                    .map_err(|e| (CODE_EXEC_FAILED, e.to_string())),
+            let ip = params_of(&args);
+            let full_page = ip.get("full_page").and_then(Value::as_bool).unwrap_or(false);
+            match str_arg(ip, "save_path") {
+                Some(path) => {
+                    let shot = if full_page {
+                        chrome_browser::screenshot_full_page_to_file(&page, path).await
+                    } else {
+                        chrome_browser::screenshot_to_file(&page, path).await
+                    };
+                    shot.map(|(path, bytes, w, h)| {
+                        json!({"format": "png", "path": path, "bytes": bytes, "width": w, "height": h,
+                               "full_page": full_page})
+                    })
+                    .map_err(|e| (CODE_EXEC_FAILED, e.to_string()))
+                }
+                None => {
+                    let shot = if full_page {
+                        chrome_browser::screenshot_full_page_base64(&page).await
+                    } else {
+                        chrome_browser::screenshot_base64(&page).await
+                    };
+                    shot.map(|b64| json!({"format": "png", "image_base64": b64, "full_page": full_page}))
+                        .map_err(|e| (CODE_EXEC_FAILED, e.to_string()))
+                }
             }
         })
         .await,
@@ -747,7 +926,7 @@ async fn run_inspect(args: Value) -> Result<String> {
     match result {
         // 信封形状与 control 对齐:顶层语义键统一 `result`;`data` 保留一版
         // 兼容字段(旧提示词/文档写的是 data.data 路径),后续版本可移除。
-        Ok(data) => envelope(0, "ok", json!({"page_id": page_id, "result": data, "data": data})),
+        Ok(data) => envelope(0, "ok", json!({"page_id": page_id, "page_id_auto": page_auto, "result": data, "data": data})),
         Err((_, msg)) if evict_if_dead(&page_id, &msg) => envelope(
             CODE_PAGE_NOT_FOUND,
             &dead_page_message(&page_id, &msg),

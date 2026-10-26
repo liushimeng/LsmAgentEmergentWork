@@ -10,8 +10,9 @@ use crate::agent::browser;
 use crate::error::Result;
 
 pub(super) async fn run(args: Value) -> Result<String> {
-    let Some(page_id) = str_arg(&args, "page_id").map(str::to_string) else {
-        return envelope(1001, "inspect 需要 page_id", json!({}));
+    let (page_id, page_auto) = match super::resolve_page_id(&args).await {
+        Ok(v) => v,
+        Err(msg) => return envelope(1001, &msg, json!({})),
     };
     let Some(info) = str_arg(&args, "info").map(str::to_string) else {
         return envelope(
@@ -31,7 +32,10 @@ pub(super) async fn run(args: Value) -> Result<String> {
     }
     let mgr = McpWebLsmBrowserUseTool::mgr();
     if info != "ping" && !mgr.page_exists(&page_id).await {
-        return envelope(2000, "page_id 无效或页面已关闭", json!({"page_id": page_id}));
+        // 走 EngineError::page_not_found:跨工具 page_id 误用(Chrome 的 c_ 前缀)
+        // 在此给出可操作指引 —— 2026-10-26 实测本路径此前直发通用文案,
+        // 导致文档 41 §F4 的跨工具诊断成为死代码。
+        return Ok(engine_error(browser::EngineError::page_not_found(&page_id)));
     }
     let params = normalize_inspect_params(&args);
     match browser::inspect::inspect(&mgr, &page_id, &info, &params).await {
@@ -40,6 +44,7 @@ pub(super) async fn run(args: Value) -> Result<String> {
                 data = json!({"result": data});
             }
             data["page_id"] = json!(page_id);
+            data["page_id_auto"] = json!(page_auto);
             if info != "screenshot" && info != "ocr" {
                 if let Some(p) = mgr.page_summary(&page_id).await {
                     if p.url.trim().eq_ignore_ascii_case("about:blank") {

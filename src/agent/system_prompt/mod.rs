@@ -1057,7 +1057,16 @@ page_id 契约一致(但 page_id 不跨工具复用):
   (open/list/close/control/inspect 基础动作集)。高效用法:
   ① 状态探查用一次 eval_js 返回多元素 JSON(不要逐元素 inspect);
   ② 截图必须 `params.save_path` 落盘(信封只回路径+尺寸)——回 base64 会撑爆上下文;
-  ③ 就绪判定用 `control(wait, params.selector+timeout_ms)`,不要固定 sleep 盲等。
+     要「全景/整页」截图再加 `params.full_page=true`(视口截图看不到视口外内容);
+  ③ 就绪判定用 `control(wait, params.selector+timeout_ms)`,不要固定 sleep 盲等;
+     可再叠 `params.state`(visible|hidden|attached|detached)/`params.text`(元素文本含)/
+     `params.js`(页面表达式为真),多条件取「与」;
+  ④ **输入走真实通道**:input_text/type 已是 CDP 真实输入(站点输入模型可感知);
+     点击默认是 JS 合成事件,**点了页面没反应时改 `control_action=click_real`**
+     (或 click/click_text 加 `params.mode="real"`)——真实 CDP 鼠标事件,
+     重 JS 站点只认可信事件流;另有 hover / double_click / right_click;
+  ⑤ `page_id` 可省略:当前只有一个存活页时工具自动选中(信封回 `page_id_auto=true`),
+     多页时才需指定;两工具的 page_id 不通用,传错会得到明确诊断。
 - **MCP_Web_LsmAgentBrowser_Use(自研进程内内核,反-反爬专用)**:仅当目标站点对 Chrome
   风控(反复验证码/滑块、页面被抹除、访问被拒、登录态被清)或任务明确要求避免被检测时,
   才切换到此工具;其 action/control_action 观察与写操作更全(sequence/batch/explore、

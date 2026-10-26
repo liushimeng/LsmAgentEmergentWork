@@ -12,15 +12,15 @@ use serde_json::Value;
 use crate::error::{AgentError, Result};
 
 /// 单条 CDP 轻量调用的默认墙钟预算(与历史 `CDP_BOUND_SECS` 同值同语义)。
-const CDP_BOUND_SECS: u64 = 10;
+pub(super) const CDP_BOUND_SECS: u64 = 10;
 /// 导航级调用的墙钟预算(load 事件等待,给慢站点留余量)。
 const NAV_BOUND_SECS: u64 = 30;
 
-fn err(what: &str, e: impl std::fmt::Display) -> AgentError {
+pub(super) fn err(what: &str, e: impl std::fmt::Display) -> AgentError {
     AgentError::ToolExecution { tool: "chrome_browser".into(), reason: format!("{what} 失败: {e}")}
 }
 
-fn timeout_err(what: &str, secs: u64) -> AgentError {
+pub(super) fn timeout_err(what: &str, secs: u64) -> AgentError {
     AgentError::ToolExecution { tool: "chrome_browser".into(), reason: format!("{what} 超时({secs}s),浏览器 handler 可能已卡死")}
 }
 
@@ -95,18 +95,25 @@ pub async fn click(page: &Page, selector: &str) -> Result<bool> {
 ///
 /// 现代站点大量按钮没有稳定 id/class(「选为终点」「查询」等纯文本按钮),
 /// 只给 CSS 选择器会迫使模型反复猜选择器甚至改用 eval_js 手搓事件。
-/// 返回 `{hit, tag, id, cls, text}`;`exact=true` 时要求整段文本完全相等。
+/// 返回 `{hit, tag, id, cls, text, x, y}`;`exact=true` 时要求整段文本完全相等。
+///
+/// `mode`:`js`(默认)命中后执行 `el.click()` 合成事件;`real` **不执行** JS 点击,
+/// 只定位元素并回传视口中心坐标,由调用方派发 CDP 真实鼠标事件
+/// (与 `type_text_real` 的可信输入通道同源,见 `mouse.rs`)。
 pub async fn click_text(
     page: &Page,
     text: &str,
     scope: Option<&str>,
     exact: bool,
+    mode: &str,
 ) -> Result<Value> {
+    let real_mode = mode.eq_ignore_ascii_case("real");
     let js = format!(
         r#"(function(){{
             var target = {text};
             var scopeSel = {scope};
             var exact = {exact};
+            var realMode = {real_mode};
             var root = null;
             try {{ root = scopeSel ? document.querySelector(scopeSel) : document.body; }} catch (e) {{}}
             if (!root) return JSON.stringify({{hit:false, reason:'scope_not_found'}});
@@ -207,17 +214,27 @@ pub async fn click_text(
                         hint:'命中文字但没有可点击元素;用 inspect(info="elements", params.text=...) 查看可点击元素,或改用 click(params.selector)'}});
                 }}
             }}
-            try {{ clicked.scrollIntoView({{block:'center'}}); }} catch (e) {{}}
-            try {{ clicked.click(); }} catch (e) {{}}
+            try {{ clicked.scrollIntoView({{block:'center', behavior:'instant'}}); }} catch (e) {{}}
+            // 真实鼠标通道需要「可视中心」的视口坐标(CDP 事件坐标是视口 CSS 像素)。
+            var cx = 0, cy = 0, cw = 0, ch = 0;
+            try {{
+                var cr = clicked.getBoundingClientRect();
+                cx = cr.left + cr.width / 2; cy = cr.top + cr.height / 2;
+                cw = cr.width; ch = cr.height;
+            }} catch (e) {{}}
+            // real 模式只定位不点击:点击交由 CDP 真实鼠标事件派发(可信事件流)。
+            if (!realMode) {{ try {{ clicked.click(); }} catch (e) {{}} }}
             var cls = '';
             try {{ cls = String(clicked.className || ''); }} catch (e) {{}}
             return JSON.stringify({{hit:true, via:via, tag:clicked.tagName, id:clicked.id||'', cls:cls.slice(0,120),
-                                     score:bestScore, matched_text:bestText,
+                                     score:bestScore, matched_text:bestText, x:cx, y:cy, w:cw, h:ch,
+                                     mode: realMode ? 'cdp_mouse' : 'js_click',
                                      text:norm(clicked.innerText||clicked.textContent||clicked.value||'').slice(0,200)}});
         }})()"#,
         text = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into()),
         scope = serde_json::to_string(&scope).unwrap_or_else(|_| "null".into()),
         exact = if exact { "true" } else { "false" },
+        real_mode = if real_mode { "true" } else { "false" },
     );
     let v = eval_js(page, &js).await?;
     let raw = v.as_str().unwrap_or("{}");
@@ -652,6 +669,79 @@ pub fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
     Some((w, h))
 }
 
+/// 整页内容尺寸(CSS 像素):`Page.getLayoutMetrics` 的 `cssContentSize`。
+///
+/// 整页截图的裁剪依据 —— 视口高度之外的区域(长列表页、滚动面板)视口截图看不到。
+pub async fn content_size(page: &Page) -> Result<(f64, f64)> {
+    use chromiumoxide::cdp::browser_protocol::page::GetLayoutMetricsParams;
+    let resp = tokio::time::timeout(
+        Duration::from_secs(CDP_BOUND_SECS),
+        page.execute(GetLayoutMetricsParams::default()),
+    )
+    .await
+    .map_err(|_| timeout_err("getLayoutMetrics", CDP_BOUND_SECS))?
+    .map_err(|e| err("getLayoutMetrics", e))?;
+    let s = &resp.result.css_content_size;
+    Ok((s.width, s.height))
+}
+
+/// 整页 PNG 截图(base64):按 `cssContentSize` 整页裁剪并置 `captureBeyondViewport`。
+///
+/// 与 [`screenshot_base64`] 的差异:本函数拿到的是**整页**而非视口。
+///
+/// 背景(2026-10-26 百度地图实测):用户要求「地图的全景截图」,Chrome 工具
+/// 此前只有视口截图,模型被迫连拍多张视口图充数(实测两张 md5 完全相同),
+/// 「全景」诉求实际未满足。Lsm 版早有 `full_page` 参数,本函数补齐该能力对齐。
+pub async fn screenshot_full_page_base64(page: &Page) -> Result<String> {
+    use chromiumoxide::cdp::browser_protocol::page::{
+        CaptureScreenshotFormat, CaptureScreenshotParams, Viewport,
+    };
+    let (cw, ch) = content_size(page).await?;
+    // 兜底:极端页面(内容尺寸为 0)退回视口尺寸量级,避免 clip 非法。
+    let width = if cw > 1.0 { cw } else { 1920.0 };
+    let height = if ch > 1.0 { ch } else { 1080.0 };
+    let clip = Viewport::builder()
+        .x(0.0)
+        .y(0.0)
+        .width(width)
+        .height(height)
+        .scale(1.0)
+        .build()
+        .map_err(|e| err("screenshot_full_page(clip)", e))?;
+    let resp = tokio::time::timeout(
+        Duration::from_secs(CDP_BOUND_SECS),
+        page.execute(
+            CaptureScreenshotParams::builder()
+                .format(CaptureScreenshotFormat::Png)
+                .clip(clip)
+                .capture_beyond_viewport(true)
+                .from_surface(true)
+                .build(),
+        ),
+    )
+    .await
+    .map_err(|_| timeout_err("screenshot_full_page", CDP_BOUND_SECS))?
+    .map_err(|e| err("screenshot_full_page", e))?;
+    let b64: &str = AsRef::<str>::as_ref(&resp.result.data);
+    Ok(b64.to_string())
+}
+
+/// 整页 PNG 截图落盘:返回 `(路径, 字节数, 宽, 高)`。
+pub async fn screenshot_full_page_to_file(page: &Page, path: &str) -> Result<(String, usize, u32, u32)> {
+    let b64 = screenshot_full_page_base64(page).await?;
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64.trim())
+        .map_err(|e| err("screenshot_full_page 解码", e))?;
+    let (w, h) = png_size(&bytes).unwrap_or((0, 0));
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
+    std::fs::write(path, &bytes)
+        .map_err(|e| err("screenshot_full_page 落盘", e))?;
+    Ok((path.to_string(), bytes.len(), w, h))
+}
+
 /// 就绪判定:轮询选择器直到元素可见(上限 timeout_ms,上限 30s)。
 /// 返回是否在超时前命中。
 pub async fn wait_for_selector(page: &Page, selector: &str, timeout_ms: u64) -> Result<bool> {
@@ -682,6 +772,77 @@ pub async fn wait_for_selector(page: &Page, selector: &str, timeout_ms: u64) -> 
 /// 等待固定毫秒(页面 settle 用)。
 pub async fn wait(ms: u64) {
     tokio::time::sleep(Duration::from_millis(ms.min(30_000))).await;
+}
+
+/// 就绪判定(对齐 Lsm 版 `control(wait)` 原语集)。
+///
+/// 支持三类条件,**多条件取「与」**(与 Lsm 版 `browser/api.rs::act_wait` 语义一致):
+/// - `selector` + `state`:`visible`(默认)/`hidden`/`attached`/`detached`;
+/// - `selector` + `text`:该元素文本包含目标串;
+/// - `js`:页面上下文表达式求值为真(如 `window.__ready===1`)。
+///
+/// 背景(2026-10-26 实测):Chrome 侧此前只有「选择器可见」一种判定,模型想等
+/// 「路线结果面板出现」只能固定 sleep 盲等(实测连等 4s/2.5s/5s 三次),慢且不可靠。
+pub async fn wait_until(
+    page: &Page,
+    selector: Option<&str>,
+    state: &str,
+    text: Option<&str>,
+    js: Option<&str>,
+    timeout_ms: u64,
+) -> Result<bool> {
+    let budget = Duration::from_millis(timeout_ms.min(120_000).max(200));
+    let start = std::time::Instant::now();
+    let js_src = format!(
+        r#"(function(){{
+            var sel = {selector};
+            var state = {state};
+            var want = {text};
+            var jsExpr = {js};
+            function ok(cond) {{ return !!cond; }}
+            if (jsExpr) {{
+                var jv = false;
+                try {{ jv = eval(jsExpr); }} catch (e) {{ jv = false; }}
+                if (!ok(jv)) return false;
+                if (!sel) return true;
+            }}
+            if (!sel) return jsExpr ? true : false;
+            var el = null;
+            try {{ el = document.querySelector(sel); }} catch (e) {{ return false; }}
+            if (state === 'detached') return el === null;
+            if (!el) return false;
+            if (state === 'attached') {{
+                if (!want) return true;
+                var at = String(el.innerText || el.textContent || el.value || '');
+                return at.indexOf(want) >= 0;
+            }}
+            var r = el.getBoundingClientRect();
+            var st = getComputedStyle(el);
+            var visible = r.width > 0 && r.height > 0 &&
+                          st.visibility !== 'hidden' && st.display !== 'none';
+            if (state === 'hidden') return !visible;
+            if (!visible) return false;
+            if (want) {{
+                var t = String(el.innerText || el.textContent || el.value || '');
+                return t.indexOf(want) >= 0;
+            }}
+            return true;
+        }})()"#,
+        selector = serde_json::to_string(&selector).unwrap_or_else(|_| "null".into()),
+        state = serde_json::to_string(&state).unwrap_or_else(|_| "\"visible\"".into()),
+        text = serde_json::to_string(&text).unwrap_or_else(|_| "null".into()),
+        js = serde_json::to_string(&js).unwrap_or_else(|_| "null".into()),
+    );
+    loop {
+        let v = eval_js(page, &js_src).await?;
+        if v.as_bool().unwrap_or(false) {
+            return Ok(true);
+        }
+        if start.elapsed() >= budget {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 /// 页面可见文本(`body.innerText`,截断由调用方按信封预算处理)。

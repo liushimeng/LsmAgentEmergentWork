@@ -60,6 +60,42 @@ pub(super) fn u64_arg(args: &Value, key: &str) -> Option<u64> {
     })
 }
 
+/// 页面句柄解析:顶层 / `params` 双位置取值;缺失时按「唯一存活页」自动选中。
+///
+/// 与 Chrome 侧 `mcp_chrome_use::resolve_page_id` 同语义(2026-10-26 实测补齐):
+/// 单页任务里 page_id 是纯冗余参数,强制必填只制造失败面(实测漏传一次白费
+/// 一整轮 LLM 往返)。多页时返回错误并附存活页清单,避免模型继续盲猜。
+pub(super) async fn resolve_page_id(
+    args: &Value,
+) -> std::result::Result<(String, bool), String> {
+    let p = args.get("params").filter(|v| v.is_object()).unwrap_or(args);
+    if let Some(id) = str_arg(args, "page_id").or_else(|| str_arg(p, "page_id")) {
+        return Ok((id.to_string(), false));
+    }
+    let live = McpWebLsmBrowserUseTool::mgr().list_pages().await;
+    match live.len() {
+        1 => Ok((live[0].page_id.clone(), true)),
+        0 => Err("缺少 page_id,且当前没有存活页面;请先 action=open 打开页面".to_string()),
+        _ => {
+            let desc: Vec<Value> = live
+                .iter()
+                .take(8)
+                .map(|p| {
+                    json!({
+                        "page_id": p.page_id,
+                        "url": crate::agent::web_activity::clip_chars(&p.url, 80),
+                    })
+                })
+                .collect();
+            Err(format!(
+                "缺少 page_id(当前有 {} 个存活页面,请指定其一);存活页:{}",
+                live.len(),
+                serde_json::to_string(&desc).unwrap_or_default()
+            ))
+        }
+    }
+}
+
 /// 任务锚点:目标站外导航阻断(兼容旧 6001 契约)。
 pub(super) fn target_anchor_guard(url: &str) -> Option<Result<String>> {
     let v = crate::agent::safety::check_open_against_target_anchor(url)?;

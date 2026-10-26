@@ -25,9 +25,11 @@ use crate::error::{AgentError, Result};
 mod page;
 #[cfg(test)]
 mod tests;
+pub mod mouse;
 pub mod status;
 pub mod watchdog;
 
+pub use mouse::*;
 pub use page::*;
 
 /// Chrome 启动形态。

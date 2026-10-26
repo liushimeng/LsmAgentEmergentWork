@@ -224,3 +224,45 @@ fn human_reasons_白名单包含登录与验证码() {
     assert!(HUMAN_REASONS.contains(&"qr_login"));
     assert!(HUMAN_REASONS.contains(&"custom"));
 }
+
+/// 2026-10-26 实测补齐:真实鼠标通道动作入枚举(与 Lsm 版对齐)。
+#[test]
+fn schema_含真实鼠标动作() {
+    let tool = McpChromeUseTool;
+    let schema = tool.parameters();
+    let c_enums = schema["properties"]["control_action"]["enum"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(c_enums.contains(&"click_real"), "{c_enums:?}");
+    assert!(c_enums.contains(&"hover"), "{c_enums:?}");
+    assert!(c_enums.contains(&"double_click"), "{c_enums:?}");
+    assert!(c_enums.contains(&"right_click"), "{c_enums:?}");
+}
+
+/// 2026-10-26 实测补齐:整页截图 / 就绪判定 / 真实点击通道 / page_id 双位置。
+#[test]
+fn schema_含_full_page_与就绪判定与_mode_参数() {
+    let schema = McpChromeUseTool.parameters();
+    let props = &schema["properties"]["params"]["properties"];
+    assert!(props.get("full_page").is_some(), "缺 full_page(整页截图)");
+    assert!(props.get("state").is_some(), "缺 state(就绪判定)");
+    assert!(props.get("js").is_some(), "缺 js(就绪判定)");
+    assert!(props.get("mode").is_some(), "缺 mode(真实点击通道)");
+    assert!(props.get("page_id").is_some(), "缺 params.page_id");
+    // page_id 不再是硬性必填(唯一存活页时自动选中)。
+    let desc = schema["properties"]["page_id"]["description"].as_str().unwrap();
+    assert!(desc.contains("省略"), "page_id 描述应说明可省略:{desc}");
+}
+
+/// 新能力必须可发现:工具 description 需点明真实鼠标通道与整页截图。
+#[test]
+fn description_点明真实鼠标与整页截图() {
+    let d = McpChromeUseTool.description();
+    assert!(d.contains("click_real"), "description 缺真实鼠标通道说明");
+    assert!(d.contains("full_page"), "description 缺整页截图说明");
+    assert!(d.contains("真实输入通道"), "description 缺真实输入通道说明");
+    assert!(d.contains("state"), "description 缺就绪判定 state 说明");
+}

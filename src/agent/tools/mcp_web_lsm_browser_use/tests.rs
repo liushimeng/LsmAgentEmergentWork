@@ -104,3 +104,52 @@ async fn reuse_existing_返回_3002() {
     .unwrap();
     assert_eq!(v["code"], 3002);
 }
+
+/// 2026-10-26 实测回归:把 Chrome 的 `c_` page_id 传给本工具,必须给出
+/// 「属于另一浏览器工具」的可操作指引(文档 41 §F4 声称已修,但兼容层此前
+/// 直发通用文案,跨工具诊断是死代码)。
+#[tokio::test]
+async fn 跨工具_page_id_给出诊断指引() {
+    let tool = McpWebLsmBrowserUseTool;
+    let out = tool
+        .execute(json!({"action": "control", "page_id": "c_00000000",
+                        "control_action": "wait", "params": {"ms": 10}}))
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["code"], 2000, "{v}");
+    let msg = v["message"].as_str().unwrap();
+    assert!(msg.contains("MCP_Web_Chrome_Use"), "跨工具诊断未生效:{msg}");
+    assert!(msg.contains("不跨工具复用"), "跨工具诊断未生效:{msg}");
+    assert_eq!(v["data"]["cross_tool_page_id"], json!(true), "{v}");
+}
+
+/// `inspect` 路径同样必须给出跨工具诊断(此前与 control 各自直发通用文案)。
+#[tokio::test]
+async fn 跨工具_page_id_inspect_给出诊断指引() {
+    let tool = McpWebLsmBrowserUseTool;
+    let out = tool
+        .execute(json!({"action": "inspect", "page_id": "c_00000000", "info": "title"}))
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["code"], 2000, "{v}");
+    assert!(
+        v["message"].as_str().unwrap().contains("MCP_Web_Chrome_Use"),
+        "{v}"
+    );
+}
+
+/// 非跨工具前缀的未知 page_id 仍走通用文案(不得误报跨工具)。
+#[tokio::test]
+async fn 非跨工具_page_id_走通用文案() {
+    let tool = McpWebLsmBrowserUseTool;
+    let out = tool
+        .execute(json!({"action": "control", "page_id": "p_00ff00ff",
+                        "control_action": "wait", "params": {"ms": 10}}))
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["code"], 2000, "{v}");
+    assert!(!v["message"].as_str().unwrap().contains("Chrome"), "{v}");
+}

@@ -29,16 +29,18 @@ pub(super) async fn run(mut args: Value) -> Result<String> {
     if action == "request_human" {
         return request_human(&args, &params).await;
     }
-    let Some(page_id) = str_arg(&args, "page_id").map(str::to_string) else {
-        return envelope(
-            1001,
-            "缺少 page_id(request_human 除外)",
-            json!({"control_action": action}),
-        );
+    let (page_id, page_auto) = match super::resolve_page_id(&args).await {
+        Ok(v) => v,
+        Err(msg) => {
+            return envelope(1001, &msg, json!({"control_action": action}));
+        }
     };
     let mgr = McpWebLsmBrowserUseTool::mgr();
     if !mgr.page_exists(&page_id).await {
-        return envelope(2000, "page_id 无效或页面已关闭", json!({"page_id": page_id}));
+        // 走 EngineError::page_not_found:跨工具 page_id 误用(Chrome 的 c_ 前缀)
+        // 在此给出可操作指引 —— 2026-10-26 实测本路径此前直发通用文案,
+        // 导致文档 41 §F4 的跨工具诊断成为死代码。
+        return Ok(super::engine_error(browser::EngineError::page_not_found(&page_id)));
     }
     // 显式导航动作继续受任务锚点约束。
     if matches!(action.as_str(), "navigate" | "new_tab" | "new_window") {
@@ -56,6 +58,7 @@ pub(super) async fn run(mut args: Value) -> Result<String> {
                 data = json!({"result": data});
             }
             data["page_id"] = json!(page_id);
+            data["page_id_auto"] = json!(page_auto);
             record_visit(&page_id, &action, &data);
             envelope(0, "ok", data)
         }
