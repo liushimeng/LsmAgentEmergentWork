@@ -329,6 +329,31 @@ function __lsmLive(collect) {
   });
 }
 
+// ---------- 快照节点序列化(快照 DOM 子树 → HTML 字符串) ----------
+// innerHTML / outerHTML 要给的是**HTML**,不是可见文本。
+// 快照里每个节点带自己的可见文本(父节点的是后代文本之和),所以只取
+// 「叶子节点的文本」,父节点不再重复输出,避免文本翻倍。
+function __serSnapNode(n) {
+  var tag = String((n && n.tag) || "div");
+  var attrs = (n && n.attrs) || {};
+  var a = [];
+  for (var k in attrs) {
+    if (!Object.prototype.hasOwnProperty.call(attrs, k)) continue;
+    if (k === "outer_html") continue;
+    a.push(" " + k + "=\"" + String(attrs[k]).replace(/"/g, "&quot;") + "\"");
+  }
+  var inner = "";
+  var hasChild = false;
+  for (var i = 0; i < __lsmNodes.length; i++) {
+    if (__lsmNodes[i].parent === n.i) {
+      hasChild = true;
+      try { inner += __serSnapNode(__lsmNodes[i]); } catch (e) {}
+    }
+  }
+  if (!hasChild) inner = __escHtml((n && n.text) || "");
+  return "<" + tag + a.join("") + ">" + inner + "</" + tag + ">";
+}
+
 // ---------- HTML 轻量序列化(detached 元素树 → HTML 字符串) ----------
 function __escHtml(s) {
   return String(s == null ? "" : s)
@@ -794,7 +819,22 @@ function __mk(n) {
     __push({ type: "set_attr", selector: n.sel, key: "class", value: String(v) });
   });
   define("innerHTML", function () {
-    return Object.prototype.hasOwnProperty.call(__lsmText, key) ? __lsmText[key] : (n.attrs && n.attrs.outer_html ? n.attrs.outer_html : n.text || "");
+    if (Object.prototype.hasOwnProperty.call(__lsmText, key)) return __lsmText[key];
+    if (n.attrs && n.attrs.outer_html) return n.attrs.outer_html;
+    // innerHTML 是**子节点的序列化 HTML**,不是可见文本。
+    // 此前回退到 `n.text`(元素的可见文本),于是 `document.body.innerHTML`
+    // 只有一个元素的文字(实测百度地图:7 个字符「百度地图 mz」),
+    // 站点脚本与 Agent 都会误判「页面是空壳」。
+    var inner = "";
+    for (var si = 0; si < __lsmNodes.length; si++) {
+      if (__lsmNodes[si].parent === n.i) {
+        try { inner += __serSnapNode(__lsmNodes[si]); } catch (e) {}
+      }
+    }
+    for (var dk = 0; dk < dynKids.length; dk++) {
+      try { inner += __serEl(dynKids[dk]); } catch (e) {}
+    }
+    return inner;
   }, function (v) {
     var s = String(v);
     __lsmText[key] = s;
@@ -805,7 +845,8 @@ function __mk(n) {
     __push({ type: "set_html", selector: n.sel, value: s });
   });
   define("outerHTML", function () {
-    return (n.attrs && n.attrs.outer_html) || n.text || "";
+    if (n.attrs && n.attrs.outer_html) return n.attrs.outer_html;
+    try { return __serSnapNode(n); } catch (e) { return n.text || ""; }
   }, function (v) {
     __push({ type: "replace_html", selector: n.sel, value: String(v) });
   });

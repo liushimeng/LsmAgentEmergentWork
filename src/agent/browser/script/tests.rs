@@ -1246,3 +1246,42 @@ fn 应用_append_text_不清空既有子节点() {
     assert!(out.contains("原有"), "既有子节点不得被清空:{out}");
     assert!(out.contains("追加文本"), "追加的文本必须落地:{out}");
 }
+
+#[test]
+fn innerHTML_返回子节点_HTML_而非可见文本() {
+    // 回归:innerHTML 此前回退到元素的**可见文本**,于是
+    // `document.body.innerHTML` 只有一个元素的文字(实测百度地图:7 个字符
+    // 「百度地图 mz」)。站点脚本与 Agent 都会据此误判「页面是空壳」。
+    let handle = JsHandle::spawn();
+    let r = eval_on(
+        &handle,
+        r#"(function(){
+          var b = document.body;
+          var h = b.innerHTML;
+          return JSON.stringify({
+            len: h.length,
+            hasTag: h.indexOf('<div') >= 0 || h.indexOf('<p') >= 0,
+            head: h.slice(0, 80)
+          });
+        })()"#,
+        "<html><body><div id='box'><p>正文</p></div></body></html>",
+        "https://a.test/",
+    );
+    assert!(r.outcome.ok, "求值应成功:{r:?}");
+    let v: serde_json::Value = serde_json::from_str(&r.outcome.value).unwrap_or_default();
+    assert!(
+        v["hasTag"].as_bool().unwrap_or(false),
+        "innerHTML 必须是 HTML(应含 <div/<p),实际 {}",
+        r.outcome.value
+    );
+    assert!(
+        v["len"].as_u64().unwrap_or(0) > 20,
+        "innerHTML 长度应远大于可见文本,实际 {}",
+        r.outcome.value
+    );
+    assert!(
+        r.outcome.value.contains("正文"),
+        "innerHTML 应含子节点文本,实际 {}",
+        r.outcome.value
+    );
+}
