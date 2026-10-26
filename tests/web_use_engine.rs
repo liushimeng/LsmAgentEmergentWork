@@ -1193,3 +1193,99 @@ async fn 富视觉页面_渐变圆角阴影与溢出裁剪截图() {
 
     exec(&tool, json!({"action": "close", "page_id": page_id})).await;
 }
+
+#[tokio::test]
+async fn xhr_回调带事件对象与响应头可读() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+    let open = exec(&tool, json!({"action": "open", "url": base, "mode": "hidden", "reuse": false})).await;
+    assert_eq!(open["code"], 0, "{open}");
+    let page_id = open["data"]["page_id"].as_str().unwrap().to_string();
+    let probe = exec(
+        &tool,
+        json!({
+            "action": "control", "page_id": page_id, "control_action": "eval_js",
+            "params": {"expression": format!(r#"(function(){{
+                var out={{}};
+                var x=new XMLHttpRequest();
+                x.open("GET","{base}/");
+                var rsEvent=null;
+                x.onreadystatechange=function(e){{
+                    if(this.readyState===4){{
+                        rsEvent = e ? String(e.type) : "missing";
+                        out.rsTarget = !!(e && e.target===this);
+                        out.ct = this.getResponseHeader("content-type");
+                        out.all = this.getAllResponseHeaders().length>0;
+                        out.url = this.responseURL;
+                        out.status = this.status;
+                    }}
+                }};
+                x.addEventListener("load",function(e){{ out.loadType = e ? String(e.type) : "missing"; }});
+                x.send();
+                out.rsEvent = rsEvent;
+                return JSON.stringify(out);
+            }})()"#)}
+        }),
+    )
+    .await;
+    let result = probe["data"]["result"].as_str().unwrap_or("");
+    let v: Value = serde_json::from_str(result)
+        .unwrap_or_else(|e| panic!("XHR 探针返回非 JSON:{e};raw={probe}"));
+    assert_eq!(v["rsEvent"], "readystatechange", "onreadystatechange 应带事件对象:{v}");
+    assert_eq!(v["rsTarget"], true, "事件 target 应为当前 XHR:{v}");
+    assert_eq!(v["loadType"], "load", "load 监听器应带事件对象:{v}");
+    assert!(
+        v["ct"].as_str().unwrap_or("").contains("text/html"),
+        "应能读到 Content-Type 响应头:{v}"
+    );
+    assert_eq!(v["all"], true, "getAllResponseHeaders 应非空:{v}");
+    assert!(
+        v["url"].as_str().unwrap_or("").starts_with("http"),
+        "responseURL 应回填:{v}"
+    );
+    assert_eq!(v["status"], 200, "状态码应为 200:{v}");
+
+    exec(&tool, json!({"action": "close", "page_id": page_id})).await;
+}
+
+#[tokio::test]
+async fn dispatch_event_兼容事件对象与type参数() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+    let open = exec(&tool, json!({"action": "open", "url": base, "mode": "hidden", "reuse": false})).await;
+    assert_eq!(open["code"], 0, "{open}");
+    let page_id = open["data"]["page_id"].as_str().unwrap().to_string();
+
+    // 事件对象形状(模型按 DOM dispatchEvent 直觉传参)不再 1001。
+    let obj = exec(
+        &tool,
+        json!({"action": "control", "page_id": page_id, "control_action": "dispatch_event",
+               "params": {"selector": "body", "event": {"type": "mousedown", "bubbles": true}}}),
+    )
+    .await;
+    assert_eq!(obj["code"], 0, "event 对象形状应被接受:{obj}");
+    assert_eq!(obj["data"]["event"], "mousedown", "事件名应取自 event.type:{obj}");
+
+    // params.type 兜底形状。
+    let flat = exec(
+        &tool,
+        json!({"action": "control", "page_id": page_id, "control_action": "dispatch_event",
+               "params": {"selector": "body", "type": "mouseup"}}),
+    )
+    .await;
+    assert_eq!(flat["code"], 0, "params.type 兜底形状应被接受:{flat}");
+    assert_eq!(flat["data"]["event"], "mouseup", "事件名应取自 params.type:{flat}");
+
+    // 既有的字符串形状保持可用。
+    let text = exec(
+        &tool,
+        json!({"action": "control", "page_id": page_id, "control_action": "dispatch_event",
+               "params": {"selector": "body", "event": "mousemove"}}),
+    )
+    .await;
+    assert_eq!(text["code"], 0, "字符串形状应继续可用:{text}");
+
+    exec(&tool, json!({"action": "close", "page_id": page_id})).await;
+}

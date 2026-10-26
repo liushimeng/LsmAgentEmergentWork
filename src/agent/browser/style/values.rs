@@ -53,6 +53,11 @@ pub struct ComputedStyle {
     pub line_height: f64,
     pub text_align: String,
     pub white_space: String,
+    /// CSS `float`(非继承):none/left/right。布局层在块容器内按浮动带布置,
+    /// 缺此字段时浮动声明只落在 `extra`、布局完全不可见(浮动卡片纵向堆叠)。
+    pub float: String,
+    /// CSS `clear`(非继承):none/left/right/both。布置该盒前把游标推到相应浮动底边之下。
+    pub clear: String,
     pub margin_top: f64,
     pub margin_right: f64,
     pub margin_bottom: f64,
@@ -364,6 +369,8 @@ impl Default for ComputedStyle {
             line_height: 16.0 * 1.45,
             text_align: "left".to_string(),
             white_space: "normal".to_string(),
+            float: "none".to_string(),
+            clear: "none".to_string(),
             margin_top: 0.0,
             margin_right: 0.0,
             margin_bottom: 0.0,
@@ -439,6 +446,8 @@ impl ComputedStyle {
     pub fn to_map(&self) -> BTreeMap<String, String> {
         let mut out = BTreeMap::new();
         out.insert("display".into(), self.display.clone());
+        out.insert("float".into(), self.float.clone());
+        out.insert("clear".into(), self.clear.clone());
         out.insert("visibility".into(), self.visibility.clone());
         out.insert("color".into(), rgb_text(self.color));
         out.insert(
@@ -1286,9 +1295,20 @@ pub fn apply_declaration(
                 st.overflow_clip = true;
             }
         }
-        "float"
-        | "clear"
-        | "text-decoration"
+        "float" => {
+            st.float = match value.to_ascii_lowercase().as_str() {
+                "left" | "inline-start" => "left".to_string(),
+                "right" | "inline-end" => "right".to_string(),
+                _ => "none".to_string(),
+            };
+        }
+        "clear" => {
+            st.clear = match value.to_ascii_lowercase().as_str() {
+                "left" | "right" | "both" => value.to_ascii_lowercase(),
+                _ => "none".to_string(),
+            };
+        }
+        "text-decoration"
         | "cursor"
         | "letter-spacing"
         | "word-spacing"
@@ -1336,6 +1356,8 @@ fn apply_inherited(st: &mut ComputedStyle, key: &str, parent: &ComputedStyle) {
         "white-space" => st.white_space = parent.white_space.clone(),
         "visibility" => st.visibility = parent.visibility.clone(),
         "display" => st.display = parent.display.clone(),
+        "float" => st.float = parent.float.clone(),
+        "clear" => st.clear = parent.clear.clone(),
         other => {
             if let Some(v) = parent.extra.get(other) {
                 st.extra.insert(other.to_string(), v.clone());
@@ -1358,6 +1380,8 @@ fn apply_initial(st: &mut ComputedStyle, key: &str, root: &ComputedStyle) {
         "white-space" => st.white_space = "normal".to_string(),
         "visibility" => st.visibility = "visible".to_string(),
         "display" => st.display = "inline".to_string(),
+        "float" => st.float = "none".to_string(),
+        "clear" => st.clear = "none".to_string(),
         "margin-top" | "margin-right" | "margin-bottom" | "margin-left" => {
             let _ = root;
             match key {

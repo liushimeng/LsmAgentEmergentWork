@@ -1344,7 +1344,20 @@ async fn act_dispatch_event(
 ) -> EngineResult<Value> {
     require_page(pid)?;
     let selector = require_selector(params)?;
-    let event = p_str(params, "event").ok_or_else(|| EngineError::param("dispatch_event 需要 event"))?;
+    // `event` 兼容两种形状:事件名字符串("mousedown")或事件对象({"type":...}),
+    // 并接受 `params.type` 兜底。模型常按 DOM `dispatchEvent(new Event(...))`
+    // 的直觉传对象,此前一律 1001,连续操作被打断(实测百度地图路线按钮)。
+    let event = p_str(params, "event")
+        .map(str::to_string)
+        .or_else(|| {
+            params
+                .get("event")
+                .and_then(|e| e.get("type"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .or_else(|| p_str(params, "type").map(str::to_string))
+        .ok_or_else(|| EngineError::param("dispatch_event 需要 event(事件名字符串或 {type:...} 对象)"))?;
     let ev = event.to_ascii_lowercase();
     if ev == "click" {
         let mut out = click_inner(mgr, pid, params, "event").await?;

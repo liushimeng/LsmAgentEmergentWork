@@ -6,6 +6,7 @@
 //! `grid.rs` Grid 网格布局,`position.rs` 定位体系,`tests.rs` 布局单测。
 
 mod flex;
+mod float;
 mod grid;
 mod position;
 #[cfg(test)]
@@ -927,6 +928,10 @@ impl<'a> LayoutCtx<'a> {
         }
         // 阶段三:脱离流的定位元素延后到兄弟节点布置完再处理。
         let mut deferred: Vec<(NodeRef, ComputedStyle)> = Vec::new();
+        // 阶段七:本容器内的浮动台账(浮动不跨块容器)。
+        let mut floats = float::FloatState::default();
+        // 阶段七:本容器内联上下文共享的行占用(行内浮动跨兄弟元素排同一行)。
+        let mut inline_row = float::InlineRow::default();
         for child in parent.children() {
             if let Some(text) = child.as_text() {
                 let raw = text.borrow();
@@ -1012,8 +1017,27 @@ impl<'a> LayoutCtx<'a> {
                 self.y = by + ih + style.margin_bottom.max(0.0);
                 continue;
             }
+            // 阶段七:`clear` 在布置本盒前把游标推到相应浮动底边之下。
+            if style.clear != "none" {
+                if !floats.is_empty() {
+                    let y = floats.cleared_y(&style.clear, self.y);
+                    if y > self.y {
+                        self.y = y;
+                    }
+                }
+                if inline_row.has_floats() {
+                    let y = inline_row.float_bottom();
+                    if y > self.y {
+                        self.y = y;
+                    }
+                    inline_row.deactivate();
+                }
+            }
             if style.is_block() {
                 self.flush_inline(buf, width);
+                // 阶段七:浮动盒求带/定位,或非浮动 auto 宽盒在浮动旁收窄。
+                let placement = float::place(self, &child, &style, x, width, depth, &mut floats, &mut inline_row);
+                let (x, width) = (placement.x, placement.width);
                 let mark_lines = self.lines.len();
                 let mark_boxes = self.boxes.len();
                 let mark_borders = self.borders.len();
@@ -1133,10 +1157,32 @@ impl<'a> LayoutCtx<'a> {
                 self.apply_group(mark_display, &style, bx + rdx, start_y + rdy, bw, box_h);
                 let tag = document::tag_name(&child);
                 self.emit_element(seq, &style, &tag, bx + rdx, start_y + rdy, bw, box_h);
+                // 阶段七:浮动盒登记并恢复流式游标(非浮动为 no-op)。
+                float::finish(self, placement, &mut floats, &mut inline_row);
                 continue;
             }
             // 行内元素:递归收集文本,保留自身样式(祖先链无行内变换)。
-            self.collect_inline(&child, &style, buf, depth + 1, x, width, None);
+            // 阶段七:浮动激活时行内内容下沉到浮动之下(不做文字环绕)。
+            float::sink_inline_below_floats(self, &floats);
+            if style.float != "none" {
+                // 阶段七:块容器的直接行内子级带浮动时,同样走行内浮动带。
+                self.layout_inline_float(&child, &style, buf, depth, x, width, &mut inline_row, None);
+            } else {
+                if inline_row.has_floats() {
+                    let y = inline_row.float_bottom();
+                    if y > self.y {
+                        self.y = y;
+                    }
+                    inline_row.deactivate();
+                }
+                self.collect_inline(&child, &style, buf, depth + 1, x, width, None, &mut inline_row);
+            }
+        }
+        // 阶段七:容器内容底收编浮动(clearfix 友好近似,auto 高不再塌缩)。
+        float::include_floats_in_content_bottom(self, &floats);
+        let inline_bottom = inline_row.content_bottom();
+        if inline_bottom > self.y {
+            self.y = inline_bottom;
         }
         if !deferred.is_empty() {
             position::layout_deferred(self, deferred, cb, depth);
@@ -1181,6 +1227,89 @@ impl<'a> LayoutCtx<'a> {
         (w, h)
     }
 
+    /// 在行内表单控件盒内绘制 value/placeholder 文本。
+    ///
+    /// 只发射文本显示项,不推进游标、不改变既有盒几何;占位符用 UA 灰
+    /// (#757575),密码按 `•` 掩码,超宽按盒内可用宽截断(与真实输入框裁剪一致)。
+    #[allow(clippy::too_many_arguments)]
+    fn emit_form_control_text(
+        &mut self,
+        node: &NodeRef,
+        style: &ComputedStyle,
+        tag: &str,
+        bx: f64,
+        by: f64,
+        w: f64,
+        h: f64,
+        tf: Option<Affine>,
+    ) {
+        if tag != "input" && tag != "textarea" {
+            return;
+        }
+        let ty = document::attr(node, "type")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let text_like = matches!(
+            ty.as_str(),
+            "" | "text" | "search" | "url" | "tel" | "email" | "password" | "number"
+        );
+        let button_like = matches!(ty.as_str(), "submit" | "button" | "reset");
+        if tag == "input" && !text_like && !button_like {
+            return;
+        }
+        let value = document::attr(node, "value").unwrap_or_default();
+        let (mut text, color) = if !value.trim().is_empty() {
+            (value, style.color)
+        } else if tag == "textarea" {
+            let t = node.text_contents();
+            if t.trim().is_empty() {
+                (document::attr(node, "placeholder").unwrap_or_default(), [117, 117, 117])
+            } else {
+                (t, style.color)
+            }
+        } else if text_like {
+            (document::attr(node, "placeholder").unwrap_or_default(), [117, 117, 117])
+        } else {
+            return;
+        };
+        if text.trim().is_empty() {
+            return;
+        }
+        if ty == "password" {
+            text = "•".repeat(text.chars().count());
+        }
+        let size = style.font_size.max(8.0);
+        let max_w = (w - 6.0).max(0.0);
+        if max_w < size {
+            return;
+        }
+        let mut clipped = String::new();
+        let mut used = 0.0;
+        for ch in text.chars() {
+            let cw = self.font.char_width(ch, size);
+            if used + cw > max_w {
+                break;
+            }
+            used += cw;
+            clipped.push(ch);
+        }
+        if clipped.is_empty() {
+            return;
+        }
+        let line_height = size * 1.35;
+        let line = TextLine {
+            text: clipped,
+            x: bx + 3.0,
+            y: by + ((h - line_height) / 2.0).max(1.0),
+            size,
+            color,
+            bold: style.font_weight >= 600,
+            visible: style_visible(style),
+        };
+        self.emit_text(&line, tf, &[]);
+        self.lines.push(line);
+    }
+
     fn collect_inline(
         &mut self,
         node: &NodeRef,
@@ -1190,6 +1319,7 @@ impl<'a> LayoutCtx<'a> {
         line_x: f64,
         avail_w: f64,
         inherited_tf: Option<Affine>,
+        row: &mut float::InlineRow,
     ) {
         if depth > 40 || buf.chars > 200_000 {
             return;
@@ -1199,35 +1329,46 @@ impl<'a> LayoutCtx<'a> {
         let mut tf = inherited_tf;
         // 行内元素自身建盒。此前只有"块级盒的直接行内子节点"才拿到盒子,
         // 导致 `<div><input></div>` 这类结构完全取不到几何(inspect 的 rect 恒 0×0)。
-        if self.inline_box_worthy(node, style) {
+        let own_box = self.inline_box_worthy(node, style);
+        let mut box_x = line_x;
+        let mut box_w = avail_w;
+        if own_box {
             let (w, h) = self.inline_box_size(node, style, avail_w);
             let (dx, dy) = relative_offset(style);
             let bx = line_x + style.margin_left + style.padding_left + dx;
             let by = self.y + dy;
-            if let Some(m) = self.own_transform(style, bx, by, w, h) {
-                tf = Some(match tf {
-                    Some(anc) => m.compose(&anc),
-                    None => m,
-                });
-            }
-            // 阶段六:显示项发射(行内元素视觉,边框/阴影/背景/渐变全量)。
-            let seq = self.next_seq();
-            self.boxes.push(ElementBox {
-                selector: Document::stable_selector(node),
-                tag: document::tag_name(node),
-                x: bx,
-                y: by,
-                w,
-                h,
-                background: style.background,
-                visible: style_visible(style),
-                z_index: style.pos.z_index,
-            });
-            // 输入框/按钮等交互元素的边框与外阴影(绘制不占几何)。
-            push_border_and_shadow(self, style, bx, by, w, h);
-            let tag = document::tag_name(node);
-            self.emit_element(seq, style, &tag, bx, by, w, h);
+            tf = self.emit_inline_box(node, style, bx, by, w, h, tf);
+            // 阶段七:登记当前行占用,后续行内浮动可排在它的右侧剩余带。
+            row.register(bx, by, w, h, line_x + avail_w);
+            box_x = bx;
+            box_w = w;
         }
+        // 行内块/控件盒为子代建立独立行内上下文(浮动不越出该盒),子代几何
+        // 也相对自身盒求解(此前一律沿用祖先 line_x/avail_w)。
+        let mut inner_row = float::InlineRow::default();
+        let child_row: &mut float::InlineRow = if own_box { &mut inner_row } else { row };
+        self.collect_inline_children(node, style, buf, depth, box_x, box_w, child_row, tf);
+        if own_box {
+            let bottom = inner_row.content_bottom();
+            if bottom > self.y {
+                self.y = bottom;
+            }
+        }
+    }
+
+    /// `collect_inline` 的子代遍历(行内浮动入口复用同一套收集逻辑)。
+    #[allow(clippy::too_many_arguments)]
+    fn collect_inline_children(
+        &mut self,
+        node: &NodeRef,
+        style: &ComputedStyle,
+        buf: &mut InlineBuf,
+        depth: usize,
+        line_x: f64,
+        avail_w: f64,
+        row: &mut float::InlineRow,
+        tf: Option<Affine>,
+    ) {
         for child in node.children() {
             if let Some(text) = child.as_text() {
                 let raw = text.borrow();
@@ -1293,10 +1434,89 @@ impl<'a> LayoutCtx<'a> {
                 buf.reserve_height(ih);
                 continue;
             }
+            // 阶段七:行内浮动排在当前行剩余带(输入框+按钮/图标+文字经典浮动行)。
+            if child_style.float != "none" {
+                self.layout_inline_float(&child, &child_style, buf, depth, line_x, avail_w, row, tf);
+                continue;
+            }
+            // 非浮动行内内容:当前行已有浮动时下沉到浮动之下(不做文字环绕)。
+            if row.has_floats() {
+                let y = row.float_bottom();
+                if y > self.y {
+                    self.y = y;
+                }
+                row.deactivate();
+            }
             // 交互类行内元素的矩形由 `collect_inline` 入口统一建盒(元素自身),
             // 此处只负责继续收集其子树文本。
-            self.collect_inline(&child, &child_style, buf, depth + 1, line_x, avail_w, tf);
+            self.collect_inline(&child, &child_style, buf, depth + 1, line_x, avail_w, tf, row);
         }
+    }
+
+    /// 行内盒统一发射(自身视觉 + 边框/阴影 + 表单控件文本),返回合成后的变换。
+    fn emit_inline_box(
+        &mut self,
+        node: &NodeRef,
+        style: &ComputedStyle,
+        bx: f64,
+        by: f64,
+        w: f64,
+        h: f64,
+        inherited_tf: Option<Affine>,
+    ) -> Option<Affine> {
+        let mut tf = inherited_tf;
+        if let Some(m) = self.own_transform(style, bx, by, w, h) {
+            tf = Some(match tf {
+                Some(anc) => m.compose(&anc),
+                None => m,
+            });
+        }
+        // 阶段六:显示项发射(行内元素视觉,边框/阴影/背景/渐变全量)。
+        let seq = self.next_seq();
+        self.boxes.push(ElementBox {
+            selector: Document::stable_selector(node),
+            tag: document::tag_name(node),
+            x: bx,
+            y: by,
+            w,
+            h,
+            background: style.background,
+            visible: style_visible(style),
+            z_index: style.pos.z_index,
+        });
+        // 输入框/按钮等交互元素的边框与外阴影(绘制不占几何)。
+        push_border_and_shadow(self, style, bx, by, w, h);
+        let tag = document::tag_name(node);
+        self.emit_element(seq, style, &tag, bx, by, w, h);
+        // 阶段七:表单控件的 value/placeholder 文本(此前只画背景+边框,
+        // 输入框在截图里是没有任何提示文字的灰盒)。
+        self.emit_form_control_text(node, style, &tag, bx, by, w, h, tf);
+        tf
+    }
+
+    /// 行内浮动:排在当前行已占用内容的剩余带,带宽不足换行;
+    /// 子代在浮动盒内按独立行内上下文排布。
+    #[allow(clippy::too_many_arguments)]
+    fn layout_inline_float(
+        &mut self,
+        node: &NodeRef,
+        style: &ComputedStyle,
+        buf: &mut InlineBuf,
+        depth: usize,
+        line_x: f64,
+        avail_w: f64,
+        row: &mut float::InlineRow,
+        tf: Option<Affine>,
+    ) {
+        let (w, h) = self.inline_box_size(node, style, avail_w);
+        let (bx, by) = row.place_float(style, line_x, line_x + avail_w, self.y, w, h);
+        self.y = by;
+        let tf = self.emit_inline_box(node, style, bx, by, w, h, tf);
+        let mut inner = float::InlineRow::default();
+        self.collect_inline_children(node, style, buf, depth + 1, bx, w, &mut inner, tf);
+        row.note_bottom(inner.content_bottom());
+        // 游标留在本行,后续浮动继续排在同一行剩余带。
+        self.y = by;
     }
 
     fn flush_inline(&mut self, buf: &mut InlineBuf, max_w: f64) {

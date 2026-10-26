@@ -1349,8 +1349,19 @@ function fetch(url, opts) {
 }
 function XMLHttpRequest() {
   this.readyState = 0; this.status = 0; this.statusText = ""; this.responseText = ""; this.response = "";
+  this.responseType = ""; this.responseURL = "";
   this.onload = null; this.onerror = null; this.onreadystatechange = null;
   this._url = ""; this._method = "GET"; this._headers = {}; this._listeners = {};
+  this._respHeaders = {};
+}
+// 真实浏览器派发回调时一定带 Event 实参;此前裸调用导致站点回调里
+// 读 `e.target` / 对事件对象做 ToObject 时抛 "cannot convert 'null' or
+// 'undefined' to object"(实测百度地图 `xhr rs` 报错,数据 boot 链中断)。
+function __lsmXhrEvent(type, xhr) {
+  return { type: String(type), target: xhr, currentTarget: xhr, timeStamp: Date.now(),
+           bubbles: false, cancelable: false, defaultPrevented: false,
+           preventDefault: function () { this.defaultPrevented = true; },
+           stopPropagation: function () {} };
 }
 XMLHttpRequest.prototype.open = function (m, u) {
   this._method = String(m || "GET").toUpperCase();
@@ -1365,10 +1376,10 @@ XMLHttpRequest.prototype.addEventListener = function (name, fn) {
 };
 XMLHttpRequest.prototype.__fire = function (name) {
   var list = this._listeners[name] || [];
-  for (var i = 0; i < list.length; i++) { try { list[i].call(this); } catch (e) { __cerror("xhr " + name + ": " + String(e)); } }
+  for (var i = 0; i < list.length; i++) { try { list[i].call(this, __lsmXhrEvent(name, this)); } catch (e) { __cerror("xhr " + name + ": " + String(e)); } }
 };
 XMLHttpRequest.prototype.__rs = function () {
-  if (this.onreadystatechange) { try { this.onreadystatechange(); } catch (e) { __cerror("xhr rs: " + String(e)); } }
+  if (this.onreadystatechange) { try { this.onreadystatechange.call(this, __lsmXhrEvent("readystatechange", this)); } catch (e) { __cerror("xhr rs: " + String(e)); } }
 };
 XMLHttpRequest.prototype.send = function (body) {
   var o = { method: this._method, headers: this._headers, cookies: __lsmCookie };
@@ -1381,7 +1392,7 @@ XMLHttpRequest.prototype.send = function (body) {
   if (r.error) {
     this.readyState = 4; this.status = 0;
     this.__rs();
-    if (this.onerror) { try { this.onerror(); } catch (e4) {} }
+    if (this.onerror) { try { this.onerror.call(this, __lsmXhrEvent("error", this)); } catch (e4) {} }
     this.__fire("error");
     return;
   }
@@ -1392,13 +1403,26 @@ XMLHttpRequest.prototype.send = function (body) {
   this.statusText = String(r.statusText || "");
   this.responseText = r.body == null ? "" : String(r.body);
   this.response = this.responseText;
+  // 响应头/最终 URL 回填:`getResponseHeader` 此前永远拿到 null(_respHeaders 从不赋值)。
+  this._respHeaders = r.headers || {};
+  this.responseURL = String(r.url || this._url);
+  if (this.responseType === "json") {
+    try { this.response = this.responseText === "" ? null : JSON.parse(this.responseText); }
+    catch (e6) { this.response = null; }
+  }
   this.__rs();
-  if (this.onload) { try { this.onload(); } catch (e5) { __cerror("xhr load: " + String(e5)); } }
+  if (this.onload) { try { this.onload.call(this, __lsmXhrEvent("load", this)); } catch (e5) { __cerror("xhr load: " + String(e5)); } }
   this.__fire("load");
 };
 XMLHttpRequest.prototype.abort = function () {};
 XMLHttpRequest.prototype.getResponseHeader = function (k) {
   return (this._respHeaders && this._respHeaders[String(k).toLowerCase()]) || null;
+};
+XMLHttpRequest.prototype.getAllResponseHeaders = function () {
+  var out = [];
+  var h = this._respHeaders || {};
+  for (var k in h) { out.push(k + ": " + h[k]); }
+  return out.join("\r\n");
 };
 
 // ---------- matchMedia(视口/方向/配色子集) ----------

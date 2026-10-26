@@ -966,3 +966,256 @@ fn 显示列表_模糊阴影携带blur半径() {
         _ => unreachable!(),
     }
 }
+
+// ===================== CSS 浮动(阶段七) =====================
+
+fn 盒<'a>(layout: &'a super::Layout, selector: &str) -> &'a super::ElementBox {
+    layout
+        .boxes
+        .iter()
+        .find(|b| b.selector == selector)
+        .unwrap_or_else(|| panic!("找不到元素盒 {selector}: {:?}", layout.boxes.iter().map(|b| &b.selector).collect::<Vec<_>>()))
+}
+
+#[test]
+fn 浮动_左右浮动同一行排列() {
+    let doc = Document::parse(
+        "<body><div id='c' style='width:400px'>\
+         <div id='a' style='float:left;width:100px;height:30px'></div>\
+         <div id='b' style='float:left;width:200px;height:30px'></div>\
+         </div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let a = 盒(&layout, "#a");
+    let b = 盒(&layout, "#b");
+    assert_eq!(a.y, b.y, "两个左浮动应同一行:a={a:?} b={b:?}");
+    assert!(b.x >= a.x + a.w, "第二个浮动应排在第一个右侧:a={a:?} b={b:?}");
+}
+
+#[test]
+fn 浮动_右浮动贴容器右缘() {
+    let doc = Document::parse(
+        "<body><div id='c' style='width:400px'>\
+         <div id='r' style='float:right;width:100px;height:20px'></div>\
+         </div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let c = 盒(&layout, "#c");
+    let r = 盒(&layout, "#r");
+    assert!(
+        (r.x + r.w - (c.x + c.w)).abs() < 0.01,
+        "右浮动应贴容器右缘:c={c:?} r={r:?}"
+    );
+}
+
+#[test]
+fn 浮动_容器auto高收编浮动底边() {
+    let doc = Document::parse(
+        "<body><div id='c'>\
+         <div id='a' style='float:left;width:100px;height:50px'></div>\
+         </div><div id='after'>后续</div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let c = 盒(&layout, "#c");
+    let a = 盒(&layout, "#a");
+    let after = 盒(&layout, "#after");
+    assert!(c.h >= a.h, "容器 auto 高不应塌缩:c={c:?} a={a:?}");
+    assert!(
+        after.y >= a.y + a.h,
+        "后续内容不应与浮动重叠:a={a:?} after={after:?}"
+    );
+}
+
+#[test]
+fn 浮动_clear换行到浮动之下() {
+    let doc = Document::parse(
+        "<body><div id='c' style='width:400px'>\
+         <div id='a' style='float:left;width:100px;height:30px'></div>\
+         <div id='b' style='clear:both;width:50px;height:10px'></div>\
+         </div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let a = 盒(&layout, "#a");
+    let b = 盒(&layout, "#b");
+    assert!(
+        b.y >= a.y + a.h,
+        "clear:both 应下沉到浮动底边之下:a={a:?} b={b:?}"
+    );
+}
+
+#[test]
+fn 浮动_auto宽内容盒在浮动旁收窄() {
+    let doc = Document::parse(
+        "<body><div id='c' style='width:400px'>\
+         <div id='side' style='float:left;width:100px;height:30px'></div>\
+         <div id='main' style='height:40px'></div>\
+         </div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let c = 盒(&layout, "#c");
+    let side = 盒(&layout, "#side");
+    let main = 盒(&layout, "#main");
+    assert!(
+        main.x >= side.x + side.w,
+        "内容盒应位于左浮动右侧:side={side:?} main={main:?}"
+    );
+    assert!(main.w < c.w, "内容盒应收窄到剩余带:c={c:?} main={main:?}");
+}
+
+#[test]
+fn 浮动_带宽不足时下沉换行() {
+    let doc = Document::parse(
+        "<body><div id='c' style='width:400px'>\
+         <div id='a' style='float:left;width:300px;height:30px'></div>\
+         <div id='b' style='float:left;width:300px;height:30px'></div>\
+         <div id='d' style='float:left;width:300px;height:30px'></div>\
+         </div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let a = 盒(&layout, "#a");
+    let b = 盒(&layout, "#b");
+    let d = 盒(&layout, "#d");
+    assert!(b.y > a.y, "第二个 300px 浮动在 400px 容器里应换行:a={a:?} b={b:?}");
+    assert!(d.y > b.y, "第三个浮动应再换一行:b={b:?} d={d:?}");
+}
+
+#[test]
+fn 浮动_行内控件与行内块排成一行() {
+    // 百度地图搜索卡片同构:input 329 + 路线 39 = 内容盒 368;内容盒 368 + 搜索 57 = 425。
+    let doc = Document::parse(
+        "<body><div id='card' style='width:425px;height:44px'>\
+         <div id='content' style='display:inline-block;width:368px;height:40px'>\
+         <input id='q' style='float:left;width:329px;height:38px'>\
+         <div id='route' style='float:left;width:39px;height:38px'></div>\
+         </div>\
+         <button id='go' style='float:left;width:57px;height:38px'></button>\
+         </div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let content = 盒(&layout, "#content");
+    let q = 盒(&layout, "#q");
+    let route = 盒(&layout, "#route");
+    let go = 盒(&layout, "#go");
+    assert_eq!(q.y, route.y, "输入框与路线按钮应同一行:q={q:?} route={route:?}");
+    assert!(
+        (route.x - (q.x + q.w)).abs() < 0.01,
+        "路线按钮应紧贴输入框右侧:q={q:?} route={route:?}"
+    );
+    assert_eq!(content.y, go.y, "搜索按钮应与内容盒同一行:content={content:?} go={go:?}");
+    assert!(
+        (go.x - (content.x + content.w)).abs() < 0.01,
+        "搜索按钮应紧贴内容盒右侧:content={content:?} go={go:?}"
+    );
+}
+
+#[test]
+fn 浮动_行内右浮动贴容器右缘() {
+    let doc = Document::parse(
+        "<body><div id='card' style='width:400px;height:44px'>\
+         <span id='txt'>说明</span>\
+         <button id='go' style='float:right;width:60px;height:30px'>Go</button>\
+         </div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let card = 盒(&layout, "#card");
+    let go = 盒(&layout, "#go");
+    assert!(
+        (go.x + go.w - (card.x + card.w)).abs() < 0.01,
+        "行内右浮动应贴容器右缘:card={card:?} go={go:?}"
+    );
+}
+
+#[test]
+fn 浮动_块级浮动容器收缩宽度并与行内浮动混排() {
+    // 真实百度结构:#searchbox(425) > #searchbox-container(float:left,auto 宽)
+    //   > 内容盒(block) > input(float 329) + 路线按钮(block float 39);
+    // 搜索按钮(inline float 57)应紧贴容器右侧。
+    let doc = Document::parse(
+        "<body><div id='card' style='width:425px;height:44px'>\
+         <div id='container' style='float:left'>\
+         <div id='content' style='height:40px'>\
+         <input id='q' style='float:left;width:329px;height:38px'>\
+         <div id='route' style='float:left;width:39px;height:38px'></div>\
+         </div></div>\
+         <button id='go' style='float:left;width:57px;height:38px'></button>\
+         </div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let container = 盒(&layout, "#container");
+    let q = 盒(&layout, "#q");
+    let route = 盒(&layout, "#route");
+    let go = 盒(&layout, "#go");
+    assert!(
+        (container.w - 368.0).abs() < 0.01,
+        "auto 宽浮动容器应收缩为内容宽 368,实际 {container:?}"
+    );
+    assert_eq!(q.y, route.y, "输入框与路线按钮应同一行:q={q:?} route={route:?}");
+    assert!(
+        (route.x - (q.x + q.w)).abs() < 0.01,
+        "块级路线浮动应排在行内输入框右侧:q={q:?} route={route:?}"
+    );
+    assert_eq!(container.y, go.y, "搜索按钮应与浮动容器同一行:container={container:?} go={go:?}");
+    assert!(
+        (go.x - (container.x + container.w)).abs() < 0.01,
+        "搜索按钮应紧贴浮动容器右侧:container={container:?} go={go:?}"
+    );
+}
+
+// ===================== 表单控件文本绘制(阶段七) =====================
+#[test]
+fn 表单_输入框placeholder被绘制为灰字() {
+    let doc = Document::parse(
+        "<body><div><input id='q' placeholder='搜地点、查公交' style='width:200px;height:30px'></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let line = layout
+        .lines
+        .iter()
+        .find(|l| l.text.contains("搜地点"))
+        .expect("placeholder 应产生文本行");
+    assert_eq!(line.color, [117, 117, 117], "占位符应为 UA 灰");
+}
+
+#[test]
+fn 表单_输入框value优先于placeholder() {
+    let doc = Document::parse(
+        "<body><div><input id='q' value='沙河镇' placeholder='搜地点' style='width:200px;height:30px'></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    assert!(
+        layout.lines.iter().any(|l| l.text.contains("沙河镇")),
+        "value 文本应被绘制"
+    );
+    assert!(
+        !layout.lines.iter().any(|l| l.text.contains("搜地点")),
+        "有 value 时不应再画 placeholder"
+    );
+}
+
+#[test]
+fn 表单_密码值按圆点掩码() {
+    let doc = Document::parse(
+        "<body><div><input type='password' value='abc' style='width:200px;height:30px'></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let line = layout
+        .lines
+        .iter()
+        .find(|l| l.text.contains('•'))
+        .expect("密码应绘制掩码");
+    assert_eq!(line.text, "•••");
+    assert!(!layout.lines.iter().any(|l| l.text.contains("abc")));
+}
+
