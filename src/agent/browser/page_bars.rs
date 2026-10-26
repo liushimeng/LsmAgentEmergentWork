@@ -122,7 +122,14 @@ pub fn lsm_mode_text() -> (&'static str, &'static str) {
 }
 
 /// 组装两条栏的全部行文本。返 `(状态栏行, 进度栏行, 进度百分比 0..=100)`。
-pub fn assemble_rows(bars: &PageBars, guard_note: Option<&str>) -> (Vec<BarRow>, Vec<BarRow>, f32) {
+/// `webgl_asked`:页面申请过 WebGL 上下文的次数(>0 = 站点依赖 WebGL 绘制,
+/// 内核无 GPU 后端 → 地图/三维区域不会出像素)。此时状态栏补一行说明,
+/// 让**用户看到的画面**自己讲清为什么是空的,而不是面对一片无解释的灰底。
+pub fn assemble_rows(
+    bars: &PageBars,
+    guard_note: Option<&str>,
+    webgl_asked: u32,
+) -> (Vec<BarRow>, Vec<BarRow>, f32) {
     const TITLE: [u8; 3] = [0x60, 0xa5, 0xfa];
     const BRIGHT: [u8; 3] = [0xe2, 0xe8, 0xf0];
     const MUTED: [u8; 3] = [0x94, 0xa3, 0xb8];
@@ -146,6 +153,14 @@ pub fn assemble_rows(bars: &PageBars, guard_note: Option<&str>) -> (Vec<BarRow>,
         status.push(BarRow {
             text: web_activity::clip_chars(note, 60),
             color: NORMAL,
+            bold: false,
+            size: 12.0,
+        });
+    }
+    if webgl_asked > 0 {
+        status.push(BarRow {
+            text: "内核无 WebGL:地图/三维区域不出像素(需像素级画面请用 Chrome)".to_string(),
+            color: MUTED,
             bold: false,
             size: 12.0,
         });
@@ -256,7 +271,7 @@ pub(crate) fn draw(pixmap: &mut Pixmap, font: &FontSet, tab: &TabState) {
     if vw < 320.0 || vh < 240.0 {
         return; // 视口过小(极端窗口),两条栏无处安放,跳过。
     }
-    let (status, progress, fill_pct) = assemble_rows(&tab.bars, tab.guard.note.as_deref());
+    let (status, progress, fill_pct) = assemble_rows(&tab.bars, tab.guard.note.as_deref(), tab.webgl_asked);
     let status_w = layout_bar(font, &status, vw, false);
     draw_bar(pixmap, font, &status, status_w, vw - MARGIN - status_w.0, MARGIN, None);
     // 进度栏:左下角锚定;含 3px 进度条,总高相应加高。
@@ -459,7 +474,7 @@ mod tests {
 
     #[test]
     fn 状态栏标题必须带具体Agent名() {
-        let (status, _, _) = assemble_rows(&bars(), None);
+        let (status, _, _) = assemble_rows(&bars(), None, 0);
         assert_eq!(
             status[0].text,
             "LAEW Agent 控制中 · LsmAgentEmergentWork-SubAgent-Work"
@@ -469,13 +484,13 @@ mod tests {
 
     #[test]
     fn 无台账时回退品牌名() {
-        let (status, _, _) = assemble_rows(&PageBars::default(), None);
+        let (status, _, _) = assemble_rows(&PageBars::default(), None, 0);
         assert_eq!(status[0].text, "LAEW Agent 控制中 · LAEW Agent");
     }
 
     #[test]
     fn 静态注意事项在状态栏且进度栏无固定声明() {
-        let (status, progress, _) = assemble_rows(&bars(), None);
+        let (status, progress, _) = assemble_rows(&bars(), None, 0);
         let (_, notice) = lsm_mode_text();
         // 状态栏:档位行 + 注意事项行齐全。
         assert!(status.iter().any(|r| r.text.contains("仅观看")), "档位行应在状态栏");
@@ -490,11 +505,11 @@ mod tests {
     #[test]
     fn guard_note进状态栏且截断() {
         let note = "自".repeat(80);
-        let (status, _, _) = assemble_rows(&bars(), Some(&note));
+        let (status, _, _) = assemble_rows(&bars(), Some(&note), 0);
         let note_rows: Vec<&BarRow> = status.iter().filter(|r| r.text.starts_with("自")).collect();
         assert_eq!(note_rows.len(), 1, "note 行应恰好一行");
         assert!(note_rows[0].text.chars().count() <= 60, "note 超 60 字符应截断");
-        let (s2, _, _) = assemble_rows(&bars(), Some("  "));
+        let (s2, _, _) = assemble_rows(&bars(), Some("  "), 0);
         assert_eq!(s2.len(), 3, "空白 note 不产生行");
     }
 
@@ -505,7 +520,7 @@ mod tests {
             BarEvent { t: 1_700_000_000_000, label: "open https://a".into(), ok: true, ms: 800 },
             BarEvent { t: 1_700_000_020_000, label: "click #buy".into(), ok: false, ms: 0 },
         ];
-        let (_, progress, fill) = assemble_rows(&b, None);
+        let (_, progress, fill) = assemble_rows(&b, None, 0);
         assert!(progress[0].text.starts_with("▶ 第 3/12 轮 · 执行工具 · control click #buy"));
         assert!(progress[1].text.contains("迭代 3/12"), "{}", progress[1].text);
         assert!(progress[1].text.contains("会话 sess-a"), "{}", progress[1].text);
@@ -521,7 +536,7 @@ mod tests {
     fn 动作全空时进度栏占位() {
         let mut b = PageBars::default();
         b.agent = "LsmAgentEmergentWork-Yolo".into();
-        let (_, progress, fill) = assemble_rows(&b, None);
+        let (_, progress, fill) = assemble_rows(&b, None, 0);
         assert_eq!(progress[0].text, "待命中 · 等待下一次浏览器动作");
         assert_eq!(fill, 0.0);
     }
@@ -615,5 +630,20 @@ mod tests {
         let changed = pixmap.pixels().iter().filter(|p| p.red() < 40 && p.blue() > 20).count();
         assert!(changed > 0, "两条栏底色应已绘制");
     }
+    #[test]
+    fn webgl_缺口_状态栏多一行说明() {
+        // 用户看到的是**有头窗口里的画面**:地图区域一片灰底时,状态栏要自己
+        // 讲清「内核无 WebGL」,而不是让用户对着空白猜。
+        let bars = PageBars::default();
+        let (status, _, _) = assemble_rows(&bars, None, 0);
+        assert!(
+            !status.iter().any(|r| r.text.contains("WebGL")),
+            "无 WebGL 缺口时不应出现该行:{status:?}"
+        );
+        let (status2, _, _) = assemble_rows(&bars, None, 2);
+        assert!(
+            status2.iter().any(|r| r.text.contains("WebGL")),
+            "有 WebGL 缺口时状态栏必须给出说明:{status2:?}"
+        );
+    }
 }
-
