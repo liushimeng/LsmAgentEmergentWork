@@ -224,9 +224,10 @@ function __lsmPushText(n, c) {
   var txt = String(c.textContent != null ? c.textContent : (c.data != null ? c.data : ""));
   var key = n.sel || ("#idx_" + n.i);
   var prev = Object.prototype.hasOwnProperty.call(__lsmText, key) ? __lsmText[key] : (n.text || "");
-  var merged = String(prev) + txt;
-  __lsmText[key] = merged;
-  __push({ type: "set_text", selector: n.sel, value: merged });
+  __lsmText[key] = String(prev) + txt;
+  // append_text 而非 set_text:浏览器的 appendChild(textNode) 是**追加**,
+  // set_text 会把元素既有子节点全换掉(误删原有内容)。
+  __push({ type: "append_text", selector: n.sel, value: txt });
 }
 
 // ---------- HTMLCollection:活集合 ----------

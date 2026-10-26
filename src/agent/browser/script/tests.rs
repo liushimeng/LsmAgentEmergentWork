@@ -1223,10 +1223,26 @@ fn 文本节点追加落到宿主_dom() {
         .outcome
         .actions
         .iter()
-        .find(|a| a.kind == "set_text" && a.value.contains("body{color:red}"));
+        .find(|a| a.kind == "append_text" && a.value.contains("body{color:red}"));
     assert!(
         hit.is_some(),
-        "文本节点应产生 set_text 动作落进宿主 DOM,实际动作:{:?}",
+        "文本节点应产生 append_text 动作落进宿主 DOM,实际动作:{:?}",
         r.outcome.actions
     );
+}
+
+#[test]
+fn 应用_append_text_不清空既有子节点() {
+    // 浏览器的 appendChild(textNode) 是**追加**;若内核用 set_text 落地,
+    // 元素原有子节点会被整体换掉(误删内容)。append_text 才是正确语义。
+    let doc = Document::parse(
+        "<html><body><div id='box'><span>原有</span></div></body></html>",
+        "https://a.test/",
+    );
+    let actions = vec![action("append_text", "#box", "", "追加文本")];
+    let summary = dom_ops::apply(&doc, &actions, "https://a.test/");
+    assert_eq!(summary.applied, 1);
+    let out = doc.serialize_full();
+    assert!(out.contains("原有"), "既有子节点不得被清空:{out}");
+    assert!(out.contains("追加文本"), "追加的文本必须落地:{out}");
 }

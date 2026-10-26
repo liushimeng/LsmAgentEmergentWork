@@ -97,6 +97,16 @@ pub fn apply(doc: &Document, actions: &[JsAction], base_url: &str) -> ApplySumma
                 node.append(NodeRef::new_text(&action.value));
                 summary.applied += 1;
             }
+            // 追加文本节点(浏览器语义:appendChild(textNode) **不清空**既有子节点)。
+            // set_text 会把子节点全换掉,用它做 appendChild 会误删元素原有内容。
+            "append_text" => {
+                let Some(node) = find(doc, &action.selector) else {
+                    summary.failed += 1;
+                    continue;
+                };
+                node.append(NodeRef::new_text(&action.value));
+                summary.applied += 1;
+            }
             "set_html" | "replace_html" => {
                 if action.selector.starts_with("@created:") {
                     // detached 元素上的 innerHTML 赋值:节点未入树,无处落地,静默忽略。
