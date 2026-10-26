@@ -143,6 +143,8 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 - **JS 引擎**：`JsRuntime` 抽象；阶段一默认 `boa_engine`（纯 Rust，离线可编译），DOM 通过快照桥暴露 `document/window/location/storage`；`rusty_v8` 作为可选目标后端（`v8-backend` 特性），上层接口不变。
 - **页面观察与就绪判定**：`MutationObserver`/`IntersectionObserver`/`ResizeObserver` 在 PRELUDE 层**真实派发**（记账点/选项过滤/子树/旧值/阈值）；宿主侧变更经快照 diff 合成 mutation 记录（Agent 侧动作对页面脚本可见）。`control(wait)` 是就绪判定原语：`selector`+`state`(visible/hidden/attached/detached)、`text`、`js`、`network_idle` 可组合取「与」，超时返 2002。设计见 `docs/MCP_Web_LsmAgentBrowser_Use/17-阶段五第一步页面观察与就绪判定设计.md`。
 - **页面能力与安全**：网络请求走本进程 `reqwest`（rustls），沿用 `LAEW_TLS_INSECURE` 与 SSRF 私网拦截；任务锚点 6001 继续在显式 URL 动作入口生效；页面脚本执行、原生窗口、资源加载器分别在阶段二/三/四补齐。
+- **DOM 集合语义**：`getElementsByTagName`/`getElementsByClassName`/`getElementsByName` 返回**活集合**（`Proxy` 实时重查，浏览器语义）；曾返回一次性数组快照，导致站点「取集合→改 DOM→再读集合[0]」读到 `undefined` 直接炸链（实测百度地图 `require.loadCss` 的 CSS 注入器 → `dataCopyRight` 模块工厂失败 → 地图初始化链断掉 → 地图/路线面板全不出图）。见 `docs/MCP_Web_LsmAgentBrowser_Use/26-`。
+- **内核能力缺口如实上报**：站点申请过 WebGL 上下文（`canvas.getContext('webgl')`）时，内核无 GPU 后端 → 该区域画不出像素；`open` 回 `capability_gaps`、`inspect(info=page_health)` 直说「需要像素级地图请改用 `MCP_Web_Chrome_Use`」，免得 Agent 对同一片空白反复截图重试。
 - **人工介入**：`control(request_human)` 桥接 `human_assist`（桌面原生弹窗 / TUI），返回 0/4001/4002；取消任务同时置位进程级旗标。弹窗实现见 `src/agent/human_ui/`。
 
 ### 多 Agent 架构（8 角色）

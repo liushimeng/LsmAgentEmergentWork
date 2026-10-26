@@ -23,6 +23,9 @@ pub struct JsOutcome {
     pub actions: Vec<JsAction>,
     pub logs: Vec<JsLog>,
     pub truncated: bool,
+    /// 页面申请过 WebGL 上下文的次数(>0 = 站点依赖 WebGL 绘制,
+    /// 而 LsmAgentBrowser 内核无 WebGL → 相关区域画不出,须如实告知调用方)。
+    pub webgl_asked: u32,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -144,6 +147,7 @@ pub fn eval(script: &str, nodes: &[SnapshotNode], meta: &JsPageMeta<'_>) -> Resu
         actions,
         logs,
         truncated,
+        webgl_asked: 0,
     })
 }
 

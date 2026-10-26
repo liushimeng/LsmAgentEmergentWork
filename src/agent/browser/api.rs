@@ -184,6 +184,9 @@ async fn apply_js_reply(
             at_ms: super::now_ms(),
         });
     }
+    if reply.outcome.webgl_asked > t.webgl_asked {
+        t.webgl_asked = reply.outcome.webgl_asked;
+    }
     for rec in &reply.network {
         if t.network.len() > 200 {
             t.network.remove(0);
@@ -224,7 +227,7 @@ async fn apply_js_reply(
     if let Some(tab) = inner.tabs.get_mut(pid) {
         tab.images = images_out.store;
         let dom = Document::parse(&tab.html, &tab.url);
-        let media = super::style::MediaCtx::new(tab.viewport.width as f64, 720.0);
+        let media = super::style::MediaCtx::new(tab.viewport.width as f64, tab.viewport.height as f64);
         let sizes = super::images::ImageSizes::from_store(&tab.images);
         tab.layout = super::layout::compute_full(
             &dom,
@@ -370,7 +373,7 @@ async fn run_pending_scripts(mgr: &LsmBrowserManager, pid: &str, budget_ms: u64)
     }
     if changed {
         let dom = Document::parse(&tab.html, &tab.url);
-        let media = super::style::MediaCtx::new(tab.viewport.width as f64, 720.0);
+        let media = super::style::MediaCtx::new(tab.viewport.width as f64, tab.viewport.height as f64);
         let sizes = super::images::ImageSizes::from_store(&tab.images);
         tab.layout = super::layout::compute_full(
             &dom,
@@ -604,7 +607,7 @@ pub async fn control(
             }
             let doc = Document::parse(&tab.html, &tab.url);
             // 阶段三第三步:视口变化复用已解码图片的固有尺寸重排。
-            let media = super::style::MediaCtx::new(tab.viewport.width as f64, 720.0);
+            let media = super::style::MediaCtx::new(tab.viewport.width as f64, tab.viewport.height as f64);
             let sizes = super::images::ImageSizes::from_store(&tab.images);
             tab.layout = super::layout::compute_full(
                 &doc,
@@ -623,7 +626,7 @@ pub async fn control(
                 "left": p_u64(params, "left"),
                 "top": p_u64(params, "top"),
                 "window_state": p_str(params, "window_state").unwrap_or("normal"),
-                "note": "LsmAgentBrowser 阶段一为逻辑窗口,原生窗口在阶段三实现",
+                "note": "LsmAgentBrowser 为进程内逻辑窗口;headed 模式下由独立查看器子进程(laew __browser-view)以原生窗口显示渲染帧,工具栏(后退/前进/刷新/首页 + 地址栏)经命令通道驱动本引擎",
             }))
         }
         "sync_viewport" => {

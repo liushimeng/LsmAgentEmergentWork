@@ -49,7 +49,7 @@ src/agent/browser/               内核:窗口/标签页 / 网络 / DOM / 布局
 
 | action | 参数 | 行为 |
 | --- | --- | --- |
-| `open` | `url*`、`mode`、`reuse`、`new_window`、`window_width/height`、`timeout_ms`、`user_agent`；兼容接受 `guard/overlay/stealth/highlight/auto_expand_viewport/wait_until/block_resources` | 打开页面，返回 `page_id/title/final_url/reused/mode/...` |
+| `open` | `url*`、`mode`、`reuse`、`new_window`、`window_width/height`、`timeout_ms`、`user_agent`；兼容接受 `guard/overlay/stealth/highlight/wait_until/block_resources` | 打开页面，返回 `page_id/title/final_url/reused/mode/...`;站点依赖 WebGL 时附 `capability_gaps`(见 `26-` §四) |
 | `list` | — | `{pages:[...], count, windows}` |
 | `close` | `page_id*`（可 `all`/`background`/`others`）、`keep`（others 必填） | 关闭页面/窗口 |
 | `control` | `page_id*`、`control_action*`、`params` | 写操作 |

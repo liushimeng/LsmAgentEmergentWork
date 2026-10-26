@@ -42,6 +42,9 @@ var __lsmUidSeq = 0;
 var __lsmFlushDepth = 0;
 // 变更序号:观察者只应看到登记之后的变更(seq 守卫)。
 var __lsmMutSeq = 0;
+// DOM 代号:任何结构性改动(append/remove/innerHTML/快照重建)都 +1。
+// 活集合据此判定缓存是否过期(见 __lsmLive)。
+var __lsmDomGen = 0;
 // ---------- 动态节点几何回填表 ----------
 // 站点地图/路线面板的容器由 JS 建出(document.createElement + 设尺寸 + appendChild),
 // 这些节点不在服务端 HTML 里,旧实现把 clientWidth/offsetWidth 写死为 0,
@@ -172,6 +175,7 @@ function __lsmRefresh(nodes, meta) {
     }
   }
   __lsmNodes = next;
+  __lsmDomGen++;
   __lsmMeta = meta || {};
   __lsmLocal = {};
   var src = __lsmMeta.local || {};
@@ -210,6 +214,118 @@ function __ancestorChain(idx) {
     cur = p;
   }
   return chain;
+}
+
+// 文本节点落到宿主 DOM:站点用 `document.createTextNode(css)` 往 <style> 里塞 CSS
+// (百度地图 require.loadCss 的注入方式)。此前 appendChild 只认「detached 元素」和
+// 「快照节点」两种,文本节点两个分支都不落 → 运行时注入的 CSS 全部丢失,
+// 站点动态样式缺失 → 布局与真实浏览器对不上。
+function __lsmPushText(n, c) {
+  var txt = String(c.textContent != null ? c.textContent : (c.data != null ? c.data : ""));
+  var key = n.sel || ("#idx_" + n.i);
+  var prev = Object.prototype.hasOwnProperty.call(__lsmText, key) ? __lsmText[key] : (n.text || "");
+  var merged = String(prev) + txt;
+  __lsmText[key] = merged;
+  __push({ type: "set_text", selector: n.sel, value: merged });
+}
+
+// ---------- HTMLCollection:活集合 ----------
+// 真实浏览器的 getElementsByTagName / getElementsByClassName 返回**实时集合**:
+// 「取集合 → 改 DOM → 再读集合」,集合内容随 DOM 变化。
+// Lsm 曾返回一次性数组快照,站点当场读到 undefined 而炸链。
+// 实测百度地图:`mod_5dbb339.js` 的 `require.loadCss` → 内部 CSS 注入函数
+//   var n=head.getElementsByTagName("style");
+//   if(!n.length){ 创建 <style> 并 appendChild }
+//   var o=n[0]; o.getAttribute("media")
+// 快照期 head 里还没有 <style>(宿主动作尚未回写),走创建分支;而 n 是静态数组,
+// appendChild 之后 n[0] 仍是 undefined → `o.getAttribute` 抛 TypeError
+// → `common:widget/ui/dataCopyRight/dataCopyRight.js` 模块工厂失败
+// → setCurCity → init → setStatus 整条地图初始化链断掉
+// → 地图不出图、路线面板不出、页面只剩搜索框。
+//
+// 实现:Proxy 包裹一个数组,`length`/数字下标/`item()`/`namedItem()`/迭代/`Object.keys`
+// 全部**实时重查** collect();无 Proxy 环境(理论上不会发生)回退成普通数组快照。
+function __lsmLive(collect) {
+  if (typeof Proxy !== "function") return collect();
+  var METHODS = ["forEach", "map", "filter", "slice", "indexOf", "lastIndexOf", "join",
+    "some", "every", "find", "findIndex", "includes", "concat", "reduce", "reduceRight",
+    "sort", "reverse", "at"];
+  var target = [];
+  // 结果按 DOM 代号缓存:结构性改动(__lsmRec / 快照重建)后代号前进,缓存失效。
+  // 避免每次读 length/下标都重跑整棵树查询(大页面上很贵)。
+  var cache = { gen: -1, arr: null };
+  function current() {
+    if (cache.arr === null || cache.gen !== __lsmDomGen) {
+      cache.arr = collect();
+      cache.gen = __lsmDomGen;
+    }
+    return cache.arr;
+  }
+  return new Proxy(target, {
+    get: function (t, k) {
+      var arr = current();
+      if (k === "length") return arr.length;
+      if (k === "item") {
+        return function (i) {
+          var a = current();
+          var x = a[Number(i)];
+          return x === undefined ? null : x;
+        };
+      }
+      if (k === "namedItem") {
+        return function (nm) {
+          var a = current();
+          for (var i = 0; i < a.length; i++) {
+            var e = a[i];
+            if (!e) continue;
+            if (e.id === nm) return e;
+            try { if (e.getAttribute && e.getAttribute("name") === nm) return e; } catch (x) {}
+          }
+          return null;
+        };
+      }
+      if (typeof k === "symbol") {
+        if (k === Symbol.iterator) {
+          return function () { var a = current(); return a[Symbol.iterator](); };
+        }
+        return undefined;
+      }
+      if (typeof k === "string") {
+        if (/^\d+$/.test(k)) return arr[Number(k)];
+        if (METHODS.indexOf(k) >= 0) {
+          return function () { var a = current(); return Array.prototype[k].apply(a, arguments); };
+        }
+        if (k === "toString") return function () { return "[object HTMLCollection]"; };
+      }
+      return undefined;
+    },
+    has: function (t, k) {
+      if (typeof k === "string" && /^\d+$/.test(k)) return Number(k) < current().length;
+      return false;
+    },
+    ownKeys: function (t) {
+      var arr = current();
+      var keys = [];
+      for (var i = 0; i < arr.length; i++) keys.push(String(i));
+      keys.push("length");
+      return keys;
+    },
+    getOwnPropertyDescriptor: function (t, k) {
+      var arr = current();
+      // 「length」在目标数组上是非配置自有属性,报成 writable 才能合法改值
+      // (Proxy 不变式:不可写属性的值必须 SameValue)。
+      if (k === "length") {
+        return { value: arr.length, writable: true, enumerable: false, configurable: false };
+      }
+      if (typeof k === "string" && /^\d+$/.test(k)) {
+        var idx = Number(k);
+        if (idx < arr.length) {
+          return { value: arr[idx], writable: false, enumerable: true, configurable: true };
+        }
+      }
+      return undefined;
+    }
+  });
 }
 
 // ---------- HTML 轻量序列化(detached 元素树 → HTML 字符串) ----------
@@ -493,23 +609,27 @@ function __mk(n) {
       return null;
     },
     getElementsByTagName: function (t) {
-      var out = [];
       var tag = String(t).toLowerCase();
       // 快照子树(父索引)∪ 动态覆盖层,一起按标签收集。
-      for (var i = 0; i < __lsmNodes.length; i++) {
-        var nd = __lsmNodes[i];
-        var anc = __ancestorChain(nd.i);
-        if (anc.indexOf(n.i) >= 0 && (tag === "*" || String(nd.tag).toLowerCase() === tag)) out.push(__mk(nd));
-      }
-      for (var d = 0; d < dynKids.length; d++) {
-        (function walk(k) {
-          var kt = String((k.__tag || k.tagName || "")).toLowerCase();
-          if (tag === "*" || kt === tag) out.push(k);
-          var ks = k.__kids || [];
-          for (var q = 0; q < ks.length; q++) walk(ks[q]);
-        })(dynKids[d]);
-      }
-      return out;
+      // 返回**活集合**:站点「取集合 → 改 DOM → 再读集合」要能立刻看到变化
+      // (百度地图 require.loadCss 的 CSS 注入器就靠这个,见 __lsmLive 注释)。
+      return __lsmLive(function () {
+        var out = [];
+        for (var i = 0; i < __lsmNodes.length; i++) {
+          var nd = __lsmNodes[i];
+          var anc = __ancestorChain(nd.i);
+          if (anc.indexOf(n.i) >= 0 && (tag === "*" || String(nd.tag).toLowerCase() === tag)) out.push(__mk(nd));
+        }
+        for (var d = 0; d < dynKids.length; d++) {
+          (function walk(k) {
+            var kt = String((k.__tag || k.tagName || "")).toLowerCase();
+            if (tag === "*" || kt === tag) out.push(k);
+            var ks = k.__kids || [];
+            for (var q = 0; q < ks.length; q++) walk(ks[q]);
+          })(dynKids[d]);
+        }
+        return out;
+      });
     },
     querySelectorAll: function (s) { return __lsmQuery(s, n.i); },
     appendChild: function (c) {
@@ -518,6 +638,7 @@ function __mk(n) {
       __lsmRec("childList", el, { addedNodes: c ? [c] : [] });
       if (c && c.__detached) __push({ type: "append_html", selector: n.sel, value: __serEl(c) });
       else if (c && c.__lsm_node) __push({ type: "append_node", selector: c.__lsm_node.sel, key: n.sel });
+      else if (c && c.nodeType === 3) __lsmPushText(n, c);
       return c;
     },
     insertBefore: function (c, ref) {
@@ -533,6 +654,8 @@ function __mk(n) {
         __push({ type: "insert_html", selector: n.sel, value: html });
       } else if (c && c.__lsm_node) {
         __push({ type: "insert_node", selector: c.__lsm_node.sel, key: n.sel });
+      } else if (c && c.nodeType === 3) {
+        __lsmPushText(n, c);
       }
       return c;
     },
@@ -941,22 +1064,27 @@ function __newEl(tag) {
     }
   }
   el.getElementsByTagName = function (t) {
-    var out = [];
     var tag = String(t).toLowerCase();
-    __walkKids(el, function (k) {
-      var kt = String((k.__tag || k.tagName || "")).toLowerCase();
-      if (tag === "*" || kt === tag) out.push(k);
+    // 活集合(见 __lsmLive):动态子树改动后立刻可见。
+    return __lsmLive(function () {
+      var out = [];
+      __walkKids(el, function (k) {
+        var kt = String((k.__tag || k.tagName || "")).toLowerCase();
+        if (tag === "*" || kt === tag) out.push(k);
+      });
+      return out;
     });
-    return out;
   };
   el.getElementsByClassName = function (c) {
-    var out = [];
     var cls = String(c);
-    __walkKids(el, function (k) {
-      var kc = String((k.className != null ? k.className : (k.__attrs && k.__attrs["class"]) || ""));
-      if (cls === "*" || kc.split(/\s+/).indexOf(cls) >= 0) out.push(k);
+    return __lsmLive(function () {
+      var out = [];
+      __walkKids(el, function (k) {
+        var kc = String((k.className != null ? k.className : (k.__attrs && k.__attrs["class"]) || ""));
+        if (cls === "*" || kc.split(/\s+/).indexOf(cls) >= 0) out.push(k);
+      });
+      return out;
     });
-    return out;
   };
   def("innerText", function () { return el.__text; }, function (v) { el.__text = String(v); el.__kids = []; });
   def("value", function () { return el.__attrs.value || ""; }, function (v) { el.__attrs.value = String(v); });
@@ -967,7 +1095,14 @@ function __newEl(tag) {
     el.height = 150;
     el.getContext = function (kind) {
       var k = String(kind || "").toLowerCase();
-      if (k.indexOf("2d") !== 0) return null;
+      if (k.indexOf("2d") !== 0) {
+        // WebGL / experimental-webgl:内核没有 GPU 后端,一律给 null(与真实
+        // 无 WebGL 环境一致)。但**记一笔**:站点据此判定能力并(如百度地图)
+        // 直接放弃整个地图渲染,页面只剩空壳。记下来如实告知调用方,免得
+        // Agent 反复重试一个内核根本画不出来的区域。
+        if (k.indexOf("webgl") === 0) window.__lsmWebGLAsked = (window.__lsmWebGLAsked || 0) + 1;
+        return null;
+      }
       if (!el.__ctx2d) el.__ctx2d = __mkCanvas2d(el);
       return el.__ctx2d;
     };
@@ -1158,11 +1293,21 @@ var document = {
   querySelectorAll: __lsmQuery,
   getElementById: function (id) { return __lsmQueryOne("#" + id); },
   getElementsByTagName: function (t) {
-    if (t === "*") return __lsmQuery("*");
-    return __lsmQuery(String(t));
+    var tag = String(t);
+    // 活集合(见 __lsmLive)。
+    return __lsmLive(function () {
+      if (tag === "*") return __lsmQuery("*");
+      return __lsmQuery(tag);
+    });
   },
-  getElementsByClassName: function (c) { return __lsmQuery("." + String(c)); },
-  getElementsByName: function (n) { return __lsmQuery("[name=" + n + "]"); },
+  getElementsByClassName: function (c) {
+    var cls = String(c);
+    return __lsmLive(function () { return __lsmQuery("." + cls); });
+  },
+  getElementsByName: function (n) {
+    var nm = String(n);
+    return __lsmLive(function () { return __lsmQuery("[name=" + nm + "]"); });
+  },
   createElement: function (tag) { return __newEl(tag); },
   // createElementNS:SVG/图标站点(图表、地图图例)用 NS 建元素;内核暂不渲染 SVG,
   // 但「建出来、能挂树、不崩」即可让面板/widget 完成初始化与挂载。
@@ -1912,6 +2057,7 @@ function __lsmRec(type, target, extra) {
     timeStamp: __lsmNow,
     seq: ++__lsmMutSeq
   };
+  __lsmDomGen++;
   __lsmMutQueue.push(rec);
   if (__lsmMutQueue.length > 4096) __lsmMutQueue.shift();
   return rec;
@@ -2328,15 +2474,26 @@ function __lsmErrText(e) {
       if (typeof orig !== "function") return;
       var w = function (v) {
         "use strict";
+        var bad = false;
         try {
-          var bad = where === "this"
+          bad = where === "this"
             ? (this === null || this === undefined)
             : (v === null || v === undefined);
-          if (globalThis.__lsmTraceToObj && bad) {
-            __cerror("[toobj] " + label + " where=" + where + " this=" + String(this) + " arg0=" + String(v) + " argc=" + arguments.length);
-          }
         } catch (e) {}
-        return orig.apply(this, arguments);
+        try {
+          return orig.apply(this, arguments);
+        } catch (e) {
+          // 只在**真的抛错**时记录。早前是「调用即记」,压缩脚本里 `Object.create(null)`
+          // 这类完全正常的调用会把控制台刷爆(实测百度地图一轮 300+ 条),
+          // 真正的抛错点反被挤到采集上限之外,开关等于白开。
+          if (globalThis.__lsmTraceToObj) {
+            var st = "";
+            try { st = String((new Error()).stack || e); } catch (x) { st = String(e); }
+            __cerror("[toobj] " + label + " where=" + where + " bad=" + bad +
+                     " arg0=" + String(v) + " | " + st);
+          }
+          throw e;
+        }
       };
       w.__lsmOrig = orig;
       owner[name] = w;
@@ -2517,7 +2674,8 @@ function __lsmCollect(ov) {
     actions: __lsmActions,
     console: __lsmConsole,
     handled: __lsmDispatchResult.handled,
-    defaultPrevented: __lsmDispatchResult.defaultPrevented
+    defaultPrevented: __lsmDispatchResult.defaultPrevented,
+    webglAsked: Number(window.__lsmWebGLAsked) || 0
   });
 }
 __lsmFatal = null;

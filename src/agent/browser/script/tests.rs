@@ -1166,3 +1166,67 @@ fn 动态元素序列化携带节点键() {
     assert!(r.outcome.value.contains("id=\"k\""), "原有属性不得丢失:{}", r.outcome.value);
     assert!(r.outcome.value.contains("class=\"box\""), "原有属性不得丢失:{}", r.outcome.value);
 }
+
+#[test]
+fn 元素集合是活集合_追加后立即可见() {
+    // 回归:getElementsByTagName 曾返回**一次性数组快照**。百度地图
+    // `require.loadCss` 的 CSS 注入器依赖浏览器的实时集合语义:
+    //   var n = head.getElementsByTagName("style");
+    //   if (!n.length) { 创建 <style> 并 appendChild }
+    //   var o = n[0]; o.getAttribute("media")     ← 快照下 o 是 undefined → TypeError
+    // 那个 TypeError 会打断 dataCopyRight 模块工厂 → setCurCity → init 整条
+    // 地图初始化链 → 地图与路线面板全都不出图。
+    let handle = JsHandle::spawn();
+    let r = eval_on(
+        &handle,
+        r#"(function(){
+          var head = document.getElementsByTagName('head')[0];
+          var n = head.getElementsByTagName('style');
+          if (n.length === 0) {
+            var s = document.createElement('style');
+            s.setAttribute('type','text/css');
+            head.appendChild(s);
+          }
+          var o = n[0];
+          return JSON.stringify({len: n.length, first: o ? String(o.tagName) : null});
+        })()"#,
+        "<html><head><title>T</title></head><body><div id='x'></div></body></html>",
+        "https://a.test/",
+    );
+    assert!(r.outcome.ok, "求值应成功:{r:?}");
+    assert_eq!(
+        r.outcome.value, r#"{"len":1,"first":"STYLE"}"#,
+        "追加 <style> 后集合必须立即可见(活集合),实际 {}",
+        r.outcome.value
+    );
+}
+
+#[test]
+fn 文本节点追加落到宿主_dom() {
+    // 回归:快照元素的 appendChild 只认「detached 元素」与「快照节点」,
+    // 文本节点两个分支都不落 → 站点运行时注入的 CSS(如 require.loadCss
+    // 往 <style> 里塞的样式文本)到不了宿主 DOM,动态样式全丢。
+    let handle = JsHandle::spawn();
+    let r = eval_on(
+        &handle,
+        r#"(function(){
+          var st = document.getElementById('s');
+          var t = document.createTextNode('body{color:red}');
+          st.appendChild(t);
+          return 'ok';
+        })()"#,
+        "<html><head><style id='s'></style></head><body></body></html>",
+        "https://a.test/",
+    );
+    assert!(r.outcome.ok, "求值应成功:{r:?}");
+    let hit = r
+        .outcome
+        .actions
+        .iter()
+        .find(|a| a.kind == "set_text" && a.value.contains("body{color:red}"));
+    assert!(
+        hit.is_some(),
+        "文本节点应产生 set_text 动作落进宿主 DOM,实际动作:{:?}",
+        r.outcome.actions
+    );
+}

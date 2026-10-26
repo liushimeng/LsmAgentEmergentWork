@@ -1275,3 +1275,40 @@ fn position_fixed_子树带标记() {
         "普通流元素不应带 fixed 标记:{fx:?}"
     );
 }
+
+#[test]
+fn 视口高度参与百分比高度解析() {
+    // 回归:MediaCtx 的视口高此前被写死 720(8 处调用点),视口 1920×1080 时
+    // `height:100%` 仍解析成 720 → 页面底部大片空白(显示不全),
+    // 百度地图的 #MapHolder 也只有 720 高,地图铺不满窗口。
+    use super::super::style::MediaCtx;
+    use super::super::images::ImageSizes;
+    use super::super::layout::compute_full;
+    let doc = Document::parse(
+        "<html><head><style>html,body{height:100%;margin:0}#wrap{height:100%}</style></head>\
+         <body><div id='wrap'><div id='mh' style='height:100%'></div></div></body></html>",
+        "https://a.test/",
+    );
+    let media = MediaCtx::new(1920.0, 1080.0);
+    let layout = compute_full(&doc, 1920.0, &font(), &media, &ImageSizes::default());
+    let wrap = layout
+        .boxes
+        .iter()
+        .find(|b| b.selector == "#wrap")
+        .unwrap_or_else(|| panic!("应有 #wrap 盒"));
+    assert!(
+        (wrap.h - 1080.0).abs() < 2.0,
+        "100% 容器应解析为真实视口高 1080,实际 {}",
+        wrap.h
+    );
+    let mh = layout
+        .boxes
+        .iter()
+        .find(|b| b.selector == "#mh")
+        .unwrap_or_else(|| panic!("应有 #mh 盒"));
+    assert!(
+        (mh.h - 1080.0).abs() < 2.0,
+        "子代 100% 应解析为 1080,实际 {}",
+        mh.h
+    );
+}

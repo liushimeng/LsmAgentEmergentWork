@@ -200,7 +200,6 @@ js(页面表达式为真)、network_idle(网络静默毫秒),多条件取「与�
                           "description": "浏览器模式。headed = 进程内内核 + 独立原生窗口查看器(用户可直接看到浏览器窗口,含后退/前进/刷新/地址栏);hidden = 纯无头无窗口。需要让用户看到浏览器运行过程时用 headed(默认)" },
                 "window_width": { "type": "integer", "minimum": 320, "maximum": 7680 },
                 "window_height": { "type": "integer", "minimum": 240, "maximum": 4320 },
-                "auto_expand_viewport": { "type": "boolean", "default": true },
                 "highlight": { "type": "boolean", "default": true },
                 "guard": { "type": "string", "enum": ["locked", "open", "partial"], "default": "locked" },
                 "stealth": { "type": "string", "enum": ["fidelity", "hardened", "off"], "default": "hardened" },
@@ -458,6 +457,17 @@ pub(super) async fn run_open(mut args: Value) -> Result<String> {
     }
     if out.final_url.trim().eq_ignore_ascii_case("about:blank") {
         data["page_health"] = json!({"blank": true, "hint": "落地为空白页;可检查 URL 或重新 open"});
+    }
+    // 能力缺口如实告知:站点申请过 WebGL 上下文(百度地图等三维/地图站点),
+    // 而本内核无 GPU 后端 → 地图底图画不出来。不说清楚,Agent 会对同一片
+    // 空白反复截图/重试,白烧好几轮。
+    if out.webgl_asked > 0 {
+        data["capability_gaps"] = json!([{
+            "kind": "webgl",
+            "requested": out.webgl_asked,
+            "detail": "站点申请过 WebGL 上下文(常见于地图/三维场景);LsmAgentBrowser 内核无 WebGL,                       该区域不会绘制出像素(底图留空/仅剩 DOM 控件)。",
+            "hint": "需要像素级地图底图时改用 MCP_Web_Chrome_Use(真 Chromium 渲染);                     本工具仍可用于读取页面 DOM 文本(如路线方案列表)。",
+        }]);
     }
     envelope(0, "ok", data)
 }

@@ -237,6 +237,9 @@ pub struct PipelineOut {
     /// 已执行脚本指纹(内联内容/外链 URL)。交互后补齐懒加载脚本时作为种子,
     /// 避免把首屏脚本整批重跑一遍。
     pub executed: std::collections::HashSet<u64>,
+    /// 页面申请过 WebGL 上下文的次数(>0 = 站点依赖 WebGL 绘制,内核无 WebGL
+    /// → 该区域画不出,须如实告知调用方,别让它反复重试)。
+    pub webgl_asked: u32,
 }
 
 /// 管线续跑种子。交互(eval_js / click 等)后页面可能注入新的 `<script>`
@@ -599,6 +602,9 @@ pub(crate) fn append_reply(
         if out.console.len() > 400 {
             out.console.remove(0);
         }
+    }
+    if reply.outcome.webgl_asked > out.webgl_asked {
+        out.webgl_asked = reply.outcome.webgl_asked;
     }
     if let Some(title) = &summary.title {
         out.title = Some(title.clone());

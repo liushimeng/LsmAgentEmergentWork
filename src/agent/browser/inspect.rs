@@ -173,6 +173,7 @@ pub async fn inspect(
             "user_agent": tab.user_agent,
             "status": tab.status,
             "content_type": tab.content_type,
+            "webgl_requested": tab.webgl_asked,
         })),
         "viewport" => {
             let scroll_height = tab.layout.page_height();
@@ -268,20 +269,26 @@ pub async fn inspect(
             let errors: Vec<&super::ConsoleRecord> =
                 tab.console.iter().filter(|c| c.level == "error").collect();
             let blank = layout_text_chars == 0 && visible_boxes == 0;
-            let (diagnosis, hint) = if !blank {
+            // 能力缺口:站点申请过 WebGL 上下文(百度地图等)→ 内核无 GPU 后端,
+            // 该区域画不出像素。这是**内核边界**而非页面故障,如实说明,免得
+            // Agent 对同一片空白反复截图/重试。
+            let webgl_gap = tab.webgl_asked > 0;
+            let (diagnosis, hint) = if webgl_gap {
+                (
+                    "页面已渲染出 DOM,但站点依赖 WebGL 绘制(地图/三维),该区域无像素",
+                    "内核无 WebGL:底图/三维区域画不出来。需要像素级地图请改用 MCP_Web_Chrome_Use(真 Chromium);本工具仍可读页面 DOM 文本。",
+                )
+            } else if !blank {
                 ("页面已渲染出内容", "")
             } else if !errors.is_empty() {
                 (
-                    "页面脚本执行失败:主内容由 JS 生成,内核脚本运行时未能完成初始化,\
-                     导致内容节点保持初始隐藏态或未被创建",
-                    "先用 inspect(console) 看具体报错;若目标站点重度依赖 JS 渲染,\
-                     应改用该站点的非 JS 入口(如静态接口页/服务端渲染页)完成取证",
+                    "页面脚本执行失败:主内容由 JS 生成,内核脚本运行时未能完成初始化,导致内容节点保持初始隐藏态或未被创建",
+                    "先用 inspect(console) 看具体报错;若目标站点重度依赖 JS 渲染,应改用该站点的非 JS 入口(如静态接口页/服务端渲染页)完成取证",
                 )
             } else {
                 (
                     "页面内容为空或全部被 display:none 隐藏(内核未渲染出任何可见内容)",
-                    "用 inspect(elements) 逐层查祖先是否有 display:none;\
-                     用 inspect(dom) 看静态 HTML 是否包含目标节点",
+                    "用 inspect(elements) 逐层查祖先是否有 display:none;用 inspect(dom) 看静态 HTML 是否包含目标节点",
                 )
             };
             Ok(json!({
@@ -297,6 +304,7 @@ pub async fn inspect(
                 "console_errors": errors.len(),
                 "first_errors": errors.iter().take(3).map(|e| e.text.clone()).collect::<Vec<_>>(),
                 "blank_page": blank,
+                "webgl_requested": tab.webgl_asked,
                 "diagnosis": diagnosis,
                 "hint": hint,
             }))

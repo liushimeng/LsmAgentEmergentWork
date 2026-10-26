@@ -210,6 +210,9 @@ pub struct TabState {
     pub images: images::ImageStore,
     /// 安全上下文（CORS/CSP 缓存、页面源）。
     pub security: security::SecurityContext,
+    /// 页面申请过 WebGL 上下文的次数(>0 = 站点依赖 WebGL 绘制;内核无 WebGL,
+    /// 该区域画不出 → 工具层据此如实告知调用方改用 MCP_Web_Chrome_Use)。
+    pub webgl_asked: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -261,6 +264,8 @@ pub struct OpenOutcome {
     pub window_id: String,
     pub viewport_width: u32,
     pub viewport_height: u32,
+    /// 页面申请过 WebGL 上下文(>0 = 站点依赖 WebGL 绘制,内核无 WebGL → 该区域画不出)。
+    pub webgl_asked: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -617,10 +622,17 @@ impl LsmBrowserManager {
                     .await
                 {
                     Ok(nav) => {
-                        let (window_id, vw, vh) = inner
+                        let (window_id, vw, vh, webgl_asked) = inner
                             .tabs
                             .get(&pid)
-                            .map(|t| (t.window_id.clone(), t.viewport.width, t.viewport.height))
+                            .map(|t| {
+                                (
+                                    t.window_id.clone(),
+                                    t.viewport.width,
+                                    t.viewport.height,
+                                    t.webgl_asked,
+                                )
+                            })
                             .unwrap_or_default();
                         return Ok(OpenOutcome {
                             page_id: pid,
@@ -637,6 +649,7 @@ impl LsmBrowserManager {
                             window_id,
                             viewport_width: vw,
                             viewport_height: vh,
+                            webgl_asked: webgl_asked,
                         });
                     }
                     Err(err) => {
@@ -686,7 +699,7 @@ impl LsmBrowserManager {
         // 容器 CSS 定宽场景(BMap 初始化读 #MapHolder 尺寸)不依赖图片固有尺寸。
         let pre_rects = {
             let pre_doc = document::Document::parse(&resources_out.html, &resp.final_url);
-            let pre_media = style::MediaCtx::new(viewport.width as f64, 720.0);
+            let pre_media = style::MediaCtx::new(viewport.width as f64, viewport.height as f64);
             let pre_sizes = images::ImageSizes::default();
             layout::compute_full(&pre_doc, viewport.width as f64, &self.font, &pre_media, &pre_sizes)
                 .rect_map()
@@ -724,7 +737,7 @@ impl LsmBrowserManager {
         .await;
         let doc = document::Document::parse(&html, &resp.final_url);
         let title = pipeline.title.clone().unwrap_or_else(|| doc.title());
-        let media = style::MediaCtx::new(viewport.width as f64, 720.0);
+        let media = style::MediaCtx::new(viewport.width as f64, viewport.height as f64);
         let layout = layout::compute_full(
             &doc,
             viewport.width as f64,
@@ -826,6 +839,7 @@ impl LsmBrowserManager {
             executed_scripts: pipeline.executed,
             images: images_out.store,
             security: security::SecurityContext::new(),
+            webgl_asked: pipeline.webgl_asked,
         };
         inner.tabs.insert(page_id.clone(), tab);
         // 阶段四第二步：CSP 策略与页面源写入安全上下文（供 fetch/XHR connect-src 门禁）。
@@ -859,6 +873,7 @@ impl LsmBrowserManager {
             window_id,
             viewport_width: viewport.width,
             viewport_height: viewport.height,
+            webgl_asked: pipeline.webgl_asked,
         })
     }
 
@@ -990,7 +1005,7 @@ impl LsmBrowserManager {
         // 脚本前预布局(空图片尺寸):与 open 同理,给 JS 桥喂元素几何。
         let pre_rects = {
             let pre_doc = document::Document::parse(&resources_out.html, &resp.final_url);
-            let pre_media = style::MediaCtx::new(viewport_w as f64, 720.0);
+            let pre_media = style::MediaCtx::new(viewport_w as f64, viewport_h as f64);
             let pre_sizes = images::ImageSizes::default();
             layout::compute_full(&pre_doc, viewport_w as f64, &self.font, &pre_media, &pre_sizes)
                 .rect_map()
@@ -1022,7 +1037,7 @@ impl LsmBrowserManager {
         .await;
         let doc = document::Document::parse(&html, &resp.final_url);
         let title = pipeline.title.clone().unwrap_or_else(|| doc.title());
-        let media = style::MediaCtx::new(viewport_w as f64, 720.0);
+        let media = style::MediaCtx::new(viewport_w as f64, viewport_h as f64);
         let layout = layout::compute_full(&doc, viewport_w as f64, &self.font, &media, &images_out.sizes);
         let Some(tab) = inner.tabs.get_mut(page_id) else {
             return Err(EngineError::page_not_found(page_id));
@@ -1331,7 +1346,7 @@ impl LsmBrowserManager {
         tab.viewport.width = width.clamp(320, 7680);
         tab.viewport.height = height.clamp(240, 4320);
         let doc = document::Document::parse(&tab.html, &tab.url);
-        let media = style::MediaCtx::new(tab.viewport.width as f64, 720.0);
+        let media = style::MediaCtx::new(tab.viewport.width as f64, tab.viewport.height as f64);
         let sizes = images::ImageSizes::from_store(&tab.images);
         tab.layout = layout::compute_full(&doc, tab.viewport.width as f64, &self.font, &media, &sizes);
         // 有头:视口重排后推帧。

@@ -479,6 +479,10 @@ impl ThreadRuntime {
                 .and_then(|v| serde_json::from_value::<Vec<JsLog>>(v).ok())
                 .unwrap_or_default(),
             truncated: false,
+            webgl_asked: parsed
+                .get("webglAsked")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32,
         };
         let (clipped, truncated) = clip_owned(outcome.value, MAX_VALUE_CHARS);
         outcome.value = clipped;
