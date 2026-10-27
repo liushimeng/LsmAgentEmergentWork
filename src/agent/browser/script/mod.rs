@@ -313,6 +313,8 @@ pub(crate) async fn run_pipeline(
         return out;
     }
     let mut executed = seed.executed;
+    // 外链取回失败次数(URL → 次数):第一次失败允许重试,第二次起不再取回。
+    let mut fetch_failures: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
     let mut handle: Option<JsHandle> = seed.handle;
     let max_rounds = if seed.max_rounds == 0 { MAX_ROUNDS } else { seed.max_rounds };
     let budget = if seed.budget_ms == 0 { pipeline_budget_ms() } else { seed.budget_ms };
@@ -330,17 +332,54 @@ pub(crate) async fn run_pipeline(
             });
             break;
         }
-        let collected = {
+        let mut collected = {
             // Document(NodeRef)非 Send,收集完立即销毁,不跨 await 存活。
             let doc = super::document::Document::parse(&out.html, base_url);
             dom_ops::collect_scripts(&doc, base_url, &mut executed)
         };
+        // defer 语义:阻塞组先执行、defer 组整组后置(同组内保持文档序),
+        // 与真实浏览器「解析完 → defer 队列 → DOMContentLoaded」一致。
+        let deferred_items = std::mem::take(&mut collected.deferred);
+        collected.items.extend(deferred_items);
+        if std::env::var("LAEW_DOM_TRACE").is_ok() {
+            let ext = collected
+                .items
+                .iter()
+                .filter(|it| matches!(it, dom_ops::CollectedItem::External(_)))
+                .count();
+            eprintln!(
+                "[domtrace] round={} collected={} external={} executed={} html_len={}",
+                round,
+                collected.items.len(),
+                ext,
+                executed.len(),
+                out.html.len()
+            );
+        }
         if collected.items.is_empty() {
             break;
         }
+        // 本轮**收集到**的外链 URL 先留底:执行完成后记账进 executed,
+        // 下一轮 collect_scripts 不再取回(真实浏览器语义:script 只执行一次)。
+        //
+        // 记账必须覆盖「取回但内容为空」的脚本:站点会注入 200 但零字节的
+        // 占位脚本(百度地图的 `com-conf_d41b8cd.js`,d41b8cd 即空内容 MD5),
+        // 若不记账,它们每轮都会被重新收集,管线反复空转到墙钟预算耗尽,
+        // 后面的地图模块脚本永远轮不到。
+        let collected_externals: Vec<String> = collected
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                dom_ops::CollectedItem::External(u) => Some(u.clone()),
+                _ => None,
+            })
+            .collect();
         // 按 DOM 文档序执行(内联/外链混排),不得拆成两组重排:
         // 装载器初始化链(`mod.js` → `require.resourceMap` → pkg)依赖真实顺序。
         let mut scripts = Vec::new();
+        // 本轮取回失败的外链(网络错误):允许重试一次再放弃,避免一次抖动
+        // 就永久丢掉站点模块。
+        let mut failed_fetches: Vec<String> = Vec::new();
         for item in collected.items {
             let url = match item {
                 dom_ops::CollectedItem::Inline(s) => {
@@ -425,6 +464,7 @@ pub(crate) async fn run_pipeline(
                         text: format!("外链脚本加载失败 {url}:{e}"),
                         at_ms: super::now_ms(),
                     });
+                    failed_fetches.push(url.clone());
                 }
             }
         }
@@ -447,13 +487,6 @@ pub(crate) async fn run_pipeline(
         if handle.is_none() {
             handle = Some(JsHandle::spawn());
         }
-        // 本轮执行的外链 URL 先留底:执行完成后记账进 executed,
-        // 下一轮 collect_scripts 不再取回(真实浏览器语义:script 只执行一次)。
-        let executed_externals: Vec<String> = scripts
-            .iter()
-            .filter(|s| s.kind == "external")
-            .map(|s| s.src_url.clone())
-            .collect();
         let Some(h) = handle.clone() else { break };
         let env = build_env(inner, base_url, &title_now, ua, viewport, session_storage, csp);
         // 快照后立即销毁 Document(NodeRef 非 Send,不能跨 await 存活)。
@@ -509,7 +542,16 @@ pub(crate) async fn run_pipeline(
             );
         }
         // 外链执行记账(含执行抛错的:真实浏览器里抛错的 script 同样不会重跑)。
-        for url in &executed_externals {
+        // 记账覆盖「取回但内容为空」的脚本(站点注入的零字节占位脚本),
+        // 否则它们每轮都被重新收集,管线空转到预算耗尽。
+        for url in &collected_externals {
+            if failed_fetches.iter().any(|u| u == url) {
+                let n = fetch_failures.entry(url.clone()).or_insert(0);
+                *n += 1;
+                if *n < 2 {
+                    continue; // 允许重试一次
+                }
+            }
             executed.insert(dom_ops::fingerprint(url));
         }
         if round + 1 < max_rounds {

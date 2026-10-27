@@ -203,6 +203,25 @@ function __lsmRefresh(nodes, meta) {
   // 导航换页会重建 JS 线程,新 Context 天然从 "loading" 开始。
 }
 
+// 快照节点身份:跨轮次必须稳定。
+//
+// 快照用数组下标标识节点,但 DOM 会在两轮之间变化(站点脚本插入/删除节点),
+// 下标随之错位:上一轮捕获的元素包装器会指向**别的**元素。百度地图首屏就是
+// 这么断的——`find(".right-button")` 落空 → `offset()` 返回 undefined →
+// 读 `s.left` 抛 TypeError → 搜索框整块初始化失败、地图不出图。
+// 真实浏览器的元素身份与 DOM 变化无关,这里按**稳定选择器**重新定位。
+function __lsmCurrentIdx(n) {
+  if (!n) return -1;
+  var sel = String(n.sel || "");
+  if (sel) {
+    for (var i = 0; i < __lsmNodes.length; i++) {
+      if (String(__lsmNodes[i].sel || "") === sel) return i;
+    }
+  }
+  var idx = Number(n.i);
+  return (isFinite(idx) && idx >= 0 && idx < __lsmNodes.length) ? idx : -1;
+}
+
 function __ancestorChain(idx) {
   var chain = [];
   var cur = idx;
@@ -435,15 +454,34 @@ function __mkStyle(getCss, setCss) {
 // 站点用 `document.createElement("script")` 插脚本后,靠脚本元素的 onload
 // 回调推进后续逻辑(AMD 装载器全部依赖这个信号)。宿主执行完外链脚本后会
 // 调用 `__lsmFireScriptLoad(src_url)` 触发对应回调。
+function __lsmScriptKey(url) {
+  var raw = String(url == null ? "" : url).trim();
+  if (!raw) return raw;
+  // 已是绝对地址。
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(raw)) return raw;
+  // 纯字符串解析,不依赖 URL 构造器:页面脚本可能覆盖/破坏全局 URL
+  // (实测百度地图环境里 new URL 抛错,归一退化成原样,load 回调再也对不上)。
+  var base = String(__lsmMeta.url || "");
+  var proto = String(__lsmMeta.protocol || "https:");
+  var host = String(__lsmMeta.host || "");
+  var origin = String(__lsmMeta.origin || (host ? proto + "//" + host : ""));
+  if (raw.indexOf("//") === 0) return proto + raw;          // 协议相对
+  if (raw.charAt(0) === "/") return origin + raw;            // 根相对
+  if (!origin) return raw;
+  // 目录相对:只取 base 的路径部分(去掉 scheme+host),再按目录拼接。
+  var path = base.replace(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^\/?#]*/, "");
+  var dir = path.replace(/[?#].*$/, "").replace(/[^/]*$/, "");
+  return origin + dir + raw;
+}
 function __lsmRegisterScriptLoad(el) {
   if (!el || !el.__attrs) return;
-  var url = String(el.__attrs.src || "");
+  var url = __lsmScriptKey(el.__attrs.src || "");
   if (!url) return;
   if (!__lsmScriptCbs[url]) __lsmScriptCbs[url] = [];
   __lsmScriptCbs[url].push(el);
 }
 function __lsmFireScriptLoad(url) {
-  var key = String(url == null ? "" : url);
+  var key = __lsmScriptKey(url);
   var list = __lsmScriptCbs[key];
   if (!list || !list.length) return;
   delete __lsmScriptCbs[key];
@@ -526,6 +564,71 @@ function __lsmDynMatch(el, sel) {
   }
   return false;
 }
+// ---------- element.attributes(NamedNodeMap 近似) ----------
+// 真实浏览器里每个元素都有 attributes 集合;站点库(jQuery support 检测、
+// removeAttr 遍历、表单序列化)直接下标/按名访问它。此前动态节点与快照节点
+// 都没有该属性,`el.attributes[name]` 在 Boa 上报 ToObject 一炸整个库死亡
+// (实测 zhipin jQuery 1.12.2 的 support 分支)。
+// 实现为按需构造的 Proxy 视图:每次访问实时读 attrs 容器(setAttribute
+// 原地改容器,视图天然「活」),数字下标/名称下标/length/getNamedItem 全支持。
+function __attrNode(ownerEl, name, value) {
+  var v = value == null ? "" : String(value);
+  return {
+    name: String(name), nodeName: String(name), nodeType: 2,
+    value: v, nodeValue: v, textContent: v,
+    specified: true, expando: false, ownerElement: ownerEl || null
+  };
+}
+function __attrMap(ownerEl, attrsRef) {
+  var base = {
+    getNamedItem: function (n) {
+      var a = attrsRef(); n = String(n);
+      return Object.prototype.hasOwnProperty.call(a, n) ? __attrNode(ownerEl, n, a[n]) : null;
+    },
+    setNamedItem: function (attr) {
+      if (attr && attr.name != null && ownerEl && ownerEl.setAttribute) {
+        ownerEl.setAttribute(String(attr.name), attr.value);
+      }
+      return attr || null;
+    },
+    removeNamedItem: function (n) {
+      var old = base.getNamedItem(n);
+      if (ownerEl && ownerEl.removeAttribute) ownerEl.removeAttribute(String(n));
+      return old;
+    },
+    item: function (i) {
+      var a = attrsRef(); var ks = Object.keys(a); var idx = Number(i) | 0;
+      return (idx >= 0 && idx < ks.length) ? __attrNode(ownerEl, ks[idx], a[ks[idx]]) : null;
+    }
+  };
+  return new Proxy(base, {
+    get: function (t, k) {
+      if (k in t) return t[k];
+      var a = attrsRef();
+      if (k === "length") return Object.keys(a).length;
+      var ks; var idx = Number(k);
+      if (typeof k === "string" && String(idx) === k) {
+        ks = Object.keys(a);
+        return (idx >= 0 && idx < ks.length) ? __attrNode(ownerEl, ks[idx], a[ks[idx]]) : undefined;
+      }
+      if (typeof k === "string" && Object.prototype.hasOwnProperty.call(a, k)) {
+        return __attrNode(ownerEl, k, a[k]);
+      }
+      return undefined;
+    },
+    has: function (t, k) {
+      if (k in t) return true;
+      var a = attrsRef();
+      if (k === "length") return true;
+      if (typeof k === "string" && Object.prototype.hasOwnProperty.call(a, k)) return true;
+      var idx = Number(k);
+      if (typeof k === "string" && String(idx) === k) {
+        return idx >= 0 && idx < Object.keys(a).length;
+      }
+      return false;
+    }
+  });
+}
 function __mk(n) {
   var attrs = n.attrs || {};
   // 布局几何:快照 rect [x,y,w,h] → clientWidth/offsetWidth 等属性。
@@ -578,6 +681,9 @@ function __mk(n) {
     offsetTop: __geo.y,
     clientLeft: 0,
     clientTop: 0,
+    // 滚动偏移:缺这两个值时站点的 offset() 会算出 NaN(定位全部失效)。
+    scrollLeft: 0,
+    scrollTop: 0,
     getAttribute: function (k) {
       k = String(k);
       return Object.prototype.hasOwnProperty.call(attrs, k) ? attrs[k] : null;
@@ -615,12 +721,13 @@ function __mk(n) {
     },
     scrollIntoView: function () { __push({ type: "scroll_to", selector: n.sel }); },
     scrollTo: function (x, y) { __push({ type: "scroll", value: String(y || 0) }); },
-    querySelector: function (s) { return __lsmQueryOne(s, n.i); },
+    querySelector: function (s) { return __lsmQueryOne(s, __lsmCurrentIdx(n)); },
     // matches/closest:事件委托(jQuery `$(document).on('click', sel, fn)`、各框架
     // 委托)依赖 `el.matches()/el.closest()` 从 target 向上匹配委托选择器;
     // 缺失则委托 handler 一跑就抛,面板按钮「点击无反应」(实测百度地图路线按钮)。
     matches: function (sel) {
-      if (__lsmMatchSel(n.i, String(sel))) return true;
+      var self = __lsmCurrentIdx(n);
+      if (self >= 0 && __lsmMatchSel(self, String(sel))) return true;
       // 动态覆盖层节点按标签/类名做宽松匹配。
       return __lsmDynMatch(el, String(sel));
     },
@@ -641,10 +748,12 @@ function __mk(n) {
       // (百度地图 require.loadCss 的 CSS 注入器就靠这个,见 __lsmLive 注释)。
       return __lsmLive(function () {
         var out = [];
+        var self = __lsmCurrentIdx(n);
+        if (self < 0) return out;
         for (var i = 0; i < __lsmNodes.length; i++) {
           var nd = __lsmNodes[i];
           var anc = __ancestorChain(nd.i);
-          if (anc.indexOf(n.i) >= 0 && (tag === "*" || String(nd.tag).toLowerCase() === tag)) out.push(__mk(nd));
+          if (anc.indexOf(self) >= 0 && (tag === "*" || String(nd.tag).toLowerCase() === tag)) out.push(__mk(nd));
         }
         for (var d = 0; d < dynKids.length; d++) {
           (function walk(k) {
@@ -657,7 +766,7 @@ function __mk(n) {
         return out;
       });
     },
-    querySelectorAll: function (s) { return __lsmQuery(s, n.i); },
+    querySelectorAll: function (s) { return __lsmQuery(s, __lsmCurrentIdx(n)); },
     appendChild: function (c) {
       try { __lsmRegisterScriptLoad(c); } catch (e) {}
       if (c) dynKids.push(c);
@@ -762,6 +871,9 @@ function __mk(n) {
   // 元素包装器每次 refresh 重建,覆盖层随之自然重置(彼时宿主 DOM 已应用动作)。
   var dynKids = [];
   var htmlCleared = false;
+  // attributes 集合(NamedNodeMap 近似,见 __attrMap 注释):getter 保证
+  // 每次 `el.attributes` 都是读当前 attrs 容器的活视图。
+  define("attributes", function () { return __attrMap(el, function () { return attrs; }); }, function (v) {});
   define("value", function () {
     return Object.prototype.hasOwnProperty.call(__lsmValues, key) ? __lsmValues[key] : (n.value || "");
   }, function (v) {
@@ -869,9 +981,89 @@ function __mk(n) {
   });
   // ownerDocument 指向 document(document.defaultView → window 在 window 创建后统一回填)。
   el.ownerDocument = document;
+  // parentNode/parentElement:按**当前**快照树实时解析(数组下标会随 DOM 变化错位)。
+  // Sizzle/jQuery 的上下文查询与 `closest` 依赖父链,缺失时元素作用域查询落空。
+  try {
+    Object.defineProperty(el, "parentNode", {
+      configurable: true,
+      enumerable: true,
+      get: function () {
+        var self = __lsmCurrentIdx(n);
+        if (self < 0) return null;
+        var p = __lsmNodes[self] ? __lsmNodes[self].parent : -1;
+        if (p == null || p < 0 || p >= __lsmNodes.length) return null;
+        return __mk(__lsmNodes[p]);
+      }
+    });
+    Object.defineProperty(el, "parentElement", {
+      configurable: true,
+      enumerable: true,
+      get: function () { return this.parentNode; }
+    });
+    // compareDocumentPosition:DOM 顺序判定(位掩码,仅实现内核用得到的语义)。
+    // Sizzle 的 contains/uniqueSort 依赖它,缺失会让上下文查询结果被丢弃。
+    el.compareDocumentPosition = function (other) {
+      var self = __lsmCurrentIdx(n);
+      var oi = (other && other.__lsm_node) ? __lsmCurrentIdx(other.__lsm_node) : -1;
+      if (self < 0 || oi < 0) return 0;
+      if (__ancestorChain(oi).indexOf(self) >= 0) return 16 | 32; // CONTAINED_BY | FOLLOWING
+      if (__ancestorChain(self).indexOf(oi) >= 0) return 10; // CONTAINS | PRECEDING
+      return 4; // DISCONNECTED
+    };
+    // contains:祖先判定。事件委托(站点 `parents.contains(target)`)依赖它,
+    // 缺失时点击委托处理器直接抛错(实测百度地图路线按钮点击无反应)。
+    el.contains = function (other) {
+      if (!other) return false;
+      if (other === el) return true;
+      var self = __lsmCurrentIdx(n);
+      var oi = other.__lsm_node ? __lsmCurrentIdx(other.__lsm_node) : -1;
+      if (self < 0 || oi < 0) return false;
+      return __ancestorChain(oi).indexOf(self) >= 0;
+    };
+  } catch (e) {}
   return el;
 }
 
+// ---------- URL 解析(供 <a> 反射;GLOBALS_JS 的 URL 不可跨作用域复用) ----------
+// 真实浏览器给 <a> 设置 href 后自动反射 protocol/host/pathname/search/hash
+// 等解析结果;axios 的 URL 判同模块在装载期就调用 `a.pathname.charAt(0)`,
+// 缺失反射 = undefined.charAt 当场 ToObject 崩、整库装不上
+// (实测 zhipin bossui.min.js)。
+function __lsmParseUrl(u, base) {
+  var s = String(u == null ? "" : u);
+  if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(s) && base != null) {
+    var bm = /^([a-zA-Z][a-zA-Z0-9+.-]*:)\/\/([^\/?#]*)([^?#]*)(\?[^#]*)?(#.*)?$/.exec(String(base));
+    if (bm) {
+      var origin = bm[1] + "//" + bm[2];
+      var bpath = bm[3] || "/";
+      if (s.charAt(0) === "/") s = origin + s;
+      else if (s.charAt(0) === "?") s = origin + bpath + s;
+      else if (s.charAt(0) === "#") s = origin + bpath + (bm[4] || "") + s;
+      else s = origin + bpath.replace(/[^/]*$/, "") + s;
+    }
+  }
+  var pm = /^[a-zA-Z][a-zA-Z0-9+.-]*:/.exec(s);
+  var scheme = pm ? pm[0].toLowerCase() : "";
+  var rest = pm ? s.slice(pm[0].length) : s;
+  var hm = /^([^/?#]*)/.exec(rest);
+  var host = hm ? hm[1] : "";
+  var rp = rest.slice(host.length);
+  var hi = rp.indexOf("#");
+  var hash = hi >= 0 ? rp.slice(hi) : "";
+  if (hi >= 0) rp = rp.slice(0, hi);
+  var qi = rp.indexOf("?");
+  var query = qi >= 0 ? rp.slice(qi) : "";
+  if (qi >= 0) rp = rp.slice(0, qi);
+  var pathname = rp || "/";
+  var port = "", hostOnly = host;
+  var pm3 = /^(.*):(\d+)$/.exec(host);
+  if (pm3) { hostOnly = pm3[1]; port = pm3[2]; }
+  return {
+    href: s, protocol: scheme, host: host, hostname: hostOnly, port: port,
+    origin: (scheme && hostOnly) ? scheme + "//" + hostOnly : "",
+    pathname: pathname, search: query, hash: hash
+  };
+}
 function __newEl(tag) {
   var t = String(tag || "div").toLowerCase();
   var el = {
@@ -1009,6 +1201,13 @@ function __newEl(tag) {
   function def(name, getter, setter) {
     try { Object.defineProperty(el, name, { get: getter, set: setter, configurable: true, enumerable: true }); } catch (e) {}
   }
+  // attributes 集合(NamedNodeMap 近似,见 __attrMap 注释)。
+  def("attributes", function () { return __attrMap(el, function () { return el.__attrs; }); });
+  // childNodes/children 活视图:innerHTML 解析出的 __htmlKids 与动态 __kids
+  // 都要反映(jQuery createHTMLDocument 探测即 body.innerHTML 两 form 后读
+  // childNodes.length;静态空数组恒 0,探测恒 false)。
+  def("childNodes", function () { return (el.__htmlKids || []).concat(el.__kids || []); });
+  def("children", function () { return (el.__htmlKids || []).concat(el.__kids || []).filter(function (k) { return k && k.nodeType === 1; }); });
   // 几何 getter:宿主已把动态子树重新解析进 DOM 并参与布局,rect 随每轮快照回填。
   // 站点读到的尺寸因此与截图里画出来的盒子一致(地图才能按真实容器尺寸装载)。
   def("clientWidth", function () { return __lsmDynGeo(el).w; });
@@ -1024,6 +1223,18 @@ function __newEl(tag) {
   if (__key) __lsmDynById[__key] = el;
   // 记录动态父节点(remove() 与事件冒泡链需要)。
   el.__parentDyn = null;
+  // contains:动态子树的祖先判定(事件委托按 target 找祖先)。
+  el.contains = function (other) {
+    if (!other) return false;
+    if (other === el) return true;
+    var cur = el;
+    var guard = 0;
+    while (cur && guard++ < 64) {
+      if (cur === other) return true;
+      cur = cur.__parentDyn || null;
+    }
+    return false;
+  };
   // 反射属性:站点用 `document.createElement("script").src = url` 动态插脚本,
   // 属性必须真正落到 __attrs 上,否则序列化出来的标签是空的,宿主取不到脚本。
   ["src", "href", "type", "rel", "media", "title", "alt", "charset", "name", "value",
@@ -1031,6 +1242,26 @@ function __newEl(tag) {
     def(p, function () { return el.__attrs[p] == null ? "" : String(el.__attrs[p]); },
       function (v) { el.__attrs[p] = String(v); });
   });
+  // <a> 的 URL 反射:href 赋值后按当前页面 location 解析,
+  // protocol/host/hostname/port/pathname/search/hash/origin 可读
+  // (见 __lsmParseUrl 注释;axios 判同模块在装载期就依赖 pathname)。
+  if (t === "a") {
+    el.__urlParts = null;
+    def("href",
+      function () { return el.__attrs.href == null ? "" : String(el.__attrs.href); },
+      function (v) {
+        el.__attrs.href = String(v);
+        el.__urlParts = __lsmParseUrl(el.__attrs.href, (location && location.href) || null);
+      });
+    ["protocol", "host", "hostname", "port", "pathname", "search", "hash", "origin"].forEach(function (p) {
+      def(p, function () {
+        if (!el.__urlParts) {
+          el.__urlParts = __lsmParseUrl(el.__attrs.href || "", (location && location.href) || null);
+        }
+        return el.__urlParts ? el.__urlParts[p] : "";
+      });
+    });
+  }
   // <img> 的 src 赋值:BMap 瓦片装载器依赖 onload 推进(`new Image` /
   // `createElement("img")` → 设 src → onload 才把瓦片写进 mapPane 并触发
   // 地图 load 事件)。纯文本内核不做像素解码,这里按异步 load 语义放行:
@@ -1350,12 +1581,40 @@ var document = {
     var nm = String(n);
     return __lsmLive(function () { return __lsmQuery("[name=" + nm + "]"); });
   },
+  // document.contains:祖先判定(事件委托/工具库常用)。
+  contains: function (other) {
+    try {
+      var de = document.documentElement;
+      return de ? !!de.contains(other) : false;
+    } catch (e) { return false; }
+  },
   createElement: function (tag) { return __newEl(tag); },
+  // createEvent:老式事件构造入口(Vue 1.0 的 performance.now 校准、站点
+  // 合成键盘/自定义事件)。缺失时 `document.createEvent("Event")` 报
+  // "not a callable function" 直接打断库装载(实测 zhipin vue-core-v1.0.0)。
+  createEvent: function (type) {
+    var t = String(type || "Event");
+    return {
+      type: "", eventType: t, bubbles: false, cancelable: false,
+      timeStamp: __lsmNow, target: null, currentTarget: null,
+      defaultPrevented: false, propagationStopped: false,
+      initEvent: function (ty, b, c) { this.type = String(ty); this.bubbles = !!b; this.cancelable = !!c; },
+      preventDefault: function () { this.defaultPrevented = true; },
+      stopPropagation: function () { this.propagationStopped = true; },
+      stopImmediatePropagation: function () { this.propagationStopped = true; }
+    };
+  },
   // createElementNS:SVG/图标站点(图表、地图图例)用 NS 建元素;内核暂不渲染 SVG,
   // 但「建出来、能挂树、不崩」即可让面板/widget 完成初始化与挂载。
   createElementNS: function (ns, tag) { return __newEl(tag); },
   createSVGElement: function (tag) { return __newEl(tag); },
   createTextNode: function (t) { return { nodeType: 3, textContent: String(t), data: String(t) }; },
+  // createComment:Vue 1.x 的 VDOM 挂载路径用注释节点做 v-if 占位
+  // (`createComment('v-if')`),缺失时挂载链当场 "not a callable function"
+  // (实测 zhipin app 挂载)。
+  createComment: function (t) {
+    return { nodeType: 8, nodeName: "#comment", textContent: String(t == null ? "" : t), data: String(t == null ? "" : t), nodeValue: String(t == null ? "" : t) };
+  },
   createDocumentFragment: function () {
     return { __detached: true, __tag: "div", __attrs: {}, __kids: [], __text: "", nodeType: 11, appendChild: function (c) { this.__kids.push(c); return c; } };
   },
@@ -1372,7 +1631,59 @@ var document = {
   dispatchEvent: function (e) { __fireDocument(String((e && e.type) || e)); return true; },
   getSelection: function () { return { toString: function () { return ""; }, removeAllRanges: function () {} }; },
   hasFocus: function () { return true; },
-  queryCommandSupported: function () { return false; }
+  queryCommandSupported: function () { return false; },
+  // elementFromPoint:坐标命中测试。站点 APM/安全 SDK(patas 空白页采样、
+  // ka 指纹采集)在定时器里高频调用,缺失时回调整段抛错,SDK 状态机停摆、
+  // 后续依赖它的数据请求(joblist 等)永不发出(实测 zhipin)。
+  // 实现:遍历快照节点,取包含该点的**最小**盒子(≈最深元素);无命中返回
+  // documentElement(与真实浏览器视口内行为一致)。
+  elementFromPoint: function (x, y) {
+    var px = Number(x), py = Number(y);
+    if (!isFinite(px) || !isFinite(py)) return null;
+    var best = -1, bestArea = Infinity;
+    for (var i = 0; i < __lsmNodes.length; i++) {
+      var nd = __lsmNodes[i];
+      var r = nd && nd.rect;
+      if (!r || typeof r.length !== "number" || r.length < 4) continue;
+      var rx = Number(r[0]) || 0, ry = Number(r[1]) || 0;
+      var rw = Number(r[2]) || 0, rh = Number(r[3]) || 0;
+      if (rw <= 0 || rh <= 0) continue;
+      if (px >= rx && px <= rx + rw && py >= ry && py <= ry + rh) {
+        var area = rw * rh;
+        if (area <= bestArea) { bestArea = area; best = i; }
+      }
+    }
+    if (best >= 0) return __mk(__lsmNodes[best]);
+    return document.documentElement || null;
+  },
+  // implementation:jQuery/Zepto 的 parseHTML 沙箱探测入口
+  // (`implementation.createHTMLDocument("")` → body.innerHTML 两个 form →
+  // childNodes.length===2)。此前整个属性缺失,探测链当场 ToObject 崩掉
+  // (实测 zhipin jQuery 1.12.2 的 createHTMLDocument 支持性检测)。
+  implementation: {
+    hasFeature: function () { return true; },
+    createHTMLDocument: function (title) {
+      var body = __newEl("body");
+      var doc = {
+        nodeType: 9,
+        readyState: "complete",
+        title: String(title == null ? "" : title),
+        body: body,
+        documentElement: __newEl("html"),
+        createElement: function (tag) { return __newEl(tag); },
+        createElementNS: function (ns, tag) { return __newEl(tag); },
+        createTextNode: function (t) { return { nodeType: 3, textContent: String(t), data: String(t) }; },
+        createDocumentFragment: function () {
+          return { __detached: true, __tag: "div", __attrs: {}, __kids: [], __text: "", nodeType: 11, appendChild: function (c) { this.__kids.push(c); return c; } };
+        },
+        querySelector: function () { return null; },
+        querySelectorAll: function () { return []; },
+        getElementsByTagName: function (t) { return body.getElementsByTagName(t); }
+      };
+      body.ownerDocument = doc;
+      return doc;
+    }
+  }
 };
 var __doc_nodes = [];
 function __rebindDocNodes() {
@@ -1578,6 +1889,11 @@ function __str(x) {
   if (x === null) return "null";
   if (x === undefined) return "undefined";
   if (typeof x === "object") {
+    // Error 的 name/message/stack 通常不可枚举，JSON.stringify(new Error(...))
+    // 只会得到 "{}"。鸭子类型同时覆盖跨 realm 错误与站点包装的错误对象。
+    try {
+      if (x instanceof Error || ((x.name || x.message) && x.stack)) return __lsmErrText(x);
+    } catch (e) {}
     try { return JSON.stringify(x); } catch (e) { return String(x); }
   }
   return String(x);
@@ -1825,6 +2141,15 @@ if (typeof Proxy === "function") {
       if (k in t) return t[k];
       if (typeof globalThis !== "undefined" && k in globalThis) return globalThis[k];
       return undefined;
+    },
+    // has 陷阱:`"onsubmit" in window` 在真实浏览器恒为 true(window 有一整族
+    // on* 事件处理器占位属性),站点库拿它做特性检测。缺此陷阱时默认转发到
+    // 目标对象,`on*` 名查不到返回 false → jQuery support 误判走 IE<9 兜底
+    // 分支 → `div.attributes[name].expando` 链(实测 zhipin jQuery 1.12.2)。
+    has: function (t, k) {
+      if (k in t) return true;
+      if (typeof globalThis !== "undefined" && k in globalThis) return true;
+      return typeof k === "string" ? /^on[a-z][a-z0-9]*$/.test(k) : false;
     },
     set: function (t, k, v) {
       // 目标若是「非可配置的只读访问器」(站点反爬脚本的典型手法:
@@ -2628,7 +2953,9 @@ function __lsmWrapAmdDefine() {
     }
     return orig.apply(this, arguments);
   };
-  wrapped.amd = orig.amd || {};
+  // UMD 用 `"function" == typeof define && define.amd` 选择导出通道。
+  // 原加载器没有 amd 时不能凭空补 {}，否则脚本不再注册浏览器全局。
+  if (orig.amd !== undefined) wrapped.amd = orig.amd;
   wrapped.__lsmWrapped = true;
   try { window.define = wrapped; } catch (e) {}
   try { define = wrapped; } catch (e) {}
@@ -2678,10 +3005,35 @@ function __lsmDispatchDoc(type) {
 function __lsmReady(state) { document.readyState = String(state); }
 // 宿主侧脚本执行包装:间接 eval(全局作用域)失败时把 e.stack(含行列)回传,
 // 否则只拿到 "TypeError: xxx" 一句,几百 KB 的压缩脚本无从定位。
+function __lsmTraceAlogException() {
+  if (!globalThis.__lsmTraceToObj || typeof Proxy !== "function") return;
+  try {
+    if (typeof alog !== "function" || alog.__lsmTraceWrapped) return;
+    var wrapped = new Proxy(alog, {
+      apply: function (target, thisArg, args) {
+        if (args[0] === "exception.fire") {
+          try { __cerror("[alog exception] " + __str(args)); } catch (e) {}
+        }
+        return target.apply(thisArg, args);
+      }
+    });
+    wrapped.__lsmTraceWrapped = true;
+    alog = wrapped;
+    window.alog = wrapped;
+  } catch (e) {}
+}
 function __lsmRunScript(code) {
+  __lsmTraceAlogException();
   try { (0, eval)(String(code)); return __lsmCollect({ ok: true, value: null }); }
   catch (e) {
-    var msg = String((e && e.stack) || e);
+    // Boa 的 e.stack 只有调用帧、不含 "TypeError: xxx" 消息行;
+    // 只回传 stack 会丢失错误本体(zhipin jQuery/Vue 失败只有帧无从排查)。
+    // 消息与栈都保留:消息行在前,与浏览器 DevTools 习惯一致。
+    var head = "";
+    try { head = String(e); } catch (se) { head = "(String(e) 抛错)"; }
+    var stack = "";
+    try { stack = (e && e.stack) ? String(e.stack) : ""; } catch (se2) { stack = ""; }
+    var msg = stack ? (head + "\n" + stack) : head;
     return __lsmCollect({ ok: false, value: null, error: msg });
   }
 }

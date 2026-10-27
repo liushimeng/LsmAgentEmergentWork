@@ -231,6 +231,14 @@ pub const GLOBALS_JS: &str = r##"
   if (typeof globalThis === "undefined") return;
   var G = globalThis;
 
+  // URLSearchParams 的安全百分号解码:裸 decodeURIComponent 遇孤立 %
+  // 会抛 URIError,浏览器语义按原样保留。此前 URLSearchParams 引用了
+  // 从未定义的 __lsmDecode,任何 `new URL(...)` 都当场 ReferenceError
+  // (实测 zhipin app~3 的路由解析)。
+  function __lsmDecode(s) {
+    try { return decodeURIComponent(String(s).replace(/\+/g, " ")); } catch (e) { return String(s); }
+  }
+
   // --- URL / URLSearchParams ---
   if (typeof G.URL === "undefined") {
     var URLImpl = function URL(u, base) {
@@ -921,8 +929,18 @@ pub const GLOBALS_JS: &str = r##"
       var src = fetchTextSync(url);
       if (src) {
         loadStack.push(mid);
+        // 空页面初始不应暴露 AMD：UMD 会据此决定注册模块还是浏览器全局。
+        // 仅在 require() 的内部取模块求值期间提供兜底 define；若脚本装了自己的
+        // AMD 装载器（G.define 已不再是本兜底函数），则保留页面实现。
+        var previousDefine = G.define;
+        var installedDefine = typeof previousDefine !== "function";
+        if (installedDefine) G.define = define;
         try { (0, eval)(src); }
         catch (e) { amdLog("模块 " + mid + " 执行失败: " + String((e && e.stack) || e)); }
+        if (installedDefine && G.define === define) {
+          if (previousDefine === undefined) { try { delete G.define; } catch (e2) { G.define = undefined; } }
+          else G.define = previousDefine;
+        }
         loadStack.pop();
       }
       rec = defs[mid];
@@ -995,7 +1013,8 @@ pub const GLOBALS_JS: &str = r##"
   // `if ("undefined" != typeof requirejs) { if (isFunction(requirejs)) return; ... }`
   // ——若内核抢先定义了 `requirejs`,页面自带的 requirejs 会认为"已加载过"而
   // 直接 return,AMD 装载器整层不初始化(实测百度地图的 widget 层即因此不加载)。
-  if (typeof G.define === "undefined" || !G.define.amd) G.define = define;
+  // 不预置全局 define：真实空页面没有 AMD。兜底 define 只在 loadModule 的
+  // 内部求值期间临时安装，避免 UMD 在站点装载器执行前就被截走浏览器全局导出。
 })();
 
   // performance 裸全局(部分脚本直接用 `performance.now()`)。

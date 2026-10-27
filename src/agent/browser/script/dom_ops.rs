@@ -11,11 +11,14 @@ use kuchikiki::NodeRef;
 use super::JsAction;
 use crate::agent::browser::document::{self, Document};
 
-const MAX_INLINE_SCRIPTS: usize = 32;
+const MAX_INLINE_SCRIPTS: usize = 128;
 const MAX_INLINE_BYTES: usize = 256 * 1024;
-/// 单轮外链脚本上限。需覆盖大型站点首屏全部静态脚本(百度地图 37 个),
-/// 否则跨轮补齐会让靠后的内联/外链脚本相对顺序失真。
-const MAX_EXTERNAL_SCRIPTS: usize = 64;
+/// 单轮外链脚本上限。需覆盖大型站点的**全部**注入脚本:百度地图的 widget
+/// 层一个包就注入数百个模块脚本,上限过小会让排在后面的脚本(地图图层面板
+/// 依赖的 `getjsmods` 等)永远取不到,地图只剩空壳。
+/// 真正的耗时约束是脚本管线的墙钟预算(`LAEW_WEB_SCRIPT_PIPELINE_MS`),
+/// 数量上限只需防住病态页面。
+const MAX_EXTERNAL_SCRIPTS: usize = 512;
 
 /// 单轮应用结果:DOM 之外的副作用汇总,由调用方合并进 TabState/存储。
 #[derive(Debug, Default, Clone)]
@@ -292,7 +295,13 @@ pub enum CollectedItem {
 /// 脚本收集产物。
 #[derive(Debug, Default)]
 pub struct CollectedScripts {
+    /// 阻塞脚本(文档序):解析期按序执行。
     pub items: Vec<CollectedItem>,
+    /// defer 脚本(文档序):真实浏览器在文档解析完、DOMContentLoaded 前整组
+    /// 后置执行。此前管线无视 defer 全按文档序跑,SPA 站点「阻塞库脚本
+    /// (vue-core/bossui)写在 defer 块之后」的顺序被打乱,defer 的 app 入口
+    /// 先跑、`Vue is not defined` 整页停在加载中(实测 zhipin 搜索页)。
+    pub deferred: Vec<CollectedItem>,
 }
 
 /// 收集文档中的 `<script>`:内联文本直接提取,外链 src 返回 URL 清单。
@@ -304,6 +313,10 @@ pub fn collect_scripts(doc: &Document, base_url: &str, executed: &mut HashSet<u6
     };
     let mut inline_count = 0usize;
     let mut external_count = 0usize;
+    // 调试账目:脚本元素总数 / 已执行跳过 / 上限截断(定位「模块没被取回」)。
+    let mut scanned = 0usize;
+    let mut skipped_done = 0usize;
+    let mut capped = 0usize;
     for node in scripts {
         let src = document::attr(&node, "src");
         let typ = document::attr(&node, "type")
@@ -317,9 +330,14 @@ pub fn collect_scripts(doc: &Document, base_url: &str, executed: &mut HashSet<u6
             continue;
         }
         if let Some(src) = src {
+            scanned += 1;
             if external_count >= MAX_EXTERNAL_SCRIPTS {
+                capped += 1;
                 continue;
             }
+            // defer 语义:显式 defer 属性或 type=module(规范隐式 defer)的
+            // 外链脚本整组后置执行(见 CollectedScripts.deferred 注释)。
+            let deferred = document::attr(&node, "defer").is_some() || typ.contains("module");
             if let Some(abs) = crate::agent::browser::urlutil::resolve(base_url, &src) {
                 if abs.starts_with("http://") || abs.starts_with("https://") {
                     // 已执行过的外链不再取回:真实浏览器语义是「每个 script 元素
@@ -327,10 +345,14 @@ pub fn collect_scripts(doc: &Document, base_url: &str, executed: &mut HashSet<u6
                     // 全部静态外链重新取回重新执行,重复初始化破坏页面启动时序
                     // (实测百度地图 widget 层因此整层停滞)。
                     if executed.contains(&fingerprint(&abs)) {
+                        skipped_done += 1;
                         continue;
                     }
-                    if !out.items.iter().any(|it| matches!(it, CollectedItem::External(u) if *u == abs)) {
-                        out.items.push(CollectedItem::External(abs));
+                    let seen = out.items.iter().chain(out.deferred.iter())
+                        .any(|it| matches!(it, CollectedItem::External(u) if *u == abs));
+                    if !seen {
+                        let target = if deferred { &mut out.deferred } else { &mut out.items };
+                        target.push(CollectedItem::External(abs));
                         external_count += 1;
                     }
                 } else if let Some(rest) = abs.strip_prefix("data:") {
@@ -350,6 +372,21 @@ pub fn collect_scripts(doc: &Document, base_url: &str, executed: &mut HashSet<u6
         }
         if push_inline(&mut out, &text, executed, "") {
             inline_count += 1;
+        }
+    }
+    if std::env::var("LAEW_DOM_TRACE").is_ok() {
+        eprintln!(
+            "[domtrace] collect scanned={} skipped_executed={} capped={} inline={} external={}",
+            scanned,
+            skipped_done,
+            capped,
+            inline_count,
+            external_count
+        );
+        for it in out.items.iter().take(6) {
+            if let CollectedItem::External(u) = it {
+                eprintln!("[domtrace]   picked external {}", u);
+            }
         }
     }
     out

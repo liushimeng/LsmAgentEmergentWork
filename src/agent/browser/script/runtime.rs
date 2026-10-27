@@ -23,7 +23,9 @@ use crate::agent::browser::document::SnapshotNode;
 const MAX_LOOP_ITERATIONS: u64 = 20_000_000;
 const MAX_RECURSION: usize = 256;
 const MAX_JOB_ENQUEUE: u64 = 20_000;
-const MAX_TIMER_CALLBACKS: u64 = 256;
+// 单次请求只快进一小批定时器。真实浏览器不会在一次任务里连续跑数百帧；
+// 永久动画链若占满整个墙钟预算，后续点击/求值都会被拖慢。
+const MAX_TIMER_CALLBACKS: u64 = 64;
 const MAX_FETCH_BODY: usize = 2 * 1024 * 1024;
 const MAX_VALUE_CHARS: usize = 256 * 1024;
 
@@ -303,7 +305,7 @@ impl ThreadRuntime {
                 .unwrap_or_else(|_| "{\"pending\":0,\"ran\":0}".to_string());
             let (pending, ran) = parse_tick(&tick);
             total_ran += ran;
-            if pending == 0 || total_ran > MAX_TIMER_CALLBACKS {
+            if pending == 0 || total_ran >= MAX_TIMER_CALLBACKS {
                 break;
             }
             if Instant::now() >= deadline {

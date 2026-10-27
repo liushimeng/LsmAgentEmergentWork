@@ -214,6 +214,59 @@ fn 定时器_虚拟时钟_延迟执行() {
 }
 
 #[test]
+fn 永久定时器_单请求快进次数有硬上限() {
+    let handle = JsHandle::spawn();
+    let reply = run_scripts(
+        &handle,
+        vec![r#"
+            window.__ticks = 0;
+            setInterval(function () {
+                window.__ticks++;
+                document.getElementById('app').setAttribute('data-tick', String(window.__ticks));
+            }, 16);
+        "#],
+        PAGE,
+        "https://a.test/",
+    );
+    let ticks = reply
+        .outcome
+        .actions
+        .iter()
+        .filter(|a| a.kind == "set_attr" && a.key == "data-tick")
+        .count();
+    assert_eq!(ticks, 64, "永久动画不能在一次请求里无界快进:{:?}", reply.outcome.actions);
+    assert!(reply.outcome.ok, "{:?}", reply.outcome.error);
+    handle.shutdown();
+}
+
+#[test]
+fn 控制台_error对象_保留名称消息和堆栈() {
+    let handle = JsHandle::spawn();
+    let reply = eval_on(
+        &handle,
+        r#"
+        console.error(new TypeError('route boot failed'));
+        console.error({name: 'Error', message: 'wrapped', stack: 'Error: wrapped\n    at widget.js:1:2'});
+        'logged'
+        "#,
+        PAGE,
+        "https://a.test/",
+    );
+    let text = reply
+        .outcome
+        .logs
+        .iter()
+        .map(|l| l.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("TypeError"), "错误名丢失:{text}");
+    assert!(text.contains("route boot failed"), "错误消息丢失:{text}");
+    assert!(text.contains("wrapped"), "包装错误消息丢失:{text}");
+    assert!(!text.contains("{}"), "错误对象不得再序列化成空对象:{text}");
+    handle.shutdown();
+}
+
+#[test]
 fn domcontentload_listener_被派发() {
     let handle = JsHandle::spawn();
     let reply = run_scripts(
@@ -465,6 +518,169 @@ fn 动态插入脚本可触发_load_回调() {
         "脚本取回失败时不应假触发 onload:{:?}",
         reply.outcome.actions
     );
+}
+
+#[test]
+fn 动态脚本_load回调_相对与绝对URL使用同一键() {
+    let handle = JsHandle::spawn();
+    let armed = eval_on(
+        &handle,
+        r#"(function(){
+            window.__relativeLoaded = 0;
+            window.__protocolLoaded = 0;
+            var a = document.createElement('script');
+            a.src = '/pkg/route.js';
+            a.onload = function(){ window.__relativeLoaded = 1; };
+            document.body.appendChild(a);
+            var b = document.createElement('script');
+            b.src = '//a.test/pkg/tile.js';
+            b.onload = function(){ window.__protocolLoaded = 1; };
+            document.body.appendChild(b);
+            return 'armed';
+        })()"#,
+        PAGE,
+        "https://a.test/",
+    );
+    assert!(armed.outcome.ok, "{:?}", armed.outcome.error);
+    let fired = eval_on(
+        &handle,
+        r#"
+        __lsmFireScriptLoad('https://a.test/pkg/route.js');
+        __lsmFireScriptLoad('https://a.test/pkg/tile.js');
+        String(window.__relativeLoaded) + ':' + String(window.__protocolLoaded)
+        "#,
+        PAGE,
+        "https://a.test/",
+    );
+    assert_eq!(fired.outcome.value, "1:1", "相对/协议相对 src 必须收到绝对 URL 的 load 回调");
+    handle.shutdown();
+}
+
+#[test]
+fn 脚本URL归一_相对与协议相对都归到绝对() {
+    let handle = JsHandle::spawn();
+    let reply = eval_on(
+        &handle,
+        r#"
+        try { globalThis.URL = undefined; } catch (e) {}
+        JSON.stringify({
+            abs: __lsmScriptKey('https://a.test/z.js'),
+            root: __lsmScriptKey('/pkg/route.js'),
+            rel: __lsmScriptKey('pkg/route.js'),
+            proto: __lsmScriptKey('//a.test/pkg/tile.js')
+        })
+        "#,
+        PAGE,
+        "https://a.test/",
+    );
+    assert!(reply.outcome.ok, "{:?}", reply.outcome.error);
+    let v = reply.outcome.value;
+    assert!(v.contains("\"abs\":\"https://a.test/z.js\""), "{v}");
+    assert!(v.contains("\"root\":\"https://a.test/pkg/route.js\""), "{v}");
+    assert!(v.contains("\"rel\":\"https://a.test/pkg/route.js\""), "{v}");
+    assert!(v.contains("\"proto\":\"https://a.test/pkg/tile.js\""), "{v}");
+    handle.shutdown();
+}
+
+#[test]
+fn 元素contains_按当前树判定祖先() {
+    let handle = JsHandle::spawn();
+    let reply = eval_on(
+        &handle,
+        r#"
+        var box = document.getElementById('box');
+        var child = document.getElementById('child');
+        var outside = document.getElementById('outside');
+        var out = {
+            self: box.contains(box),
+            child: box.contains(child),
+            outside: box.contains(outside),
+            doc: document.contains(child)
+        };
+        return JSON.stringify(out);
+        "#,
+        "<html><body><div id='box'><span id='child'>子</span></div><div id='outside'>外</div></body></html>",
+        "https://a.test/",
+    );
+    let v = reply.outcome.value;
+    assert!(v.contains("\"self\":true"), "{v}");
+    assert!(v.contains("\"child\":true"), "{v}");
+    assert!(v.contains("\"outside\":false"), "{v}");
+    assert!(v.contains("\"doc\":true"), "{v}");
+    handle.shutdown();
+}
+
+#[test]
+fn 元素身份跨DOM变化保持稳定_作用域查询不串位() {
+    // 快照用数组下标标识节点;DOM 在两轮之间插入节点后下标会错位,
+    // 上一轮捕获的元素包装器会指向别的元素(百度地图首屏 find(".right-button")
+    // 落空 → 搜索框初始化失败)。真实浏览器的元素身份与 DOM 变化无关。
+    const BEFORE: &str = "<html><body><div id='box'><span class='child'>子</span></div></body></html>";
+    const AFTER: &str =
+        "<html><body><div id='other'><i></i></div><div id='box'><span class='child'>子</span></div></body></html>";
+    let handle = JsHandle::spawn();
+    let armed = eval_on(
+        &handle,
+        "window.__box = document.getElementById('box'); String(window.__box.querySelectorAll('.child').length)",
+        BEFORE,
+        "https://a.test/",
+    );
+    assert_eq!(armed.outcome.value, "1", "{:?}", armed.outcome.error);
+    let after = eval_on(
+        &handle,
+        "String(window.__box.querySelectorAll('.child').length) + ':' + String(window.__box.getElementsByTagName('span').length)",
+        AFTER,
+        "https://a.test/",
+    );
+    assert_eq!(after.outcome.value, "1:1", "DOM 变化后旧元素包装器必须仍指向自身子树");
+    handle.shutdown();
+}
+
+#[test]
+fn 初始空页面不预置AMD_UMD注册浏览器全局() {
+    let handle = JsHandle::spawn();
+    let reply = eval_on(
+        &handle,
+        r#"
+        (function(root, factory){
+            if (typeof define === 'function' && define.amd) define(factory);
+            else root.__initialUmd = factory();
+        })(globalThis, function(){ return 42; });
+        return String(globalThis.__initialUmd) + ':' + typeof globalThis.define;
+        "#,
+        PAGE,
+        "https://a.test/",
+    );
+    assert!(reply.outcome.ok, "{:?}", reply.outcome.error);
+    assert_eq!(reply.outcome.value, "42:undefined", "初始 AMD 不得截走 UMD 的 window 导出");
+    handle.shutdown();
+}
+
+#[test]
+fn FIS包装define_不凭空增加amd标志_UMD仍注册全局() {
+    let handle = JsHandle::spawn();
+    let reply = eval_on(
+        &handle,
+        r#"
+        Object.defineProperty(globalThis, 'require', {
+            value: {loadJs: function(){}}, writable: true, configurable: true
+        });
+        Object.defineProperty(globalThis, 'define', {
+            value: function(id, factory){}, writable: true, configurable: true
+        });
+        __lsmAmdKind();
+        (function(root, factory){
+            if (typeof define === 'function' && define.amd) define(factory);
+            else root.__umdGlobal = factory();
+        })(globalThis, function(){ return 42; });
+        return String(globalThis.__umdGlobal) + ':' + typeof globalThis.define.amd;
+        "#,
+        PAGE,
+        "https://a.test/",
+    );
+    assert!(reply.outcome.ok, "{:?}", reply.outcome.error);
+    assert_eq!(reply.outcome.value, "42:undefined", "UMD 全局导出不能被伪造的 define.amd 截走");
+    handle.shutdown();
 }
 
 // ---------- 阶段五第一步:观察者系列 ----------
