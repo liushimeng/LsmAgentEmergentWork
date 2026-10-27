@@ -49,12 +49,43 @@ pub async fn url_and_title(page: &Page) -> (String, String) {
 }
 
 /// 页面级 eval_js:表达式/语句求值,返回 JSON 值(异常/无值按 Null 处理)。
+///
+/// 第 181 轮(2026-10-27 京东实测):①顶层 return 脚本自动 IIFE 包裹
+/// (见 `js_preprocess`);②JS 异常从 Rust Debug 转储改为「类型 + 描述 + 行列号
+/// + IIFE 提示」的简洁格式(旧报文 700+ 字符,关键信息 `SyntaxError:
+/// Illegal return statement` 埋在中段,每个新 SubAgent 会话都要重新人肉解析)。
 pub async fn eval_js(page: &Page, script: &str) -> Result<Value> {
-    let res = tokio::time::timeout(Duration::from_secs(CDP_BOUND_SECS), page.evaluate(script))
+    let wrapped = crate::agent::js_preprocess::wrap_top_level_return(script);
+    let res = tokio::time::timeout(Duration::from_secs(CDP_BOUND_SECS), page.evaluate(wrapped))
         .await
         .map_err(|_| timeout_err("eval_js", CDP_BOUND_SECS))?
-        .map_err(|e| err("eval_js", e))?;
+        .map_err(|e| eval_js_err(&e))?;
     Ok(res.value().cloned().unwrap_or(Value::Null))
+}
+
+/// eval_js 异常的友好格式化:提取异常类型/描述/行列号。
+fn eval_js_err(e: &chromiumoxide::error::CdpError) -> AgentError {
+    use chromiumoxide::error::CdpError;
+    if let CdpError::JavascriptException(details) = e {
+        let exception = details.exception.as_ref();
+        let desc = exception
+            .and_then(|ex| ex.description.as_deref())
+            .unwrap_or(details.text.as_str());
+        let class = exception
+            .and_then(|ex| ex.class_name.as_deref())
+            .unwrap_or("Error");
+        let (line, col) = (details.line_number, details.column_number);
+        let hint = if desc.contains("Illegal return") {
+            "。提示:顶层 return 非法——请用 (function(){...})() 包裹,或改写为末行表达式"
+        } else {
+            ""
+        };
+        return AgentError::ToolExecution {
+            tool: "chrome_browser".into(),
+            reason: format!("eval_js 脚本异常: Uncaught {class}: {desc} ({line}:{col}){hint}"),
+        };
+    }
+    err("eval_js", e)
 }
 
 /// 全页 PNG 截图,返回 base64(与 Lsm 版 `inspect(screenshot)` 信封对齐)。

@@ -763,6 +763,51 @@ pub const HUMAN_REASONS: &[&str] = &[
     "custom",
 ];
 
+/// reason 自由文本归一(第 181 轮,2026-10-27 京东实测)。
+///
+/// 模型首调 `request_human` 常传自由文本原因(如「京东要求登录后才能访问搜索结果」),
+/// 白名单直接 1001 拒绝会白费一整轮 LLM 往返(实测 Plan iter=8 被拒、iter=9 靠
+/// 报文里的 allowed 列表自救)。枚举值/空值直通;自由文本按中英关键词归一到
+/// 最近枚举,归不中保持原值(由白名单分支拒绝并回 allowed 清单兜底)。
+fn normalize_reason(raw: &str) -> String {
+    let r = raw.trim().to_ascii_lowercase();
+    if r.is_empty() || HUMAN_REASONS.contains(&r.as_str()) {
+        return r;
+    }
+    // (关键词组, 目标枚举):按声明顺序首个命中生效,更具体的组放前面
+    // (如「扫码登录」命中 qr 而非 login、「短信验证码」命中 sms 而非 captcha)。
+    const RULES: &[(&[&str], &str)] = &[
+        (&["扫码", "二维码", "qr", "qrcode"], "qr_login"),
+        (&["短信", "sms", "手机验证"], "sms"),
+        (&["验证码", "captcha", "拼图", "滑块"], "captcha"),
+        (&["实名", "real_name", "realname"], "real_name"),
+        (
+            &[
+                "人脸",
+                "双因素",
+                "两步验证",
+                "二次验证",
+                "two_factor",
+                "2fa",
+                "otp",
+            ],
+            "two_factor",
+        ),
+        (&["授权", "oauth", "第三方登录"], "oauth"),
+        (
+            &["登录", "登陆", "login", "sign in", "signin", "log in"],
+            "login",
+        ),
+        (&["人工", "核验", "复核", "manual", "verify"], "manual_verify"),
+    ];
+    for (kws, target) in RULES {
+        if kws.iter().any(|k| r.contains(k)) {
+            return (*target).to_string();
+        }
+    }
+    r
+}
+
 /// 工具侧 `control(request_human)` 的统一实现(Chrome / Lsm 两工具共用)。
 ///
 /// 返回 `(code, message, data)` 三元组,由各工具包进自己的 JSON 信封 ——
@@ -780,7 +825,10 @@ pub async fn request_human_action(
     multi_select: bool,
 ) -> (i32, String, serde_json::Value) {
     use serde_json::json;
-    let reason = reason_raw.trim().to_ascii_lowercase();
+    // 第 181 轮:自由文本 reason 先归一(扫码/验证码/登录等中英关键词 → 枚举),
+    // 归不中再走白名单拒绝。实测京东任务首调传「京东要求登录后才能访问…」
+    // 直接 1001 拒绝白费一轮 LLM 往返。
+    let reason = normalize_reason(reason_raw);
     if !HUMAN_REASONS.contains(&reason.as_str()) {
         return (
             1001,
@@ -914,6 +962,29 @@ mod tests {
         assert_eq!(code, 1001);
         assert!(msg.contains("reason"), "报文应点破 reason 非法: {msg}");
         assert!(data.get("allowed").is_some(), "应给出白名单: {data}");
+    }
+
+    /// 第 181 轮:自由文本 reason 归一(京东实测首调传中文长句被 1001 拒绝白费一轮)。
+    #[test]
+    fn normalize_reason_自由文本归一到枚举() {
+        // 枚举值/空值直通(含大小写)
+        assert_eq!(normalize_reason("qr_login"), "qr_login");
+        assert_eq!(normalize_reason("  Login  "), "login");
+        assert_eq!(normalize_reason(""), "");
+        // 京东实测原文:自由文本长句
+        assert_eq!(
+            normalize_reason("京东要求登录后才能访问搜索结果/价格/评论页"),
+            "login"
+        );
+        // 扫码优先于登录(规则顺序)
+        assert_eq!(normalize_reason("请人工扫码完成登录"), "qr_login");
+        assert_eq!(normalize_reason("页面弹出滑块验证码"), "captcha");
+        assert_eq!(normalize_reason("需要短信验证码"), "sms");
+        assert_eq!(normalize_reason("请人工核验订单"), "manual_verify");
+        assert_eq!(normalize_reason("需要人脸识别"), "two_factor");
+        assert_eq!(normalize_reason("OAuth 授权"), "oauth");
+        // 归不中:保持原值(交白名单分支拒绝并回 allowed)
+        assert_eq!(normalize_reason("not_a_reason"), "not_a_reason");
     }
 
     #[tokio::test]

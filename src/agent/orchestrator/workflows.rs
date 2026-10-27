@@ -991,6 +991,36 @@ pub(super) fn build_subflow_input(
         }
         // 未声明强制工具时不注入任何工具专属批量范式,避免把选用决策写死。
     }
+    // 第 181 轮(2026-10-27 京东实测):任务级浏览器工具约束传导。
+    // 实测任务原文「分别使用 Chrome 浏览器,打开京东」不含 mandated_tool 认定的
+    // 「只使用/必须使用」句式,执行单元完全不知道任务指定了 Chrome——wf-2 与
+    // layer 3 三个并行单元系统性双开 MCP_Web_LsmAgentBrowser_Use(Lsm 侧被京东
+    // 风控拦成「京东验证」,每单元浪费 3~6 轮;还意外拉起有头查看器触发 SIGPIPE
+    // 进程死亡,见 crash::ignore_sigpipe 注释)。这里对**所有单元**(不限
+    // pre_explore)注入用户指定的浏览器工具硬约束。
+    if let Some(mandate) = browser_mandate(wf.original_prompt.as_deref().unwrap_or("")) {
+        match mandate {
+            "chrome" => {
+                description.push_str(
+                    "\n\n🔒 任务级浏览器工具约束(用户任务原文指定了 Chrome 浏览器,本单元硬约束):\n\
+                     本单元全部网页操作必须使用 MCP_Web_Chrome_Use;禁止改用 MCP_Web_LsmAgentBrowser_Use\n\
+                     (它是另一个独立内核:会话/登录态不共享,同一站点会被视作两个来源,放大风控风险)。\n\
+                     唯一例外:Chrome 反复被站点风控拦截(验证码循环/整页抹除/访问被拒)且本单元已无法推进时,\n\
+                     可在产出中如实说明后改用另一工具,并说明理由。",
+                );
+            }
+            "lsm" => {
+                description.push_str(
+                    "\n\n🔒 任务级浏览器工具约束(用户任务原文指定了 LsmAgentBrowser 内核,本单元硬约束):\n\
+                     本单元全部网页操作必须使用 MCP_Web_LsmAgentBrowser_Use;禁止改用 MCP_Web_Chrome_Use\n\
+                     (用户选择自研内核通常有反-反爬/离线等明确理由)。\n\
+                     唯一例外:目标站点依赖 Lsm 内核尚不支持的能力(WebGL 地图底图等)且本单元已无法推进时,\n\
+                     可在产出中如实说明后改用另一工具,并说明理由。",
+                );
+            }
+            _ => {}
+        }
+    }
     // 2026-09-19 第 91 轮 P0-8:wf.original_prompt 透传整段用户原始 prompt(兜底回退 wf.name)
     let original_prompt = wf.original_prompt.clone().or_else(|| Some(wf.name.clone()));
     SubFlowInput {
@@ -1030,6 +1060,30 @@ pub(super) fn mandated_tool(prompt: &str, tool: &str) -> bool {
             clause.contains(tool)
         })
     })
+}
+
+/// 检测用户提示词是否指定了某个浏览器内核(第 181 轮)。
+///
+/// 与 [`mandated_tool`] 的区别:那套关键词(只使用/必须使用…)要求句式精确,
+/// 实测任务原文「分别使用 Chrome 浏览器」不命中,执行单元拿不到任何工具约束。
+/// 这里做**正向存在性检测**——提示词里点名了某个浏览器本身就是强信号
+/// (注入的也只是正向指引+例外出口,不是硬禁令):
+/// - 只出现 Chrome 系词 → `"chrome"`(注入「全程用 MCP_Web_Chrome_Use」);
+/// - 只出现 Lsm 系词 → `"lsm"`;
+/// - 两者都出现或都不出现 → `None`(不注入,选用决策留给模型)。
+pub(super) fn browser_mandate(prompt: &str) -> Option<&'static str> {
+    let lower = prompt.to_ascii_lowercase();
+    let chrome = ["chrome", "chromium", "谷歌浏览器", "谷歌内核"]
+        .iter()
+        .any(|k| lower.contains(k));
+    let lsm = ["lsmagentbrowser", "lsm 浏览器", "自研内核", "反反爬", "反-反爬"]
+        .iter()
+        .any(|k| lower.contains(k));
+    match (chrome, lsm) {
+        (true, false) => Some("chrome"),
+        (false, true) => Some("lsm"),
+        _ => None,
+    }
 }
 
 // ===================== 第 146 轮:完成单元摘要(断点续跑) =====================
@@ -1139,6 +1193,38 @@ pub(super) fn merge_completed_digest(acc: &mut String, incoming: &str) {
     } else {
         merged
     };
+}
+
+/// `browser_mandate` 词形矩阵(第 181 轮):京东实测原文必须命中 chrome。
+#[cfg(test)]
+mod browser_mandate_tests {
+    use super::*;
+
+    #[test]
+    fn 京东实测原文命中_chrome() {
+        // 2026-10-27 京东实测任务原文节选:不含「只使用/必须使用」句式,
+        // mandated_tool 判不中,但 browser_mandate 必须命中。
+        let prompt = "### 组装一个 1W 块钱左右的台式机\n1. 分别使用 Chrome 浏览器,打开 京东 网站,必须先登录。\n2. 找到搜素工具栏";
+        assert_eq!(browser_mandate(prompt), Some("chrome"));
+        assert!(!mandated_tool(prompt, "MCP_Web_Chrome_Use"), "旧判定不应命中(回归对照)");
+    }
+
+    #[test]
+    fn 常见词形与大小写() {
+        assert_eq!(browser_mandate("用 chrome 打开京东"), Some("chrome"));
+        assert_eq!(browser_mandate("使用谷歌浏览器查询"), Some("chrome"));
+        assert_eq!(browser_mandate("用 Chromium 内核"), Some("chrome"));
+        assert_eq!(browser_mandate("改用 MCP_Web_LsmAgentBrowser_Use 重试"), Some("lsm"));
+        assert_eq!(browser_mandate("用自研内核反反爬"), Some("lsm"));
+    }
+
+    #[test]
+    fn 双指定与无指定不注入() {
+        // 两个内核都被点名(对比类任务)或都没点名:不注入,选用决策留给模型
+        assert_eq!(browser_mandate("分别用 Chrome 与 LsmAgentBrowser 对比渲染"), None);
+        assert_eq!(browser_mandate("打开京东收集价格"), None);
+        assert_eq!(browser_mandate(""), None);
+    }
 }
 
 #[cfg(test)]

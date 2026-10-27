@@ -1251,6 +1251,15 @@ async fn main() -> Result<()> {
                 unreachable!("browser-watchdog returned before setup")
             }
             None => {
+                // 第 181 轮(2026-10-27 京东实测):长跑模式(TUI/-p/-f)显式忽略
+                // SIGPIPE。本分支进程会持有查看器(`__browser-view`)、Chrome
+                // watchdog 等子进程管道,若沿用启动期的 SIG_DFL,子进程死亡后的
+                // 下一次管道写会直接杀死整个 Agent 进程(exit 141,无 CrashDump,
+                // 实测 47 分钟任务全损)。忽略后 EPIPE 成为普通 Err 交还各写点
+                // 既有容错(view/mod.rs 回退纯无头等);stdout 的 println! 若遇
+                // Broken pipe 由 panic hook 静默退 141。短命子命令(provider/mcp
+                // /sessions/version)保持启动期 SIG_DFL,`| head` 惯例不变。
+                lsm_agent::crash::ignore_sigpipe();
                 // 纯函数斜杠命令前置检测(/diff 等不依赖 LLM 的命令在 -p 模式也可直接执行)
                 if let Some(prompt) = &cli.prompt {
                     if try_run_pure_slash_command(prompt) {

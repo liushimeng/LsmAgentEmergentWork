@@ -500,13 +500,21 @@ impl Tool for BashTool {
         // Unix:强制新 session / 新进程组,使后续 killpg 能整组清理孙子进程
         #[cfg(unix)]
         {
-            // SAFETY:pre_exec 在子进程 fork 后 exec 前执行,只调用 setsid(可重入安全),
-            // 调用失败时返回 Err,子进程将 _exit 而不是污染父进程。
+            // SAFETY:pre_exec 在子进程 fork 后 exec 前执行,只调用 setsid 与
+            // signal(均为可重入安全函数),调用失败时返回 Err,子进程将 _exit
+            // 而不是污染父进程。
             unsafe {
                 cmd.pre_exec(|| {
                     if libc::setsid() == -1 {
                         return Err(std::io::Error::last_os_error());
                     }
+                    // 第 181 轮:长跑模式下宿主进程忽略 SIGPIPE(防子进程管道
+                    // 对端死亡杀死 Agent,见 crash::ignore_sigpipe);POSIX 语义
+                    // 被忽略的信号跨 exec 保持忽略,会让 shell 里 `grep … | head`
+                    // 这类管道在 head 退出后对端报 "write error: Broken pipe"
+                    // 而非静默退出。这里在 exec 前恢复 SIG_DFL,保住用户命令的
+                    // Unix 管道惯例。
+                    libc::signal(libc::SIGPIPE, libc::SIG_DFL);
                     Ok(())
                 });
             }

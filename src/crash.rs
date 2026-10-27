@@ -102,6 +102,12 @@ pub fn install_panic_hook(report_dir: impl Into<PathBuf>) {
             }
             let _guard = HookActiveGuard;
 
+            // 第 181 轮:stdout/stderr 写 Broken pipe(`laew -p … | head`)属
+            // Unix 管道惯例,静默退 141,不生成 CrashDump(见 `ignore_sigpipe`)。
+            if is_broken_pipe_panic(info) {
+                std::process::exit(141);
+            }
+
             // 第 108 轮:panic 时优先还原终端(alt screen / raw mode / 滚动区 / 光标),
             // 否则终端残留 alt screen + raw mode 会导致整个 Terminal 软件僵死。
             // sync 版本不依赖 tokio runtime(panic 时 runtime 状态不可靠)。
@@ -177,6 +183,38 @@ pub fn restore_sigpipe_default() {
         // 不能在初始化阶段因信号设置失败中断 CLI。
         let _ = libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
+}
+
+/// 长跑模式（TUI / `-p` / `-f`）改为显式忽略 SIGPIPE。
+///
+/// 第 181 轮(2026-10-27 京东实测):`restore_sigpipe_default()` 曾在 main 无条件
+/// 调用,长跑 Agent 进程持有查看器(`laew __browser-view`)、watchdog 等子进程
+/// 管道,对端死亡后的下一次管道写会直接被 SIGPIPE 杀死整个进程(exit 141,
+/// 无 CrashDump)——实测 47 分钟任务在 Lsm 查看器窗口关闭后整体死亡,
+/// `view/mod.rs` 里 `write_all().is_ok()` 的「查看器退出自动回退」容错
+/// 根本来不及执行。忽略 SIGPIPE 后,EPIPE 变成普通 `Err` 交还各写点容错;
+/// stdout 的 `println!` 若遇 Broken pipe 走 panic hook 的静默退出分支
+/// (见 [`is_broken_pipe_panic`]),保持 Unix 管道惯例。
+pub fn ignore_sigpipe() {
+    #[cfg(unix)]
+    unsafe {
+        let _ = libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+}
+
+/// 判定 panic 是否为「stdout/stderr 写入 Broken pipe」(`println!` 在
+/// SIG_IGN 语义下对已关闭管道的 panic)。
+///
+/// 该类 panic 属 Unix 管道惯例(`laew -p … | head`),应静默退 141,
+/// 不生成 CrashDump。
+fn is_broken_pipe_panic(info: &panic::PanicHookInfo<'_>) -> bool {
+    let msg = info
+        .payload()
+        .downcast_ref::<String>()
+        .map(|s| s.as_str())
+        .or_else(|| info.payload().downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    msg.contains("Broken pipe") || msg.contains("os error 32")
 }
 
 /// 按 laew 根目录安装全局 panic hook。

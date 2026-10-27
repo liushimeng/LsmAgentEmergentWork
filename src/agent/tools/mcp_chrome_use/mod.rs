@@ -381,6 +381,10 @@ close 释放页面(page_id=all 全关并回收 Chrome 进程)。\
 避免整页 HTML 撑爆上下文。\
 ★ wait 是就绪判定原语:params.selector + params.state(visible|hidden|attached|detached)/\
 params.text(元素文本包含)/params.js(页面表达式为真),多条件取「与」;可与 params.ms 同给(先 settle 再等就绪)。\
+★ 遇登录墙/验证码/滑块/短信核验需要人工时,用 control_action=request_human:\
+params.reason **必须取枚举值**(qr_login/captcha/sms/login/two_factor/oauth/manual_verify/custom),\
+params.message 写清要人工做什么;人工在原生弹窗完成(扫码/输码)后工具返回结果。\
+params.timeout_ms 可延长等待(默认按 reason 分档 120s/300s)。
 ★ page_id 可省略:当前只有一个存活页时自动选中(信封回 page_id_auto=true);多页时须指定。\
 page_id 仅本工具内有效,不跨工具复用。\
 当目标站点对 Chrome 风控(反复验证码/页面抹除/访问被拒)时,改用 MCP_Web_LsmAgentBrowser_Use。\
@@ -434,7 +438,11 @@ page_id 仅本工具内有效,不跨工具复用。\
                         "state": { "type": "string", "enum": ["visible", "hidden", "attached", "detached"], "description": "wait 的元素状态判定(默认 visible);与 selector 同用" },
                         "y": { "type": "integer", "description": "scroll 像素(正向下)" },
                         "ms": { "type": "integer", "description": "wait 固定等待毫秒(上限 30000);与就绪判定条件同给时先 settle 再等就绪" },
-                        "timeout_ms": { "type": "integer", "description": "wait 就绪判定超时,默认 10000,上限 120000" },
+                        "timeout_ms": { "type": "integer", "description": "wait 就绪判定超时(默认 10000,上限 120000);request_human 等待人工的超时(默认按 reason 分档 120s/300s)" },
+                        "reason": { "type": "string", "enum": ["captcha", "sms", "qr_login", "login", "real_name", "two_factor", "oauth", "manual_verify", "custom"], "description": "control(request_human) 的介入原因,必须取枚举值(传自由文本会被关键词归一,但请直接传枚举;非法值返回 1001+allowed 清单)" },
+                        "message": { "type": "string", "description": "request_human 展示给人工的现场说明(缺省按 reason 自动生成)" },
+                        "options": { "type": "array", "items": { "type": "string" }, "description": "request_human 人工可选项(最多 8 项,人工点选其一/多选后回传)" },
+                        "multi_select": { "type": "boolean", "description": "request_human 人工可选项是否允许多选(默认 false)" },
                         "full_page": { "type": "boolean", "description": "screenshot 是否取整页(按整页高度裁剪,视口外内容也进图);对齐 Lsm 版同名参数" },
                         "save_path": { "type": "string", "description": "screenshot 落盘路径(.png);给了就只回路径+尺寸,绝不回 base64(防上下文爆炸)" }
                     }
@@ -529,11 +537,20 @@ async fn run_open(args: Value) -> Result<String> {
 }
 
 async fn run_list() -> Result<String> {
-    let pages = McpChromeUseTool::mgr().list_pages().await;
+    let pages = McpChromeUseTool::mgr().list_pages_detailed().await;
     envelope(
         0,
         "ok",
-        json!({ "pages": pages.iter().map(|(id, url)| json!({"page_id": id, "url": url})).collect::<Vec<_>>() }),
+        json!({ "pages": pages.iter().map(|info| json!({
+            "page_id": info.page_id,
+            "url": info.url,
+            // 第 181 轮:所有权视图——owner_alive=true 的页面属于仍在运行的
+            // (可能是并行的)单元,不要 close / 导航它。
+            "owner": info.owner.as_ref().map(|o| json!({
+                "agent": o.agent,
+                "alive": o.alive(),
+            })),
+        })).collect::<Vec<_>>() }),
     )
 }
 
@@ -542,6 +559,40 @@ async fn run_close(args: Value) -> Result<String> {
         return envelope(CODE_PARAM_ERROR, "close 缺少 page_id", json!({}));
     };
     let mgr = McpChromeUseTool::mgr();
+    // 第 181 轮(2026-10-27 京东实测):并行 WorkFlow 单元共享页面注册表,
+    // 曾发生 A 单元把 B 单元正在使用的页面当「风控页」close 掉(B 下一次
+    // 调用 2004,被迫自愈浪费 2+ 轮)。close 前做所有权守门:
+    // 只在调用者自身处于 Agent 上下文时生效(测试/非编排路径不受限)。
+    let caller = crate::agent::web_activity::current_weak();
+    if let Some(caller_weak) = caller.as_ref() {
+        if page_id == "all" {
+            // 全关会连带回收 Chrome 进程:并行层有兄弟单元还开着页面时必须拒绝。
+            if let Some((pid, agent)) = mgr.foreign_owner_page(Some(caller_weak)).await {
+                return envelope(
+                    CODE_PARAM_ERROR,
+                    "close(all) 被拒绝",
+                    json!({
+                        "page_id": "all",
+                        "blocker_page": pid,
+                        "blocker_agent": agent,
+                        "hint": "仍有其它并行单元打开的存活页面;请只 close 自己打开的页面,或等兄弟单元结束后再全关"
+                    }),
+                );
+            }
+        } else if let Some(owner) = mgr.page_owner(&page_id) {
+            if owner.alive() && !owner.is_current(Some(caller_weak)) {
+                return envelope(
+                    CODE_PARAM_ERROR,
+                    "跨单元 close 被拒绝",
+                    json!({
+                        "page_id": page_id,
+                        "owner_agent": owner.agent,
+                        "hint": "该页由仍在运行的其它单元打开(可能是并行兄弟单元);只 close 自己打开的页面"
+                    }),
+                );
+            }
+        }
+    }
     if page_id == "all" {
         mgr.close_all();
         return envelope(0, "ok", json!({"closed": "all"}));

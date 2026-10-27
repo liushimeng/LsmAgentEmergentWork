@@ -30,6 +30,7 @@ pub mod human_assist;
 pub mod human_cancel;
 pub mod human_ui;
 pub mod json_repair;
+pub mod js_preprocess;
 pub mod loop_guard;
 pub mod main_work;
 pub mod max_tokens_state;

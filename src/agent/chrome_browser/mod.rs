@@ -213,10 +213,66 @@ impl BrowserHolder {
     }
 }
 
+/// 页面所有权标签(第 181 轮,2026-10-27 京东实测)。
+///
+/// 并行 WorkFlow 单元共享同一 Chrome 实例,实测发生过 A 单元以「风控页」为由
+/// close 掉 B 单元正在使用的页面(B 下一次调用报 2004,被迫自愈浪费 2+ 轮)。
+/// `open` 时打上打开者(活动台账弱引用)标签;`close` 时拒绝关闭
+/// 「拥有者仍活跃且非当前调用者」的页面。单元结束(台账 Drop)后页面成为
+/// 孤儿页,允许后续单元 close 或被同 URL `open` 收养复用。
+#[derive(Clone)]
+pub struct PageOwner {
+    /// 打开者 Agent 名(诊断展示用)。
+    pub agent: String,
+    /// 打开者台账的会话开始时刻(毫秒,展示用)。
+    pub started_ms: u128,
+    /// 打开者活动台账弱引用:`upgrade` 成功 = 拥有者单元仍在运行。
+    weak: std::sync::Weak<std::sync::Mutex<crate::agent::web_activity::ActivityState>>,
+}
+
+impl std::fmt::Debug for PageOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PageOwner")
+            .field("agent", &self.agent)
+            .field("alive", &self.alive())
+            .finish()
+    }
+}
+
+impl PageOwner {
+    /// 拥有者单元是否仍在运行。
+    pub fn alive(&self) -> bool {
+        self.weak.upgrade().is_some()
+    }
+
+    /// 是否就是当前调用者(按台账指针判等;`current` 为 None 时恒 false)。
+    pub fn is_current(
+        &self,
+        current: Option<&std::sync::Weak<std::sync::Mutex<crate::agent::web_activity::ActivityState>>>,
+    ) -> bool {
+        current.is_some_and(|w| std::sync::Weak::ptr_eq(&self.weak, w))
+    }
+}
+
+/// 注册表条目:页面句柄 + 所有权标签。
+struct PageEntry {
+    page: Arc<Page>,
+    owner: Option<PageOwner>,
+}
+
+/// 存活页信息(`list_pages_detailed` 返回,含所有权视图)。
+#[derive(Debug, Clone)]
+pub struct PageInfo {
+    pub page_id: String,
+    pub url: String,
+    /// 打开者(无 = 上下文外打开的无主页)。
+    pub owner: Option<PageOwner>,
+}
+
 /// Chrome 驱动单例:整个进程一个 Chrome 子进程,page_id → Page 注册表。
 pub struct ChromeManager {
     holder: Mutex<Option<BrowserHolder>>,
-    pages: Mutex<HashMap<String, Arc<Page>>>,
+    pages: Mutex<HashMap<String, PageEntry>>,
     seq: AtomicU64,
     mode: ChromeMode,
 }
@@ -239,6 +295,17 @@ impl ChromeManager {
 
     pub fn mode(&self) -> ChromeMode {
         self.mode
+    }
+
+    /// 取当前调用者的所有权标签(不在 Agent 任务树内 = None,无主页)。
+    fn owner_of_now() -> Option<PageOwner> {
+        let act = crate::agent::web_activity::current()?;
+        let snap = act.snapshot();
+        Some(PageOwner {
+            agent: snap.agent,
+            started_ms: snap.started_ms,
+            weak: act.inner_weak(),
+        })
     }
 
     /// 确保 Chrome 子进程已拉起(惰性,首次 open 时触发)。
@@ -349,8 +416,12 @@ impl ChromeManager {
     fn register(&self, page: Page) -> (String, Arc<Page>) {
         let id = self.next_page_id();
         let arc = Arc::new(page);
+        let entry = PageEntry {
+            page: arc.clone(),
+            owner: Self::owner_of_now(),
+        };
         if let Ok(mut pages) = self.pages.lock() {
-            pages.insert(id.clone(), arc.clone());
+            pages.insert(id.clone(), entry);
         }
         (id, arc)
     }
@@ -359,7 +430,42 @@ impl ChromeManager {
         self.pages
             .lock()
             .ok()
-            .and_then(|pages| pages.get(page_id).cloned())
+            .and_then(|pages| pages.get(page_id).map(|e| e.page.clone()))
+    }
+
+    /// 取页面所有权标签(不存在/无主页返回 None)。
+    pub fn page_owner(&self, page_id: &str) -> Option<PageOwner> {
+        self.pages
+            .lock()
+            .ok()
+            .and_then(|pages| pages.get(page_id).and_then(|e| e.owner.clone()))
+    }
+
+    /// 转移页面所有权(孤儿页收养时把标签改写为当前调用者)。
+    fn set_owner(&self, page_id: &str, owner: Option<PageOwner>) {
+        if let Ok(mut pages) = self.pages.lock() {
+            if let Some(e) = pages.get_mut(page_id) {
+                e.owner = owner;
+            }
+        }
+    }
+
+    /// 找「拥有者仍活跃且非当前调用者」的**存活**页(返回 page_id + 打开者 Agent 名)。
+    ///
+    /// `close(all)` 的守门:并行层若有兄弟单元还开着页面,全关会连带回收
+    /// Chrome 进程杀死全部兄弟单元,必须拒绝。`current` = 当前调用者台账弱引用。
+    pub async fn foreign_owner_page(
+        &self,
+        current: Option<&std::sync::Weak<std::sync::Mutex<crate::agent::web_activity::ActivityState>>>,
+    ) -> Option<(String, String)> {
+        for info in self.list_pages_detailed().await {
+            if let Some(owner) = &info.owner {
+                if owner.alive() && !owner.is_current(current) {
+                    return Some((info.page_id, owner.agent.clone()));
+                }
+            }
+        }
+        None
     }
 
     /// 打开 URL,返 `(page_id, 最终 URL, 标题)`。
@@ -368,6 +474,11 @@ impl ChromeManager {
     /// (实测 page_id 返回 12s 后 eval 报 `receiver is gone`)。这里做一次
     /// 存活探测 + 同浏览器内重建,避免一次瞬态失败污染整个任务。
     pub async fn open(&self, url: &str) -> Result<(String, String, String)> {
+        // 第 181 轮:同 URL 孤儿页收养(见 adopt_orphan 文档)。
+        if let Some(adopted) = self.adopt_orphan(url).await {
+            tracing::info!(url, page_id = %adopted.0, "Chrome open 收养孤儿页(前序单元残留)");
+            return Ok(adopted);
+        }
         let browser = self.ensure_browser().await?;
         let mut last_err: Option<AgentError> = None;
         for attempt in 0..2 {
@@ -416,17 +527,34 @@ impl ChromeManager {
     /// 同时剔除已失效页面:target 销毁/崩溃后 `Page` 句柄仍在注册表里,
     /// 旧实现会把 url="" 的幽灵页返回给模型(实测 c_00000000)。
     pub async fn list_pages(&self) -> Vec<(String, String)> {
-        let pages: Vec<(String, Arc<Page>)> = self
+        self.list_pages_detailed()
+            .await
+            .into_iter()
+            .map(|info| (info.page_id, info.url))
+            .collect()
+    }
+
+    /// 列出存活页面(含所有权视图,第 181 轮)。
+    pub async fn list_pages_detailed(&self) -> Vec<PageInfo> {
+        let pages: Vec<(String, Arc<Page>, Option<PageOwner>)> = self
             .pages
             .lock()
-            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .map(|m| {
+                m.iter()
+                    .map(|(k, v)| (k.clone(), v.page.clone(), v.owner.clone()))
+                    .collect()
+            })
             .unwrap_or_default();
         let mut out = Vec::with_capacity(pages.len());
         let mut dead = Vec::new();
-        for (id, page) in pages {
+        for (id, page, owner) in pages {
             if page::page_alive(&page).await {
                 let (url, _) = page::url_and_title(&page).await;
-                out.push((id, url));
+                out.push(PageInfo {
+                    page_id: id,
+                    url,
+                    owner,
+                });
             } else {
                 dead.push(id);
             }
@@ -440,6 +568,32 @@ impl ChromeManager {
             }
         }
         out
+    }
+
+    /// 同 URL 孤儿页收养(第 181 轮)。
+    ///
+    /// 前序单元结束后页面残留(open 恒新建页,实测页面 id 一路涨到
+    /// c_00000014+,后续单元还要花轮次分辨「这些页面是不是上个任务留的」)。
+    /// 存活页当前 URL 与请求一致且无主/拥有者已死 → 直接复用该页,所有权
+    /// 转移给当前调用者;拥有者仍活跃(并行兄弟在用)→ 不复用(避免互踩导航)。
+    async fn adopt_orphan(&self, url: &str) -> Option<(String, String, String)> {
+        for info in self.list_pages_detailed().await {
+            if info.url != url {
+                continue;
+            }
+            let reuse = match &info.owner {
+                None => true,
+                Some(owner) => !owner.alive(),
+            };
+            if !reuse {
+                return None;
+            }
+            let page = self.get_page(&info.page_id)?;
+            let (cur_url, title) = page::url_and_title(&page).await;
+            self.set_owner(&info.page_id, Self::owner_of_now());
+            return Some((info.page_id, cur_url, title));
+        }
+        None
     }
 
     pub fn close_page(&self, page_id: &str) -> bool {

@@ -1700,6 +1700,9 @@ async fn act_eval(
         .find_map(|k| p_str(params, k))
         .ok_or_else(|| EngineError::param("eval_js 需要 expression"))?
         .to_string();
+    // 第 181 轮:顶层 return 自动 IIFE 包裹(Boa 同样不允许顶层 return;
+    // 与 Chrome/CDP 侧共用 js_preprocess,详见该模块文档)。
+    let script = crate::agent::js_preprocess::wrap_top_level_return(&script);
     let await_promise = p_bool(params, "await_promise", false);
     let _ = timeout_ms(params, top, 30_000);
 

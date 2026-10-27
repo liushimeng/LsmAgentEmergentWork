@@ -199,8 +199,8 @@ js(页面表达式为真)、network_idle(网络静默毫秒),多条件取「与�
                 "force": { "type": "boolean", "default": false, "description": "兼容参数;新内核对导航不做节奏闸" },
                 "new_window": { "type": "boolean", "default": false, "description": "open 时在独立逻辑窗口打开" },
                 "reuse": { "type": "boolean", "default": true, "description": "open 时同 URL/同站已有页面则复用" },
-                "mode": { "type": "string", "enum": ["headed", "hidden", "new_headless"], "default": "headed",
-                          "description": "浏览器模式。headed = 进程内内核 + 独立原生窗口查看器(用户可直接看到浏览器窗口,含后退/前进/刷新/地址栏);hidden = 纯无头无窗口。需要让用户看到浏览器运行过程时用 headed(默认)" },
+                "mode": { "type": "string", "enum": ["headed", "hidden", "new_headless"],
+                          "description": "浏览器模式,**默认按交互性自动判定,不传即可**(终端交互=headed,管道/自动化=hidden)。headed = 进程内内核 + 独立原生窗口查看器(用户可直接看到浏览器窗口,含后退/前进/刷新/地址栏);hidden = 纯无头无窗口。⚠️ 自动化/批量采集任务**不要传 headed**——它会在本机拉起查看器窗口进程,无人值守时纯属资源浪费(2026-10-27 京东实测:并行单元误传 headed 拉起查看器,窗口被关闭后曾引发进程级故障)。仅当用户明确要看浏览器运行过程时才传 headed" },
                 "window_width": { "type": "integer", "minimum": 320, "maximum": 7680 },
                 "window_height": { "type": "integer", "minimum": 240, "maximum": 4320 },
                 "highlight": { "type": "boolean", "default": true },
@@ -250,9 +250,9 @@ js(页面表达式为真)、network_idle(网络静默毫秒),多条件取「与�
                 "queries": { "type": "array", "minItems": 1, "maxItems": 8, "items": { "type": "object" } },
                 "summary_hint": { "type": "string" },
                 "summary": { "type": "string" },
-                "message": { "type": "string", "maxLength": 600 },
-                "reason": { "type": "string" },
-                "options": { "type": "array", "items": { "type": "string" }, "maxItems": 8 }
+                "message": { "type": "string", "maxLength": 600, "description": "control(request_human) 展示给人工的现场说明" },
+                "reason": { "type": "string", "enum": ["captcha", "sms", "qr_login", "login", "real_name", "two_factor", "oauth", "manual_verify", "custom"], "description": "control(request_human) 的介入原因,必须取枚举值(自由文本会被关键词归一;非法值返回 1001+allowed 清单)" },
+                "options": { "type": "array", "items": { "type": "string" }, "maxItems": 8, "description": "control(request_human) 人工可选项" }
             }
         })
     }

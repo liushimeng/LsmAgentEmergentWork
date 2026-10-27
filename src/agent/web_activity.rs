@@ -52,6 +52,14 @@ pub struct Activity {
     inner: Arc<Mutex<ActivityState>>,
 }
 
+impl Activity {
+    /// 内部状态的弱引用(第 181 轮,Chrome 页面所有权判活:
+    /// `upgrade` 成功 = 本单元仍在运行)。
+    pub fn inner_weak(&self) -> std::sync::Weak<std::sync::Mutex<ActivityState>> {
+        std::sync::Arc::downgrade(&self.inner)
+    }
+}
+
 tokio::task_local! {
     /// 当前任务的 Agent 活动台账(作用域外 = 非 Agent 工具调用路径,`current()` 返回 None)。
     static CURRENT: Activity;
@@ -81,6 +89,14 @@ pub async fn scope<T>(act: Activity, fut: impl std::future::Future<Output = T>) 
 /// 取当前任务的活动台账(`None` = 不在 Agent 工具作用域内)。
 pub fn current() -> Option<Activity> {
     CURRENT.try_with(|a| a.clone()).ok()
+}
+
+/// 当前任务活动台账的**弱引用**(第 181 轮,Chrome 页面所有权判活用)。
+///
+/// `Weak::upgrade` 成功 = 该 Agent 单元仍在运行;单元结束(所有 Activity 克隆
+/// Drop)后弱引用死亡。并行 WorkFlow 单元各有独立台账,指针判等即可区分单元。
+pub fn current_weak() -> Option<std::sync::Weak<std::sync::Mutex<ActivityState>>> {
+    CURRENT.try_with(|a| a.inner_weak()).ok()
 }
 
 /// 当前活动快照(无台账时返回 `None`;上层据此回退到「LAEW Agent 控制中」静态文案)。

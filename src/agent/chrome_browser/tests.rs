@@ -52,3 +52,38 @@ fn 模式解析_headed_hidden() {
     assert_eq!(ChromeMode::from_env_or_default(), ChromeMode::Hidden);
     std::env::remove_var("LAEW_CHROME_MODE");
 }
+
+#[test]
+fn page_owner_判活与指针判等() {
+    // 第 181 轮:所有权状态机——拥有者 Activity 存活时 alive/is_current 成立,
+    // Drop 后变孤儿(alive=false),允许后续 close/收养。
+    let act = crate::agent::web_activity::begin("Test-Agent", "s1", "任务", 8);
+    let owner = PageOwner {
+        agent: "Test-Agent".into(),
+        started_ms: act.snapshot().started_ms,
+        weak: act.inner_weak(),
+    };
+    assert!(owner.alive(), "Activity 存活时 owner 应活跃");
+    let caller = crate::agent::web_activity::current_weak();
+    // 无 task_local 作用域(本测试不在 Agent 任务树内):caller=None,is_current 恒 false
+    assert!(!owner.is_current(caller.as_ref()));
+
+    // 模拟并行单元:两个不同 Activity 的弱引用指针不相等
+    let act2 = crate::agent::web_activity::begin("Other-Agent", "s1", "任务", 8);
+    let owner2 = PageOwner {
+        agent: "Other-Agent".into(),
+        started_ms: 0,
+        weak: act2.inner_weak(),
+    };
+    assert!(std::sync::Weak::ptr_eq(
+        &owner2.weak,
+        &act2.inner_weak()
+    ));
+    assert!(!std::sync::Weak::ptr_eq(&owner.weak, &owner2.weak));
+
+    // Drop 拥有者:弱引用死亡 → 孤儿页
+    drop(act);
+    drop(act2);
+    assert!(!owner.alive(), "Activity Drop 后 owner 应死亡(孤儿页)");
+    assert!(!owner2.alive());
+}
