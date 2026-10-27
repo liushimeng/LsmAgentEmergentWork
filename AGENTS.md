@@ -526,7 +526,12 @@ Markdown Prompt 模板，两级发现：**项目级** `{工作目录}/.laew/comm
 | `tests/cli_provider.rs` | 真实二进制 CLI：`provider` / `mcp` 增删列切 |
 | `tests/project_context.rs` | 项目说明文件五级发现链 + 注入幂等 |
 | `tests/web_use_engine.rs` | MCP_Web_LsmAgentBrowser_Use × LsmAgentBrowser 端到端（mock HTTP,无外网/无浏览器） |
+| `tests/chrome_watchdog_sigkill.rs` | Chrome watchdog 契约回归：真实二进制 `__browser-watchdog` 管道在位不误杀 → stdin EOF(=父进程被 SIGKILL)回收目标进程与 profile → 退出码 0；目标已消失路径直接清理不悬挂（unix） |
+| `tests/browser_mode_env.rs` | `LAEW_BROWSER_MODE` 与工具 `mode` 参数优先级契约 |
+| `tests/control_mask_smoke.rs` | Chrome 控制权两态真机冒烟（`#[ignore]`，需真 Chrome）：蒙层在位/撤除、`4004` 写闸、观测放行、`list` 感知外部页签、`close` 真关页 |
+| `tests/lsm_control_state_smoke.rs` | Lsm 控制权两态 + 1080p 缺省真机冒烟（`#[ignore]`） |
 | `tests/macos_ax_smoke.rs` | macOS Accessibility 冒烟（依赖宿主 TCC 授权） |
+| `tests/window_input_smoke.rs` | Windows 窗口操控实机冒烟（`LAEW_SMOKE_WINDOW_INPUT=1` 门控，默认跳过） |
 
 ### 写集成测试的规矩
 
