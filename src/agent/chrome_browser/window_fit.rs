@@ -33,35 +33,12 @@ const SCREEN_MARGIN: u32 = 48;
 const MIN_WINDOW_W: u32 = 1024;
 const MIN_WINDOW_H: u32 = 640;
 
-/// 主显示器像素尺寸(探测不到返回 `None`)。
+/// 主显示器**逻辑**尺寸(探测不到返回 `None`)。
+///
+/// 逻辑点而非物理像素:窗口尺寸是 DIP,拿 Retina 的物理像素去比会判成
+/// 「屏幕够大」,夹紧直接失效(窗口照样溢出屏幕)。
 pub fn screen_size() -> Option<(u32, u32)> {
-    #[cfg(target_os = "macos")]
-    {
-        use core_graphics::display::{CGDisplayPixelsHigh, CGDisplayPixelsWide, CGMainDisplayID};
-        let id = unsafe { CGMainDisplayID() };
-        let w = unsafe { CGDisplayPixelsWide(id) } as u32;
-        let h = unsafe { CGDisplayPixelsHigh(id) } as u32;
-        if w > 0 && h > 0 {
-            return Some((w, h));
-        }
-        None
-    }
-    #[cfg(target_os = "windows")]
-    {
-        use windows::Win32::UI::WindowsAndMessaging::{
-            GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
-        };
-        let w = unsafe { GetSystemMetrics(SM_CXSCREEN) } as u32;
-        let h = unsafe { GetSystemMetrics(SM_CYSCREEN) } as u32;
-        if w > 0 && h > 0 {
-            return Some((w, h));
-        }
-        None
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        None
-    }
+    crate::agent::display_size::main_display_size()
 }
 
 /// 把目标窗口尺寸按屏幕可用区域夹紧。

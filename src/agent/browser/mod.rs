@@ -21,6 +21,8 @@ pub mod resource;
 pub mod resources;
 pub mod script;
 pub mod security;
+/// 显示器尺寸探测(headed 查看器视口夹紧,避免窗口超出屏幕)。
+pub mod screen;
 pub mod storage;
 pub mod style;
 pub mod urlutil;
@@ -556,9 +558,31 @@ impl LsmBrowserManager {
                                    "hint": "先 close 不需要的 page_id,或复用已有页面"})));
         }
         let ua = user_agent.unwrap_or(DEFAULT_UA).to_string();
+        // 视口尺寸:缺省 1920×1080(1080p)。**headed 模式**再按主显示器可用区域
+        // 夹紧 —— 查看器窗口按视口开,屏幕比 1080p 小的时候窗口会超出屏幕,
+        // 底部区域人工根本看不到(缺区域/渲染不全)。hidden 模式不夹:
+        // 没有窗口,逻辑视口与物理屏无关,夹了反而影响站点布局。
+        let (mut vp_w, mut vp_h) = (
+            width.unwrap_or(DEFAULT_VIEWPORT_W).clamp(320, 7680),
+            height.unwrap_or(DEFAULT_VIEWPORT_H).clamp(240, 4320),
+        );
+        if mode.is_headed() {
+            let (fw, fh) = screen::fit_viewport_to_screen(vp_w, vp_h);
+            if (fw, fh) != (vp_w, vp_h) {
+                tracing::info!(
+                    requested_w = vp_w,
+                    requested_h = vp_h,
+                    fitted_w = fw,
+                    fitted_h = fh,
+                    "headed 视口按屏幕可用区夹紧(避免查看器窗口超出屏幕)"
+                );
+            }
+            vp_w = fw;
+            vp_h = fh;
+        }
         let viewport = Viewport {
-            width: width.unwrap_or(DEFAULT_VIEWPORT_W).clamp(320, 7680),
-            height: height.unwrap_or(DEFAULT_VIEWPORT_H).clamp(240, 4320),
+            width: vp_w,
+            height: vp_h,
             ..Default::default()
         };
         let (resp, from_cache) = self.fetch_main(&mut inner, &requested, &ua, timeout_ms).await?;

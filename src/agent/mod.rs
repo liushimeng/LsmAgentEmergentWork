@@ -67,6 +67,8 @@ pub mod workspace;
 // Agent 活动台账(task_local):「哪个 Agent 正在干什么」的唯一数据真源,
 // 供两条告知栏(屏蔽页面状态栏/进度栏)渲染。见 docs/双浏览器工具架构/02。
 pub mod web_activity;
+// 主显示器逻辑尺寸探测(浏览器窗口/视口按屏幕夹紧时用)。
+pub mod display_size;
 // 浏览器控制权状态机(双浏览器工具共用):Agent 控制状态 ⇄ 用户控制状态。
 // 见 docs/双浏览器工具架构/03-浏览器控制权状态机与视口自适应.md。
 pub mod web_control;
