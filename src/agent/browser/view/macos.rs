@@ -1,8 +1,15 @@
 //! macOS 有头帧查看器:AppKit FFI(NSWindow + 工具栏 + NSImageView + NSTimer 轮询)。
 //!
 //! 只在 `laew __browser-view` 子进程内运行(与 `__hitl-dialog` 同一模式),
-//! 事件循环跑在子进程主线程。布局单一真源:内容区高度 = argv 传入的视口高度
-//! + 工具栏高度,**永不回读**窗口 frame(human_ui 第 137 轮铁律同源)。
+//! 事件循环跑在子进程主线程。初始布局单一真源:内容区高度 = argv 传入的
+//! 视口高度 + 工具栏高度。
+//!
+//! **人工拖动窗口**(视口自适应):100ms 一拍读回内容区真实尺寸,与上次记录
+//! 比较;变了就重排控件(画面铺满 + 工具栏按新宽度重算)并向宿主上报
+//! `{"cmd":"resize","w":..,"h":..}`(内容区扣掉工具栏 = 新视口),
+//! 宿主按新视口重排重渲染,新帧 1:1 铺满内容区(不缺区域、不变形)。
+//! 读取内容区尺寸与 `human_ui` 的「永不回读窗口 frame」铁律**刻意不同**:
+//! 那条铁律针对 HITL 弹窗自身布局的回环,详见 `content_size` 的注释。
 //!
 //! 窗口形态 = 真浏览器:
 //! * 顶部工具栏:后退 / 前进 / 刷新 / 首页 四个按钮 + 地址栏;
@@ -92,6 +99,12 @@ msg!(send_void_bool, (arg: bool) -> ());
 msg!(send_void_i64, (arg: i64) -> ());
 msg!(send_void_rect, (rect: NSRect) -> ());
 msg!(send_void_sel, (arg: Sel) -> ());
+// 返回 NSRect 的消息(结构体返回值)。
+//
+// NSRect 是 4 个 f64 的聚合体,macOS(x86_64 SysV / arm64 Darwin HFA)的 C
+// ABI 都按浮点寄存器返回,与 Rust `extern "C"` 的聚合体返回约定一致;
+// 已用探针实测取到正确尺寸。取不到合理值时上层按「读不到」处理。
+msg!(send_rect, () -> NSRect);
 
 fn cls(name: &'static [u8]) -> Id {
     unsafe { objc_getClass(name.as_ptr().cast()) }
@@ -144,6 +157,14 @@ static BACK_BTN: once_cell::sync::Lazy<Mutex<IdCell>> =
     once_cell::sync::Lazy::new(|| Mutex::new(IdCell(std::ptr::null_mut())));
 static FWD_BTN: once_cell::sync::Lazy<Mutex<IdCell>> =
     once_cell::sync::Lazy::new(|| Mutex::new(IdCell(std::ptr::null_mut())));
+/// 刷新/首页按钮(人工拖动窗口后需按新宽度重排)。
+static RELOAD_BTN: once_cell::sync::Lazy<Mutex<IdCell>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(IdCell(std::ptr::null_mut())));
+static HOME_BTN: once_cell::sync::Lazy<Mutex<IdCell>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(IdCell(std::ptr::null_mut())));
+/// 上一次已知的窗口内容区尺寸(点);变了才重排 + 上报宿主。
+static CONTENT_SIZE: once_cell::sync::Lazy<Mutex<(f64, f64)>> =
+    once_cell::sync::Lazy::new(|| Mutex::new((0.0, 0.0)));
 /// 用户是否正在地址栏里编辑(编辑中不覆盖用户输入)。
 static EDITING: AtomicBool = AtomicBool::new(false);
 /// 宿主最后下发的 URL(地址栏失焦时回填,避免残留外来输入)。
@@ -197,6 +218,83 @@ fn cmd_json(cmd: &str, url: Option<&str>) -> String {
     }
 }
 
+/// 读回窗口**内容区**尺寸(点)。
+///
+/// 与 `human_ui` 的「永不回读窗口 frame」铁律**刻意不同**:那条铁律针对
+/// HITL 弹窗自身的布局回环(弹窗按自身设定值重排,回读会自激);此处读回
+/// 内容区尺寸是「人工拖动窗口 → 视口自适应」的必需输入——拿不到真实尺寸
+/// 就无从知道新视口该是多少,只能停在初始视口(拖动后大片空白)。
+unsafe fn content_size(window: Id) -> Option<(f64, f64)> {
+    if window.is_null() {
+        return None;
+    }
+    let content = send_id(window, sel(b"contentView\0"));
+    if content.is_null() {
+        return None;
+    }
+    let r = send_rect(content, sel(b"frame\0"));
+    let (w, h) = (r.size.width, r.size.height);
+    // 合理性闸:结构体返回值若因 ABI 不符取到垃圾值,宁可当作「读不到」。
+    if !w.is_finite() || !h.is_finite() || w <= 0.0 || h <= 0.0 || w > 20000.0 || h > 20000.0 {
+        return None;
+    }
+    Some((w, h))
+}
+
+/// 按新的内容区尺寸重排控件:画面铺满下半部,工具栏按新宽度重算。
+///
+/// AppKit 原点在左下:画面区在 `[0, view_h]`,工具栏在 `[view_h, view_h+TOOLBAR_H]`。
+unsafe fn reflow_controls(cw: f64, ch: f64) {
+    let view_h = (ch - TOOLBAR_H).max(1.0);
+    let iv = IMAGE_VIEW.lock().unwrap().0;
+    if !iv.is_null() {
+        send_void_rect(iv, sel(b"setFrame:\0"), ns_rect(0.0, 0.0, cw, view_h));
+    }
+    let btn_w = if cw >= 640.0 { 46.0 } else { 30.0 };
+    let btn_y = view_h + (TOOLBAR_H - BTN_H) / 2.0;
+    let mut x = PAD;
+    let back = BACK_BTN.lock().unwrap().0;
+    let fwd = FWD_BTN.lock().unwrap().0;
+    let reload = RELOAD_BTN.lock().unwrap().0;
+    let home = HOME_BTN.lock().unwrap().0;
+    for b in [back, fwd, reload, home] {
+        if !b.is_null() {
+            send_void_rect(b, sel(b"setFrame:\0"), ns_rect(x, btn_y, btn_w, BTN_H));
+        }
+        x += btn_w + BTN_GAP;
+    }
+    let field = ADDRESS_FIELD.lock().unwrap().0;
+    if !field.is_null() {
+        let addr_w = (cw - x - PAD).max(60.0);
+        send_void_rect(field, sel(b"setFrame:\0"), ns_rect(x, btn_y, addr_w, BTN_H));
+    }
+}
+
+/// 定时器一拍:同步窗口内容区尺寸——变了就重排控件并上报宿主。
+///
+/// 宿主收到后按新视口重排重渲染,新帧按 1:1 铺满内容区(不变形)。
+unsafe fn sync_content_size() {
+    let window = WINDOW.lock().unwrap().0;
+    if window.is_null() {
+        return;
+    }
+    let Some((cw, ch)) = content_size(window) else {
+        return;
+    };
+    {
+        let mut last = CONTENT_SIZE.lock().unwrap();
+        if (cw - last.0).abs() < 0.5 && (ch - last.1).abs() < 0.5 {
+            return;
+        }
+        *last = (cw, ch);
+    }
+    reflow_controls(cw, ch);
+    // 上报宿主:内容区宽 = 视口宽;内容区高扣掉工具栏 = 视口高(四舍五入到整像素)。
+    let vw = cw.round().clamp(1.0, 7680.0) as u32;
+    let vh = (ch - TOOLBAR_H).round().clamp(1.0, 4320.0) as u32;
+    send_cmd(&super::resize::resize_cmd_json(vw, vh));
+}
+
 /// 定时器回调:取新帧 → NSImage initWithData → setImage;标题/地址栏/关闭同理。
 extern "C" fn on_tick(_self: Id, _cmd: Sel, _timer: Id) {
     unsafe {
@@ -212,6 +310,8 @@ extern "C" fn on_tick(_self: Id, _cmd: Sel, _timer: Id) {
             send_void_id(app, sel(b"terminate:\0"), std::ptr::null_mut());
             return;
         }
+        // 人工拖动窗口 → 内容区尺寸变化 → 重排控件 + 上报宿主(视口自适应)。
+        sync_content_size();
         if let Some(t) = title {
             let w = WINDOW.lock().unwrap().0;
             if !w.is_null() {
@@ -577,6 +677,12 @@ pub fn run(width: u32, height: u32, title: &str) -> i32 {
         *ADDRESS_FIELD.lock().unwrap() = IdCell(field);
         *BACK_BTN.lock().unwrap() = IdCell(back);
         *FWD_BTN.lock().unwrap() = IdCell(fwd);
+        *RELOAD_BTN.lock().unwrap() = IdCell(reload);
+        *HOME_BTN.lock().unwrap() = IdCell(home);
+        // 初始内容区尺寸登记为基线:启动后不重复上报(只有人工拖动才上报)。
+        if let Some((cw, ch)) = content_size(window) {
+            *CONTENT_SIZE.lock().unwrap() = (cw, ch);
+        }
 
         // 读线程:stdin → 帧槽。
         std::thread::spawn(|| {

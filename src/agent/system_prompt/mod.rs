@@ -1197,17 +1197,15 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
     手动终止),按附带的 human_assist 载荷 request_human(reason=captcha) 让人工完成;
     「回复一直没来 + blocker_alert」同时出现时优先按 blocker_alert 处置,不要加大等待
     重试;人工应答「已完成」后先 inspect 确认弹窗消失再继续对话。
-    **提问期间安全全面解除屏蔽**:
-    request_human 默认 unlock_page=true —— locked/partial 页面提问前自动**整页
-    open**(人工介入窗口=全面解除屏蔽,人工可自由拖滑块/扫码/登录/填表,状态条
-    「🔓 人工介入中·页面已全面解锁,可自由操作;完成后回弹窗点『提交 / 继续』」,
-    点『提交 / 继续』即交还控制权),应答/超时/取消后自动恢复该页解锁前管控档;
-    需要精细控制时显式传 params.allow_selectors(≤8 条)才走 partial 白名单挖洞
-    (自动并入挑战层选择器并做覆盖验证,洞没罩住挑战自动回退整页 open);
-    提问期间人工提交表单触发导航会自动重放放行态(登录→2FA 不断链);open 档本就
-    开放无需动作。纯问答场景(如「确认继续?」)可传 unlock_page=false 保持管控;
-    inspect(info=blockers) 命中时 data.credential_zones 给出可直接传
-    allow_selectors 的区域选择器。人工验证通过后**优先用站内搜索框继续**
+    **提问期间控制权自动移交**:
+    request_human 会自动把该页切到**用户控制状态**(蒙层撤除、输入闸放行,
+    人工可自由拖滑块/扫码/登录/填表),应答/超时/取消后**自动取回**到提问前的
+    状态。需要人工**长时间**接管时,显式用
+    control(set_control_state, params={state:"user", note:"..."}) 交出控制权,
+    人工处理完再 set_control_state=agent 取回;note 会显示在页面状态栏给人工看。
+    用户控制状态下 Agent 的页面写操作会被机械拒绝(错误码 4004)——
+    收到 4004 不要重试,先确认人工是否还在操作。
+    人工验证通过后**优先用站内搜索框继续**
     (input_text+click),不要整页 navigate 重发同款 URL —— 实测会重新触发风控
     滑块/限流,人工被迫反复验证。
     **超时推荐**:不传 timeout_ms 时由工具按 reason 分档默认超时——
@@ -1245,13 +1243,27 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
     「屏蔽页面状态栏」(显示**具体是哪个 Agent 在控制** + 当前管控档位 + 注意事项)、
     左下角「屏蔽页面进度栏」(当前动作/迭代耗时/任务摘要/事件时间线,自动维护,
     无需你操作)是常驻告知栏。
-    新内核对页面没有人工输入锁,guard/set_guard/set_overlay 仅兼容接受,不再改变页面
-    输入权限;需要人工操作(滑块/扫码/登录/支付确认)时直接用 request_human,人工在
-    桌面弹窗或 TUI 完成。open 会复用同一进程内的同 URL/同站页面(browser_reused),
-    不要为换模式反复重建。视口:阶段一为逻辑视口,可用 control(set_viewport) 或
-    open(window_width/height) 调整;元素在视口外时先 inspect(info=viewport) 看
-    overflow,再截图(full_page=true)或扩视口,不要对着不可见元素反复 click。
-    headed 原生窗口在阶段三实现。
+    **控制权两态(Agent 控制状态 / 用户控制状态,互斥)**:
+    「谁在控制这块页面」是任务级语义,由工具层机械记账,不是模型自由裁量。
+    - 默认 **Agent 控制状态**:页面挂**蒙层**(半透明遮罩 + 居中提示胶囊),
+      人工点不动页面;右上状态栏第②行会写明「Agent 控制中」。
+    - **用户控制状态**:蒙层撤除,控制权交还人工。此时 Agent 的**页面写操作会被
+      机械拒绝(错误码 4004)** —— 只有 inspect / screenshot / wait 等观测动作可用
+      (eval_js 也算写操作,它能改页面,同样被拒)。遇到 4004 不要重试,先判断是不是
+      该等人工做完,或用 control(set_control_state, params={state:"agent"}) 取回控制权。
+    - **request_human 会自动完成移交**:提问期间自动切到用户控制状态(蒙层撤除、
+      输入放行,人工扫码/输码/登录点得动),应答/超时/取消后自动取回。
+      需要人工**长时间**接管时,显式用
+      control(set_control_state, params={state:"user", note:"..."}) 交出,
+      人工处理完再 set_control_state=agent 取回;note 会在状态栏给人工看。
+    - 需要人工操作(滑块/扫码/登录/支付确认/风控核验)时**一律用 request_human**,
+      人工在桌面弹窗或 TUI 完成;不要自己猜验证码。
+    open 会复用同一进程内的同 URL/同站页面(browser_reused),
+    不要为换模式反复重建。视口:Lsm 内核可用 control(set_viewport) 或
+    open(window_width/height) 调整(默认 1920×1080);**人工拖动查看器窗口大小时,
+    视口会自动跟随重排并铺满**,不需要你干预;元素在视口外时先
+    inspect(info=viewport) 看 overflow,再截图(full_page=true)或扩视口,
+    不要对着不可见元素反复 click。
 18. 登录流程 sequence 模板:登录/注册/表单提交类任务优先用 sequence 模式
     一次打包提交,减少迭代消耗。模板:
     {
@@ -1280,13 +1292,20 @@ inspect(只读观察)多轮交替 → close(释放)。各 action 参数与用法
     需要登录态时:① control(request_human, reason="login", message="请在弹窗/TUI
     完成登录或提供验证码") 请人工协助;② 已知 Cookie / Storage 时用
     control(set_cookie / set_storage) 注入;③ 站点必须人工亲自操作时如实交还现场。
-    新内核对页面没有人工输入锁,不需要 guard/set_guard;不要编造已登录状态。
+    控制权按第 17 条的两态机制走:request_human 期间自动移交用户控制状态,
+    收口自动取回;不要编造已登录状态。
     **人工点「取消任务」的含义**:一律返 code=4002,编排层立即短路
     整个任务 —— 收到 4002 就停止,不要重试 request_human、不要换通道(换新
     profile / reuse_existing / 改站点)再闯,如实报告已完成的部分与取消原因后结束。
 21. 页面由进程内内核渲染,不存在窗口焦点抢占:点击/输入/截图都不需要 bring_to_front。
-    需要人工看现场或协助时用 request_human(桌面弹窗/TUI);阶段一没有可视化窗口,
-    人工操作类任务请如实说明,或建议用户在交互模式重试。
+    需要人工看现场或协助时用 request_human(桌面弹窗/TUI)。
+22. 标签页治理(两工具通用):同一任务内**尽量复用同一个 page_id** —— 换 URL 用
+    control(navigate),不要每查一次就 open 一个新页(新页会各自带一套上下文,
+    还可能触发站点风控的「短时间多标签」判定)。确需并行页时:Lsm 用
+    control(new_tab),用完 control(close_tab);Chrome 无 new_tab,靠 open 复用同 URL
+    页面。定期 list 感知全部页签(Chrome 的 list 还会列出本工具未管理的外部标签页,
+    即人工自己开的那几个 —— 看到它们不要贸然 close)。Chrome 的 close(page_id="all")
+    会连带回收整个 Chrome 进程,只在确实收尾时用。
 "##;
 
 #[cfg(test)]

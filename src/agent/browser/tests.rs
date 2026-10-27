@@ -543,3 +543,113 @@ async fn 截图ocr参数不吞掉落盘() {
     );
     mgr.shutdown().await;
 }
+
+// ---------- 视口自适应(查看器人工拖动窗口 → 宿主重排重渲染) ----------
+
+#[test]
+fn 默认视口为1920乘1080() {
+    assert_eq!(DEFAULT_VIEWPORT_W, 1920, "默认视口宽应提到 1920");
+    assert_eq!(DEFAULT_VIEWPORT_H, 1080, "默认视口高应提到 1080");
+    assert_eq!(
+        Viewport::default().width,
+        1920,
+        "Viewport::default 宽应跟随默认视口"
+    );
+    assert_eq!(
+        Viewport::default().height,
+        1080,
+        "Viewport::default 高应跟随默认视口"
+    );
+}
+
+#[tokio::test]
+async fn 查看器上报尺寸_更新前台页视口() {
+    // 人工拖动有头窗口 → 查看器上报 `{"cmd":"resize"}` → 宿主更新视口并重排。
+    let mgr = LsmBrowserManager::new_arc();
+    let url = html_doc("<h1>P</h1>");
+    let out = mgr
+        .new_page(&url, BrowserMode::Hidden, None, Some(800), Some(600), false, true, 5_000)
+        .await
+        .unwrap();
+    let pid = out.page_id.clone();
+    // 置为 headed(不真的拉起查看器:无查看器时 push_frame 是 no-op)。
+    {
+        let mut inner = mgr.inner.lock().await;
+        inner.tabs.get_mut(&pid).unwrap().mode = BrowserMode::Headed;
+    }
+
+    mgr.handle_view_command(view::ViewCommand::Resize {
+        width: 1280,
+        height: 720,
+    })
+    .await;
+
+    let inner = mgr.inner.lock().await;
+    let tab = inner.tabs.get(&pid).unwrap();
+    assert_eq!(
+        (tab.viewport.width, tab.viewport.height),
+        (1280, 720),
+        "查看器上报的尺寸应成为新的视口尺寸"
+    );
+    drop(inner);
+    mgr.shutdown().await;
+}
+
+#[tokio::test]
+async fn 查看器上报尺寸_越界按宿主视口范围夹紧() {
+    let mgr = LsmBrowserManager::new_arc();
+    let url = html_doc("<h1>P</h1>");
+    let out = mgr
+        .new_page(&url, BrowserMode::Hidden, None, Some(800), Some(600), false, true, 5_000)
+        .await
+        .unwrap();
+    let pid = out.page_id.clone();
+    {
+        let mut inner = mgr.inner.lock().await;
+        inner.tabs.get_mut(&pid).unwrap().mode = BrowserMode::Headed;
+    }
+
+    mgr.handle_view_command(view::ViewCommand::Resize {
+        width: 99999,
+        height: 99999,
+    })
+    .await;
+
+    let inner = mgr.inner.lock().await;
+    let tab = inner.tabs.get(&pid).unwrap();
+    assert_eq!(
+        (tab.viewport.width, tab.viewport.height),
+        (7680, 4320),
+        "超范围尺寸应被夹到宿主视口上限"
+    );
+    drop(inner);
+    mgr.shutdown().await;
+}
+
+#[tokio::test]
+async fn 查看器上报尺寸_非有头页忽略() {
+    // 没有查看器的页面(纯无头)不应被 resize 命令改动视口。
+    let mgr = LsmBrowserManager::new_arc();
+    let url = html_doc("<h1>P</h1>");
+    let out = mgr
+        .new_page(&url, BrowserMode::Hidden, None, Some(800), Some(600), false, true, 5_000)
+        .await
+        .unwrap();
+    let pid = out.page_id.clone();
+
+    mgr.handle_view_command(view::ViewCommand::Resize {
+        width: 1280,
+        height: 720,
+    })
+    .await;
+
+    let inner = mgr.inner.lock().await;
+    let tab = inner.tabs.get(&pid).unwrap();
+    assert_eq!(
+        (tab.viewport.width, tab.viewport.height),
+        (800, 600),
+        "非 headed 页应忽略 resize 命令"
+    );
+    drop(inner);
+    mgr.shutdown().await;
+}

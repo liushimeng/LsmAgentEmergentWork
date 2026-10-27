@@ -12,12 +12,16 @@
 //!
 //! 命令通道(stdout,查看器 → 宿主,按行 JSON):
 //! `{"cmd":"navigate","url":"..."}` / `{"cmd":"back"}` / `{"cmd":"forward"}` /
-//! `{"cmd":"reload"}` / `{"cmd":"home"}`。
+//! `{"cmd":"reload"}` / `{"cmd":"home"}` / `{"cmd":"resize","w":1920,"h":1080}`。
 //! 浏览器窗口的工具栏(后退/前进/刷新/首页)与地址栏都经这条通道驱动宿主引擎,
 //! 窗口因此是**可交互的真浏览器形态**,而不只是被动显示渲染帧。
+//! `resize` 是人工拖动窗口后查看器上报的新内容区尺寸(已扣工具栏),
+//! 宿主据此重排重渲染 → 新帧按 1:1 铺满内容区(见 `view::resize`)。
 
 #[cfg(target_os = "macos")]
 pub mod macos;
+pub mod bridge;
+pub mod resize;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
@@ -44,6 +48,8 @@ pub enum ViewCommand {
     Reload,
     /// 回到空白首页。
     Home,
+    /// 人工拖动窗口后新的内容区尺寸(已扣工具栏;= 宿主侧的新视口尺寸)。
+    Resize { width: u32, height: u32 },
 }
 
 /// 解析查看器发来的一行 JSON 命令。非法行返回 None(忽略,不打断通道)。
@@ -62,6 +68,17 @@ pub fn parse_command(line: &str) -> Option<ViewCommand> {
         "forward" => Some(ViewCommand::Forward),
         "reload" => Some(ViewCommand::Reload),
         "home" => Some(ViewCommand::Home),
+        // 人工拖动窗口 → 新内容区尺寸;非法值整行忽略(不 panic)。
+        "resize" => {
+            let (w, h) = resize::size_from_json(&v)?;
+            if !resize::valid_view_size(w, h) {
+                return None;
+            }
+            Some(ViewCommand::Resize {
+                width: w,
+                height: h,
+            })
+        }
         _ => None,
     }
 }
@@ -247,5 +264,45 @@ mod tests {
         assert_eq!(parse_command("not json"), None);
         assert_eq!(parse_command(r#"{"cmd":"unknown"}"#), None);
         assert_eq!(parse_command(r#"{"cmd":"navigate"}"#), None);
+    }
+
+    #[test]
+    fn 解析命令_窗口尺寸变化() {
+        assert_eq!(
+            parse_command(r#"{"cmd":"resize","w":1920,"h":1080}"#),
+            Some(ViewCommand::Resize {
+                width: 1920,
+                height: 1080
+            })
+        );
+        // 长名别名。
+        assert_eq!(
+            parse_command(r#"{"cmd":"resize","width":800,"height":600}"#),
+            Some(ViewCommand::Resize {
+                width: 800,
+                height: 600
+            })
+        );
+    }
+
+    #[test]
+    fn 解析命令_尺寸缺字段或越界忽略() {
+        // 缺一不可。
+        assert_eq!(parse_command(r#"{"cmd":"resize","w":1920}"#), None);
+        assert_eq!(parse_command(r#"{"cmd":"resize","h":1080}"#), None);
+        assert_eq!(parse_command(r#"{"cmd":"resize"}"#), None);
+        // 越界 / 非法值。
+        assert_eq!(parse_command(r#"{"cmd":"resize","w":0,"h":1080}"#), None);
+        assert_eq!(parse_command(r#"{"cmd":"resize","w":1920,"h":0}"#), None);
+        assert_eq!(
+            parse_command(r#"{"cmd":"resize","w":7681,"h":1080}"#),
+            None
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"resize","w":1920,"h":4321}"#),
+            None
+        );
+        assert_eq!(parse_command(r#"{"cmd":"resize","w":"1920","h":1080}"#), None);
+        assert_eq!(parse_command(r#"{"cmd":"resize","w":-5,"h":1080}"#), None);
     }
 }

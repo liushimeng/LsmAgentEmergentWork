@@ -1,9 +1,13 @@
 //! Windows 有头帧查看器:Win32(GDI `StretchDIBits` + 原生工具栏控件)。
 //!
 //! 只在 `laew __browser-view` 子进程内运行(与 `__hitl-dialog` 同一模式)。
-//! 窗口客户区 = 工具栏(后退/前进/刷新/首页 + 地址栏)+ 视口画面;
-//! PNG 帧经 image crate 解码为 RGBA 后以自顶向下 32bpp DIB 绘制。
+//! 窗口客户区 = 工具栏(后退/前进/刷新/首页 + 地址栏,在**上**边)+ 视口画面;
+//! PNG 帧经 image crate 解码为 RGBA 后以自顶向下 32bpp DIB **1:1 绘制**
+//! (不拉伸:宿主按内容区尺寸重渲染,新帧尺寸 == 内容区尺寸 → 铺满且不变形)。
 //! 100ms `WM_TIMER` 轮询共享帧槽(与 macOS 侧同构)。
+//!
+//! **人工拖动窗口**(视口自适应):`WM_SIZE` → 读客户区尺寸 → 变了就重排工具栏
+//! 子控件并向宿主上报 `{"cmd":"resize","w":..,"h":..}`(内容区扣掉工具栏)。
 //!
 //! 工具栏交互经 stdout 命令通道驱动宿主引擎(与 macOS 侧协议一致)。
 
@@ -20,12 +24,13 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus, SetFocus};
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
-    GetMessageW, GetWindowTextW, LoadCursorW, PostQuitMessage, RegisterClassW, SetTimer,
-    SetWindowTextW, ShowWindow, TranslateMessage, BS_PUSHBUTTON, CS_HREDRAW, CS_VREDRAW,
-    CW_USEDEFAULT, ES_AUTOHSCROLL, HMENU, IDC_ARROW, MSG, SW_SHOWNORMAL, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_KEYDOWN, WM_KILLFOCUS, WM_PAINT, WM_TIMER,
-    WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+    AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    GetClientRect, GetMessageW, GetWindowTextW, LoadCursorW, MoveWindow, PostQuitMessage,
+    RegisterClassW, SetTimer, SetWindowTextW, ShowWindow, TranslateMessage, BS_PUSHBUTTON,
+    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, ES_AUTOHSCROLL, HMENU, IDC_ARROW, MSG, SW_SHOWNORMAL,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_KEYDOWN, WM_KILLFOCUS,
+    WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
+    WS_VISIBLE,
 };
 
 use super::read_frame;
@@ -53,6 +58,11 @@ static PENDING_URL: Mutex<Option<(String, bool, bool)>> = Mutex::new(None);
 static ADDR_EDIT: Mutex<Option<HwndCell>> = Mutex::new(None);
 static BACK_BTN: Mutex<Option<HwndCell>> = Mutex::new(None);
 static FWD_BTN: Mutex<Option<HwndCell>> = Mutex::new(None);
+/// 刷新/首页按钮(人工拖动窗口后需按新宽度重排)。
+static RELOAD_BTN: Mutex<Option<HwndCell>> = Mutex::new(None);
+static HOME_BTN: Mutex<Option<HwndCell>> = Mutex::new(None);
+/// 上一次已知的客户区尺寸(像素);变了才重排 + 上报宿主。
+static LAST_SIZE: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 
 const TIMER_ID: usize = 1;
 const TIMER_MS: u32 = 100;
@@ -179,6 +189,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
+        WM_SIZE => {
+            // 人工拖动窗口 → 客户区尺寸变化 → 重排工具栏 + 上报宿主。
+            unsafe { handle_resize(hwnd) };
+            LRESULT(0)
+        }
         WM_CLOSE => {
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
@@ -213,8 +228,10 @@ fn apply_urlbar(url: &str, can_back: bool, can_forward: bool) {
 unsafe fn paint(hdc: HDC, hwnd: HWND) {
     // 客户区底色(无帧/帧较小时可见)。
     let mut rc = RECT::default();
-    let _ = GetClientRect(hwnd, &mut rc);
-    // 工具栏条:浅灰底。
+    if GetClientRect(hwnd, &mut rc).is_err() {
+        return;
+    }
+    // 工具栏条:浅灰底(工具栏在**上**边,与既有视觉一致)。
     let bar = RECT {
         left: 0,
         top: 0,
@@ -224,7 +241,18 @@ unsafe fn paint(hdc: HDC, hwnd: HWND) {
     let brush = CreateSolidBrush(COLORREF(0x00F0F0F0));
     FillRect(hdc, &bar, brush);
     let _ = DeleteObject(brush);
-    // 画面区:工具栏之下。
+    // 画面区:工具栏之下,先铺白底(帧比内容区小时露白边)。
+    let area = RECT {
+        left: 0,
+        top: TOOLBAR_H,
+        right: rc.right,
+        bottom: rc.bottom,
+    };
+    let brush = CreateSolidBrush(COLORREF(0x00FFFFFF));
+    FillRect(hdc, &area, brush);
+    let _ = DeleteObject(brush);
+    // 画面 1:1 绘制(**不拉伸**):宿主按内容区尺寸重渲染,新帧尺寸 == 内容区
+    // 尺寸,于是天然铺满且不变形;尺寸暂时不一致时居中摆放(仍不缩放)。
     let frame = FRAME.lock().unwrap();
     if let Some(f) = frame.as_ref() {
         let info = BITMAPINFO {
@@ -239,12 +267,16 @@ unsafe fn paint(hdc: HDC, hwnd: HWND) {
             },
             ..Default::default()
         };
+        let view_w = rc.right - rc.left;
+        let view_h = rc.bottom - rc.top - TOOLBAR_H;
+        let dx = (view_w - f.width) / 2;
+        let dy = TOOLBAR_H + (view_h - f.height) / 2;
         let _ = StretchDIBits(
             hdc,
-            0,
-            TOOLBAR_H,
-            rc.right,
-            rc.bottom - TOOLBAR_H,
+            dx,
+            dy,
+            f.width,
+            f.height,
             0,
             0,
             f.width,
@@ -254,17 +286,57 @@ unsafe fn paint(hdc: HDC, hwnd: HWND) {
             DIB_RGB_COLORS,
             SRCCOPY,
         );
-    } else {
-        let area = RECT {
-            left: 0,
-            top: TOOLBAR_H,
-            right: rc.right,
-            bottom: rc.bottom,
-        };
-        let brush = CreateSolidBrush(COLORREF(0x00FFFFFF));
-        FillRect(hdc, &area, brush);
-        let _ = DeleteObject(brush);
     }
+}
+
+/// 客户区尺寸(像素);取不到返回 None。
+unsafe fn client_size(hwnd: HWND) -> Option<(i32, i32)> {
+    let mut rc = RECT::default();
+    if GetClientRect(hwnd, &mut rc).is_err() {
+        return None;
+    }
+    Some((rc.right - rc.left, rc.bottom - rc.top))
+}
+
+/// 人工拖动窗口 → 客户区尺寸变化 → 重排工具栏 + 上报宿主。
+///
+/// * 工具栏在**上**边(与既有视觉一致),画面区 = 客户区扣掉工具栏;
+/// * 尺寸不变不重复上报;窗口创建过程中触发的 WM_SIZE 用初始尺寸兜底;
+/// * 上报的是内容区尺寸(已扣工具栏)= 宿主侧的新视口。
+unsafe fn handle_resize(hwnd: HWND) {
+    let Some((cw, ch)) = client_size(hwnd) else {
+        return;
+    };
+    if cw <= 0 || ch <= TOOLBAR_H {
+        return;
+    }
+    {
+        let mut last = LAST_SIZE.lock().unwrap();
+        if *last == Some((cw, ch)) {
+            return;
+        }
+        *last = Some((cw, ch));
+    }
+    // 工具栏子控件重排(按钮宽度固定,地址栏吃掉剩余宽度)。
+    let mut x = PAD;
+    let back = BACK_BTN.lock().unwrap().map(|c| c.0);
+    let fwd = FWD_BTN.lock().unwrap().map(|c| c.0);
+    let reload = RELOAD_BTN.lock().unwrap().map(|c| c.0);
+    let home = HOME_BTN.lock().unwrap().map(|c| c.0);
+    for b in [back, fwd, reload, home] {
+        if let Some(b) = b {
+            let _ = MoveWindow(b, x, (TOOLBAR_H - BTN_H) / 2, BTN_W, BTN_H, true);
+        }
+        x += BTN_W + BTN_GAP;
+    }
+    if let Some(edit) = ADDR_EDIT.lock().unwrap().map(|c| c.0) {
+        let edit_w = (cw - x - PAD).max(60);
+        let _ = MoveWindow(edit, x, (TOOLBAR_H - BTN_H) / 2, edit_w, BTN_H, true);
+    }
+    // 上报宿主:内容区宽 = 客户区宽;内容区高扣掉工具栏 = 视口高。
+    let vw = cw.clamp(1, 7680) as u32;
+    let vh = (ch - TOOLBAR_H).clamp(1, 4320) as u32;
+    send_cmd(&super::resize::resize_cmd_json(vw, vh));
 }
 
 /// 创建工具栏按钮(子控件)。
@@ -318,6 +390,20 @@ pub fn run(width: u32, height: u32, title: &str) -> i32 {
 
         let w = width.clamp(320, 3840) as i32;
         let h = height.clamp(240, 2160) as i32;
+        // 客户区尺寸 = 视口 + 工具栏;用 AdjustWindowRectEx 反算外框尺寸,
+        // 保证客户区**正好**是 w × (h + TOOLBAR_H)(否则画面区比视口小,
+        // 1:1 绘制会在右侧/底部露白边)。
+        let mut wr = RECT {
+            left: 0,
+            top: 0,
+            right: w,
+            bottom: h + TOOLBAR_H,
+        };
+        let _ = AdjustWindowRectEx(&mut wr, WS_OVERLAPPEDWINDOW, false, WINDOW_EX_STYLE(0));
+        let outer_w = (wr.right - wr.left).max(w);
+        let outer_h = (wr.bottom - wr.top).max(h + TOOLBAR_H);
+        // 初始客户区尺寸登记为基线:创建过程中的 WM_SIZE 不重复上报。
+        *LAST_SIZE.lock().unwrap() = Some((w, h + TOOLBAR_H));
         let title_w = to_wide(title);
         let hwnd = match CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -326,8 +412,8 @@ pub fn run(width: u32, height: u32, title: &str) -> i32 {
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            w,
-            h + TOOLBAR_H,
+            outer_w,
+            outer_h,
             None,
             HMENU(std::ptr::null_mut()),
             hinstance,
@@ -346,9 +432,9 @@ pub fn run(width: u32, height: u32, title: &str) -> i32 {
         x += BTN_W + BTN_GAP;
         let forward = make_button(hwnd, hinstance, x, "前进", ID_FORWARD);
         x += BTN_W + BTN_GAP;
-        let _reload = make_button(hwnd, hinstance, x, "刷新", ID_RELOAD);
+        let reload = make_button(hwnd, hinstance, x, "刷新", ID_RELOAD);
         x += BTN_W + BTN_GAP;
-        let _home = make_button(hwnd, hinstance, x, "首页", ID_HOME);
+        let home = make_button(hwnd, hinstance, x, "首页", ID_HOME);
         x += BTN_W + BTN_GAP;
         let edit_w = (w - x - PAD).max(60);
         let edit_cls = to_wide("EDIT");
@@ -380,6 +466,8 @@ pub fn run(width: u32, height: u32, title: &str) -> i32 {
         *ADDR_EDIT.lock().unwrap() = Some(HwndCell(edit));
         *BACK_BTN.lock().unwrap() = Some(HwndCell(back));
         *FWD_BTN.lock().unwrap() = Some(HwndCell(forward));
+        *RELOAD_BTN.lock().unwrap() = Some(HwndCell(reload));
+        *HOME_BTN.lock().unwrap() = Some(HwndCell(home));
 
         let _ = SetTimer(hwnd, TIMER_ID, TIMER_MS, None);
         let _ = ShowWindow(hwnd, SW_SHOWNORMAL);

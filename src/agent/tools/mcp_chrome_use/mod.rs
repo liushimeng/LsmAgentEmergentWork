@@ -33,6 +33,7 @@ use serde_json::{json, Value};
 
 use super::Tool;
 use crate::agent::chrome_browser::{self, ChromeManager};
+use crate::agent::web_control::{self, ControlState, Engine};
 use crate::error::Result;
 
 #[cfg(test)]
@@ -188,9 +189,41 @@ async fn with_bars_suspended<T>(
     if evade {
         chrome_browser::status::set_suspended(page, true).await;
     }
+    // 控制权蒙层同样要在取证截图时避让:证据图不能蒙一层灰。
+    chrome_browser::control_mask::set_visual_suspended(page, true).await;
     let out = f.await;
+    chrome_browser::control_mask::set_visual_suspended(page, false).await;
     if evade {
         chrome_browser::status::set_suspended(page, false).await;
+    }
+    out
+}
+
+/// 控制权闸门 + 输入闸「先解后锁」包裹。
+///
+/// - **控制权闸门**:用户控制状态下 Agent 的页面写操作一律拒绝(4004);
+/// - **输入闸**:Agent 控制状态下,走 CDP 合成输入的动作必须临时解锁输入闸
+///   (`Input.setIgnoreInputEvents` 会一并拦下 CDP 派发,毫秒级窗口),
+///   不走输入管线的动作(JS `el.click()` / `eval_js`)锁着也能跑,不开窗。
+async fn with_control_gate<T>(
+    page: &std::sync::Arc<chromiumoxide::Page>,
+    page_id: &str,
+    needs_unlock: bool,
+    f: impl std::future::Future<Output = T>,
+) -> T {
+    // 只在 headed + 蒙层开启 + Agent 控制状态时才需要「先解后锁」。
+    // hidden 模式压根没设输入闸(见 control_mask::apply_state),不必多发两次 CDP。
+    let locked = McpChromeUseTool::mgr().mode().is_headed()
+        && chrome_browser::control_mask::mask_enabled()
+        && web_control::state_of(web_control::Engine::Chrome, page_id)
+            == web_control::ControlState::Agent;
+    let unlock = locked && needs_unlock;
+    if unlock {
+        chrome_browser::control_mask::set_input_ignored(page, false).await;
+    }
+    let out = f.await;
+    if unlock {
+        chrome_browser::control_mask::set_input_ignored(page, true).await;
     }
     out
 }
@@ -343,7 +376,8 @@ fn dead_page_message(page_id: &str, raw: &str) -> String {
 /// 动作失败后若判定为死页,同步剔除注册表条目(避免下次 list 再返回幽灵页)。
 fn evict_if_dead(page_id: &str, msg: &str) -> bool {
     if is_dead_page_error(msg) {
-        McpChromeUseTool::mgr().close_page(page_id);
+        // 死页:target 已销毁,只需从注册表剔除(同步路径,不动真实标签页)。
+        McpChromeUseTool::mgr().evict_page(page_id);
         true
     } else {
         false
@@ -384,10 +418,18 @@ params.text(元素文本包含)/params.js(页面表达式为真),多条件取「
 ★ 遇登录墙/验证码/滑块/短信核验需要人工时,用 control_action=request_human:\
 params.reason **必须取枚举值**(qr_login/captcha/sms/login/two_factor/oauth/manual_verify/custom),\
 params.message 写清要人工做什么;人工在原生弹窗完成(扫码/输码)后工具返回结果。\
-params.timeout_ms 可延长等待(默认按 reason 分档 120s/300s)。
+params.timeout_ms 可延长等待(默认按 reason 分档 120s/300s)。\
+★ 控制权两态互斥:默认「Agent 控制状态」(蒙层在位,人工点不动页面);\
+request_human 会自动把控制权交还人工(蒙层撤除),收口后自动取回。\
+需要人工长时间接管时用 control_action=set_control_state,params.state=\"user\"(交人工)或 \"agent\"(取回),\
+params.note 可写一句给人工看的提示;用户控制状态下 Agent 的写操作会被拒绝(错误码 4004),\
+此时只有 inspect/screenshot/wait 等观测动作可用。\
 ★ page_id 可省略:当前只有一个存活页时自动选中(信封回 page_id_auto=true);多页时须指定。\
 page_id 仅本工具内有效,不跨工具复用。\
 当目标站点对 Chrome 风控(反复验证码/页面抹除/访问被拒)时,改用 MCP_Web_LsmAgentBrowser_Use。\
+★ 标签页治理:同一任务内**尽量复用同一个 page_id**(换 URL 用 control(navigate),别每次都 open);\
+open 同 URL 会自动复用无主页面;list 会一并列出本工具未管理的外部标签页(人工自己开的);\
+用完的页面及时 close(page_id=具体 id),close(all) 会连带回收整个 Chrome 进程。\
 返回统一信封 {code,message,data};6001=任务锚点越界,3001=未检测到浏览器。"
     }
 
@@ -411,7 +453,8 @@ page_id 仅本工具内有效,不跨工具复用。\
                         "navigate", "click", "click_text", "type", "input_text",
                         "key_press", "eval_js", "screenshot", "scroll", "wait",
                         "back", "forward", "reload", "request_human",
-                        "click_real", "hover", "double_click", "right_click"
+                        "click_real", "hover", "double_click", "right_click",
+                        "set_control_state"
                     ]
                 },
                 "info": {
@@ -443,6 +486,8 @@ page_id 仅本工具内有效,不跨工具复用。\
                         "message": { "type": "string", "description": "request_human 展示给人工的现场说明(缺省按 reason 自动生成)" },
                         "options": { "type": "array", "items": { "type": "string" }, "description": "request_human 人工可选项(最多 8 项,人工点选其一/多选后回传)" },
                         "multi_select": { "type": "boolean", "description": "request_human 人工可选项是否允许多选(默认 false)" },
+                        "state": { "type": "string", "enum": ["agent", "user"], "description": "set_control_state 的目标控制权状态:agent=Agent 控制状态(蒙层在位,人工点不动);user=用户控制状态(蒙层撤除,控制权交还人工,Agent 的写操作会被 4004 拒绝)" },
+                        "note": { "type": "string", "maxLength": 60, "description": "set_control_state 的自定义提示(≤60 字符),显示在页面状态栏" },
                         "full_page": { "type": "boolean", "description": "screenshot 是否取整页(按整页高度裁剪,视口外内容也进图);对齐 Lsm 版同名参数" },
                         "save_path": { "type": "string", "description": "screenshot 落盘路径(.png);给了就只回路径+尺寸,绝不回 base64(防上下文爆炸)" }
                     }
@@ -496,6 +541,16 @@ async fn run_open(args: Value) -> Result<String> {
     let mgr = McpChromeUseTool::mgr();
     match mgr.open(&url).await {
         Ok((page_id, final_url, title)) => {
+            // 控制权:新开的页默认「Agent 控制状态」(蒙层在位 + 输入闸拦截)。
+            // 同一 URL 复用既有页时沿用该页既有状态,不覆盖人工正在使用的状态。
+            let state = web_control::state_of(Engine::Chrome, &page_id);
+            web_control::set_state(
+                Engine::Chrome,
+                &page_id,
+                state,
+                str_arg(&args, "guard_note"),
+                "open",
+            );
             // 屏蔽页面状态栏/进度栏:headed 时注入两条栏脚本并推首份全量载荷
             // (含档位/注意事项;后续动作走 execute 的 broadcast 增量推)。
             if chrome_browser::status::should_inject(mgr.mode().is_headed()) {
@@ -507,8 +562,15 @@ async fn run_open(args: Value) -> Result<String> {
                         None,
                         str_arg(&args, "guard_note"),
                         true,
+                        state,
                     )
                     .await;
+                }
+            }
+            // 蒙层 + 输入闸(headed 才注入;hidden 无人工观看,零开销)。
+            if mgr.mode().is_headed() {
+                if let Some(page) = mgr.get_page(&page_id) {
+                    chrome_browser::control_mask::apply_state(&page, state).await;
                 }
             }
             envelope(
@@ -520,6 +582,8 @@ async fn run_open(args: Value) -> Result<String> {
                     "title": title,
                     "engine": "chrome",
                     "mode": if mgr.mode().is_headed() { "headed" } else { "hidden" },
+                    "control_state": state.as_str(),
+                    "control_state_label": state.label(),
                     "tool_hint": "page_id 仅 MCP_Web_Chrome_Use 内有效;另一浏览器工具的 page_id 不跨工具复用",
                 }),
             )
@@ -537,21 +601,55 @@ async fn run_open(args: Value) -> Result<String> {
 }
 
 async fn run_list() -> Result<String> {
-    let pages = McpChromeUseTool::mgr().list_pages_detailed().await;
-    envelope(
-        0,
-        "ok",
-        json!({ "pages": pages.iter().map(|info| json!({
-            "page_id": info.page_id,
-            "url": info.url,
-            // 第 181 轮:所有权视图——owner_alive=true 的页面属于仍在运行的
-            // (可能是并行的)单元,不要 close / 导航它。
-            "owner": info.owner.as_ref().map(|o| json!({
-                "agent": o.agent,
-                "alive": o.alive(),
-            })),
-        })).collect::<Vec<_>>() }),
-    )
+    let mgr = McpChromeUseTool::mgr();
+    let pages = mgr.list_pages_detailed().await;
+    // **全面感知页签**:注册表之外的真实 Chrome 标签页(人工自己开的、
+    // 页面 window.open 派生的)一并列出 —— Agent 不能对现场一无所知。
+    let real_tabs = mgr.list_browser_tabs().await;
+    let managed: std::collections::HashSet<String> = pages
+        .iter()
+        .filter_map(|info| {
+            mgr.get_page(&info.page_id)
+                .map(|p| p.target_id().inner().clone())
+        })
+        .collect();
+    let external: Vec<Value> = real_tabs
+        .iter()
+        .filter(|(tid, _, _)| !managed.contains(tid))
+        .map(|(tid, title, url)| {
+            json!({
+                "target_id": tid,
+                "title": title,
+                "url": url,
+                "managed": false,
+                "hint": "非本工具打开的标签页(人工或页面派生);本工具无法直接操作它,需要时请重新 open 目标 URL",
+            })
+        })
+        .collect();
+    let mut data = json!({ "pages": pages.iter().map(|info| json!({
+        "page_id": info.page_id,
+        "url": info.url,
+        // 第 181 轮:所有权视图——owner_alive=true 的页面属于仍在运行的
+        // (可能是并行的)单元,不要 close / 导航它。
+        "owner": info.owner.as_ref().map(|o| json!({
+            "agent": o.agent,
+            "alive": o.alive(),
+        })),
+        // 控制权视图:该页当前归谁管(agent=蒙层在位人工点不动;user=控制权在人工手上)。
+        "control_state": web_control::state_of(Engine::Chrome, &info.page_id).as_str(),
+    })).collect::<Vec<_>>() });
+    if !external.is_empty() {
+        data["external_tabs"] = json!(external);
+        data["tabs_hint"] = json!(
+            "浏览器里还有本工具未管理的标签页(人工开的/页面派生的);先看清现场再决定是否重新 open。"
+        );
+    }
+    if pages.len() >= 4 {
+        data["tabs_hint"] = json!(
+            "已开页面较多:同一任务内优先复用已有 page_id(导航到新 URL),用完及时 close,不要为每次查询新开一页。"
+        );
+    }
+    envelope(0, "ok", data)
 }
 
 async fn run_close(args: Value) -> Result<String> {
@@ -594,10 +692,17 @@ async fn run_close(args: Value) -> Result<String> {
         }
     }
     if page_id == "all" {
+        // 先取存活页清单(close_all 会清空注册表),逐页清掉控制权记录。
+        let live: Vec<String> = mgr.list_pages().await.into_iter().map(|(pid, _)| pid).collect();
         mgr.close_all();
+        for pid in live {
+            web_control::clear(Engine::Chrome, &pid);
+        }
         return envelope(0, "ok", json!({"closed": "all"}));
     }
-    if mgr.close_page(&page_id) {
+    if mgr.close_page(&page_id).await {
+        // 控制权记录随页面一起清掉(防状态泄漏到复用的同号页)。
+        web_control::clear(Engine::Chrome, &page_id);
         envelope(0, "ok", json!({"closed": page_id}))
     } else {
         envelope(CODE_PAGE_NOT_FOUND, "页面不存在", json!({"page_id": page_id}))
@@ -656,7 +761,27 @@ async fn run_control(args: Value) -> Result<String> {
             }
         };
         let image_path = str_arg(p, "image_path").unwrap_or("");
-        let (code, message, data) = crate::agent::human_assist::request_human_action(
+
+        // **控制权移交**:提问期间控制权必须交还人工 —— 撤蒙层、放行输入闸,
+        // 否则人工扫码/输码/登录点不动页面,弹窗就成了摆设。
+        // 收口(应答/超时/取消)后按进入前的状态恢复,回到防交叉操作基线。
+        let hitl_note = format!("人工介入中({reason});完成后由 Agent 取回控制权");
+        let prev_state = if page_id.is_empty() {
+            ControlState::Agent
+        } else {
+            web_control::enter_user_control(
+                Engine::Chrome,
+                &page_id,
+                Some(hitl_note.as_str()),
+                "hitl",
+            )
+        };
+        if !page_id.is_empty() {
+            if let Ok(pg) = McpChromeUseTool::page_of(&page_id) {
+                chrome_browser::control_mask::apply_state(&pg, ControlState::User).await;
+            }
+        }
+        let (code, message, mut data) = crate::agent::human_assist::request_human_action(
             reason,
             message.as_deref(),
             options,
@@ -667,6 +792,23 @@ async fn run_control(args: Value) -> Result<String> {
             multi_select,
         )
         .await;
+        // 收口:恢复进入前的控制权状态(应答/超时/取消三条路径都走到这里)。
+        if !page_id.is_empty() {
+            web_control::restore_control(Engine::Chrome, &page_id, prev_state, "hitl_end");
+            if let Ok(pg) = McpChromeUseTool::page_of(&page_id) {
+                chrome_browser::control_mask::apply_state(&pg, prev_state).await;
+            }
+        }
+        if let Some(obj) = data.as_object_mut() {
+            obj.insert(
+                "control_state".into(),
+                json!(if page_id.is_empty() {
+                    ControlState::Agent.as_str()
+                } else {
+                    web_control::state_of(Engine::Chrome, &page_id).as_str()
+                }),
+            );
+        }
         return envelope(code, &message, data);
     }
     // 页面句柄:顶层 / params 双位置取值;缺失时唯一存活页自动选中(2026-10-26 实测
@@ -692,6 +834,67 @@ async fn run_control(args: Value) -> Result<String> {
         }
     };
 
+    // 控制权状态切换:Agent 控制状态 ⇄ 用户控制状态(两态互斥)。
+    // 这是「把控制权交还给用户 / 取回控制权」的唯一显式入口。
+    if control_action == "set_control_state" {
+        let raw = str_arg(p, "state")
+            .or_else(|| str_arg(&args, "state"))
+            .unwrap_or("agent");
+        let Some(state) = ControlState::parse(raw) else {
+            return envelope(
+                CODE_PARAM_ERROR,
+                "set_control_state 的 state 非法(取值 agent|user)",
+                json!({"state": raw, "allowed": ["agent", "user"]}),
+            );
+        };
+        let note = str_arg(p, "note").or_else(|| str_arg(&args, "note"));
+        web_control::set_state(Engine::Chrome, &page_id, state, note, "manual");
+        chrome_browser::control_mask::apply_state(&page, state).await;
+        // 状态栏第②行随控制权切换刷新(带 mode 字段全量推)。
+        chrome_browser::status::push(
+            &page,
+            Some(&format!("set_control_state {}", state.as_str())),
+            None,
+            None,
+            true,
+            state,
+        )
+        .await;
+        return envelope(
+            0,
+            "ok",
+            json!({
+                "page_id": page_id,
+                "page_id_auto": page_auto,
+                "control_action": control_action,
+                "control_state": state.as_str(),
+                "control_state_label": state.label(),
+                "result": {
+                    "control_state": state.as_str(),
+                    "mask_active": chrome_browser::control_mask::mask_enabled() && state == ControlState::Agent,
+                    "hint": match state {
+                        ControlState::Agent => "已取回控制权:蒙层在位,人工点击被拦截,Agent 可正常操作页面",
+                        ControlState::User => "已交还控制权:蒙层撤除,人工可自由操作页面;Agent 的页面写操作会被拒绝(4004),直到再次 set_control_state=agent",
+                    },
+                }
+            }),
+        );
+    }
+
+    // **控制权闸门**:用户控制状态下,Agent 的页面写操作一律拒绝(4004);
+    // 观测类动作(inspect/screenshot/wait)始终放行。
+    if let Err(denied) = web_control::guard_agent_write(Engine::Chrome, &page_id, &control_action) {
+        return envelope(denied.code, &denied.message, denied.data);
+    }
+
+    // 「先解后锁」判定:走 CDP 合成输入的动作要在 Agent 控制状态下临时解锁输入闸。
+    let needs_unlock = chrome_browser::control_mask::action_needs_unlock(&control_action)
+        || ((control_action == "click" || control_action == "click_text")
+            && str_arg(p, "mode").map(|m| m.eq_ignore_ascii_case("real")).unwrap_or(false));
+
+    // 控制权闸门包裹整个动作派发:走 CDP 合成输入的动作在 Agent 控制状态下
+    // 临时解锁输入闸(毫秒级),动作结束立即复锁。
+    with_control_gate(&page, &page_id, needs_unlock, async {
     let result: std::result::Result<Value, (i32, String)> = match control_action.as_str() {
         "navigate" => {
             let Some(url) = str_arg(p, "url").or_else(|| str_arg(&args, "url")) else {
@@ -938,7 +1141,7 @@ async fn run_control(args: Value) -> Result<String> {
     };
 
     match result {
-        Ok(data) => envelope(0, "ok", json!({"page_id": page_id, "page_id_auto": page_auto, "control_action": control_action, "result": data})),
+        Ok(data) => envelope(0, "ok", json!({"page_id": page_id, "page_id_auto": page_auto, "control_action": control_action, "control_state": web_control::state_of(Engine::Chrome, &page_id).as_str(), "result": data})),
         Err((_, msg)) if evict_if_dead(&page_id, &msg) => envelope(
             CODE_PAGE_NOT_FOUND,
             &dead_page_message(&page_id, &msg),
@@ -946,6 +1149,8 @@ async fn run_control(args: Value) -> Result<String> {
         ),
         Err((code, msg)) => envelope(code, &msg, json!({"page_id": page_id, "control_action": control_action})),
     }
+    })
+    .await
 }
 
 // ===================== inspect =====================

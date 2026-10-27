@@ -7,8 +7,11 @@ use serde_json::{json, Value};
 
 use super::{bool_arg, engine_error, envelope, str_arg, target_anchor_guard, u64_arg, McpWebLsmBrowserUseTool};
 use crate::agent::browser;
+use crate::agent::web_control::{self, ControlState, Engine};
 use crate::error::Result;
 
+/// 人工介入原因白名单(与 `human_assist::HUMAN_REASONS` 同源,此处保留本地副本
+/// 仅为报错时给出 allowed 清单)。
 const HUMAN_REASONS: &[&str] = &[
     "captcha",
     "sms",
@@ -42,6 +45,48 @@ pub(super) async fn run(mut args: Value) -> Result<String> {
         // 导致文档 41 §F4 的跨工具诊断成为死代码。
         return Ok(super::engine_error(browser::EngineError::page_not_found(&page_id)));
     }
+    // 控制权状态切换:Agent 控制状态 ⇄ 用户控制状态(两态互斥)。
+    if action == "set_control_state" {
+        let raw = str_arg(&params, "state")
+            .or_else(|| str_arg(&args, "state"))
+            .unwrap_or("agent");
+        let Some(state) = ControlState::parse(raw) else {
+            return envelope(
+                1001,
+                "set_control_state 的 state 非法(取值 agent|user)",
+                json!({"state": raw, "allowed": ["agent", "user"]}),
+            );
+        };
+        let note = str_arg(&params, "note").or_else(|| str_arg(&args, "note"));
+        web_control::set_state(Engine::Lsm, &page_id, state, note, "manual");
+        // Lsm 侧蒙层在**查看器帧合成层**绘制(page_bars::draw),下一次推帧即生效;
+        // 这里主动触发一帧刷新,让状态切换立刻可见。
+        mgr.refresh_control_state(&page_id).await;
+        return envelope(
+            0,
+            "ok",
+            json!({
+                "page_id": page_id,
+                "page_id_auto": page_auto,
+                "control_action": action,
+                "control_state": state.as_str(),
+                "control_state_label": state.label(),
+                "result": {
+                    "control_state": state.as_str(),
+                    "mask_active": web_control::mask_enabled() && state == ControlState::Agent,
+                    "hint": match state {
+                        ControlState::Agent => "已取回控制权:蒙层在位,Agent 可正常操作页面",
+                        ControlState::User => "已交还控制权:蒙层撤除;Agent 的页面写操作会被拒绝(4004),直到再次 set_control_state=agent",
+                    },
+                }
+            }),
+        );
+    }
+    // **控制权闸门**:用户控制状态下 Agent 的页面写操作一律拒绝(4004);
+    // 观测类动作(inspect/screenshot/wait)始终放行。
+    if let Err(denied) = web_control::guard_agent_write(Engine::Lsm, &page_id, &action) {
+        return envelope(denied.code, &denied.message, denied.data);
+    }
     // 显式导航动作继续受任务锚点约束。
     if matches!(action.as_str(), "navigate" | "new_tab" | "new_window") {
         if let Some(url) = str_arg(&params, "url") {
@@ -59,6 +104,7 @@ pub(super) async fn run(mut args: Value) -> Result<String> {
             }
             data["page_id"] = json!(page_id);
             data["page_id_auto"] = json!(page_auto);
+            data["control_state"] = json!(web_control::state_of(Engine::Lsm, &page_id).as_str());
             record_visit(&page_id, &action, &data);
             envelope(0, "ok", data)
         }
@@ -132,10 +178,12 @@ fn record_visit(page_id: &str, action: &str, data: &Value) {
 // ===================== 人工介入 =====================
 
 async fn request_human(args: &Value, params: &Value) -> Result<String> {
-    let reason = str_arg(params, "reason")
+    // 自由文本 reason 先按关键词归一(与 Chrome 侧共用 `human_assist::normalize_reason`),
+    // 否则「京东要求登录后才能访问」这类描述会被判非法,白白浪费一轮往返。
+    let raw_reason = str_arg(params, "reason")
         .or_else(|| str_arg(args, "reason"))
-        .unwrap_or("custom")
-        .to_ascii_lowercase();
+        .unwrap_or("custom");
+    let reason = crate::agent::human_assist::normalize_reason(raw_reason);
     if !HUMAN_REASONS.contains(&reason.as_str()) {
         return envelope(
             1001,
@@ -173,6 +221,17 @@ async fn request_human(args: &Value, params: &Value) -> Result<String> {
     };
     let image_path = str_arg(params, "image_path").unwrap_or("");
 
+    // **控制权移交**:提问期间控制权交还人工 —— 撤蒙层;收口后按进入前的状态恢复。
+    let hitl_note = format!("人工介入中({reason});完成后由 Agent 取回控制权");
+    let prev_state = if page_id.is_empty() {
+        ControlState::Agent
+    } else {
+        web_control::enter_user_control(Engine::Lsm, page_id, Some(hitl_note.as_str()), "hitl")
+    };
+    if !page_id.is_empty() {
+        mgr.refresh_control_state(page_id).await;
+    }
+
     let hub = crate::agent::human_assist::HumanAssistHub::global();
     let outcome = hub
         .request(
@@ -188,6 +247,11 @@ async fn request_human(args: &Value, params: &Value) -> Result<String> {
             None,
         )
         .await;
+    // 收口:恢复进入前的控制权状态(应答/超时/取消三条路径都走到这里)。
+    if !page_id.is_empty() {
+        web_control::restore_control(Engine::Lsm, page_id, prev_state, "hitl_end");
+        mgr.refresh_control_state(page_id).await;
+    }
     use crate::agent::human_assist::HumanAssistOutcome;
     match outcome {
         HumanAssistOutcome::Answered { text, via } => {

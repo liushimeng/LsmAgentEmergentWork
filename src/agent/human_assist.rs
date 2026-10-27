@@ -769,7 +769,7 @@ pub const HUMAN_REASONS: &[&str] = &[
 /// 白名单直接 1001 拒绝会白费一整轮 LLM 往返(实测 Plan iter=8 被拒、iter=9 靠
 /// 报文里的 allowed 列表自救)。枚举值/空值直通;自由文本按中英关键词归一到
 /// 最近枚举,归不中保持原值(由白名单分支拒绝并回 allowed 清单兜底)。
-fn normalize_reason(raw: &str) -> String {
+pub fn normalize_reason(raw: &str) -> String {
     let r = raw.trim().to_ascii_lowercase();
     if r.is_empty() || HUMAN_REASONS.contains(&r.as_str()) {
         return r;

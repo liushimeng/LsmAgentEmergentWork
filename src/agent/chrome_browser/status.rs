@@ -28,6 +28,7 @@ use chromiumoxide::Page;
 use serde_json::{json, Value};
 
 use crate::agent::web_activity;
+use crate::agent::web_control::ControlState;
 
 /// 事件时间线在页面侧的保留条数(JS `MAX_EVENTS` 同步值;超出滚动丢弃)。
 pub const EVENT_WINDOW: usize = 6;
@@ -48,7 +49,7 @@ pub fn bars_enabled() -> bool {
 
 /// 进程级随机命名空间(与归档 `browser_ns.rs` 同款):两条栏的 host id / 页面侧 API
 /// 都拼在随机 ns 后面,页面脚本无法按固定签名枚举「LAEW」痕迹。
-fn dom_ns() -> &'static str {
+pub(crate) fn dom_ns() -> &'static str {
     use std::sync::OnceLock;
     static NS: OnceLock<String> = OnceLock::new();
     NS.get_or_init(|| {
@@ -66,7 +67,7 @@ pub fn render_ns(template: &str) -> String {
 /// 页面侧 API 的安全调用表达式:符号命名空间对象未建立(脚本未注入)时求值为
 /// `undefined` 而不是抛 TypeError。形如:
 /// `((window[Symbol.for('l…')] || {}).StatusUpdate)`
-fn ns_member_expr(api: &str) -> String {
+pub(crate) fn ns_member_expr(api: &str) -> String {
     format!("(window[Symbol.for('{}')] || {{}}).{}", dom_ns(), api)
 }
 
@@ -81,13 +82,22 @@ pub fn probe_expr() -> String {
 
 /// 状态栏第②行(档位)与第③行(静态注意事项)文案。
 ///
-/// 新 Chrome 基础框架**没有人工输入拦截**(P4 蒙层未移植),headed 窗口人工可以直接
-/// 操作 —— 档位如实写「页面开放」,不虚标「已锁定」。
-pub fn chrome_mode_text() -> (&'static str, &'static str) {
-    (
-        "🔓 页面开放 · 人工可直接操作",
-        "Chrome 由 LAEW Agent 驱动;人工可直接操作本窗口;如需 Agent 配合请在终端对话中说明",
-    )
+/// 档位**如实反映控制权状态机**(`crate::agent::web_control`):
+/// - `agent` Agent 控制状态:蒙层在位 + 输入闸拦截,人工点不动页面;
+/// - `user` 用户控制状态:蒙层撤除,控制权交还人工,Agent 写操作被机械拒绝。
+///
+/// 不虚标档位:控制权状态由工具层如实记账,状态栏只是它的投影。
+pub fn chrome_mode_text(state: ControlState) -> (&'static str, &'static str) {
+    match state {
+        ControlState::Agent => (
+            "🔒 Agent 控制中 · 人工请勿操作页面",
+            "Chrome 由 LAEW Agent 驱动;页面处于 Agent 控制状态,人工点击已被拦截;如需人工介入请用 request_human",
+        ),
+        ControlState::User => (
+            "🔓 用户控制中 · 人工可直接操作",
+            "Chrome 由 LAEW Agent 驱动;控制权已交还人工,Agent 的页面写操作会被拒绝;人工完成后请用 set_control_state 取回控制权",
+        ),
+    }
 }
 
 // ===================== JS 模板 =====================
@@ -432,7 +442,13 @@ pub fn describe_web_action(args: &Value) -> String {
 /// 档位/注意事项/note 字段**只在 `with_mode=true` 时下发**(浅合并语义:纯进度刷新
 /// 不得携带空档位字段把上一次推来的档位覆盖成空)。`note` 为 `open(guard_note=…)`
 /// 自定义提示。
-pub fn build_payload(action: Option<&str>, event: Option<Value>, note: Option<&str>, with_mode: bool) -> Value {
+pub fn build_payload(
+    action: Option<&str>,
+    event: Option<Value>,
+    note: Option<&str>,
+    with_mode: bool,
+    control_state: ControlState,
+) -> Value {
     let (agent, session, iter, max_iter, task, phase, started_ms, tool) =
         match web_activity::current_snapshot() {
             Some(a) => (
@@ -462,9 +478,9 @@ pub fn build_payload(action: Option<&str>, event: Option<Value>, note: Option<&s
         "event": event,
     });
     if with_mode {
-        let (mode_text, notice) = chrome_mode_text();
+        let (mode_text, notice) = chrome_mode_text(control_state);
         if let Some(obj) = payload.as_object_mut() {
-            obj.insert("mode".into(), json!("open"));
+            obj.insert("mode".into(), json!(control_state.as_str()));
             obj.insert("mode_text".into(), json!(mode_text));
             obj.insert("notice".into(), json!(notice));
             obj.insert("note".into(), json!(note.unwrap_or_default()));
@@ -490,8 +506,15 @@ pub async fn ensure(page: &Page) {
 }
 
 /// 推一次全量刷新(open 后首推 / 动作前后共用)。
-pub async fn push(page: &Page, action: Option<&str>, event: Option<Value>, note: Option<&str>, with_mode: bool) {
-    let payload = build_payload(action, event, note, with_mode);
+pub async fn push(
+    page: &Page,
+    action: Option<&str>,
+    event: Option<Value>,
+    note: Option<&str>,
+    with_mode: bool,
+    control_state: ControlState,
+) {
+    let payload = build_payload(action, event, note, with_mode, control_state);
     let api = ns_member_expr("StatusUpdate");
     let js = format!("{api} ? {api}({payload}) : false");
     let _ = page.evaluate(js.as_str()).await;
@@ -527,6 +550,7 @@ pub async fn broadcast_done(action: &str, ok: bool, elapsed_ms: u64) {
 
 /// 广播实现:遍历存活页面逐个推(浏览器是进程级单实例,页面即全部现场)。
 /// `with_mode` 仅首推(open 后)为 true —— 档位字段不随纯进度刷新反复下发。
+/// 档位行取**该页自己的**控制权状态(并行单元各控各页,不能用全局值)。
 async fn broadcast(action: &str, event: Option<Value>, with_mode: bool) {
     let mgr = super::ChromeManager::global();
     if !should_inject(mgr.mode().is_headed()) {
@@ -534,7 +558,11 @@ async fn broadcast(action: &str, event: Option<Value>, with_mode: bool) {
     }
     for (page_id, _) in mgr.list_pages().await {
         if let Some(page) = mgr.get_page(&page_id) {
-            push(&page, Some(action), event.clone(), None, with_mode).await;
+            let state = crate::agent::web_control::state_of(
+                crate::agent::web_control::Engine::Chrome,
+                &page_id,
+            );
+            push(&page, Some(action), event.clone(), None, with_mode, state).await;
         }
     }
 }
@@ -598,11 +626,17 @@ mod tests {
     }
 
     #[test]
-    fn chrome档位文案如实描述无输入拦截() {
-        let (mode, notice) = chrome_mode_text();
-        assert!(mode.contains("页面开放"), "基础框架无输入拦截,档位必须如实为开放");
-        assert!(!mode.contains("锁定"));
+    fn chrome档位文案如实反映控制权两态() {
+        // Agent 控制状态:蒙层在位,人工点不动。
+        let (mode, notice) = chrome_mode_text(ControlState::Agent);
+        assert!(mode.contains("Agent 控制中"), "Agent 态档位应写明 Agent 控制中");
+        assert!(mode.contains("请勿操作"), "Agent 态应提示人工不要操作页面");
         assert!(!notice.is_empty(), "静态注意事项应随档位下发(状态栏第③行)");
+        // 用户控制状态:控制权交还人工。
+        let (umode, unotice) = chrome_mode_text(ControlState::User);
+        assert!(umode.contains("用户控制中"), "User 态档位应写明用户控制中");
+        assert!(umode.contains("可直接操作"), "User 态应提示人工可操作");
+        assert!(!unotice.is_empty());
     }
 
     #[test]
@@ -630,11 +664,12 @@ mod tests {
 
     #[test]
     fn 纯进度推送不带档位字段不覆盖状态栏() {
-        let full = build_payload(Some("open https://a"), None, Some("自定义提示"), true);
-        assert!(full["mode_text"].as_str().unwrap().contains("页面开放"));
+        let full = build_payload(Some("open https://a"), None, Some("自定义提示"), true, ControlState::Agent);
+        assert!(full["mode_text"].as_str().unwrap().contains("Agent 控制中"));
+        assert_eq!(full["mode"], "agent", "档位字段应如实反映控制权状态");
         assert!(!full["notice"].as_str().unwrap().is_empty(), "静态注意事项应下发");
         assert_eq!(full["note"], "自定义提示");
-        let bare = build_payload(Some("inspect elements"), None, None, false);
+        let bare = build_payload(Some("inspect elements"), None, None, false, ControlState::Agent);
         assert!(bare.get("mode_text").is_none(), "with_mode=false 不得下发档位字段(浅合并覆盖空)");
         assert!(bare.get("notice").is_none());
         assert!(bare.get("note").is_none());
@@ -643,10 +678,10 @@ mod tests {
 
     #[test]
     fn 载荷无台账时回退品牌名() {
-        let p = build_payload(None, None, None, false);
+        let p = build_payload(None, None, None, false, ControlState::Agent);
         assert_eq!(p["agent"], "LAEW Agent");
         assert_eq!(p["tool"], "", "无活动台账时工具标签为空");
-        let e = build_payload(None, Some(json!({"t":1,"label":"x","ok":true,"ms":5})), None, false);
+        let e = build_payload(None, Some(json!({"t":1,"label":"x","ok":true,"ms":5})), None, false, ControlState::Agent);
         assert!(e["event"].is_object());
     }
 
@@ -661,7 +696,7 @@ mod tests {
         a.set_iter(3, "第 3/12 轮 · 执行工具");
         a.set_tool("MCP_Web_Chrome_Use control click #buy");
         let p = web_activity::scope(a, async {
-            build_payload(Some("control click #buy"), None, None, false)
+            build_payload(Some("control click #buy"), None, None, false, ControlState::Agent)
         })
         .await;
         assert_eq!(p["agent"], "LsmAgentEmergentWork-SubAgent-Work");

@@ -153,3 +153,32 @@ async fn 非跨工具_page_id_走通用文案() {
     assert_eq!(v["code"], 2000, "{v}");
     assert!(!v["message"].as_str().unwrap().contains("Chrome"), "{v}");
 }
+
+/// 控制权动作必须可发现:schema 枚举含 `set_control_state`,参数含 state/note。
+#[test]
+fn schema_含控制权切换动作与参数() {
+    let schema = McpWebLsmBrowserUseTool.parameters();
+    let c_enums = schema["properties"]["control_action"]["enum"]
+        .as_array()
+        .unwrap();
+    assert!(
+        c_enums.iter().any(|v| v == "set_control_state"),
+        "control_action 枚举缺 set_control_state:{c_enums:?}"
+    );
+    assert!(schema["properties"].get("state").is_some(), "缺 state(agent|user)");
+    assert!(schema["properties"].get("note").is_some(), "缺 note(状态栏提示)");
+    let d = McpWebLsmBrowserUseTool.description();
+    assert!(d.contains("set_control_state"), "description 缺控制权切换说明");
+    assert!(d.contains("4004"), "description 应点明用户控制状态下写操作被拒");
+}
+
+/// 标签页治理必须写进 description(模型据此少开页、复用 page_id)。
+#[test]
+fn description_点明标签页治理() {
+    let d = McpWebLsmBrowserUseTool.description();
+    assert!(d.contains("复用"), "description 缺页签复用提示");
+    assert!(d.contains("标签页"), "description 缺标签页治理提示");
+    // 转义残留自查:description 是给模型看的自然语言,不该出现任何反斜杠
+    // (行续行写成 `\\` 会让模型看到 "文字\\" 这种噪声)。
+    assert!(!d.contains('\\'), "description 不得含反斜杠残留:{d}");
+}

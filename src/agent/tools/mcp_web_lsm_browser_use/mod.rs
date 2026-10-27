@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 
 use super::Tool;
 use crate::agent::browser::{BrowserMode, EngineError, LsmBrowserManager};
+use crate::agent::web_control;
 use crate::error::Result;
 
 mod control;
@@ -182,6 +183,12 @@ js(页面表达式为真)、network_idle(网络静默毫秒),多条件取「与�
 ★ 搜地址/填地点时,input_text 建议带 params.submit=true:输入后自动回车,\
 把「联想下拉里的规范 POI」提交出去;只输入不回车,站点会用原始文本做地理编码,\
 结果页直接报「未找到相关地点」(实测百度地图路线规划)。\
+★ 控制权两态互斥:默认「Agent 控制状态」(蒙层在位);request_human 会自动把控制权\
+交还人工(蒙层撤除),收口后自动取回。需要人工长时间接管时用\
+control_action=set_control_state,params.state=\"user\"(交人工)或 \"agent\"(取回);\
+用户控制状态下 Agent 的写操作会被拒绝(错误码 4004),此时只有 inspect/screenshot/wait 可用。\
+★ 标签页治理:同一任务内尽量复用同一个 page_id(换 URL 用 control(navigate));\
+需要并行页时用 control(new_tab),用完 control(close_tab) 关掉;list 可看全部页签与各自控制权状态。\
 返回统一信封 {code,message,data}。"
     }
 
@@ -231,7 +238,7 @@ js(页面表达式为真)、network_idle(网络静默毫秒),多条件取「与�
                         "set_viewport", "screenshot", "heartbeat", "drag", "focus", "blur",
                         "mouse_move", "dispatch_event", "set_window", "sync_viewport",
                         "set_highlight", "set_overlay", "set_guard", "auto_follow",
-                        "set_stealth", "request_human"
+                        "set_stealth", "request_human", "set_control_state"
                     ]
                 },
                 "info": {
@@ -252,6 +259,8 @@ js(页面表达式为真)、network_idle(网络静默毫秒),多条件取「与�
                 "summary": { "type": "string" },
                 "message": { "type": "string", "maxLength": 600, "description": "control(request_human) 展示给人工的现场说明" },
                 "reason": { "type": "string", "enum": ["captcha", "sms", "qr_login", "login", "real_name", "two_factor", "oauth", "manual_verify", "custom"], "description": "control(request_human) 的介入原因,必须取枚举值(自由文本会被关键词归一;非法值返回 1001+allowed 清单)" },
+                "state": { "type": "string", "enum": ["agent", "user"], "description": "control(set_control_state) 的目标控制权状态:agent=Agent 控制状态(蒙层在位);user=用户控制状态(控制权交还人工,Agent 写操作被 4004 拒绝)" },
+                "note": { "type": "string", "maxLength": 60, "description": "control(set_control_state) 的自定义提示(≤60 字符),显示在页面状态栏" },
                 "options": { "type": "array", "items": { "type": "string" }, "maxItems": 8, "description": "control(request_human) 人工可选项" }
             }
         })
@@ -421,6 +430,16 @@ pub(super) async fn run_open(mut args: Value) -> Result<String> {
         visit_ledger::VisitSource::Open,
     );
     let guard_mode = str_arg(&args, "guard").unwrap_or("locked");
+    // 控制权:新开的页默认「Agent 控制状态」(蒙层在位)。复用既有页时沿用该页
+    // 既有状态,不覆盖人工正在使用的状态。
+    let control_state = web_control::state_of(web_control::Engine::Lsm, &out.page_id);
+    web_control::set_state(
+        web_control::Engine::Lsm,
+        &out.page_id,
+        control_state,
+        str_arg(&args, "guard_note"),
+        "open",
+    );
     let mut data = json!({
         "page_id": out.page_id,
         "title": out.title,
@@ -444,8 +463,12 @@ pub(super) async fn run_open(mut args: Value) -> Result<String> {
             "supported": false,
             "hint": "阶段一无原生窗口,guard 仅记录状态",
         },
-        "overlay": {"enabled": false, "input_locked": false, "visual_mask": false,
-                     "hint": "进程内无头内核无可视化蒙层"},
+        "overlay": {"enabled": web_control::mask_enabled() && control_state == web_control::ControlState::Agent,
+                     "input_locked": false,
+                     "visual_mask": web_control::mask_enabled() && control_state == web_control::ControlState::Agent,
+                     "hint": "蒙层画在查看器帧合成层(仅 headed 可见);取证截图不含蒙层"},
+        "control_state": control_state.as_str(),
+        "control_state_label": control_state.label(),
         "window": {
             "requested": {"width": width, "height": height},
             "effective": {"width": out.viewport_width, "height": out.viewport_height},
@@ -490,6 +513,8 @@ async fn run_list() -> Result<String> {
                 "created_at": p.created_at,
                 "foreground": p.foreground,
                 "window_id": p.window_id,
+                // 控制权视图:该页当前归谁管(agent=蒙层在位;user=控制权在人工手上)。
+                "control_state": web_control::state_of(web_control::Engine::Lsm, &p.page_id).as_str(),
             })
         })
         .collect();
@@ -517,6 +542,9 @@ async fn run_close(args: Value) -> Result<String> {
             return envelope(2000, "keep 页面不存在", json!({"page_id": keep}));
         }
         let out = mgr.close_others(keep).await;
+        for pid in &out.closed {
+            web_control::clear(web_control::Engine::Lsm, pid);
+        }
         return envelope(
             0,
             "closed",
@@ -524,6 +552,9 @@ async fn run_close(args: Value) -> Result<String> {
         );
     }
     let out = mgr.close_page(&page_id).await;
+    for pid in &out.closed {
+        web_control::clear(web_control::Engine::Lsm, pid);
+    }
     match page_id.as_str() {
         "all" => envelope(
             0,

@@ -25,9 +25,13 @@ use crate::error::{AgentError, Result};
 mod page;
 #[cfg(test)]
 mod tests;
+/// 控制权蒙层(Agent 控制状态 ⇄ 用户控制状态),见 docs/双浏览器工具架构/03。
+pub mod control_mask;
 pub mod mouse;
 pub mod status;
 pub mod watchdog;
+/// 窗口尺寸与屏幕适配(1080p + 不溢出屏幕)。
+pub mod window_fit;
 
 pub use mouse::*;
 pub use page::*;
@@ -338,8 +342,13 @@ impl ChromeManager {
         } else {
             builder = builder.with_head();
         }
-        // 窗口尺寸缺省 1920×1080(历史第 125 轮:1440×900 过窄会裁现代 Web 应用)。
-        let (win_w, win_h) = (1920u32, 1080u32);
+        // 窗口尺寸缺省 1920×1080(历史第 125 轮:1440×900 过窄会裁现代 Web 应用);
+        // 按主显示器可用区域夹紧 —— 屏幕比 1080p 小的时候窗口会溢出屏幕,
+        // 底部区域在人工视角里根本看不到(「缺区域」)。
+        let (win_w, win_h) = window_fit::fit_to_screen(
+            window_fit::TARGET_WINDOW_W,
+            window_fit::TARGET_WINDOW_H,
+        );
         builder = builder.window_size(win_w, win_h);
         builder = if self.mode.is_headed() {
             // 有头禁用视口仿真:页面视口=窗口内容区,天然铺满(历史第 161 轮)。
@@ -518,7 +527,16 @@ impl ChromeManager {
                 reason: "新建标签页初始化后立即失效(target 已销毁或崩溃)".into(),
             });
         }
-        let (id, _) = self.register(page);
+        let (id, arc) = self.register(page);
+        // 有头模式:把窗口摆到屏幕左上并按夹紧后的尺寸摆好(headed 不做视口仿真,
+        // 页面视口 = 窗口内容区,人工拖动窗口时 Chrome 原生重新布局,天然铺满)。
+        if self.mode.is_headed() {
+            let (fw, fh) = window_fit::fit_to_screen(
+                window_fit::TARGET_WINDOW_W,
+                window_fit::TARGET_WINDOW_H,
+            );
+            let _ = window_fit::apply_window_bounds(browser, &arc, fw, fh).await;
+        }
         Ok((id, final_url, title))
     }
 
@@ -596,11 +614,80 @@ impl ChromeManager {
         None
     }
 
-    pub fn close_page(&self, page_id: &str) -> bool {
-        if let Ok(mut pages) = self.pages.lock() {
-            return pages.remove(page_id).is_some();
-        }
-        false
+    /// 关闭一个页面:**真关掉 Chrome 标签页**(不只是从注册表摘掉)。
+    ///
+    /// 旧实现只删注册表条目,Chrome 里的标签页还开着 —— 人工窗口里会越攒越多,
+    /// 与「尽量少开标签页、复用浏览器」的治理目标相悖(2026-10-27 实测发现)。
+    /// 这里用 CDP `Target.closeTarget` 关掉真实 target(不依赖 `Arc<Page>` 独占,
+    /// `Page::close(self)` 会消费句柄,而注册表里是共享的 `Arc`)。
+    pub async fn close_page(&self, page_id: &str) -> bool {
+        // 先把句柄从注册表摘掉(拿到 Arc<Page> 再关,顺序反了就拿不到了)。
+        let page = self
+            .pages
+            .lock()
+            .ok()
+            .and_then(|mut pages| pages.remove(page_id).map(|e| e.page));
+        let Some(page) = page else { return false };
+        self.close_target(&page).await;
+        true
+    }
+
+    /// 列出 Chrome **真实标签页**(经 CDP `Target.getTargets`)。
+    ///
+    /// 与本进程注册表互补:注册表只认 Agent 自己开过的页;人工在 headed 窗口里
+    /// 自己开的标签页、页面 `window.open` 派生页都在这里 —— Agent 据此做到
+    /// **对全部页签的全面感知**(需求 7)。
+    pub async fn list_browser_tabs(&self) -> Vec<(String, String, String)> {
+        use chromiumoxide::cdp::browser_protocol::target::GetTargetsParams;
+        let Some(browser) = self.browser_ref() else {
+            return Vec::new();
+        };
+        let Ok(resp) = browser.execute(GetTargetsParams::default()).await else {
+            return Vec::new();
+        };
+        resp.target_infos
+            .clone()
+            .into_iter()
+            .filter(|t| t.r#type == "page")
+            .map(|t| {
+                (
+                    t.target_id.inner().clone(),
+                    t.title.clone(),
+                    t.url.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// 只把页面从注册表剔除(**不**动真实标签页)。
+    ///
+    /// 用于「页面已死」路径:target 已被销毁/崩溃,再发 `Target.closeTarget`
+    /// 是多余的;此处必须同步可用(死页判定发生在同步上下文中)。
+    pub fn evict_page(&self, page_id: &str) -> bool {
+        self.pages
+            .lock()
+            .map(|mut pages| pages.remove(page_id).is_some())
+            .unwrap_or(false)
+    }
+
+    /// 取已启动的 Chrome 实例(**不启动**新的;没有就返回 None)。
+    fn browser_ref(&self) -> Option<Arc<chromiumoxide::Browser>> {
+        let holder = self.holder.lock().ok()?;
+        holder.as_ref().map(|h| h.browser.clone())
+    }
+
+    /// 通过 CDP `Target.closeTarget` 关掉真实标签页(失败静默:标签页最终会随
+    /// Chrome 进程退出一起回收,不值得为它让整个 close 失败)。
+    async fn close_target(&self, page: &Page) {
+        use chromiumoxide::cdp::browser_protocol::target::CloseTargetParams;
+        let Some(browser) = self.browser_ref() else { return };
+        let Ok(params) = CloseTargetParams::builder()
+            .target_id(page.target_id().clone())
+            .build()
+        else {
+            return;
+        };
+        let _ = browser.execute(params).await;
     }
 
     /// 关闭全部页面并回收 Chrome 子进程(`close(page_id="all")` 与进程退出路径调用)。

@@ -15,6 +15,10 @@
 //! 重绘,必须落账而不是实时读台账)。Chrome 侧姊妹实现在
 //! `src/agent/chrome_browser/status.rs`(注入 JS)。
 //!
+//! **控制权蒙层**(Agent 控制状态 ⇄ 用户控制状态)同在本层绘制:
+//! Agent 控制状态 → 整页半透明遮罩 + 居中提示胶囊;用户控制状态 → 不画。
+//! 设计详案 `docs/双浏览器工具架构/03-浏览器控制权状态机与视口自适应.md`。
+//!
 //! 设计详案 `docs/双浏览器工具架构/02-屏蔽页面状态栏与进度栏.md`。
 
 use tiny_skia::Pixmap;
@@ -22,6 +26,7 @@ use tiny_skia::Pixmap;
 use super::render::FontSet;
 use super::{LsmBrowserManager, TabState};
 use crate::agent::web_activity;
+use crate::agent::web_control::{self, ControlState};
 
 /// 事件时间线保留条数(与 Chrome 侧 JS `MAX_EVENTS` 同步)。
 pub const EVENT_WINDOW: usize = 6;
@@ -112,23 +117,46 @@ pub struct BarRow {
     pub size: f32,
 }
 
-/// Lsm 档位行:查看器是被动帧显示窗,人工确实只能观看(工具栏/地址栏除外),
-/// 如实描述为「仅观看」—— 与 Chrome 侧(headed 真窗口,人工可直接操作)不同。
-pub fn lsm_mode_text() -> (&'static str, &'static str) {
-    (
-        "页面已锁定(仅观看)",
-        "反-反爬进程内内核;页面交互由 Agent 工具执行;如需人工介入请在终端对话中说明",
-    )
+/// Lsm 档位行:如实反映**控制权状态机**(`crate::agent::web_control`)。
+///
+/// - `agent` Agent 控制状态:蒙层在位,人工不可操作页面;
+/// - `user` 用户控制状态:控制权交还人工,Agent 的页面写操作被机械拒绝。
+///
+/// 注意 Lsm 查看器是**被动帧显示窗**(人工不能直接点页面),所以即便在
+/// `user` 态,人工也只能通过工具栏/地址栏与终端对话介入 —— 这一点照实写。
+pub fn lsm_mode_text(state: ControlState) -> (&'static str, &'static str) {
+    match state {
+        ControlState::Agent => (
+            "Agent 控制中 · 蒙层在位,人工请勿操作页面",
+            "反-反爬进程内内核;页面交互由 Agent 工具执行;如需人工介入请用 request_human",
+        ),
+        ControlState::User => (
+            "用户控制中 · 控制权已交还人工",
+            "反-反爬进程内内核;Agent 的页面写操作已被拒绝;人工完成后请用 set_control_state 取回控制权",
+        ),
+    }
 }
 
-/// 组装两条栏的全部行文本。返 `(状态栏行, 进度栏行, 进度百分比 0..=100)`。
-/// `webgl_asked`:页面申请过 WebGL 上下文的次数(>0 = 站点依赖 WebGL 绘制,
-/// 内核无 GPU 后端 → 地图/三维区域不会出像素)。此时状态栏补一行说明,
-/// 让**用户看到的画面**自己讲清为什么是空的,而不是面对一片无解释的灰底。
+/// 组装两条栏的全部行文本(缺省按 Agent 控制状态)。
 pub fn assemble_rows(
     bars: &PageBars,
     guard_note: Option<&str>,
     webgl_asked: u32,
+) -> (Vec<BarRow>, Vec<BarRow>, f32) {
+    assemble_rows_with_control(bars, guard_note, webgl_asked, ControlState::Agent)
+}
+
+/// 组装两条栏的全部行文本,档位行按**给定的控制权状态**渲染。
+///
+/// 返 `(状态栏行, 进度栏行, 进度百分比 0..=100)`。
+/// `webgl_asked`:页面申请过 WebGL 上下文的次数(>0 = 站点依赖 WebGL 绘制,
+/// 内核无 GPU 后端 → 地图/三维区域不会出像素)。此时状态栏补一行说明,
+/// 让**用户看到的画面**自己讲清为什么是空的,而不是面对一片无解释的灰底。
+pub fn assemble_rows_with_control(
+    bars: &PageBars,
+    guard_note: Option<&str>,
+    webgl_asked: u32,
+    control_state: ControlState,
 ) -> (Vec<BarRow>, Vec<BarRow>, f32) {
     const TITLE: [u8; 3] = [0x60, 0xa5, 0xfa];
     const BRIGHT: [u8; 3] = [0xe2, 0xe8, 0xf0];
@@ -146,7 +174,7 @@ pub fn assemble_rows(
             size: 13.0,
         },
     ];
-    let (mode, notice) = lsm_mode_text();
+    let (mode, notice) = lsm_mode_text(control_state);
     status.push(BarRow { text: mode.to_string(), color: BRIGHT, bold: false, size: 12.0 });
     status.push(BarRow { text: notice.to_string(), color: MUTED, bold: false, size: 12.0 });
     if let Some(note) = guard_note.filter(|n| !n.trim().is_empty()) {
@@ -271,7 +299,18 @@ pub(crate) fn draw(pixmap: &mut Pixmap, font: &FontSet, tab: &TabState) {
     if vw < 320.0 || vh < 240.0 {
         return; // 视口过小(极端窗口),两条栏无处安放,跳过。
     }
-    let (status, progress, fill_pct) = assemble_rows(&tab.bars, tab.guard.note.as_deref(), tab.webgl_asked);
+    // 控制权蒙层:Agent 控制状态 → 整页半透明遮罩 + 居中提示胶囊;
+    // 用户控制状态 → 不画(控制权已交还人工)。
+    let control_state = web_control::state_of(web_control::Engine::Lsm, &tab.id);
+    if control_state == ControlState::Agent && web_control::mask_enabled() {
+        draw_control_veil(pixmap, font, vw, vh);
+    }
+    let (status, progress, fill_pct) = assemble_rows_with_control(
+        &tab.bars,
+        tab.guard.note.as_deref(),
+        tab.webgl_asked,
+        control_state,
+    );
     let status_w = layout_bar(font, &status, vw, false);
     draw_bar(pixmap, font, &status, status_w, vw - MARGIN - status_w.0, MARGIN, None);
     // 进度栏:左下角锚定;含 3px 进度条,总高相应加高。
@@ -279,6 +318,55 @@ pub(crate) fn draw(pixmap: &mut Pixmap, font: &FontSet, tab: &TabState) {
     let bar_h = prog_w.1;
     let y0 = vh - MARGIN - bar_h;
     draw_bar(pixmap, font, &progress, prog_w, MARGIN, y0, Some(fill_pct));
+}
+
+/// 控制权蒙层:整页半透明遮罩 + 居中提示胶囊。
+///
+/// 与 Chrome 侧 `chrome_browser/control_mask.rs` 的 DOM 蒙层同款视觉:
+/// `rgba(15,23,42,0.30)` 全屏遮罩 + 顶部/底部蓝色边条 + 居中胶囊文案。
+/// **只在查看器帧合成层绘制** —— 取证截图路径(`screenshot_locked`)不经过本层,
+/// 证据图永远干净(与两条告知栏同款保证)。
+fn draw_control_veil(pixmap: &mut Pixmap, font: &FontSet, vw: f32, vh: f32) {
+    // 全屏半透明遮罩。
+    if let Some(rect) = tiny_skia::Rect::from_xywh(0.0, 0.0, vw, vh) {
+        let mut paint = tiny_skia::Paint::default();
+        paint.set_color_rgba8(15, 23, 42, 76);
+        pixmap.fill_rect(rect, &paint, tiny_skia::Transform::identity(), None);
+    }
+    // 顶部/底部蓝色边条(与 Chrome 侧一致,一眼能看出「这是 Agent 的窗口」)。
+    let mut accent = tiny_skia::Paint::default();
+    accent.set_color_rgba8(37, 99, 235, 217);
+    if let Some(rect) = tiny_skia::Rect::from_xywh(0.0, 0.0, vw, 4.0) {
+        pixmap.fill_rect(rect, &accent, tiny_skia::Transform::identity(), None);
+    }
+    if let Some(rect) = tiny_skia::Rect::from_xywh(0.0, vh - 4.0, vw, 4.0) {
+        pixmap.fill_rect(rect, &accent, tiny_skia::Transform::identity(), None);
+    }
+    // 居中提示胶囊。fontdue 无彩色字形,故用纯文本(不用 emoji)。
+    let label = "Agent 控制中 · 人工请勿操作页面";
+    let size = 15.0f32;
+    let text_w = font.text_width(label, size as f64) as f32;
+    let pad_x = 18.0f32;
+    let pad_y = 10.0f32;
+    let w = (text_w + pad_x * 2.0).min(vw - 24.0);
+    let h = size * 1.8 + pad_y;
+    let x0 = ((vw - w) / 2.0).max(12.0);
+    let y0 = ((vh - h) / 2.0).max(12.0);
+    if let Some(rect) = tiny_skia::Rect::from_xywh(x0, y0, w, h) {
+        let mut bg = tiny_skia::Paint::default();
+        bg.set_color_rgba8(15, 23, 42, 224);
+        pixmap.fill_rect(rect, &bg, tiny_skia::Transform::identity(), None);
+    }
+    font.draw_overlay_text(
+        pixmap,
+        x0 + pad_x,
+        y0 + pad_y,
+        label,
+        size,
+        [0xe2, 0xe8, 0xf0],
+        true,
+        w - pad_x * 2.0,
+    );
 }
 
 /// 量算一条栏的 `(宽, 高)`(按最长行宽收敛,带上限防撑破视口)。
@@ -354,6 +442,19 @@ fn draw_bar(
 // ===================== 管理器接线(动作落账 + 1Hz 心跳) =====================
 
 impl LsmBrowserManager {
+    /// 控制权状态切换后重推一帧(查看器里的蒙层立刻更新,不必等 1Hz 心跳)。
+    ///
+    /// 蒙层画在**帧合成层**,所以「状态变了」必须靠「重推一帧」才能被看见;
+    /// 工具层 `set_control_state` 收口后调用本方法。
+    pub async fn refresh_control_state(&self, page_id: &str) {
+        let inner = self.inner.lock().await;
+        let Some(tab) = inner.tabs.get(page_id) else { return };
+        if !tab.mode.is_headed() {
+            return;
+        }
+        self.push_frame(tab);
+    }
+
     /// 工具动作开始:把台账快照 + 动作标签落进目标标签页(`None` = 广播全部;
     /// ticker 在 Agent 任务树外,必须落账而不是渲染时实时读台账)。
     pub(crate) async fn note_action_begin(&self, page_hint: Option<&str>, label: &str) {
@@ -491,9 +592,12 @@ mod tests {
     #[test]
     fn 静态注意事项在状态栏且进度栏无固定声明() {
         let (status, progress, _) = assemble_rows(&bars(), None, 0);
-        let (_, notice) = lsm_mode_text();
+        let (_, notice) = lsm_mode_text(ControlState::Agent);
         // 状态栏:档位行 + 注意事项行齐全。
-        assert!(status.iter().any(|r| r.text.contains("仅观看")), "档位行应在状态栏");
+        assert!(
+            status.iter().any(|r| r.text.contains("Agent 控制中")),
+            "档位行应在状态栏"
+        );
         assert!(
             status.iter().any(|r| r.text == notice),
             "静态注意事项应整体迁入状态栏"
