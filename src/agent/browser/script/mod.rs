@@ -266,6 +266,9 @@ const MAX_ROUNDS: usize = 64;
 /// 脚本采完后允许的「空轮」上限:用来把页面定时器/rAF 排空(百度地图瓦片淡入
 /// 依赖 img load 后的定时器)。连续这么多轮既无新脚本也无新动作即收工。
 const MAX_IDLE_ROUNDS: u32 = 8;
+/// 「无脚本」排空轮次总上限:地图动画类站点每帧都产生动作,靠 idle_rounds
+/// 收敛不了,这里用总轮次封顶,避免空转到管线墙钟预算耗尽。
+const MAX_DRAIN_ROUNDS: u32 = 12;
 /// 整条脚本管线的墙钟预算(毫秒),可用 `LAEW_WEB_SCRIPT_PIPELINE_MS` 覆盖。
 // 整条脚本管线(多轮取回执行)的墙钟预算。40s 对百度地图这类首屏 60+ 脚本、
 // 含 195KB 反爬脚本的站点不够:实测在脚本链中途被截断,地图内核不启动。
@@ -319,6 +322,9 @@ pub(crate) async fn run_pipeline(
     // 连续「无新脚本且无新动作」的轮次计数:脚本采完后仍需把页面定时器排空
     // (见下方 collected.items.is_empty() 分支的说明)。
     let mut idle_rounds: u32 = 0;
+    // 「无脚本」排空轮次计数(总上限):地图动画类站点每帧都有动作,不能只靠
+    // idle_rounds 收敛,否则会空转到管线墙钟预算耗尽。
+    let mut drain_rounds: u32 = 0;
     // 外链取回失败次数(URL → 次数):第一次失败允许重试,第二次起不再取回。
     let mut fetch_failures: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
     let mut handle: Option<JsHandle> = seed.handle;
@@ -349,6 +355,9 @@ pub(crate) async fn run_pipeline(
         collected.items.extend(deferred_items);
         // 本轮是否有脚本待执行(collected.items 稍后会被 move,先留底)。
         let had_scripts = !collected.items.is_empty();
+        if !had_scripts {
+            drain_rounds += 1;
+        }
         if std::env::var("LAEW_DOM_TRACE").is_ok() {
             let ext = collected
                 .items
@@ -364,16 +373,10 @@ pub(crate) async fn run_pipeline(
                 out.html.len()
             );
         }
-        if collected.items.is_empty() {
-            // 无新脚本可取,但页面可能还有**定时器/rAF** 待跑:百度地图瓦片淡入
-            // 是「img load → setTimeout → opacity 0→1」,而事件循环每轮最多只跑
-            // 64 个回调(见 runtime.rs::MAX_TIMER_CALLBACKS),40+ 张瓦片 + 地图自身
-            // 的定时器一次排不完。旧实现此处直接 break,页面永远停在入场前状态
-            // → 瓦片全透明 → 地图区域整片空白(实测 80/81 张瓦片 opacity:0)。
-            // 追加「空脚本」轮次把事件循环排空,直到连续若干轮既无新脚本也无新动作。
-            if idle_rounds >= MAX_IDLE_ROUNDS {
-                break;
-            }
+        if collected.items.is_empty() && idle_rounds >= MAX_IDLE_ROUNDS {
+            // 连续多轮既无新脚本也无新动作:页面已无待办,收工。
+            // (单轮为空不收工:见下方 scripts.is_empty() 分支的排空说明。)
+            break;
         }
         // 本轮**收集到**的外链 URL 先留底:执行完成后记账进 executed,
         // 下一轮 collect_scripts 不再取回(真实浏览器语义:script 只执行一次)。
@@ -498,7 +501,17 @@ pub(crate) async fn run_pipeline(
             }
         }
         if scripts.is_empty() {
-            break;
+            // 没有脚本可执行,但页面可能还有**定时器/rAF** 待跑:百度地图瓦片淡入
+            // 是「img load → setTimeout → opacity 0→1」,每轮事件循环最多只跑
+            // 64 个回调(runtime.rs::MAX_TIMER_CALLBACKS),40+ 张瓦片一次排不完。
+            // 旧实现直接 break → 页面永远停在入场前状态 → 瓦片全透明 →
+            // 地图区域整片空白(实测 80/81 张瓦片 opacity:0)。
+            // 这里补发一轮「空脚本」请求把事件循环排空,直到连续若干轮既无新
+            // 动作也无待办定时器(排空轮次另有上限,防地图动画类站点空转到
+            // 管线墙钟预算耗尽)。
+            if handle.is_none() || drain_rounds >= MAX_DRAIN_ROUNDS || idle_rounds >= MAX_IDLE_ROUNDS {
+                break;
+            }
         }
         if handle.is_none() {
             handle = Some(JsHandle::spawn());
@@ -536,9 +549,6 @@ pub(crate) async fn run_pipeline(
         let reply = match reply {
             Ok(r) => r,
             Err(e) => {
-                if std::env::var("LAEW_DOM_TRACE").is_ok() {
-                    eprintln!("[domtrace] round={} 管线中断:{e}", round);
-                }
                 out.console.push(super::ConsoleRecord {
                     level: "error".to_string(),
                     text: format!("页面脚本管线中断:{e}"),
@@ -555,30 +565,11 @@ pub(crate) async fn run_pipeline(
         let doc = super::document::Document::parse(&out.html, base_url);
         append_reply(&mut out, inner, base_url, &reply, &doc);
         out.html = doc.serialize_full();
-        if std::env::var("LAEW_DOM_TRACE").is_ok() {
-            eprintln!(
-                "[domtrace] round={} 回包 actions={} idle_rounds={}",
-                round,
-                reply.outcome.actions.len(),
-                idle_rounds
-            );
-        }
         // 静默轮次记账:既无新脚本又无新动作 = 页面已无待办(定时器排空了)。
         if reply.outcome.actions.is_empty() && !had_scripts {
             idle_rounds += 1;
         } else {
             idle_rounds = 0;
-        }
-        if std::env::var("LAEW_DOM_TRACE").is_ok() {
-            eprintln!(
-                "[domtrace] round={} html_len={} has_app={} has_MapHolder={} opacity1={} opacity0={}",
-                round,
-                out.html.len(),
-                out.html.contains("id=\"app\""),
-                out.html.contains("MapHolder"),
-                out.html.matches("opacity:1").count(),
-                out.html.matches("opacity:0").count(),
-            );
         }
         // 外链执行记账(含执行抛错的:真实浏览器里抛错的 script 同样不会重跑)。
         // 记账覆盖「取回但内容为空」的脚本(站点注入的零字节占位脚本),

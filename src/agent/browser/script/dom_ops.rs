@@ -70,37 +70,13 @@ pub fn apply(doc: &Document, actions: &[JsAction], base_url: &str) -> ApplySumma
         }
     }
     for action in actions {
-        if std::env::var("LAEW_DOM_TRACE").is_ok() && action.kind == "set_attr" {
-            eprintln!(
-                "[domtrace] apply set_attr selector={} key={} value_tail={:?}",
-                action.selector,
-                action.key,
-                &action.value[action.value.len().saturating_sub(30)..]
-            );
-        }
         match action.kind.as_str() {
             "set_attr" => {
                 let Some(node) = find(doc, &action.selector) else {
-                    if std::env::var("LAEW_DOM_TRACE").is_ok() {
-                        eprintln!(
-                            "[domtrace] set_attr 未命中 selector={} key={}",
-                            action.selector, action.key
-                        );
-                    }
                     summary.failed += 1;
                     continue;
                 };
                 set_attr_value(&node, &action.key, &action.value);
-                if std::env::var("LAEW_DOM_TRACE").is_ok()
-                    && action.key == "style"
-                    && action.selector.starts_with("[data-lsm-id")
-                {
-                    eprintln!(
-                        "[domtrace] set_attr 命中 selector={} tail={:?}",
-                        action.selector,
-                        &action.value[action.value.len().saturating_sub(40)..]
-                    );
-                }
                 summary.applied += 1;
             }
             "remove_attr" => {

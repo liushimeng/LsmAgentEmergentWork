@@ -96,9 +96,6 @@ function __lsmMarkMounted(el) {
 }
 function __lsmRecordAttr(el, name, value) {
   if (!el || !el.__mounted) return;
-  if (String(el.__tag || "") === "img") {
-    __cerror("[probe] img " + String(__lsmDynKey(el)) + " 属性变更 " + String(name) + " = " + String(value));
-  }
   var key = __lsmDynKey(el);
   if (!key) return;
   var p = __lsmPendingAttrs[key];
@@ -573,6 +570,16 @@ function __mkStyle(getCss, setCss) {
       return __cssGet(getCss(), String(k));
     },
     set: function (t, k, v) {
+      // `cssText` 语义 = **整体替换**声明块(不是新增一条名为 cssText 的声明)。
+      // 站点(jQuery 风格 css 助手、百度地图图层面板)大量用
+      // `el.style.cssText = "position:absolute;left:...;top:..."` 一次性铺样式,
+      // 旧实现把它当普通属性追加成 `cssText:position:absolute;...`,
+      // 于是 `position:absolute` 失效 —— 百度地图瓦片层退化成静态块,
+      // 瓦片的 left/top(以地图中心为原点)整体错位,地图区域画不出内容。
+      if (String(k) === "cssText") {
+        setCss(String(v == null ? "" : v));
+        return true;
+      }
       setCss(__cssSet(getCss(), String(k), String(v)));
       return true;
     }
@@ -1486,11 +1493,6 @@ function __newEl(tag) {
           try {
             if (typeof el.onload === "function") el.onload.call(el, { type: "load", target: el });
           } catch (e) { __cerror("img onload: " + String((e && e.stack) || e)); }
-          var nlist = 0;
-          for (var li = 0; li < __lsmListeners.length; li++) {
-            if (__lsmListeners[li].node === el) nlist++;
-          }
-          __cerror("[probe] img load 触发 onload=" + (typeof el.onload) + " listeners=" + nlist + " complete=" + el.complete);
           // 监听器通道:真实浏览器里 load 事件既走 onload 属性,也走
           // addEventListener('load') 注册的监听器。旧实现只走前者,站点
           // 用监听器时事件永不触发 → 瓦片永不「就绪」→ 停在入场前状态

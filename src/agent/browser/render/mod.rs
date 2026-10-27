@@ -190,6 +190,30 @@ impl FontSet {
         } else {
             &layout.display
         };
+        // 诊断:显示列表全量落盘(LAEW_DUMP_DISPLAY=路径),定位「布局有文本/渲染无像素」类矛盾。
+        if let Ok(path) = std::env::var("LAEW_DUMP_DISPLAY") {
+            let mut buf = String::new();
+            for (i, it) in items.iter().enumerate() {
+                let kind = match &it.kind {
+                    DisplayKind::Background { fill } => format!("bg({:?})", fill),
+                    DisplayKind::Border { .. } => "border".to_string(),
+                    DisplayKind::Shadow { .. } => "shadow".to_string(),
+                    DisplayKind::Image { src, .. } => format!("img({})", src),
+                    DisplayKind::Text { text, size, color, bold } => format!(
+                        "text(sz={:.0} color={:?} bold={} t={})",
+                        size, color, bold,
+                        &text.chars().take(14).collect::<String>()
+                    ),
+                    DisplayKind::TextShadow { .. } => "textshadow".to_string(),
+                    DisplayKind::CanvasNote { .. } => "canvasnote".to_string(),
+                };
+                buf.push_str(&format!(
+                    "#{i} {} x={:.0} y={:.0} w={:.0} h={:.0} op={:.2} fixed={} z={:?} clip={:?}\n",
+                    kind, it.x, it.y, it.w, it.h, it.opacity, it.fixed, it.z, it.clip
+                ));
+            }
+            std::fs::write(&path, buf).ok();
+        }
         raster::rasterize(self, &mut pixmap, items, scroll_y, images);
         Some(pixmap)
     }

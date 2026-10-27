@@ -8,7 +8,7 @@ use kuchikiki::NodeRef;
 
 use super::super::document::{self, Document};
 use super::super::style::ComputedStyle;
-use super::{style_visible, translate, ElementBox, LayoutCtx, UNKNOWN_CB_H};
+use super::{style_visible, translate, ElementBox, LayoutCtx, PaintBox, PaintKind, UNKNOWN_CB_H};
 
 /// 布置一批延后处理的脱离流元素。
 pub(crate) fn layout_deferred(
@@ -116,6 +116,33 @@ fn layout_abs(
         visible: style_visible(style),
         z_index: style.pos.z_index,
     });
+    // 阶段三第三步:定位体系里的替换元素(<img>)同样要贴图。
+    // `measure_content` 的 img 分支只产出几何、不产出绘制指令(见 layout/mod.rs),
+    // 于是**绝对定位**的图片「有盒子、没像素」——百度地图的栅格瓦片
+    // (`qt=vtile` 返回 256×256 PNG,`position:absolute` 铺在地图容器里)
+    // 因此整片画不出来,地图区域只剩一块灰底(实测 40/40 张瓦片几何正确但无像素)。
+    // 这里补发 PaintBox + 显示项,与流内 img 路径保持一致。
+    if document::tag_name(node).eq_ignore_ascii_case("img") {
+        let (iw, ih, isrc) = ctx.replaced_size(node, style, avail_w, avail_h_known.then_some(avail_h));
+        if let Some(src) = isrc.filter(|s| ctx.image_loaded(s)) {
+            let paint = PaintBox {
+                src,
+                x: bx + pad_l,
+                y: by + pad_t,
+                w: (iw - pad_l - pad_r).max(0.0),
+                h: (ih - pad_t - pad_b).max(0.0),
+                fit: style.object_fit.clone(),
+                kind: PaintKind::Content,
+                visible: style_visible(style),
+                z_index: style.pos.z_index,
+                off_x: 0.0,
+                off_y: 0.0,
+            };
+            let tf = ctx.own_transform(style, bx, by, bw, bh);
+            ctx.emit_image(&paint, style.opacity, tf);
+            ctx.push_paint(paint);
+        }
+    }
     let mark = ctx.display_len();
     super::append(ctx, frag);
     ctx.apply_group(mark, style, bx, by, bw, bh);

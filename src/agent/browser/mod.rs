@@ -82,7 +82,15 @@ impl BrowserMode {
     ///
     /// 用户在终端跑 `LAEW_BROWSER_MODE=headed laew ...` 是「我要看着浏览器跑」的强信号,
     /// 应压过 LLM 自行挑选的 `mode`(实测百度地图任务里 LLM 会选 hidden 导致窗口不显示,
-    /// 用户反馈「看不到浏览器运行」)。未设环境变量时仍以工具参数为准。
+    /// 用户反馈「看不到浏览器运行」)。
+    ///
+    /// **未设环境变量时**:工具参数里的 `hidden` 视为「模型没有意见」,由交互式
+    /// 判定决定(终端交互 = headed,管道/CI = hidden)。模型显式给的 `headed` 仍然
+    /// 照办(自动化里偶尔需要真的开窗口看渲染)。
+    /// 理由:「用户看不到浏览器跑起来」的根因就是 LLM 顺手挑了 `hidden`
+    /// (2026-10-27 百度地图任务实测:模型第一句就写「使用内置浏览器(hidden 模式)」),
+    /// 而用户本人就在终端前看着 —— 终端交互这个信号比模型的选择更权威。
+    /// 真要无头跑,`LAEW_BROWSER_MODE=hidden` 精确覆盖(CI / 批量采集零影响)。
     pub fn from_env_or_arg(mode_arg: Option<&str>) -> Self {
         if let Ok(v) = std::env::var("LAEW_BROWSER_MODE") {
             if let Some(m) = Self::from_arg(&v) {
@@ -90,8 +98,9 @@ impl BrowserMode {
             }
         }
         match mode_arg.and_then(Self::from_arg) {
-            Some(m) => m,
-            None => Self::interactive_default(),
+            Some(Self::Headed) => Self::Headed,
+            // `hidden` / 未指定:交给交互性判定(终端交互默认有头)。
+            _ => Self::interactive_default(),
         }
     }
 
