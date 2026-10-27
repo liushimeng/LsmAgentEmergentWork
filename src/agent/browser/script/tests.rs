@@ -583,6 +583,37 @@ fn 脚本URL归一_相对与协议相对都归到绝对() {
 }
 
 #[test]
+fn 动态节点挂载后再追加子节点_回写宿主dom() {
+    // 动态节点在宿主里以 data-lsm-id 定位;站点常在挂载之后才往里塞内容
+    // (百度地图先挂 platform,再追加图层面板与瓦片)。旧实现只改本地树,
+    // 宿主 DOM 永远看不到这些内容(地图面板不进页面)。
+    let handle = JsHandle::spawn();
+    let reply = run_scripts(
+        &handle,
+        vec![r#"
+            var d = document.createElement('div');
+            d.id = 'dyn';
+            document.body.appendChild(d);
+            var c = document.createElement('span');
+            c.id = 'kid';
+            d.appendChild(c);
+        "#],
+        PAGE,
+        "https://a.test/",
+    );
+    assert!(reply.outcome.ok, "{:?}", reply.outcome.error);
+    let hit = reply.outcome.actions.iter().any(|a| {
+        a.kind == "append_html" && a.selector.contains("data-lsm-id") && a.value.contains("kid")
+    });
+    assert!(
+        hit,
+        "动态节点挂载后的追加必须回写宿主 DOM:{:?}",
+        reply.outcome.actions
+    );
+    handle.shutdown();
+}
+
+#[test]
 fn 元素contains_按当前树判定祖先() {
     let handle = JsHandle::spawn();
     let reply = eval_on(

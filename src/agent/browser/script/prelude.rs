@@ -249,6 +249,41 @@ function __lsmPushText(n, c) {
   __push({ type: "append_text", selector: n.sel, value: txt });
 }
 
+// 动态节点**挂载之后**再追加子节点,必须回写宿主 DOM。
+//
+// 动态节点在宿主里以 `data-lsm-id` 定位(见 `__serEl`),站点却常在挂载之后
+// 才往里塞内容:百度地图先建 `platform` 挂到地图容器,再把图层面板
+// (`overlayDiv` / `mapPane` / 瓦片)追加进去。旧实现只在「动态节点被挂到快照
+// 节点」那一刻推一次宿主动作,之后动态节点内部的变更**只改本地树**,宿主 DOM
+// 永远看不到 —— 地图面板与瓦片因此进不了页面(实测 `map._panes.mapPane` 已存在,
+// 而页面里 `overlayDiv` 数量为 0)。
+function __lsmPushDynChild(el, child, before) {
+  try {
+    if (!el || !child) return;
+    var key = __lsmDynKey(el);
+    if (!key) return;
+    var html = __serEl(child);
+    if (!html) return;
+    var sel = '[data-lsm-id="' + key + '"]';
+    __push({ type: before ? "insert_html" : "append_html", selector: sel, value: html });
+  } catch (e) {}
+}
+
+// 动态节点的整棵子树替换(清空 + 重填)。
+function __lsmPushDynContent(el) {
+  try {
+    if (!el) return;
+    var key = __lsmDynKey(el);
+    if (!key) return;
+    var sel = '[data-lsm-id="' + key + '"]';
+    var html = "";
+    var kids = el.__kids || [];
+    for (var i = 0; i < kids.length; i++) html += __serEl(kids[i]);
+    if (el.__pendingHtml) html = el.__pendingHtml + html;
+    __push({ type: "set_html", selector: sel, value: html });
+  } catch (e) {}
+}
+
 // ---------- HTMLCollection:活集合 ----------
 // 真实浏览器的 getElementsByTagName / getElementsByClassName 返回**实时集合**:
 // 「取集合 → 改 DOM → 再读集合」,集合内容随 DOM 变化。
@@ -1104,6 +1139,7 @@ function __newEl(tag) {
       if (c && c.__tag) c.__parentDyn = el;
       try { __lsmRegisterScriptLoad(c); } catch (e) {}
       __lsmRec("childList", el, { addedNodes: c ? [c] : [] });
+      __lsmPushDynChild(el, c, true);
       return c;
     },
     insertBefore: function (c) {
@@ -1111,6 +1147,7 @@ function __newEl(tag) {
       if (c && c.__tag) c.__parentDyn = el;
       try { __lsmRegisterScriptLoad(c); } catch (e) {}
       __lsmRec("childList", el, { addedNodes: c ? [c] : [] });
+      __lsmPushDynChild(el, c, false);
       return c;
     },
     removeChild: function (c) {
@@ -1127,7 +1164,7 @@ function __newEl(tag) {
       else this.appendChild(pseudo);
     },
     insertAdjacentElement: function (pos, c) { this.appendChild(c); return c; },
-    // 动态节点的 append/prepend:只进本地子树(未挂载,宿主无处落地)。
+    // 动态节点的 append/prepend:进本地子树,并回写宿主(动态节点以 data-lsm-id 定位)。
     append: function () {
       var kids = Array.prototype.slice.call(arguments);
       for (var i = 0; i < kids.length; i++) {
@@ -1135,6 +1172,7 @@ function __newEl(tag) {
         if (kids[i] && kids[i].__tag) kids[i].__parentDyn = el;
         try { __lsmRegisterScriptLoad(kids[i]); } catch (e) {}
         __lsmRec("childList", el, { addedNodes: [kids[i]] });
+        __lsmPushDynChild(el, kids[i], true);
       }
     },
     prepend: function () {
@@ -1144,6 +1182,7 @@ function __newEl(tag) {
         if (kids[i] && kids[i].__tag) kids[i].__parentDyn = el;
         try { __lsmRegisterScriptLoad(kids[i]); } catch (e) {}
         __lsmRec("childList", el, { addedNodes: [kids[i]] });
+        __lsmPushDynChild(el, kids[i], false);
       }
     },
     replaceChildren: function () {
@@ -1154,6 +1193,7 @@ function __newEl(tag) {
         this.__kids.push(kids[i]);
         __lsmRec("childList", el, { addedNodes: [kids[i]] });
       }
+      __lsmPushDynContent(el);
     },
     remove: function () {
       var p = el.__parentDyn;
