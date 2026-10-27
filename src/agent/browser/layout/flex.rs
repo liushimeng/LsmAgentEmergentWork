@@ -129,6 +129,10 @@ pub(crate) fn layout_container(
     if let Some(mw) = style.max_width {
         bw = bw.min(mw.max(1.0));
     }
+    // 显式 content-box:width 即内容盒宽,padding 加回边框盒(见 mod.rs 同名注释)。
+    if style.box_sizing_content && style.width.is_some() {
+        bw += style.padding_left + style.padding_right;
+    }
     let start_y = ctx.cursor_y();
     ctx.advance_y(style.padding_top);
     let inner_w = (bw - style.padding_left - style.padding_right).max(0.0);

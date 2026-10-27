@@ -515,3 +515,72 @@ fn 圆角与溢出计算值文本可见() {
     assert_eq!(m.get("border-radius").map(String::as_str), Some("8px 8px 8px 8px"));
     assert_eq!(m.get("overflow").map(String::as_str), Some("hidden"));
 }
+
+// ============ calc() 与视口单位(2026-10-27 渲染引擎优化) ============
+
+#[test]
+fn calc基础加减乘除() {
+    let ctx = super::values::ValueCtx { viewport_width: 1000.0, viewport_height: 500.0, root_font_size: 16.0 };
+    let p = |s: &str| super::values::parse_length(s, 16.0, &ctx);
+    assert_eq!(p("calc(100px + 20px)"), Some(120.0));
+    assert_eq!(p("calc(100px - 30px)"), Some(70.0));
+    assert_eq!(p("calc(50px * 2)"), Some(100.0));
+    assert_eq!(p("calc(100px / 4)"), Some(25.0));
+    assert_eq!(p("calc( 100px+20px )"), Some(120.0), "宽松空白");
+}
+
+#[test]
+fn calc混合单位与嵌套() {
+    let ctx = super::values::ValueCtx { viewport_width: 1000.0, viewport_height: 500.0, root_font_size: 16.0 };
+    let p = |s: &str| super::values::parse_length(s, 16.0, &ctx);
+    assert_eq!(p("calc(100% - 40px)"), Some(960.0), "百分比按视口宽近似");
+    assert_eq!(p("calc(50vw - 10px)"), Some(490.0));
+    assert_eq!(p("calc(100vh - 60px)"), Some(440.0));
+    assert_eq!(p("calc(2rem + 1em)"), Some(48.0), "rem=16 em=16");
+    assert_eq!(p("calc((100px + 50px) * 2)"), Some(300.0), "括号嵌套");
+    assert_eq!(p("calc(-100px + 150px)"), Some(50.0), "一元负号");
+    assert_eq!(p("calc(10px + calc(20px + 30px))"), Some(60.0), "内嵌 calc");
+}
+
+#[test]
+fn calc非法表达式返回none() {
+    let ctx = super::values::ValueCtx::default();
+    let p = |s: &str| super::values::parse_length(s, 16.0, &ctx);
+    assert_eq!(p("calc(100px +)"), None);
+    assert_eq!(p("calc(100px / 0)"), None, "除零");
+    assert_eq!(p("calc(abc)"), None);
+    assert_eq!(p("calc((10px)"), None, "括号不闭合");
+}
+
+#[test]
+fn 视口单位vw_vh解析() {
+    let ctx = super::values::ValueCtx { viewport_width: 1920.0, viewport_height: 1080.0, root_font_size: 16.0 };
+    let p = |s: &str| super::values::parse_length(s, 16.0, &ctx);
+    assert_eq!(p("50vw"), Some(960.0));
+    assert_eq!(p("100vh"), Some(1080.0));
+    assert_eq!(p("10vmin"), Some(108.0), "min(1920,1080)/10");
+    assert_eq!(p("10vmax"), Some(192.0));
+}
+
+#[test]
+fn box_sizing捕获与计算反射() {
+    // 显式 content-box 被捕获;未声明时反射 border-box(布局默认语义)。
+    let html = r#"<html><head><style>
+        * { box-sizing: border-box; }
+        .cb { box-sizing: content-box; width: 200px; padding: 20px; }
+        .bb { width: 200px; padding: 20px; }
+    </style></head><body><div class="cb">A</div><div class="bb">B</div></body></html>"#;
+    let doc = crate::agent::browser::document::Document::parse(html, "https://t.test/");
+    let media = crate::agent::browser::style::MediaCtx::new(1280.0, 720.0);
+    let engine = crate::agent::browser::style::StyleEngine::from_document(&doc, media);
+    let mut probe = |sel: &str| -> Option<bool> {
+        let nodes = doc.select(sel).ok()?;
+        let node = nodes.first()?.clone();
+        let st = engine.computed_chain(&node);
+        Some(st.box_sizing_content)
+    };
+    let cb = probe(".cb");
+    let bb = probe(".bb");
+    assert_eq!(cb, Some(true), "显式 content-box 应捕获");
+    assert_eq!(bb, Some(false), "border-box 重置下应为 false");
+}

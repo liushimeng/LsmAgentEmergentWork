@@ -95,10 +95,15 @@ async fn js_dispatch(
     .await;
     match result {
         Ok(Ok(reply)) => Some(reply),
-        _ => {
+        // 线程真退出(sender 已关)才清句柄;**忙碌超时不清**——线程还在跑
+        // 页面的挂载/定时器链(Boa 下重站单轮可达数十秒),清掉等于把页面
+        // 全局状态(webpack 模块表/Vue 实例)整页核爆,后续 eval 全在新
+        // Context 上白手起家(实测 zhipin:超时清句柄后 app 永久停在加载中)。
+        Ok(Err(e)) if e.contains("已退出") => {
             mgr.clear_js(pid).await;
             None
         }
+        _ => None,
     }
 }
 
@@ -453,10 +458,12 @@ async fn js_eval_thread(
     .await;
     match result {
         Ok(Ok(reply)) => Some(reply),
-        _ => {
+        // 同 js_dispatch_thread:忙碌超时保留句柄,只有线程真退出才清。
+        Ok(Err(e)) if e.contains("已退出") => {
             mgr.clear_js(pid).await;
             None
         }
+        _ => None,
     }
 }
 

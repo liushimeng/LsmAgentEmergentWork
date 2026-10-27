@@ -1532,3 +1532,263 @@ fn innerHTML_返回子节点_HTML_而非可见文本() {
         r.outcome.value
     );
 }
+
+// ============ zhipin 兼容性修复回归(2026-10-27) ============
+// 实测 BOSS直聘:jQuery 1.12.2 / Vue 1.0 / bossui / webpack chunk 链在
+// 以下缺口上逐一中断,搜索页永久停在「加载中,请稍候」。每个测试对应
+// 一个已修复的缺口,防止回归。
+
+#[test]
+fn in操作符命中window的on事件族() {
+    let h = JsHandle::spawn();
+    let r = eval_on(
+        &h,
+        r#"JSON.stringify({
+            onsubmit: "onsubmit" in window,
+            onchange: "onchange" in window,
+            unknown: "zzz-not-a-handler" in window
+        })"#,
+        "<html><body><div>ok</div></body></html>",
+        "https://www.zhipin.com/",
+    );
+    assert!(r.outcome.ok, "求值应成功:{r:?}");
+    let v: serde_json::Value = serde_json::from_str(&r.outcome.value).unwrap_or_default();
+    assert_eq!(v["onsubmit"], serde_json::json!(true), "onsubmit 必须命中(jQuery support 检测)");
+    assert_eq!(v["onchange"], serde_json::json!(true));
+    assert_eq!(v["unknown"], serde_json::json!(false), "非 on* 名不应误命中");
+    h.shutdown();
+}
+
+#[test]
+fn 动态元素attributes集合可用() {
+    let h = JsHandle::spawn();
+    let r = eval_on(
+        &h,
+        r#"(function(){
+            var d = document.createElement("div");
+            d.setAttribute("onsubmit", "t");
+            d.setAttribute("data-x", "1");
+            return JSON.stringify({
+                named: d.attributes["onsubmit"] ? d.attributes["onsubmit"].value : "missing",
+                expando: d.attributes["onsubmit"] ? d.attributes["onsubmit"].expando : "missing",
+                length: d.attributes.length,
+                item: d.attributes.item(1) ? d.attributes.item(1).name : "missing",
+                getNamed: d.attributes.getNamedItem("data-x") ? d.attributes.getNamedItem("data-x").value : "missing",
+                removed: (d.removeAttribute("data-x"), d.attributes.getNamedItem("data-x") === null)
+            });
+        })()"#,
+        "<html><body><div>ok</div></body></html>",
+        "https://www.zhipin.com/",
+    );
+    assert!(r.outcome.ok, "求值应成功:{r:?}");
+    let v: serde_json::Value = serde_json::from_str(&r.outcome.value).unwrap_or_default();
+    assert_eq!(v["named"], serde_json::json!("t"));
+    assert_eq!(v["expando"], serde_json::json!(false));
+    assert_eq!(v["length"], serde_json::json!(2));
+    assert_eq!(v["getNamed"], serde_json::json!("1"));
+    assert_eq!(v["removed"], serde_json::json!(true));
+    h.shutdown();
+}
+
+#[test]
+fn 快照元素attributes集合可用() {
+    let h = JsHandle::spawn();
+    let r = eval_on(
+        &h,
+        r##"(function(){
+            var el = document.querySelector("#app");
+            return JSON.stringify({
+                hasClass: el.attributes["class"] ? el.attributes["class"].value : "missing",
+                len: el.attributes.length
+            });
+        })()"##,
+        r##"<html><body><div id="app" class="root" data-v="1">内容</div></body></html>"##,
+        "https://www.zhipin.com/",
+    );
+    assert!(r.outcome.ok, "求值应成功:{r:?}");
+    let v: serde_json::Value = serde_json::from_str(&r.outcome.value).unwrap_or_default();
+    assert_eq!(v["hasClass"], serde_json::json!("root"));
+    assert!(v["len"].as_u64().unwrap_or(0) >= 3, "id/class/data-v 至少 3 个属性");
+    h.shutdown();
+}
+
+#[test]
+fn createHTMLDocument沙箱探测可用() {
+    let h = JsHandle::spawn();
+    let r = eval_on(
+        &h,
+        r#"(function(){
+            var doc = document.implementation.createHTMLDocument("");
+            doc.body.innerHTML = "<form></form><form></form>";
+            return JSON.stringify({
+                childCount: doc.body.childNodes.length,
+                nodeType: doc.nodeType
+            });
+        })()"#,
+        "<html><body><div>ok</div></body></html>",
+        "https://www.zhipin.com/",
+    );
+    assert!(r.outcome.ok, "求值应成功:{r:?}");
+    let v: serde_json::Value = serde_json::from_str(&r.outcome.value).unwrap_or_default();
+    // jQuery 1.12.2 的 createHTMLDocument 支持性检测:两个 form → childNodes 2。
+    assert_eq!(v["childCount"], serde_json::json!(2));
+    assert_eq!(v["nodeType"], serde_json::json!(9));
+    h.shutdown();
+}
+
+#[test]
+fn createEvent与createComment可用() {
+    let h = JsHandle::spawn();
+    let r = eval_on(
+        &h,
+        r#"(function(){
+            var ev = document.createEvent("Event");
+            ev.initEvent("click", true, false);
+            var cm = document.createComment("v-if");
+            return JSON.stringify({
+                evType: ev.type, evBubbles: ev.bubbles,
+                cmNodeType: cm.nodeType, cmText: cm.textContent
+            });
+        })()"#,
+        "<html><body><div>ok</div></body></html>",
+        "https://www.zhipin.com/",
+    );
+    assert!(r.outcome.ok, "求值应成功:{r:?}");
+    let v: serde_json::Value = serde_json::from_str(&r.outcome.value).unwrap_or_default();
+    assert_eq!(v["evType"], serde_json::json!("click"));
+    assert_eq!(v["evBubbles"], serde_json::json!(true));
+    assert_eq!(v["cmNodeType"], serde_json::json!(8));
+    assert_eq!(v["cmText"], serde_json::json!("v-if"));
+    h.shutdown();
+}
+
+#[test]
+fn defer脚本整组后置执行() {
+    // 阻塞脚本(含后置位)必须先于先导位的 defer 脚本执行:
+    // zhipin 搜索页 vue-core(阻塞)写在 defer 块之后,无视 defer 会
+    // 让 defer 的 app 入口先跑、Vue is not defined。
+    let doc_html = r#"<html><head>
+        <script>window.__ord = window.__ord || []; window.__ord.push("defer-first")</script>
+        <script>window.__ord.push("blocking")</script>
+        <script defer src="https://cdn.test/defer-a.js"></script>
+    </head><body>ok</body></html>"#;
+    let doc = Document::parse(doc_html, "https://a.test/");
+    let mut executed = std::collections::HashSet::new();
+    let mut html = doc_html.to_string();
+    // 两轮收集(模拟管线):首轮应给出 blocking 组在前。
+    let collected = dom_ops::collect_scripts(&Document::parse(&html, "https://a.test/"), "https://a.test/", &mut executed);
+    let mut order: Vec<String> = Vec::new();
+    for it in collected.items.iter().chain(collected.deferred.iter()) {
+        if let dom_ops::CollectedItem::Inline(s) = it {
+            if s.content.contains("defer-first") { order.push("defer-first-inline".into()); }
+            if s.content.contains("blocking") { order.push("blocking".into()); }
+        }
+        if let dom_ops::CollectedItem::External(u) = it {
+            if u.contains("defer-a") { order.push("defer-a".into()); }
+        }
+    }
+    assert_eq!(
+        order,
+        vec!["defer-first-inline".to_string(), "blocking".to_string(), "defer-a".to_string()],
+        "defer 外链必须整组后置:实际 {order:?}"
+    );
+}
+
+#[test]
+fn url与URLSearchParams解码可用() {
+    let h = JsHandle::spawn();
+    let r = eval_on(
+        &h,
+        r#"(function(){
+            var u = new URL("https://www.zhipin.com/web/geek/job?query=AI%20%E5%B7%A5%E7%A8%8B%E5%B8%88&city=1");
+            return JSON.stringify({
+                q: u.searchParams.get("query"),
+                c: u.searchParams.get("city"),
+                has: u.searchParams.has("query")
+            });
+        })()"#,
+        "<html><body><div>ok</div></body></html>",
+        "https://www.zhipin.com/",
+    );
+    assert!(r.outcome.ok, "new URL 不应抛 ReferenceError:{r:?}");
+    let v: serde_json::Value = serde_json::from_str(&r.outcome.value).unwrap_or_default();
+    assert_eq!(v["q"], serde_json::json!("AI 工程师"));
+    assert_eq!(v["c"], serde_json::json!("1"));
+    assert_eq!(v["has"], serde_json::json!(true));
+    h.shutdown();
+}
+
+#[test]
+fn a元素URL反射可用() {
+    let h = JsHandle::spawn();
+    let r = eval_on(
+        &h,
+        r#"(function(){
+            var a = document.createElement("a");
+            a.setAttribute("href", "https://img.bosszhipin.com/x/y?k=1#frag");
+            return JSON.stringify({
+                pathname: a.pathname, host: a.host, protocol: a.protocol,
+                search: a.search, hash: a.hash,
+                firstChar: a.pathname.charAt(0)
+            });
+        })()"#,
+        "<html><body><div>ok</div></body></html>",
+        "https://www.zhipin.com/web/geek/job",
+    );
+    assert!(r.outcome.ok, "求值应成功:{r:?}");
+    let v: serde_json::Value = serde_json::from_str(&r.outcome.value).unwrap_or_default();
+    // axios 判同模块装载期直接读 a.pathname.charAt(0),缺失即崩。
+    assert_eq!(v["pathname"], serde_json::json!("/x/y"));
+    assert_eq!(v["host"], serde_json::json!("img.bosszhipin.com"));
+    assert_eq!(v["protocol"], serde_json::json!("https:"));
+    assert_eq!(v["search"], serde_json::json!("?k=1"));
+    assert_eq!(v["hash"], serde_json::json!("#frag"));
+    assert_eq!(v["firstChar"], serde_json::json!("/"));
+    h.shutdown();
+}
+
+#[test]
+fn elementFromPoint返回元素不抛错() {
+    let h = JsHandle::spawn();
+    let r = eval_on(
+        &h,
+        r#"(function(){
+            var hit = document.elementFromPoint(10, 10);
+            return JSON.stringify({
+                isObj: !!hit,
+                tag: hit ? String(hit.tagName || hit.__tag || "").toLowerCase() : "null"
+            });
+        })()"#,
+        r#"<html><body><div style="width:100px;height:100px">盒子</div></body></html>"#,
+        "https://www.zhipin.com/",
+    );
+    assert!(r.outcome.ok, "elementFromPoint 不应抛错:{r:?}");
+    let v: serde_json::Value = serde_json::from_str(&r.outcome.value).unwrap_or_default();
+    assert_eq!(v["isObj"], serde_json::json!(true), "必须返回元素(patas/ka 采样依赖)");
+    h.shutdown();
+}
+
+#[test]
+fn 动态脚本装载只针对script元素() {
+    let h = JsHandle::spawn();
+    let r = eval_on(
+        &h,
+        r#"(function(){
+            // img 带 src appendChild:不应触发脚本装载(img 二进制进 eval 会炸)。
+            var img = document.createElement("img");
+            img.setAttribute("src", "https://img.bosszhipin.com/a.jpeg");
+            document.body.appendChild(img);
+            return JSON.stringify({ imgOk: true, dynLoaded: Object.keys(__lsmDynLoaded).length });
+        })()"#,
+        "<html><body><div>ok</div></body></html>",
+        "https://www.zhipin.com/",
+    );
+    assert!(r.outcome.ok, "求值应成功:{r:?}");
+    let v: serde_json::Value = serde_json::from_str(&r.outcome.value).unwrap_or_default();
+    assert_eq!(
+        v["dynLoaded"].as_u64().unwrap_or(99),
+        0,
+        "img 的 src 不得触发动态脚本装载"
+    );
+    h.shutdown();
+}

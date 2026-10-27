@@ -700,12 +700,17 @@ fn blocking_fetch(
         let env = c.borrow();
         (env.base_url.clone(), env.user_agent.clone())
     });
-    let ctx = super::super::reqctx::RequestContext::subresource(
-        &page_url,
-        super::super::reqctx::Dest::Xhr,
-        &page_ua,
-    )
-    .with_method(&method);
+    // `script:true` = 经典 <script src> 语义的线程内动态装载(见 prelude
+    // __lsmLoadDynScript):请求头按 script 目的地合成(无 Origin),
+    // 响应不做 CORS 校验——经典脚本本就不受 CORS 约束。
+    let is_script_load = opts.get("script").and_then(Value::as_bool).unwrap_or(false);
+    let dest = if is_script_load {
+        super::super::reqctx::Dest::Script
+    } else {
+        super::super::reqctx::Dest::Xhr
+    };
+    let ctx = super::super::reqctx::RequestContext::subresource(&page_url, dest, &page_ua)
+        .with_method(&method);
     let synthesized = ctx.headers(target.as_str());
     for (k, v) in &synthesized {
         if let (Ok(name), Ok(val)) = (
@@ -763,9 +768,12 @@ fn blocking_fetch(
     let bytes = if truncated { bytes[..MAX_FETCH_BODY].to_vec() } else { bytes };
     let body = crate::agent::browser::urlutil::decode_body(&bytes, &content_type);
     // 阶段四第二步：CORS 校验（跨域响应必须有合法 Access-Control-Allow-* 头）。
-    if let Some(err) = check_cors(&base_url, target.as_str(), &method, &headers) {
-        record_network(url, &method, status, &content_type, 0, started);
-        return json!({"error": err});
+    // 经典脚本装载不受 CORS 约束(script:true 时跳过)。
+    if !is_script_load {
+        if let Some(err) = check_cors(&base_url, target.as_str(), &method, &headers) {
+            record_network(url, &method, status, &content_type, 0, started);
+            return json!({"error": err});
+        }
     }
     // 阶段四第二步：CSP connect-src 门禁。
     if let Some(err) = check_connect_csp(&base_url, target.as_str()) {

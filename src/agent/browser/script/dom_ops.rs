@@ -70,13 +70,37 @@ pub fn apply(doc: &Document, actions: &[JsAction], base_url: &str) -> ApplySumma
         }
     }
     for action in actions {
+        if std::env::var("LAEW_DOM_TRACE").is_ok() && action.kind == "set_attr" {
+            eprintln!(
+                "[domtrace] apply set_attr selector={} key={} value_tail={:?}",
+                action.selector,
+                action.key,
+                &action.value[action.value.len().saturating_sub(30)..]
+            );
+        }
         match action.kind.as_str() {
             "set_attr" => {
                 let Some(node) = find(doc, &action.selector) else {
+                    if std::env::var("LAEW_DOM_TRACE").is_ok() {
+                        eprintln!(
+                            "[domtrace] set_attr 未命中 selector={} key={}",
+                            action.selector, action.key
+                        );
+                    }
                     summary.failed += 1;
                     continue;
                 };
                 set_attr_value(&node, &action.key, &action.value);
+                if std::env::var("LAEW_DOM_TRACE").is_ok()
+                    && action.key == "style"
+                    && action.selector.starts_with("[data-lsm-id")
+                {
+                    eprintln!(
+                        "[domtrace] set_attr 命中 selector={} tail={:?}",
+                        action.selector,
+                        &action.value[action.value.len().saturating_sub(40)..]
+                    );
+                }
                 summary.applied += 1;
             }
             "remove_attr" => {
@@ -330,6 +354,11 @@ pub fn collect_scripts(doc: &Document, base_url: &str, executed: &mut HashSet<u6
             continue;
         }
         if let Some(src) = src {
+            // 线程内已同步装载过的动态脚本(见 prelude __lsmLoadDynScript):
+            // 标记属性跳过,避免宿主轮次二次执行同一 chunk。
+            if document::attr(&node, "data-lsm-executed").is_some() {
+                continue;
+            }
             scanned += 1;
             if external_count >= MAX_EXTERNAL_SCRIPTS {
                 capped += 1;

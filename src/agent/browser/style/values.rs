@@ -45,6 +45,10 @@ impl Default for CornerRadius {
 pub struct ComputedStyle {
     pub display: String,
     pub visibility: String,
+    /// `box-sizing`:默认按 border-box 处理(主流站点 `*{box-sizing:border-box}`
+    /// 全局重置的既成事实语义,布局层据此从指定宽高中扣减 padding);
+    /// 站点显式声明 `content-box` 时置 false,宽高按内容盒语义还原。
+    pub box_sizing_content: bool,
     pub color: Rgb,
     pub background: Option<Rgb>,
     pub font_size: f64,
@@ -361,6 +365,7 @@ impl Default for ComputedStyle {
         Self {
             display: "inline".to_string(),
             visibility: "visible".to_string(),
+            box_sizing_content: false,
             color: [32, 32, 32],
             background: None,
             font_size: 16.0,
@@ -414,6 +419,7 @@ impl ComputedStyle {
     pub fn root() -> Self {
         Self {
             display: "block".to_string(),
+            box_sizing_content: false,
             ..Default::default()
         }
     }
@@ -517,6 +523,10 @@ impl ComputedStyle {
         out.insert("justify-content".into(), self.flex.justify.clone());
         out.insert("align-items".into(), self.flex.align_items.clone());
         out.insert("align-content".into(), self.flex.align_content.clone());
+        out.insert(
+            "box-sizing".into(),
+            if self.box_sizing_content { "content-box" } else { "border-box" }.to_string(),
+        );
         out.insert("row-gap".into(), format!("{}px", num(self.flex.row_gap)));
         out.insert("column-gap".into(), format!("{}px", num(self.flex.col_gap)));
         out.insert("flex-grow".into(), num(self.flex_item.grow));
@@ -808,6 +818,9 @@ pub fn apply_declaration(
     }
     match key.as_str() {
         "display" => st.display = normalize_display(value),
+        "box-sizing" => {
+            st.box_sizing_content = value.trim().eq_ignore_ascii_case("content-box");
+        }
         "visibility" => {
             st.visibility = value.to_ascii_lowercase();
         }
@@ -1943,6 +1956,14 @@ pub fn parse_length(value: &str, font_size: f64, ctx: &ValueCtx) -> Option<f64> 
     if v.is_empty() || v == "auto" || v == "none" {
         return None;
     }
+    // calc(<表达式>):现代站点布局的大量使用(zhipin 全站 50+ 处),此前
+    // 整条声明被静默丢弃(元素尺寸回退 auto,布局大面积塌缩错位)。
+    if v.starts_with("calc(") && v.ends_with(')') {
+        let inner = &v[5..v.len() - 1];
+        // 内嵌 calc(...) 就地展开成普通括号(calc 语义上只是分组)。
+        let inner = inner.replace("calc(", "(");
+        return eval_calc(&inner, font_size, ctx);
+    }
     if let Some(n) = v.strip_suffix("px") {
         return n.trim().parse::<f64>().ok();
     }
@@ -1951,6 +1972,26 @@ pub fn parse_length(value: &str, font_size: f64, ctx: &ValueCtx) -> Option<f64> 
     }
     if let Some(n) = v.strip_suffix("em") {
         return n.trim().parse::<f64>().ok().map(|n| n * font_size);
+    }
+    if let Some(n) = v.strip_suffix("vw") {
+        return n.trim().parse::<f64>().ok().map(|n| n / 100.0 * ctx.viewport_width);
+    }
+    if let Some(n) = v.strip_suffix("vh") {
+        return n.trim().parse::<f64>().ok().map(|n| n / 100.0 * ctx.viewport_height);
+    }
+    if let Some(n) = v.strip_suffix("vmin") {
+        return n
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(|n| n / 100.0 * ctx.viewport_width.min(ctx.viewport_height));
+    }
+    if let Some(n) = v.strip_suffix("vmax") {
+        return n
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(|n| n / 100.0 * ctx.viewport_width.max(ctx.viewport_height));
     }
     if let Some(n) = v.strip_suffix('%') {
         return n
@@ -1975,6 +2016,168 @@ pub fn parse_length(value: &str, font_size: f64, ctx: &ValueCtx) -> Option<f64> 
         return n.trim().parse::<f64>().ok().map(|n| n * 3.7795);
     }
     v.parse::<f64>().ok()
+}
+
+/// calc() 表达式求值(长度子集)。
+///
+/// 支持加减乘除、括号、一元负号与全部 `parse_length` 单位;`%` 沿用
+/// 解析层的视口宽近似(与裸百分比的既有回退语义一致,布局层对 width/height
+/// 的精确百分比求解不受影响——那些在声明捕获阶段就走 `width_percent` 通道)。
+fn eval_calc(expr: &str, font_size: f64, ctx: &ValueCtx) -> Option<f64> {
+    let tokens = tokenize_calc(expr)?;
+    let mut pos = 0usize;
+    let v = calc_expr(&tokens, &mut pos, font_size, ctx)?;
+    if pos != tokens.len() {
+        return None;
+    }
+    Some(v)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum CalcTok {
+    Num(f64, String),
+    Op(char),
+    LParen,
+    RParen,
+}
+
+fn tokenize_calc(expr: &str) -> Option<Vec<CalcTok>> {
+    let b = expr.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        let c = b[i] as char;
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        if c == '(' {
+            out.push(CalcTok::LParen);
+            i += 1;
+            continue;
+        }
+        if c == ')' {
+            out.push(CalcTok::RParen);
+            i += 1;
+            continue;
+        }
+        if c == '+' || c == '-' || c == '*' || c == '/' {
+            out.push(CalcTok::Op(c));
+            i += 1;
+            continue;
+        }
+        // 数字(可带小数点)+ 可选单位。
+        let start = i;
+        while i < b.len() {
+            let d = b[i] as char;
+            if d.is_ascii_digit() || d == '.' {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        if i == start {
+            return None;
+        }
+        let num: String = expr[start..i].to_string();
+        let num: f64 = num.parse().ok()?;
+        let unit_start = i;
+        while i < b.len() {
+            let u = b[i] as char;
+            if u.is_ascii_alphabetic() || u == '%' {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        out.push(CalcTok::Num(num, expr[unit_start..i].to_string()));
+    }
+    Some(out)
+}
+
+/// calc 语法解析:表达式 → 项(乘除) → 因子(数字/括号/一元负)。
+fn calc_expr(tokens: &[CalcTok], pos: &mut usize, font_size: f64, ctx: &ValueCtx) -> Option<f64> {
+    let mut left = calc_term(tokens, pos, font_size, ctx)?;
+    loop {
+        let Some(CalcTok::Op(op)) = tokens.get(*pos) else { break };
+        if *op != '+' && *op != '-' {
+            break;
+        }
+        *pos += 1;
+        let right = calc_term(tokens, pos, font_size, ctx)?;
+        left = if *op == '+' { left + right } else { left - right };
+    }
+    Some(left)
+}
+
+fn calc_term(tokens: &[CalcTok], pos: &mut usize, font_size: f64, ctx: &ValueCtx) -> Option<f64> {
+    let mut left = calc_factor(tokens, pos, font_size, ctx)?;
+    loop {
+        let Some(CalcTok::Op(op)) = tokens.get(*pos) else { break };
+        if *op != '*' && *op != '/' {
+            break;
+        }
+        *pos += 1;
+        let right = calc_factor(tokens, pos, font_size, ctx)?;
+        left = if *op == '*' {
+            left * right
+        } else {
+            if right == 0.0 {
+                return None;
+            }
+            left / right
+        };
+    }
+    Some(left)
+}
+
+fn calc_factor(tokens: &[CalcTok], pos: &mut usize, font_size: f64, ctx: &ValueCtx) -> Option<f64> {
+    match tokens.get(*pos)? {
+        CalcTok::Num(n, unit) => {
+            *pos += 1;
+            calc_unit_to_px(*n, unit, font_size, ctx)
+        }
+        CalcTok::LParen => {
+            *pos += 1;
+            let v = calc_expr(tokens, pos, font_size, ctx)?;
+            match tokens.get(*pos)? {
+                CalcTok::RParen => {
+                    *pos += 1;
+                    Some(v)
+                }
+                _ => None,
+            }
+        }
+        CalcTok::Op('-') => {
+            *pos += 1;
+            calc_factor(tokens, pos, font_size, ctx).map(|v| -v)
+        }
+        CalcTok::Op('+') => {
+            *pos += 1;
+            calc_factor(tokens, pos, font_size, ctx)
+        }
+        _ => None,
+    }
+}
+
+/// calc 内部数字+单位 → px(`%` 沿用视口宽近似,见 eval_calc 注释)。
+fn calc_unit_to_px(value: f64, unit: &str, font_size: f64, ctx: &ValueCtx) -> Option<f64> {
+    match unit {
+        "" | "px" => Some(value),
+        "em" => Some(value * font_size),
+        "rem" => Some(value * ctx.root_font_size),
+        "%" => Some(value / 100.0 * ctx.viewport_width),
+        "vw" => Some(value / 100.0 * ctx.viewport_width),
+        "vh" => Some(value / 100.0 * ctx.viewport_height),
+        "vmin" => Some(value / 100.0 * ctx.viewport_width.min(ctx.viewport_height)),
+        "vmax" => Some(value / 100.0 * ctx.viewport_width.max(ctx.viewport_height)),
+        "pt" => Some(value * 4.0 / 3.0),
+        "pc" => Some(value * 16.0),
+        "in" => Some(value * 96.0),
+        "cm" => Some(value * 37.795),
+        "mm" => Some(value * 3.7795),
+        _ => None,
+    }
 }
 
 fn parse_font_size(value: &str, parent_size: f64, ctx: &ValueCtx) -> Option<f64> {

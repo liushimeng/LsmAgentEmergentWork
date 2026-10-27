@@ -1075,6 +1075,12 @@ impl<'a> LayoutCtx<'a> {
                 let bx = x + style.margin_left;
                 // 盒宽(border box,不含 margin):auto 时撑满父内容宽减 margin;
                 // 百分比按父内容宽求解;显式长度直接采用。
+                // 默认按 border-box(CSS width 即边框盒宽,padding 从中扣减——
+                // 主流站点 `*{box-sizing:border-box}` 全局重置的既成事实语义);
+                // 站点显式 `box-sizing:content-box` 时,width 是**内容盒**宽,
+                // padding 加回到边框盒上。
+                let explicit_content_w = style.box_sizing_content
+                    && (style.width.is_some() || style.width_percent.is_some());
                 let mut bw = (width - style.margin_left - style.margin_right).max(40.0);
                 if let Some(p) = style.width_percent {
                     bw = (p / 100.0 * width).max(1.0);
@@ -1084,15 +1090,26 @@ impl<'a> LayoutCtx<'a> {
                 if let Some(mw) = style.max_width {
                     bw = bw.min(mw.max(1.0));
                 }
+                if explicit_content_w {
+                    bw += style.padding_left + style.padding_right;
+                }
                 let content_w = (bw - style.padding_left - style.padding_right).max(1.0);
                 let start_y = self.y;
                 self.y += style.padding_top;
                 // 盒高先于子代布局求出:显式/百分比高度不依赖子代内容;
                 // auto 高(占位 0)待子代布局完成后用内容高回填。
+                // content-box 显式高度同样按内容盒语义(padding 加回)。
                 let own_definite_h = style.height.is_some()
                     || (style.height_percent.is_some() && cb.3 != UNKNOWN_CB_H);
                 let box_h = match style.height {
-                    Some(h) => h.max(1.0),
+                    Some(h) => {
+                        let h = h.max(1.0);
+                        if style.box_sizing_content {
+                            h + style.padding_top + style.padding_bottom
+                        } else {
+                            h
+                        }
+                    }
                     None => match style.height_percent {
                         Some(p) if cb.3 != UNKNOWN_CB_H => ((p / 100.0) * cb.3).max(1.0),
                         _ => 0.0, // auto:子代布局后回填

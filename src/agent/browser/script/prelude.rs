@@ -22,6 +22,8 @@ var __lsmListeners = [];
 var __lsmTimers = [];
 // 动态插入的 <script> 的 load/error 回调(AMD 装载器靠它推进模块解析)。
 var __lsmScriptCbs = {};
+// 线程内已同步装载过的动态脚本 URL(去重:同一 URL 只装一次)。
+var __lsmDynLoaded = {};
 var __lsmTimerSeq = 0;
 var __lsmNow = 0;
 var __lsmTimerRan = 0;
@@ -71,6 +73,96 @@ function __lsmDynRect(el) {
   var g = __lsmDynGeo(el);
   return { x: g.x, y: g.y, top: g.y, left: g.x,
            right: g.x + g.w, bottom: g.y + g.h, width: g.w, height: g.h };
+}
+
+// ---------- 动态节点「挂载后」属性回写 ----------
+//
+// 动态节点挂载那一刻,宿主只拿到「序列化当时的属性值」(`__serEl` → append_html);
+// 站点此后再改 style/class/src/显隐,旧实现**只改本地 __attrs**,不产生宿主动作,
+// 于是宿主 DOM 永远停在挂载时的样子。
+// 典型症状:百度地图瓦片 `<img>` 挂载时 `opacity:0`(入场淡入动画的初始态),
+// 站点在 load 之后把 opacity 改成 1 → 变更到不了宿主 → 瓦片永远透明 →
+// 地图区域整片空白(实测 80/81 张瓦片 opacity:0,其中 30 张几何就在视口内)。
+//
+// 这里把「挂载后的属性变更」按元素合并成一组 set_attr/remove_attr 动作,
+// 选择器用 `[data-lsm-id="d<uid>"]`(与 __lsmPushDynChild 同款定位)。
+// 挂载**前**写的属性不记:那些值会随序列化一并进宿主,重复回写只会浪费动作。
+var __lsmPendingAttrs = {};
+function __lsmMarkMounted(el) {
+  if (!el || el.__mounted) return;
+  el.__mounted = true;
+  var kids = el.__kids || [];
+  for (var i = 0; i < kids.length; i++) __lsmMarkMounted(kids[i]);
+}
+function __lsmRecordAttr(el, name, value) {
+  if (!el || !el.__mounted) return;
+  if (String(el.__tag || "") === "img") {
+    __cerror("[probe] img " + String(__lsmDynKey(el)) + " 属性变更 " + String(name) + " = " + String(value));
+  }
+  var key = __lsmDynKey(el);
+  if (!key) return;
+  var p = __lsmPendingAttrs[key];
+  if (!p) { p = { set: {}, del: [] }; __lsmPendingAttrs[key] = p; }
+  p.set[name] = value;
+  var di = p.del.indexOf(name);
+  if (di >= 0) p.del.splice(di, 1);
+}
+function __lsmRecordAttrRemove(el, name) {
+  if (!el || !el.__mounted) return;
+  var key = __lsmDynKey(el);
+  if (!key) return;
+  var p = __lsmPendingAttrs[key];
+  if (!p) { p = { set: {}, del: [] }; __lsmPendingAttrs[key] = p; }
+  delete p.set[name];
+  if (p.del.indexOf(name) < 0) p.del.push(name);
+}
+// 每轮收口前合并下发:同名属性取最终值,每元素每属性每轮只推一条。
+function __lsmFlushDynAttrs() {
+  var keys = Object.keys(__lsmPendingAttrs);
+  for (var i = 0; i < keys.length; i++) {
+    var key = keys[i];
+    var p = __lsmPendingAttrs[key];
+    var sel = '[data-lsm-id="' + key + '"]';
+    var names = Object.keys(p.set);
+    for (var j = 0; j < names.length; j++) {
+      __push({ type: "set_attr", selector: sel, key: names[j], value: String(p.set[names[j]]) });
+    }
+    for (var k = 0; k < p.del.length; k++) {
+      __push({ type: "remove_attr", selector: sel, key: p.del[k] });
+    }
+  }
+  __lsmPendingAttrs = {};
+}
+// __attrs 的写拦截:属性变更一律记账(挂载后才推宿主)。
+function __mkDynAttrs(el) {
+  var store = {};
+  if (typeof Proxy !== "function") return store;
+  return new Proxy(store, {
+    get: function (t, k) { return t[k]; },
+    set: function (t, k, v) {
+      t[k] = v;
+      var name = String(k);
+      if (name === "data-lsm-id") return true;
+      __lsmRecordAttr(el, name, v);
+      return true;
+    },
+    deleteProperty: function (t, k) {
+      delete t[k];
+      __lsmRecordAttrRemove(el, String(k));
+      return true;
+    },
+    defineProperty: function (t, k, desc) {
+      if (desc && Object.prototype.hasOwnProperty.call(desc, "value")) {
+        t[k] = desc.value;
+        var name = String(k);
+        if (name !== "data-lsm-id") __lsmRecordAttr(el, name, desc.value);
+      } else {
+        Object.defineProperty(t, k, desc);
+        __lsmRecordAttrRemove(el, String(k));
+      }
+      return true;
+    }
+  });
 }
 
 var MAX_ACTIONS = 4096;
@@ -266,6 +358,8 @@ function __lsmPushDynChild(el, child, before) {
     if (!html) return;
     var sel = '[data-lsm-id="' + key + '"]';
     __push({ type: before ? "insert_html" : "append_html", selector: sel, value: html });
+    // 进宿主了:子树上的属性变更从此要回写宿主(见 __lsmRecordAttr)。
+    __lsmMarkMounted(child);
   } catch (e) {}
 }
 
@@ -510,10 +604,56 @@ function __lsmScriptKey(url) {
 }
 function __lsmRegisterScriptLoad(el) {
   if (!el || !el.__attrs) return;
+  // 只管 <script>:img 等替换元素也带 src,误当脚本装载会把图片二进制
+  // 塞进 eval 抛 SyntaxError(实测 zhipin 登录页头像/二维码)。
+  var tag = String(el.__tag || el.tagName || "").toLowerCase();
+  if (tag !== "script") return;
   var url = __lsmScriptKey(el.__attrs.src || "");
   if (!url) return;
   if (!__lsmScriptCbs[url]) __lsmScriptCbs[url] = [];
   __lsmScriptCbs[url].push(el);
+  // 线程内同步装载:webpack/rspack 的 chunk 装载器注入 <script src> 后
+  // 挂超时定时器等 onload;宿主轮次机制(序列化→收集→取回→执行→fire)
+  // 要跨轮往返,虚拟时钟在等待期快进超过装载器超时阈值,chunk 被判失败、
+  // 异步路由整条放弃(实测 zhipin ChunkLoadError 1326)。此处当场取回执行,
+  // load 信号在回调返回前就发出。fetch 记账由原生层自动进网络台账。
+  __lsmLoadDynScript(el, url);
+}
+function __lsmLoadDynScript(el, url) {
+  url = String(url || "");
+  if (!url || __lsmDynLoaded[url]) return;
+  // 非 http(s) 目标(about:/data: 占位)直接当空载成功,不进网络层。
+  if (!/^https?:/i.test(url)) {
+    __lsmDynLoaded[url] = true;
+    return;
+  }
+  __lsmDynLoaded[url] = true;
+  var ok = false;
+  try {
+    var raw = __lsmFetchNative(url, JSON.stringify({ method: "GET", cookies: __lsmCookie, script: true }));
+    var r = {};
+    try { r = JSON.parse(raw); } catch (e2) { r = { error: "原生 fetch 返回非法结构" }; }
+    if (r.setCookie && r.setCookie.length) __lsmCookieApply(r.setCookie);
+    if (r.error) {
+      __cerror("动态脚本取回失败 " + url + ": " + String(r.error));
+    } else {
+      var code = String(r.body == null ? "" : r.body);
+      if (code.trim()) {
+        try { (0, eval)(code); ok = true; }
+        catch (e3) { __cerror("动态脚本执行失败 " + url + ": " + String((e3 && e3.stack) || e3)); ok = true; }
+      } else { ok = true; }
+    }
+  } catch (e) { __cerror("动态脚本装载异常 " + url + ": " + String(e)); }
+  // 标记已执行:宿主 collect_scripts 见 data-lsm-executed 跳过,不二次执行。
+  try {
+    if (el && el.__attrs) el.__attrs["data-lsm-executed"] = "1";
+  } catch (e4) {}
+  if (ok) __lsmFireScriptLoad(url);
+  else {
+    try {
+      if (el && typeof el.onerror === "function") el.onerror({ type: "error", target: el });
+    } catch (e5) {}
+  }
 }
 function __lsmFireScriptLoad(url) {
   var key = __lsmScriptKey(url);
@@ -806,7 +946,10 @@ function __mk(n) {
       try { __lsmRegisterScriptLoad(c); } catch (e) {}
       if (c) dynKids.push(c);
       __lsmRec("childList", el, { addedNodes: c ? [c] : [] });
-      if (c && c.__detached) __push({ type: "append_html", selector: n.sel, value: __serEl(c) });
+      if (c && c.__detached) {
+        __push({ type: "append_html", selector: n.sel, value: __serEl(c) });
+        __lsmMarkMounted(c);
+      }
       else if (c && c.__lsm_node) __push({ type: "append_node", selector: c.__lsm_node.sel, key: n.sel });
       else if (c && c.nodeType === 3) __lsmPushText(n, c);
       return c;
@@ -822,6 +965,7 @@ function __mk(n) {
         var html = "";
         try { html = __serEl(c); } catch (e) { html = ""; }
         __push({ type: "insert_html", selector: n.sel, value: html });
+        __lsmMarkMounted(c);
       } else if (c && c.__lsm_node) {
         __push({ type: "insert_node", selector: c.__lsm_node.sel, key: n.sel });
       } else if (c && c.nodeType === 3) {
@@ -1080,6 +1224,9 @@ function __lsmParseUrl(u, base) {
   var pm = /^[a-zA-Z][a-zA-Z0-9+.-]*:/.exec(s);
   var scheme = pm ? pm[0].toLowerCase() : "";
   var rest = pm ? s.slice(pm[0].length) : s;
+  // 授权段前缀 `//`:先剥离再取 host,否则 `//host/path` 的协议斜杠会被
+  // 吞进 pathname(实测 a.pathname 反射成 //host/x/y)。
+  if (rest.indexOf("//") === 0) rest = rest.slice(2);
   var hm = /^([^/?#]*)/.exec(rest);
   var host = hm ? hm[1] : "";
   var rp = rest.slice(host.length);
@@ -1139,7 +1286,7 @@ function __newEl(tag) {
       if (c && c.__tag) c.__parentDyn = el;
       try { __lsmRegisterScriptLoad(c); } catch (e) {}
       __lsmRec("childList", el, { addedNodes: c ? [c] : [] });
-      __lsmPushDynChild(el, c, true);
+      __lsmPushDynChild(el, c, false);
       return c;
     },
     insertBefore: function (c) {
@@ -1147,7 +1294,7 @@ function __newEl(tag) {
       if (c && c.__tag) c.__parentDyn = el;
       try { __lsmRegisterScriptLoad(c); } catch (e) {}
       __lsmRec("childList", el, { addedNodes: c ? [c] : [] });
-      __lsmPushDynChild(el, c, false);
+      __lsmPushDynChild(el, c, true);
       return c;
     },
     removeChild: function (c) {
@@ -1172,7 +1319,7 @@ function __newEl(tag) {
         if (kids[i] && kids[i].__tag) kids[i].__parentDyn = el;
         try { __lsmRegisterScriptLoad(kids[i]); } catch (e) {}
         __lsmRec("childList", el, { addedNodes: [kids[i]] });
-        __lsmPushDynChild(el, kids[i], true);
+        __lsmPushDynChild(el, kids[i], false);
       }
     },
     prepend: function () {
@@ -1182,7 +1329,7 @@ function __newEl(tag) {
         if (kids[i] && kids[i].__tag) kids[i].__parentDyn = el;
         try { __lsmRegisterScriptLoad(kids[i]); } catch (e) {}
         __lsmRec("childList", el, { addedNodes: [kids[i]] });
-        __lsmPushDynChild(el, kids[i], false);
+        __lsmPushDynChild(el, kids[i], true);
       }
     },
     replaceChildren: function () {
@@ -1280,7 +1427,14 @@ function __newEl(tag) {
   ["src", "href", "type", "rel", "media", "title", "alt", "charset", "name", "value",
    "id", "class", "content", "async", "defer"].forEach(function (p) {
     def(p, function () { return el.__attrs[p] == null ? "" : String(el.__attrs[p]); },
-      function (v) { el.__attrs[p] = String(v); });
+      function (v) {
+        el.__attrs[p] = String(v);
+        // 「先 appendChild 再设 src」的装载模式(webpack chunk 加载器即如此):
+        // 注册时无 src 是空操作,src 落定这一刻触发同步装载。
+        if (p === "src" && t === "script") {
+          try { __lsmLoadDynScript(el, __lsmScriptKey(el.__attrs.src || "")); } catch (e) {}
+        }
+      });
   });
   // <a> 的 URL 反射:href 赋值后按当前页面 location 解析,
   // protocol/host/hostname/port/pathname/search/hash/origin 可读
@@ -1332,6 +1486,16 @@ function __newEl(tag) {
           try {
             if (typeof el.onload === "function") el.onload.call(el, { type: "load", target: el });
           } catch (e) { __cerror("img onload: " + String((e && e.stack) || e)); }
+          var nlist = 0;
+          for (var li = 0; li < __lsmListeners.length; li++) {
+            if (__lsmListeners[li].node === el) nlist++;
+          }
+          __cerror("[probe] img load 触发 onload=" + (typeof el.onload) + " listeners=" + nlist + " complete=" + el.complete);
+          // 监听器通道:真实浏览器里 load 事件既走 onload 属性,也走
+          // addEventListener('load') 注册的监听器。旧实现只走前者,站点
+          // 用监听器时事件永不触发 → 瓦片永不「就绪」→ 停在入场前状态
+          // (百度地图瓦片停在 opacity:0,地图区域整片空白)。
+          try { __fireDyn(el, "load"); } catch (e2) { __cerror("img load 事件: " + String((e2 && e2.stack) || e2)); }
         }, 0);
       });
   }
@@ -1440,6 +1604,9 @@ function __newEl(tag) {
     return all.length ? all[all.length - 1] : null;
   }, function (v) {});
   el.ownerDocument = document;
+  // 属性写拦截:挂载后的属性变更(百度地图瓦片淡入 opacity 0→1 等)
+  // 必须回写宿主 DOM,否则宿主永远停在挂载时的属性值。
+  el.__attrs = __mkDynAttrs(el);
   return el;
 }
 
@@ -3100,6 +3267,8 @@ function __lsmCollect(ov) {
   ov = ov || {};
   // 请求收口派发观察者:回调产生的 DOM 动作在本轮动作表里,宿主一次回写。
   __lsmFlushObservers();
+  // 动态节点挂载后的属性变更合并下发(每元素每属性每轮一条)。
+  __lsmFlushDynAttrs();
   return JSON.stringify({
     ok: ("ok" in ov) ? !!ov.ok : __lsmFatal === null,
     value: ("value" in ov) ? ov.value : null,
