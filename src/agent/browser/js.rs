@@ -26,6 +26,10 @@ pub struct JsOutcome {
     /// 页面申请过 WebGL 上下文的次数(>0 = 站点依赖 WebGL 绘制,
     /// 而 LsmAgentBrowser 内核无 WebGL → 相关区域画不出,须如实告知调用方)。
     pub webgl_asked: u32,
+    /// 本轮事件循环结束后**仍有待执行定时器**的个数(0 = 页面已静默)。
+    /// 脚本管线据此判断「还要不要再排空一轮」:页面静默就立刻收工,
+    /// 不做无谓的空脚本轮次(每次空轮都要重排一次快照,代价不小)。
+    pub pending_timers: usize,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -148,6 +152,7 @@ pub fn eval(script: &str, nodes: &[SnapshotNode], meta: &JsPageMeta<'_>) -> Resu
         logs,
         truncated,
         webgl_asked: 0,
+        pending_timers: 0,
     })
 }
 

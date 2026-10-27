@@ -265,10 +265,10 @@ pub(crate) struct PipelineSeed {
 const MAX_ROUNDS: usize = 64;
 /// 脚本采完后允许的「空轮」上限:用来把页面定时器/rAF 排空(百度地图瓦片淡入
 /// 依赖 img load 后的定时器)。连续这么多轮既无新脚本也无新动作即收工。
-const MAX_IDLE_ROUNDS: u32 = 8;
+const MAX_IDLE_ROUNDS: u32 = 3;
 /// 「无脚本」排空轮次总上限:地图动画类站点每帧都产生动作,靠 idle_rounds
 /// 收敛不了,这里用总轮次封顶,避免空转到管线墙钟预算耗尽。
-const MAX_DRAIN_ROUNDS: u32 = 12;
+const MAX_DRAIN_ROUNDS: u32 = 6;
 /// 整条脚本管线的墙钟预算(毫秒),可用 `LAEW_WEB_SCRIPT_PIPELINE_MS` 覆盖。
 // 整条脚本管线(多轮取回执行)的墙钟预算。40s 对百度地图这类首屏 60+ 脚本、
 // 含 195KB 反爬脚本的站点不够:实测在脚本链中途被截断,地图内核不启动。
@@ -325,6 +325,8 @@ pub(crate) async fn run_pipeline(
     // 「无脚本」排空轮次计数(总上限):地图动画类站点每帧都有动作,不能只靠
     // idle_rounds 收敛,否则会空转到管线墙钟预算耗尽。
     let mut drain_rounds: u32 = 0;
+    // 页面是否已静默(事件循环跑完无待执行定时器):静默则不必再排空。
+    let mut page_idle = false;
     // 外链取回失败次数(URL → 次数):第一次失败允许重试,第二次起不再取回。
     let mut fetch_failures: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
     let mut handle: Option<JsHandle> = seed.handle;
@@ -512,6 +514,11 @@ pub(crate) async fn run_pipeline(
             if handle.is_none() || drain_rounds >= MAX_DRAIN_ROUNDS || idle_rounds >= MAX_IDLE_ROUNDS {
                 break;
             }
+            // 页面已静默(无待执行定时器)且上一轮没产生动作 → 没有可排空的东西,
+            // 立刻收工(否则每次交互都要白白多跑几轮快照重建,延迟明显)。
+            if page_idle && idle_rounds > 0 {
+                break;
+            }
         }
         if handle.is_none() {
             handle = Some(JsHandle::spawn());
@@ -571,6 +578,8 @@ pub(crate) async fn run_pipeline(
         } else {
             idle_rounds = 0;
         }
+        // 页面静默标志:事件循环跑完仍无待执行定时器。
+        page_idle = reply.outcome.pending_timers == 0;
         // 外链执行记账(含执行抛错的:真实浏览器里抛错的 script 同样不会重跑)。
         // 记账覆盖「取回但内容为空」的脚本(站点注入的零字节占位脚本),
         // 否则它们每轮都被重新收集,管线空转到预算耗尽。

@@ -144,6 +144,8 @@ fn take_reply(req: &mut JsRequest) -> Option<std::sync::mpsc::Sender<JsReply>> {
 struct ThreadRuntime {
     ctx: Context,
     queue: Rc<BudgetedJobQueue>,
+    /// 最近一次事件循环结束后仍未触发的定时器个数(0 = 页面已静默)。
+    last_pending_timers: usize,
 }
 
 impl ThreadRuntime {
@@ -199,7 +201,11 @@ impl ThreadRuntime {
                 tracing::warn!(error = %e, "define 陷阱安装失败");
             }
         }
-        Ok(Self { ctx, queue })
+        Ok(Self {
+            ctx,
+            queue,
+            last_pending_timers: 0,
+        })
     }
 
     fn handle(&mut self, req: JsRequest) -> Option<JsReply> {
@@ -298,12 +304,14 @@ impl ThreadRuntime {
     fn event_loop(&mut self) {
         let deadline = REQ_ENV.with(|c| c.borrow().deadline);
         let mut total_ran: u64 = 0;
+        let mut last_pending = 0usize;
         loop {
             self.drain_jobs();
             let tick = self
                 .eval_string("__lsmTick()")
                 .unwrap_or_else(|_| "{\"pending\":0,\"ran\":0}".to_string());
             let (pending, ran) = parse_tick(&tick);
+            last_pending = pending as usize;
             total_ran += ran;
             if pending == 0 || total_ran >= MAX_TIMER_CALLBACKS {
                 break;
@@ -312,6 +320,8 @@ impl ThreadRuntime {
                 break;
             }
         }
+        // 本轮结束后仍未触发的定时器个数(0 = 页面已静默)。
+        self.last_pending_timers = last_pending;
     }
 
     fn run_scripts(&mut self, scripts: &[ScriptSource], env: &PageEnv, nodes: &[SnapshotNode], budget_ms: u64) -> JsReply {
@@ -485,6 +495,7 @@ impl ThreadRuntime {
                 .get("webglAsked")
                 .and_then(Value::as_u64)
                 .unwrap_or(0) as u32,
+            pending_timers: self.last_pending_timers,
         };
         let (clipped, truncated) = clip_owned(outcome.value, MAX_VALUE_CHARS);
         outcome.value = clipped;
