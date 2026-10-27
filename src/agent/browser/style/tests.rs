@@ -584,3 +584,28 @@ fn box_sizing捕获与计算反射() {
     assert_eq!(cb, Some(true), "显式 content-box 应捕获");
     assert_eq!(bb, Some(false), "border-box 重置下应为 false");
 }
+
+#[test]
+fn 猎聘前缀display连写_最终flex生效() {
+    // 猎聘 home.css 原文片段:-webkit-box/-ms-flexbox/flex 三连写,
+    // 同特异性按源顺序后写覆盖先写,终值必须是 flex(可识别布局盒型)。
+    let (doc, engine) = doc_engine(
+        "<head><style>
+            .seo-jobcard2-common .jobcard2-company-box{border-top:1px solid #f0f3f7;display:-webkit-box;display:-ms-flexbox;display:flex;padding-top:16px}
+            .tab-list-item{display:-webkit-inline-box;display:-ms-inline-flexbox;display:inline-flex}
+            .old{display:-webkit-box}
+         </style></head>\
+         <body><div class='seo-jobcard2-common'>\
+         <a class='jobcard2-company-box'>x</a>\
+         <span class='tab-list-item'>t</span>\
+         <span class='old'>o</span>\
+         </div></body>",
+        1920.0,
+    );
+    assert_eq!(style_of(&doc, &engine, ".jobcard2-company-box").display, "flex");
+}
+
+
+
+
+

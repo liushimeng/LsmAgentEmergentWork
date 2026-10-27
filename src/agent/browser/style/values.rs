@@ -977,7 +977,15 @@ pub fn apply_declaration(
         }
         "width" => {
             st.width_percent = parse_percent(value);
-            st.width = parse_length(value, st.font_size, ctx).filter(|v| *v > 0.0);
+            // 百分比宽度交布局层按包含块求解(与下方 height 分支同一思路):
+            // 样式层按视口宽立即猜值没有依据 —— `width:100%` 的卡片 logo
+            // 曾被解成视口绝对宽(1920),按方图比例再推高,巨图撑爆卡片,
+            // 全页高度灌水(猎聘首页实测)。
+            st.width = if st.width_percent.is_some() {
+                None
+            } else {
+                parse_length(value, st.font_size, ctx).filter(|v| *v > 0.0)
+            };
         }
         "max-width" => {
             if value.eq_ignore_ascii_case("none") {
@@ -1750,7 +1758,20 @@ fn normalize_display(value: &str) -> String {
         "block" => "block".into(),
         "inline" => "inline".into(),
         "inline-block" => "inline-block".into(),
-        "flex" | "inline-flex" => "flex".into(),
+        "flex" => "flex".into(),
+        // `inline-flex` 是**行内级**容器:归一成 flex 会让 is_block() 判真,
+        // 行内导航 tab(猎聘行业分类 `display:inline-flex` 连写)被逐项
+        // 拆成块级独占一行,整行 tab 竖排堆叠。保留行内级语义,布局按
+        // 行内盒近似(inline_box_worthy),内部内容退化为文本流。
+        "inline-flex" => "inline-flex".into(),
+        // 厂商前缀的 flex 老语法(2009/2012)在现代站点 CSS 里与标准值
+        // 连写兜底;个别规则只写前缀值(猎聘 ellipsis/轮播圆点),若不归一,
+        // `is_block()` 不识别 → 整个 flex 容器退化进行内分支,布局散架。
+        "-webkit-box" | "-ms-flexbox" | "-webkit-flex" | "-moz-box" | "-moz-flex" => {
+            "flex".into()
+        }
+        "-webkit-inline-box" | "-ms-inline-flexbox" | "-webkit-inline-flex" | "-moz-inline-box"
+        | "-moz-inline-flex" => "inline-flex".into(),
         "grid" | "inline-grid" => "grid".into(),
         "table" | "inline-table" => "table".into(),
         "table-row" => "table-row".into(),

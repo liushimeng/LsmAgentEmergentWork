@@ -568,7 +568,8 @@ fn max_content_width(ctx: &mut LayoutCtx, node: &NodeRef, style: &ComputedStyle,
         // 浮动子级与行内子级一样排在同一行,不参与块级取最大。
         let inline_like = cs.float != "none" || !cs.is_block();
         if document::tag_name(&child).eq_ignore_ascii_case("img") {
-            let (w, _h, _src) = ctx.replaced_size(&child, &cs);
+            // max-content 估算没有容器宽语义,百分比宽按 auto(见 replaced_size)。
+            let (w, _h, _src) = ctx.replaced_size(&child, &cs, 0.0, None);
             if inline_like {
                 inline_acc += w + margins;
             } else {

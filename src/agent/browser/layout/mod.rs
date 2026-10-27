@@ -381,6 +381,41 @@ pub(crate) fn push_border_and_shadow(
 }
 
 /// 元素是否参与绘制(visibility/opacity)。
+/// 替换类标签:`<img>` 与 `<svg>`(后者按 viewBox/属性取固有尺寸)。
+pub(crate) fn is_replaced_tag(node: &NodeRef) -> bool {
+    matches!(
+        document::tag_name(node).to_ascii_lowercase().as_str(),
+        "img" | "svg"
+    )
+}
+
+/// `<svg>` 固有尺寸:`width`/`height` 属性优先,缺省回落 `viewBox`
+/// 的宽高,都无则按 CSS 替换元素建议缺省 300×150。
+pub(crate) fn svg_natural_size(node: &NodeRef) -> (f64, f64) {
+    let attr_num = |name: &str| {
+        document::attr(node, name)
+            .and_then(|v| {
+                let v = v.trim();
+                v.strip_suffix("px").unwrap_or(v).parse::<f64>().ok()
+            })
+            .filter(|v| *v > 0.0)
+    };
+    if let (Some(w), Some(h)) = (attr_num("width"), attr_num("height")) {
+        return (w, h);
+    }
+    if let Some(vb) = document::attr(node, "viewBox")
+        .map(|v| v.trim().split_whitespace().filter_map(|t| t.parse::<f64>().ok()).collect::<Vec<_>>())
+        .filter(|v| v.len() == 4 && v[2] > 0.0 && v[3] > 0.0)
+    {
+        let (w, h) = (vb[2], vb[3]);
+        return (
+            attr_num("width").unwrap_or(w),
+            attr_num("height").unwrap_or(h),
+        );
+    }
+    (attr_num("width").unwrap_or(300.0), attr_num("height").unwrap_or(150.0))
+}
+
 pub(crate) fn style_visible(style: &ComputedStyle) -> bool {
     style.visibility != "hidden" && style.visibility != "collapse" && style.opacity > 0.0
 }
@@ -444,7 +479,7 @@ impl<'a> LayoutCtx<'a> {
     ///
     /// 变换只影响「画」,不改占位几何;子树项的祖先链合成由 `apply_group` 回补
     /// (元素盒高在子代布局完成后才定,故用回补而非变换栈)。
-    fn own_transform(&self, style: &ComputedStyle, x: f64, y: f64, w: f64, h: f64) -> Option<Affine> {
+    pub(crate) fn own_transform(&self, style: &ComputedStyle, x: f64, y: f64, w: f64, h: f64) -> Option<Affine> {
         let t = style.transform.as_ref()?;
         Some(t.resolve_with_origin(x, y, w, h, style.transform_origin))
     }
@@ -764,13 +799,34 @@ impl<'a> LayoutCtx<'a> {
 
     /// 替换元素尺寸:CSS 宽高优先,其次 HTML `width`/`height` 属性,
     /// 最后落到固有尺寸;只给一个维度时按固有宽高比推导另一个。
+    ///
+    /// `avail_w` 为包含块内容宽,百分比宽高在此求解(样式层不再按视口
+    /// 宽预解 —— `width:100%` 的 logo 曾被解成视口绝对宽,按方图比例
+    /// 推高后巨图撑爆卡片容器)。`avail_h` 为包含块内容高(未知传 None,
+    /// 百分比高度按 auto 处理)。
+    ///
+    /// `<svg>` 同按替换元素处理:固有尺寸取 `width`/`height` 属性,
+    /// 缺省回落 `viewBox`;既无属性也无 viewBox 时按 300×150(CSS 替换
+    /// 元素缺省建议尺寸)。此前 svg 当普通块级元素,`display:block` +
+    /// auto 宽在 max-content 测量语境下撑满测量宽(10 万 px),行内
+    /// 图标把整个 tab 条目撑爆(猎聘行业分类 tab 竖排+负坐标根因)。
     pub(crate) fn replaced_size(
         &self,
         node: &NodeRef,
         style: &ComputedStyle,
+        avail_w: f64,
+        avail_h: Option<f64>,
     ) -> (f64, f64, Option<String>) {
-        let src = self.image_src(node);
-        let natural = src.as_ref().and_then(|u| self.images.natural(u));
+        let tag = document::tag_name(node);
+        let is_svg = tag.eq_ignore_ascii_case("svg");
+        let src = if is_svg { None } else { self.image_src(node) };
+        let natural = src.as_ref().and_then(|u| self.images.natural(u)).or_else(|| {
+            if is_svg {
+                Some(svg_natural_size(node))
+            } else {
+                None
+            }
+        });
         let attr_w = document::attr(node, "width")
             .and_then(|v| v.trim().parse::<f64>().ok())
             .filter(|v| *v > 0.0);
@@ -781,8 +837,19 @@ impl<'a> LayoutCtx<'a> {
             Some((w, h)) => (w, h),
             None => (attr_w.unwrap_or(0.0), attr_h.unwrap_or(0.0)),
         };
-        let css_w = style.width;
-        let css_h = style.height;
+        // 百分比宽:相对包含块内容宽;百分比高:包含块高已知才生效。
+        // avail 无效(≤0,如 shrink-to-fit 的 max-content 估算没有容器宽
+        // 语义)时百分比按 auto 处理,落回固有尺寸。
+        let pct_w = style
+            .width_percent
+            .filter(|_| avail_w > 0.0)
+            .map(|p| (p / 100.0 * avail_w).max(1.0));
+        let pct_h = style
+            .height_percent
+            .zip(avail_h.filter(|h| *h > 0.0))
+            .map(|(p, ah)| (p / 100.0 * ah).max(1.0));
+        let css_w = style.width.or(pct_w);
+        let css_h = style.height.or(pct_h);
         let mut w = css_w.or(attr_w).unwrap_or(nw);
         let mut h = css_h.or(attr_h).unwrap_or(nh);
         let ratio_known = nw > 0.0 && nh > 0.0;
@@ -858,9 +925,9 @@ impl<'a> LayoutCtx<'a> {
         style: &ComputedStyle,
         depth: usize,
     ) -> Fragment {
-        // 阶段三第三步:替换元素(<img>)没有子内容,直接按固有尺寸成盒。
-        if document::tag_name(node).eq_ignore_ascii_case("img") {
-            let (w, h, _src) = self.replaced_size(node, style);
+        // 阶段三第三步:替换元素(<img>/<svg>)没有子内容,直接按固有尺寸成盒。
+        if is_replaced_tag(node) {
+            let (w, h, _src) = self.replaced_size(node, style, content_width, None);
             let selector = Document::stable_selector(node);
             return Fragment {
                 height: h,
@@ -992,10 +1059,11 @@ impl<'a> LayoutCtx<'a> {
                 grid::layout_container(self, &child, x, width, depth, &style, cb);
                 continue;
             }
-            // 阶段三第三步:替换元素(<img>)独占一行,避免与文本重叠。
-            if document::tag_name(&child).eq_ignore_ascii_case("img") {
+            // 阶段三第三步:替换元素(<img>/<svg>)独占一行,避免与文本重叠。
+            if is_replaced_tag(&child) {
                 self.flush_inline(buf, width);
-                let (iw, ih, isrc) = self.replaced_size(&child, &style);
+                let avail_h = (cb.3 != UNKNOWN_CB_H).then_some(cb.3);
+                let (iw, ih, isrc) = self.replaced_size(&child, &style, width, avail_h);
                 let bx = x + style.margin_left;
                 let by = self.y + style.margin_top;
                 let visible = style_visible(&style);
@@ -1082,7 +1150,11 @@ impl<'a> LayoutCtx<'a> {
                 let explicit_content_w = style.box_sizing_content
                     && (style.width.is_some() || style.width_percent.is_some());
                 let mut bw = (width - style.margin_left - style.margin_right).max(40.0);
-                if let Some(p) = style.width_percent {
+                // max-content 测量语境(flex/grid 条目测量传 MAX_CONTENT_WIDTH)
+                // 下百分比宽无意义 —— `width:100%` 的 svg 会被解成 10 万 px,
+                // 条目巨宽居中到负 x(猎聘行业分类 tab 竖排+负坐标根因)。
+                // 按百分比受可用宽约束的正常语义,只在真实包含块宽下求解。
+                if let Some(p) = style.width_percent.filter(|_| width < MAX_CONTENT_WIDTH) {
                     bw = (p / 100.0 * width).max(1.0);
                 } else if let Some(w) = style.width {
                     bw = w.max(1.0);
@@ -1146,6 +1218,27 @@ impl<'a> LayoutCtx<'a> {
                 );
                 self.flush_inline(buf, width);
                 let content_h = (self.y - (start_y + style.padding_top)).max(1.0);
+                // max-content 测量语境(可用宽取 MAX_CONTENT_WIDTH 哨兵)下,
+                // auto 宽块级盒按内容需求收缩(shrink-to-fit),不撑满测量宽
+                // —— 否则条目内部任何块级子元素(如 tab 文本 div)都会把
+                // 条目撑到 10 万 px,wrap 后单条目独占一行、居中到负 x
+                // (猎聘行业分类 tab 竖排 + 负坐标根因)。
+                let auto_w = style.width.is_none()
+                    && style.width_percent.is_none()
+                    && width >= MAX_CONTENT_WIDTH;
+                if auto_w {
+                    let mut right = bx + style.padding_left;
+                    for l in &self.lines[mark_lines..] {
+                        right = right.max(l.x + self.font.text_width(&l.text, l.size));
+                    }
+                    for b in &self.boxes[mark_boxes..] {
+                        right = right.max(b.x + b.w);
+                    }
+                    let need = right - bx + style.padding_right;
+                    if need < bw {
+                        bw = need.max(40.0);
+                    }
+                }
                 let box_h = if box_h > 0.0 {
                     box_h
                 } else {
@@ -1246,6 +1339,7 @@ impl<'a> LayoutCtx<'a> {
             return true;
         }
         style.display == "inline-block"
+            || style.display == "inline-flex"
             || style.width.is_some()
             || style.height.is_some()
             || style.width_percent.is_some()
@@ -1432,9 +1526,9 @@ impl<'a> LayoutCtx<'a> {
                 buf.force_break();
                 continue;
             }
-            // 阶段三第三步:行内替换元素(<img>):记录矩形并预留行高。
-            if tag.eq_ignore_ascii_case("img") {
-                let (iw, ih, isrc) = self.replaced_size(&child, &child_style);
+            // 阶段三第三步:行内替换元素(<img>/<svg>):记录矩形并预留行高。
+            if tag.eq_ignore_ascii_case("img") || tag.eq_ignore_ascii_case("svg") {
+                let (iw, ih, isrc) = self.replaced_size(&child, &child_style, avail_w, None);
                 let ix = line_x + child_style.margin_left + child_style.padding_left;
                 let iy = self.y;
                 let visible = style_visible(&child_style);

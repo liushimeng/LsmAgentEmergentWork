@@ -1312,3 +1312,136 @@ fn 视口高度参与百分比高度解析() {
         mh.h
     );
 }
+
+#[test]
+fn 猎聘卡片_flex列_卡内条目间距与logo尺寸() {
+    // 猎聘 home.css 原文关键规则(逐字摘录)。
+    let css = r#"
+.home-industry-container .seo-jobcard2-common,.home-industry-container .seo-jobcard2-common .jobcard2-detail-box{display:-webkit-box;display:-ms-flexbox;display:flex;-webkit-box-orient:vertical;-webkit-box-direction:normal;-ms-flex-direction:column;flex-direction:column}
+.home-industry-container .seo-jobcard2-common .jobcard2-detail-box{gap:8px;padding-bottom:0;text-decoration:none}
+.seo-jobcard2-common .jobcard2-detail-box .jobcard2-detail-top{display:-webkit-box;display:-ms-flexbox;display:flex;-webkit-box-align:center;-ms-flex-align:center;align-items:center;-webkit-box-pack:start;-ms-flex-pack:start;justify-content:flex-start}
+.seo-jobcard2-common .jobcard2-detail-box .jobcard2-detail-top .jobcard2-title{color:#000;font-size:18px;font-weight:500;line-height:25px;margin-right:10px}
+.seo-jobcard2-common .jobcard2-detail-box .jobcard2-detail-top .jobcard2-salary{color:#ff6400;flex-shrink:0;font-size:18px;font-weight:500;line-height:25px;margin-left:auto}
+.seo-jobcard2-common .jobcard2-detail-box .jobcard2-detail-labels{font-size:0;height:22px;margin-top:10px;overflow:hidden}
+.seo-jobcard2-common .jobcard2-detail-box .jobcard2-detail-labels span{background:#f8f9fb;border-radius:6px;color:#999;display:inline-block;font-size:12px;font-weight:400;height:100%;line-height:16px;margin-right:8px;padding:3px 8px}
+.seo-jobcard2-common .jobcard2-company-box{border-top:1px solid #f0f3f7;display:-webkit-box;display:-ms-flexbox;display:flex;padding-top:16px}
+.home-industry-container .seo-jobcard2-common .jobcard2-company-logo{border:.5px solid #f2f6fb;border-radius:4px;flex-shrink:0;height:24px;overflow:hidden;width:24px}
+.home-industry-container .seo-jobcard2-common .jobcard2-company-logo img{display:block;height:100%;object-fit:cover;width:100%}
+.seo-jobcard2-common .jobcard2-company-inline{display:-webkit-box;display:-ms-flexbox;display:flex;align-items:center;gap:8px;min-width:0;overflow:hidden}
+"#;
+    let html = format!(
+        "<head><style>{css}</style></head><body>\
+<div class='home-industry-container'><div class='home-industry-content-container'><div class='home-industry-content-list'>\
+<a class='seo-jobcard2-common' href='/job/1'><div class='jobcard2-detail-box'>\
+<div class='jobcard2-detail-top'><span class='jobcard2-title'>高级算法专家</span><span class='jobcard2-salary'>50-80k</span></div>\
+<div class='jobcard2-detail-labels'><span>5-10年</span><span>硕士</span></div>\
+<div class='jobcard2-company-box'>\
+<div class='jobcard2-company-logo'><img src='https://img.example/logo.png' alt=''></div>\
+<div class='jobcard2-company-inline'><span class='jobcard2-company-title'>测试公司</span></div>\
+</div>\
+</div></a>\
+</div></div></div></body>"
+    );
+    let doc = Document::parse(&html, "https://a.test/");
+    let layout = compute(&doc, 1920.0, &font());
+    // 找卡片各段文字行,断言卡内 y 连续(同卡内文字最大间隔 < 300)
+    let mut card_lines: Vec<(String, f64)> = Vec::new();
+    for l in &layout.lines {
+        if ["高级算法专家", "50-80k", "5-10年", "测试公司"]
+            .iter()
+            .any(|t| l.text.contains(t))
+        {
+            card_lines.push((l.text.clone(), l.y));
+        }
+    }
+    println!("卡内文字行: {card_lines:?}");
+    if let Some((max, min)) = card_lines
+        .iter()
+        .map(|(_, y)| *y)
+        .fold(None::<(f64, f64)>, |acc, y| match acc {
+            None => Some((y, y)),
+            Some((mx, mn)) => Some((mx.max(y), mn.min(y))),
+        })
+    {
+        assert!(
+            max - min < 300.0,
+            "卡内条目间距异常: 最大y={max} 最小y={min} 跨度={}",
+            max - min
+        );
+    }
+    // logo 盒尺寸:24×24(company-logo 的 width/height 固定);
+    // stable_selector 不含类名,按 company-box(div:nth-of-type(3)) 内首个 div 定位。
+    let logo = layout.boxes.iter().find(|b| {
+        b.selector.contains("div:nth-of-type(3)") && b.selector.ends_with("> div")
+    });
+    let b = logo.unwrap_or_else(|| panic!("找不到 company-logo 盒"));
+    assert!((b.w - 24.0).abs() < 2.0, "logo 宽应为 24,实际 {}", b.w);
+    assert!((b.h - 24.0).abs() < 2.0, "logo 高应为 24,实际 {}", b.h);
+    // logo img 盒不得超出 logo 容器(百分比宽按包含块 24 求解,不再取视口宽)。
+    let img_box = layout
+        .boxes
+        .iter()
+        .find(|bch| bch.tag == "img")
+        .unwrap_or_else(|| panic!("找不到 img 盒"));
+    assert!(
+        img_box.w <= 26.0,
+        "img 盒宽应受包含块约束(≤26),实际 {}",
+        img_box.w
+    );
+}
+
+
+#[test]
+fn 猎聘tab行_inlineflex条目应横排() {
+    // 猎聘行业分类 tab:容器 flex+wrap+center+gap24;条目 inline-flex
+    // (前缀连写),内部 svg(20x20 display:block w/h 100%)+ 文本。
+    let css = r#"
+.home-industry-container .home-industry-header .industry-header-title{display:-webkit-box;display:-ms-flexbox;display:flex;-ms-flex-wrap:wrap;flex-wrap:wrap;justify-content:center;align-items:center;gap:24px;min-height:42px}
+.home-industry-container .home-industry-header .industry-header-title .header-title-item{box-sizing:border-box;display:-webkit-inline-box;display:-ms-inline-flexbox;display:inline-flex;flex:none;justify-content:center;align-items:center;background:#fff;border:1px solid transparent;border-radius:100px;height:40px;padding:0 16px}
+.home-industry-container .home-industry-header .industry-header-title .header-title-item-svg{height:20px;margin-right:8px;width:20px;flex-shrink:0}
+.home-industry-container .home-industry-header .industry-header-title .header-title-item-svg svg{display:block;height:100%;width:100%}
+.home-industry-container .home-industry-header .industry-header-title .header-title-item-text{color:#121e29;font-size:16px;height:24px;line-height:24px;white-space:nowrap}
+"#;
+    let tab = |href: &str, name: &str| {
+        format!(
+            "<a href='{href}' class='header-title-item'><div class='header-title-item-svg'><svg viewBox='0 0 20 20'><path d='M0 0h20v20H0z'></path></svg></div><div class='header-title-item-text'>{name}</div></a>"
+        )
+    };
+    let tabs = [
+        tab("/a/", "AI/互联网/IT"),
+        tab("/b/", "电子/通信/半导体"),
+        tab("/c/", "新能源"),
+        tab("/d/", "医疗健康"),
+    ]
+    .join("");
+    let html = format!(
+        "<head><style>{css}</style></head><body>\
+<div class='home-industry-container'><div class='home-industry-header'>\
+<div class='industry-header-title'>{tabs}</div>\
+</div></div></body>"
+    );
+    let doc = Document::parse(&html, "https://a.test/");
+    let layout = compute(&doc, 1920.0, &font());
+    let mut tabs_y: Vec<(String, f64, f64)> = Vec::new();
+    for l in &layout.lines {
+        if ["AI/互联网/IT", "电子/通信/半导体", "新能源", "医疗健康"]
+            .iter()
+            .any(|t| l.text.contains(t))
+        {
+            tabs_y.push((l.text.clone(), l.x, l.y));
+        }
+    }
+    println!("tab 文字坐标: {tabs_y:?}");
+    let ys: Vec<f64> = tabs_y.iter().map(|(_, _, y)| *y).collect();
+    let distinct: Vec<f64> = {
+        let mut v = ys.clone();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v.dedup();
+        v
+    };
+    assert!(
+        distinct.len() <= 2,
+        "4 个 tab 应排在 1-2 行内(容器 1184 宽),实际行数 {}:{tabs_y:?}",
+        distinct.len()
+    );
+}

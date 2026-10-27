@@ -31,6 +31,11 @@ struct Item {
     final_cross: f64,
     /// 内容片段(条目内容在最终尺寸下的布局结果;定位时平移注入)。
     frag: Option<Fragment>,
+    /// 条目先序 seq:收集时确定(DFS 先序),发射自身视觉时沿用 ——
+    /// 保证条目自身背景/边框的 seq 早于其内容文字(测量期 flush 的
+    /// 文字 item),否则排序后白底盒后画会盖掉自家文字(猎聘行业
+    /// 分类 tab 文字被自身白卡整体遮没的根因)。
+    seq: u64,
 }
 
 impl Item {
@@ -72,7 +77,7 @@ impl Item {
     }
 }
 
-fn element_item(node: &NodeRef, cs: ComputedStyle, image: Option<String>) -> Item {
+fn element_item(ctx: &mut LayoutCtx, node: &NodeRef, cs: ComputedStyle, image: Option<String>) -> Item {
     Item {
         selector: Document::stable_selector(node),
         tag: document::tag_name(node),
@@ -84,11 +89,12 @@ fn element_item(node: &NodeRef, cs: ComputedStyle, image: Option<String>) -> Ite
         final_main: 0.0,
         final_cross: 0.0,
         frag: None,
+        seq: ctx.next_seq(),
     }
 }
 
 /// 匿名文本条目:样式继承容器(近似;不经过样式引擎逐节点计算)。
-fn anon_item(text: &str, parent: &ComputedStyle) -> Item {
+fn anon_item(ctx: &mut LayoutCtx, text: &str, parent: &ComputedStyle) -> Item {
     Item {
         node: None,
         style: parent.clone(),
@@ -100,6 +106,7 @@ fn anon_item(text: &str, parent: &ComputedStyle) -> Item {
         final_main: 0.0,
         final_cross: 0.0,
         frag: None,
+        seq: ctx.next_seq(),
     }
 }
 
@@ -244,9 +251,16 @@ pub(crate) fn layout_content(
                 let inner = (item.final_main - item.pads_main(row).0 - item.pads_main(row).1).max(1.0);
                 let mut frag =
                     ctx.measure_content(item.node.as_ref().unwrap(), inner, &item.style, depth);
+                // 交叉尺寸:显式 height 优先;百分比高相对容器确定交叉;否则内容高。
+                let pct_h = item
+                    .style
+                    .height_percent
+                    .zip(definite_cross)
+                    .map(|(p, ch)| (p / 100.0 * ch).max(1.0));
                 item.final_cross = item
                     .style
                     .height
+                    .or(pct_h)
                     .unwrap_or(frag.height + item.pads_cross(row).0 + item.pads_cross(row).1);
                 item.frag = Some(std::mem::take(&mut frag));
             }
@@ -373,7 +387,7 @@ fn collect_items(
             continue;
         }
         if !pending_text.is_empty() {
-            items.push(anon_item(&pending_text, style));
+            items.push(anon_item(ctx, &pending_text, style));
             pending_text.clear();
         }
         // 阶段三第三步:`<img>` 条目记录图片地址(按固有宽度参与弹性分配)。
@@ -382,10 +396,10 @@ fn collect_items(
         } else {
             None
         };
-        items.push(element_item(&child, cs, image));
+        items.push(element_item(ctx, &child, cs, image));
     }
     if !pending_text.is_empty() {
-        items.push(anon_item(&pending_text, style));
+        items.push(anon_item(ctx, &pending_text, style));
     }
     (items, deferred)
 }
@@ -401,8 +415,18 @@ fn resolve_base(
     depth: usize,
 ) {
     let cs = &item.style;
+    // 百分比主尺寸:相对容器内容宽/高(样式层不再按视口宽预解,见 values.rs
+    // `width` 分支注释)。flex-basis 与绝对长度优先。
+    let pct_main = if row {
+        cs.width_percent.map(|p| (p / 100.0 * content_w).max(1.0))
+    } else {
+        None
+    };
     let explicit = if row {
-        cs.flex_item.basis.or(cs.width)
+        cs.flex_item
+            .basis
+            .or(cs.width)
+            .or(pct_main)
     } else {
         cs.flex_item.basis.or(cs.height)
     };
@@ -442,7 +466,11 @@ fn resolve_base(
         let align = effective_align(&cs.flex_item.align_self, align_items);
         let avail = definite_cross.unwrap_or(content_w).max(0.0);
         let (pb, pa) = item.pads_cross(row);
-        let width = cs.width.unwrap_or_else(|| {
+        // 列方向交叉宽:绝对 width 优先,其次百分比宽(相对容器交叉尺寸)。
+        let width = cs
+            .width
+            .or(cs.width_percent.map(|p| (p / 100.0 * avail).max(1.0)))
+            .unwrap_or_else(|| {
             if align == "stretch" {
                 (avail - item.margins_cross(row).0 - item.margins_cross(row).1).max(1.0)
             } else {
@@ -669,7 +697,8 @@ fn emit_item(ctx: &mut LayoutCtx, item: &mut Item, x: f64, y: f64, row: bool, de
     let iw = if row { item.final_main } else { item.final_cross };
     let ih = if row { item.final_cross } else { item.final_main };
     // 阶段六:条目视觉发射(修复 flex 条目边框/阴影/渐变缺口)。
-    let seq = ctx.next_seq();
+    // seq 用收集时的先序值(见 Item.seq 注释),不用现场新序。
+    let seq = item.seq;
     ctx.push_box(ElementBox {
         selector: item.selector.clone(),
         tag: item.tag.clone(),

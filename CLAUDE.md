@@ -104,6 +104,7 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 | `LAEW_WEB_MASK` | `off`/`0`/`false`/`no` | 只关**控制权蒙层与输入闸**(闸门与状态栏文案保留):人工想全程自己点页面时用。见 `src/agent/chrome_browser/control_mask.rs` |
 | `LAEW_JS_FORIN_GUARD` | `off`/`0`/`false`/`no` | 关闭 `for...in` 空值守卫的**源码级改写**(诊断用:压缩混淆脚本失败时排除改写误伤)。见 `src/agent/browser/script/for_in_guard.rs` |
 | `LAEW_DUMP_HTML` | 文件路径 | 脚本管线后的整页 HTML 落盘,供离线布局探针分析。见 `src/agent/browser/mod.rs` |
+| `LAEW_DUMP_DISPLAY` | 文件路径 | 每次渲染把显示列表全量落盘(kind/x/y/w/h/z/clip/文字摘要),定位「布局有文本/渲染无像素」类矛盾。见 `src/agent/browser/render/mod.rs` |
 | `LAEW_WEB_EVIDENCE` | `off`/`0`/`false`/`no` | 关闭网页取证纪律硬闸门。见 `src/agent/safety/web_evidence.rs` |
 | `LAEW_READ_IMAGE_B64` | `1`/`true`/`yes`/`on` | 恢复 Read 工具图片 base64 全文返回（缺省为存根）。见 `src/agent/tools/read.rs` |
 | `LAEW_WEB_EVAL_TIMEOUT_MS` | 正整数(默认 `30000`) | eval_js 执行预算(阶段一做脚本长度上限与结果截断) |
@@ -475,6 +476,7 @@ Markdown Prompt 模板，两级发现：**项目级** `{工作目录}/.laew/comm
   - `24-CSS浮动布局与表单控件文本与XHR兼容.md` — CSS float/clear 块级+行内浮动共用行占用带/auto 宽 shrink-to-fit/表单 value 与 placeholder 绘制/XHR 事件对象与响应头(已完成)
   - `25-动态节点几何回填与事件绑定与截图落盘修复.md` — 动态(JS 建出)节点按 `data-lsm-id` 回认宿主布局几何(地图容器自量尺寸的前提)/动态节点 addEventListener 真实注册/screenshot(ocr:true) 不再吞掉落盘/position:fixed 不随滚动/z-index 沿祖先链下传(已完成)
   - `28-zhipin站点全链路兼容与动态脚本同步装载.md` — zhipin 全链路兼容修复:window `has` 陷阱(on* 事件族)/`element.attributes` NamedNodeMap/`createHTMLDocument`/`createEvent`/`createComment`/`elementFromPoint`/`<a>` URL 反射/`__lsmDecode` 补齐/脚本管线 defer 语义(阻塞组先、defer 组后置)/动态 `<script src>` 线程内同步装载(script 语义免 CORS + data-lsm-executed 防重)/eval·dispatch·管线三处超时不再核爆持久上下文(已完成);渲染引擎优化:`calc()` 全量求值/`vw/vh/vmin/vmax` 视口单位/`box-sizing` 显式 content-box 语义(块级+flex+grid)(已完成)
+  - `29-liepin首页渲染链路四根因修复.md` — width 百分比预解/inline-flex 块级化/svg 固有尺寸/flex 条目 seq 倒序/LAEW_DUMP_DISPLAY 显示列表诊断(已完成)
 - `docs/Use_MCP/` — 通用 MCP 服务调用
 
 **上下文与会话**：
