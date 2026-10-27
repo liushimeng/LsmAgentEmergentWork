@@ -100,6 +100,8 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 | `LAEW_BROWSER_VIEW_ACTIVATE` | `1`/`true`/`yes`/`on` | 有头浏览器窗口启动时抢到前台(默认只 orderFront 不抢焦点,避免打断 TUI)。见 `src/agent/browser/view/macos.rs` |
 | `LAEW_BROWSER_VIEWER_BIN` | 任意可执行文件路径 | 覆盖有头查看器子进程的可执行文件(默认当前进程)。供库进程/自检拉起真正的 `laew __browser-view` 用。见 `src/agent/browser/view/mod.rs` |
 | `LAEW_PAGE_BARS` | `off`/`0`/`false`/`no` | 关闭**屏蔽页面状态栏/进度栏**(两浏览器工具同参;Chrome 注入 JS + Lsm 查看器帧合成)。见 `src/agent/chrome_browser/status.rs`、`src/agent/browser/page_bars.rs`、`docs/双浏览器工具架构/02-屏蔽页面状态栏与进度栏.md` |
+| `LAEW_WEB_CONTROL` | `off`/`0`/`false`/`no` | 关闭**整个浏览器控制权状态机**(两浏览器工具同参):不记控制权、不挂蒙层、不拦 Agent 写操作,回到改造前行为。见 `src/agent/web_control.rs` |
+| `LAEW_WEB_MASK` | `off`/`0`/`false`/`no` | 只关**控制权蒙层与输入闸**(闸门与状态栏文案保留):人工想全程自己点页面时用。见 `src/agent/chrome_browser/control_mask.rs` |
 | `LAEW_JS_FORIN_GUARD` | `off`/`0`/`false`/`no` | 关闭 `for...in` 空值守卫的**源码级改写**(诊断用:压缩混淆脚本失败时排除改写误伤)。见 `src/agent/browser/script/for_in_guard.rs` |
 | `LAEW_DUMP_HTML` | 文件路径 | 脚本管线后的整页 HTML 落盘,供离线布局探针分析。见 `src/agent/browser/mod.rs` |
 | `LAEW_WEB_EVIDENCE` | `off`/`0`/`false`/`no` | 关闭网页取证纪律硬闸门。见 `src/agent/safety/web_evidence.rs` |
@@ -127,6 +129,9 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 - **工具定义协议差异**：Anthropic 用 `tools[].{name,description,input_schema}`；OpenAI 用 `tools[].{type:"function",function:{name,description,parameters}}`。
 - **任务锚点（TargetAnchor，`safety/target_anchor.rs`）**：从用户原文机械抽取的目标硬约束（**不经 LLM**），全局单例。跨五层设防：L0 输入保真；L1 编排器澄清门；L2 Main-Work 提示词约束 + 澄清单元阻断；L3 `MCP_Web_LsmAgentBrowser_Use` 显式 URL 越界返 `code=6001`；L4 QC 目标一致性硬门 + `target_drift` 强信号。开关 `LAEW_TARGET_ANCHOR=off` 全关；`LAEW_TARGET_ANCHOR_BLOCK=off` 仅关 L3 阻断。
 - **网页取证纪律**：网页任务的证据只能来自 `MCP_Web_LsmAgentBrowser_Use`——不可达时**如实报告并停止**，禁止改用 `curl/ping/nc` 等 Bash 网络命令探测任务目标站点。三层设防：(1) 提示词约束；(2) 运行时硬闸门 `src/agent/safety/web_evidence.rs`；(3) `LAEW_WEB_EVIDENCE=off` 全关回退。
+- **浏览器控制权（两浏览器工具共用，`safety` 同级概念，`src/agent/web_control.rs`）**：每个 `(引擎, page_id)` 有且只有一条控制权记录，**两态互斥**——`agent` **Agent 控制状态**（蒙层在位 + 输入闸拦截，人工点不动页面，Agent 独占写操作权）与 `user` **用户控制状态**（蒙层撤除 + 输入闸放行，控制权交还人工）。**铁律**：① 蒙层在位 ⇔ 控制权在 Agent；② `user` 态下 Agent 的页面写操作一律被工具层机械拒绝（错误码 `4004`），观测类动作（inspect/screenshot/wait）放行。切换入口 `control(set_control_state, params={state:"agent"|"user", note})`；`request_human` **自动**移交 `user` 态（撤蒙层、人工可操作），收口**自动取回**原态。Chrome 侧蒙层 = JS 全屏遮罩（`pointer-events:none` 纯视觉）+ CDP `Input.setIgnoreInputEvents` 输入闸（会拦 CDP 合成输入 → Agent 的输入类动作走「先解后锁」毫秒级窗口）；Lsm 侧蒙层画在**查看器帧合成层**（不进截图取证路径）。开关 `LAEW_WEB_CONTROL=off`（全关）/ `LAEW_WEB_MASK=off`（只关蒙层）。设计见 `docs/双浏览器工具架构/03-浏览器控制权状态机与视口自适应.md`。
+- **浏览器视口自适应（两浏览器工具）**：窗口缺省 **1920×1080（1080p）**。Lsm 查看器：人工拖动窗口 → 查看器回传 `{"cmd":"resize","w":..,"h":..}`（内容区尺寸，已扣工具栏）→ 宿主改视口 → 重排重渲染 → 新帧 **1:1 铺满**（不拉伸变形）；macOS 100ms tick 读 `contentView.frame` 变更、Windows `WM_SIZE` 触发。Chrome：headed **不下发** `Emulation.setDeviceMetricsOverride`（视口=窗口内容区，拖动即原生重排），窗口尺寸按主显示器可用区**夹紧**（`window_fit::fit_to_screen`）避免溢出屏幕（缺区域）。
+- **浏览器标签页治理（两浏览器工具）**：同一任务内**尽量复用同一个 page_id**（换 URL 用 `control(navigate)`，别每次 `open` 新页）；Chrome `open` 同 URL 自动复用无主页、`list` 额外列出**本工具未管理的外部标签页**（人工自己开的/页面派生的，`external_tabs`）、`close(page_id)` **真关** Chrome 标签页（CDP `Target.closeTarget`）；`close(all)` 回收整个 Chrome 进程且并行单元有兄弟页时被拒。
 - **人工介入可见性**：`request_human` 的「该走人工」响应附 `next_action` + 完整 `human_assist` 载荷；输入硬闸 6002 与收尾探针首次命中则**直接自动弹出**（auto-HITL）。「取消任务」是真取消（返 `code=4002` 并置位进程级旗标 `human_cancel`）。`request_human` 不强制 `page_id`（无页可解锁时走任务级提问）。
 - **人工介入弹窗 = Rust 原生子进程（`human_ui/`）**：`laew __hitl-dialog <payload.json>` 隐藏子进程——macOS 走 AppKit FFI、Windows 走 Win32。铁律：布局是 Rust 纯函数单一真源，最大化/还原只用自身设定值重排、**永不回读窗口 frame**。支持选项多选、auto-HITL 自动弹出、焦点不抢夺、Windows macOS 风格主题。
 - **TUI 多行粘贴保真**：bracketed paste 整体接收，≥2 行粘贴一律转 marker 保真。Windows conhost / 部分 ConPTY 不支持 bracketed paste，通过三级粘贴判定（40ms 队列探测 → 击键节奏武装 → 正常提交）根治多行提示词被逐行拆成多次提交。实现见 `tui/paste.rs` + `tui/input/mod.rs`。
@@ -180,8 +185,8 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 | 工具 | 能力 | 平台门控 | 设计文档 |
 |------|------|----------|----------|
 | **MCP_Window_Use** | 桌面窗口操控：`action` 枚举分发（`open`/`list`/`find`/`inspect`/`control`/`ocr`/`screenshot`）；双路线（Windows UIA Pattern 优先 + Win32 消息 + 物理鼠标键盘兜底；macOS AX 控件树 + 物理输入；Linux wmctrl/xdotool 物理层） | **仅 macOS/Windows** 运行时注册；Linux 走物理层兜底 | `docs/MCP_Window_Use/01-设计与解决方案.md` |
-| **MCP_Web_Chrome_Use** | 浏览器操控（Chrome/CDP，chromiumoxide 0.9，真 Chromium 渲染，headed 窗口支持人工介入；**日常 80-90% 网页任务默认优先**）：`action` 枚举分发（`open`/`list`/`close`/`control`/`inspect` 基础集）；截图支持 `params.save_path` 落盘（只回路径+尺寸，防 base64 撑爆上下文）；`wait` 支持 selector 就绪判定 | 跨 Windows/macOS/Linux；需本机装 Chrome/Edge/Chromium/Brave（`LAEW_BROWSER_PATH` 可指路径） | `docs/双浏览器工具架构/01-设计与解决方案.md`、`docs/MCP_Web_Chrome_Use/`（实测结论见 41-） |
-| **MCP_Web_LsmAgentBrowser_Use** | 浏览器操控（LsmAgentBrowser 进程内内核，**反-反爬专用**）：`action` 枚举分发（`open`/`list`/`close`/`control`/`inspect`/`sequence`/`batch`/`explore`）；`control_action` 48 个写操作；`inspect` 23 个观察维度；单步 + 连续（`sequence` ≤24 steps）；HTTP(S) + DOM + 布局 + 软件渲染 + Boa JS；全内存 Cookie/存储 | 跨 Windows/macOS/Linux；无外部浏览器进程 | `docs/MCP_Web_LsmAgentBrowser_Use/03-MCP_Web_LsmAgentBrowser_Use兼容层设计.md` |
+| **MCP_Web_Chrome_Use** | 浏览器操控（Chrome/CDP，chromiumoxide 0.9，真 Chromium 渲染，headed 窗口支持人工介入；**日常 80-90% 网页任务默认优先**）：`action` 枚举分发（`open`/`list`/`close`/`control`/`inspect` 基础集）；截图支持 `params.save_path` 落盘（只回路径+尺寸，防 base64 撑爆上下文）；`wait` 支持 selector 就绪判定；**控制权**：`control(set_control_state)` 切 Agent/用户两态（蒙层 + 输入闸），`request_human` 自动移交用户态 | 跨 Windows/macOS/Linux；需本机装 Chrome/Edge/Chromium/Brave（`LAEW_BROWSER_PATH` 可指路径） | `docs/双浏览器工具架构/01-设计与解决方案.md`、`docs/MCP_Web_Chrome_Use/`（实测结论见 41-） |
+| **MCP_Web_LsmAgentBrowser_Use** | 浏览器操控（LsmAgentBrowser 进程内内核，**反-反爬专用**）：`action` 枚举分发（`open`/`list`/`close`/`control`/`inspect`/`sequence`/`batch`/`explore`）；`control_action` 48 个写操作（含 `set_control_state` 控制权切换）；`inspect` 23 个观察维度；单步 + 连续（`sequence` ≤24 steps）；HTTP(S) + DOM + 布局 + 软件渲染 + Boa JS；全内存 Cookie/存储 | 跨 Windows/macOS/Linux；无外部浏览器进程 | `docs/MCP_Web_LsmAgentBrowser_Use/03-MCP_Web_LsmAgentBrowser_Use兼容层设计.md` |
 | **Use_MCP** | 通用 MCP（Model Context Protocol）服务调用统一入口：**真 MCP 协议客户端**（JSON-RPC 2.0），连接外部 MCP server（stdio 子进程 / Streamable HTTP）；单工具 `action` 枚举分发 | 跨平台（由外部 MCP server 决定能力） | `docs/Use_MCP/01-设计与解决方案.md` |
 
 ### 自感知动态子 Agent（Self-Awareness SubAgent）
@@ -268,6 +273,7 @@ agent/
   dead_loop/       死循环守卫(LLM 交互级指纹检测:小循环/大循环)
   runtime_hints.rs Agent 循环运行时辅助
   web_activity.rs  Agent 活动台账(task_local:屏蔽页面状态栏/进度栏数据唯一真源)
+  web_control.rs   浏览器控制权状态机(两工具共用:Agent控制状态 ⇄ 用户控制状态,写操作闸 4004)
   context.rs       Agent-Context 独立实时上下文
   extrace.rs       提取/抽取工具输出关键信息的助手
   cancel.rs        取消竞争
@@ -324,7 +330,7 @@ agent/
     mcp_window_use/  MCP_Window_Use 工具目录
     mcp_web_lsm_browser_use/     MCP_Web_LsmAgentBrowser_Use 兼容层(mod/control/inspect/visit_ledger)
     mcp_chrome_use/      MCP_Web_Chrome_Use 工具(mod/tests,Chrome/CDP 基础框架)
-  chrome_browser/      Chrome/CDP 驱动(mod/page/tests:子进程拉起/回收、页面注册表、导航/eval/截图/点击/输入;status.rs 屏蔽页面状态栏/进度栏注入)
+  chrome_browser/      Chrome/CDP 驱动(mod/page/tests:子进程拉起/回收、页面注册表、导航/eval/截图/点击/输入;status.rs 屏蔽页面状态栏/进度栏注入;control_mask.rs 控制权蒙层+输入闸;window_fit.rs 1080p 窗口屏幕适配)
     use_mcp/         Use_MCP 工具目录
 
   window/          窗口操控平台驱动层
@@ -452,7 +458,7 @@ Markdown Prompt 模板，两级发现：**项目级** `{工作目录}/.laew/comm
 - `docs/其他Agent工具定义/`
 
 **三个 MCP 风格工具**（按工具）：
-- `docs/双浏览器工具架构/` — Chrome × LsmAgentBrowser 双浏览器工具总设计(命名映射/选用决策/分阶段路线图);`02-屏蔽页面状态栏与进度栏.md` — 两条告知栏双引擎统一落地(术语定名/内容规格/Chrome 注入 × Lsm 帧合成/埋点)
+- `docs/双浏览器工具架构/` — Chrome × LsmAgentBrowser 双浏览器工具总设计(命名映射/选用决策/分阶段路线图);`02-屏蔽页面状态栏与进度栏.md` — 两条告知栏双引擎统一落地(术语定名/内容规格/Chrome 注入 × Lsm 帧合成/埋点);`03-浏览器控制权状态机与视口自适应.md` — 控制权两态(Agent/用户互斥)+ 蒙层/输入闸 + 1080p 视口自适应 + 标签页治理
 - `docs/MCP_Web_Chrome_Use/` — Chrome/CDP 工具知识库(46 篇,含 HITL/反检测/站点治理系列) + `CDP技术方案-Rust操作Chrome浏览器.md`(CDP 完整技术方案) + `reference实现归档/`(历史实现 47 文件)
 - `docs/MCP_Window_Use/` — 桌面窗口操控
 - `docs/MCP_Web_LsmAgentBrowser_Use/` — LsmAgentBrowser 内核、兼容层与阶段路线图
