@@ -58,11 +58,39 @@ fn schema_含五个基础_action() {
 }
 
 #[test]
+fn schema_state同时容纳wait与控制权枚举() {
+    let schema = McpChromeUseTool.parameters();
+    let states = schema["properties"]["params"]["properties"]["state"]["enum"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect::<Vec<_>>();
+    for expected in ["visible", "hidden", "attached", "detached", "agent", "user"] {
+        assert!(states.contains(&expected), "state 缺少 {expected}");
+    }
+    assert_eq!(states.len(), 6, "state 不能因 JSON 重复键只保留最后一组枚举");
+}
+
+#[test]
 fn schema_顶层允许动作参数直传() {
     // 运行时 params_of 兼容顶层直传;Schema 不得再以 additionalProperties=false
     // 拒绝 max_chars/max/text(实测模型自然写法会放顶层)。
     let schema = McpChromeUseTool.parameters();
     assert!(schema.get("additionalProperties").is_none());
+}
+
+#[tokio::test]
+async fn wait_visible不再被参数校验误拒() {
+    let out = McpChromeUseTool
+        .execute(json!({
+            "action":"control", "control_action":"wait", "page_id":"c_deadbeef",
+            "params":{"selector":"li.gl-item", "state":"visible"}
+        }))
+        .await
+        .unwrap();
+    assert!(!out.contains("参数校验失败"), "{out}");
+    assert!(out.contains("c_deadbeef"), "{out}");
 }
 
 #[test]

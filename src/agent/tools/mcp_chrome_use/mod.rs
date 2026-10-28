@@ -482,7 +482,7 @@ hidden/CI 默认一次性;LAEW_CHROME_PROFILE 可指定目录,LAEW_CHROME_PROFIL
                         "max": { "type": "integer", "description": "inspect(elements) 最多返回多少个元素(默认 80,范围 1-200)" },
                         "script": { "type": "string", "description": "eval_js 的 JS 表达式/语句;别名 expression/function/js/code 等效" },
                         "js": { "type": "string", "description": "wait 的就绪判定条件:页面上下文表达式求值为真(如 window.__ready===1)" },
-                        "state": { "type": "string", "enum": ["visible", "hidden", "attached", "detached"], "description": "wait 的元素状态判定(默认 visible);与 selector 同用" },
+                        "state": { "type": "string", "enum": ["visible", "hidden", "attached", "detached", "agent", "user"], "description": "wait 元素状态(visible|hidden|attached|detached);set_control_state 控制权(agent|user),按 control_action 分用" },
                         "y": { "type": "integer", "description": "scroll 像素(正向下)" },
                         "ms": { "type": "integer", "description": "wait 固定等待毫秒(上限 30000);与就绪判定条件同给时先 settle 再等就绪" },
                         "timeout_ms": { "type": "integer", "description": "wait 就绪判定超时(默认 10000,上限 120000);request_human 等待人工的超时(默认按 reason 分档 120s/300s)" },
@@ -490,7 +490,6 @@ hidden/CI 默认一次性;LAEW_CHROME_PROFILE 可指定目录,LAEW_CHROME_PROFIL
                         "message": { "type": "string", "description": "request_human 展示给人工的现场说明(缺省按 reason 自动生成)" },
                         "options": { "type": "array", "items": { "type": "string" }, "description": "request_human 人工可选项(最多 8 项,人工点选其一/多选后回传)" },
                         "multi_select": { "type": "boolean", "description": "request_human 人工可选项是否允许多选(默认 false)" },
-                        "state": { "type": "string", "enum": ["agent", "user"], "description": "set_control_state 的目标控制权状态:agent=Agent 控制状态(蒙层在位,人工点不动);user=用户控制状态(蒙层撤除,控制权交还人工,Agent 的写操作会被 4004 拒绝)" },
                         "note": { "type": "string", "maxLength": 60, "description": "set_control_state 的自定义提示(≤60 字符),显示在页面状态栏" },
                         "full_page": { "type": "boolean", "description": "screenshot 是否取整页(按整页高度裁剪,视口外内容也进图);对齐 Lsm 版同名参数" },
                         "save_path": { "type": "string", "description": "screenshot 落盘路径(.png);给了就只回路径+尺寸,绝不回 base64(防上下文爆炸)" }
