@@ -122,6 +122,41 @@ fn watchdog_父管道eof后回收目标进程与profile() {
 }
 
 #[test]
+fn watchdog_keep_profile回收目标但保留登录目录() {
+    let (_dir, bin) = isolated_laew();
+    let mut target = spawn_target();
+    let target_pid = target.id();
+    let profile = tempfile::tempdir().expect("创建持久 profile 失败");
+    std::fs::write(profile.path().join("Cookies"), b"keep").unwrap();
+
+    let mut watchdog = Command::new(&bin)
+        .arg("__browser-watchdog")
+        .arg(target_pid.to_string())
+        .arg(profile.path())
+        .arg("--keep-profile")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("启动持久 profile watchdog 失败");
+    let stdin = watchdog.stdin.take().unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    drop(stdin);
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = watchdog.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "持久 profile watchdog 未在 20s 内退出");
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    assert!(status.success(), "持久 watchdog 退出失败: {status}");
+    assert!(target.try_wait().unwrap().is_some(), "目标进程必须被回收");
+    assert!(profile.path().join("Cookies").exists(), "--keep-profile 必须保留登录目录");
+}
+
+#[test]
 fn watchdog_目标进程已消失时不悬挂直接清理profile() {
     let (_dir, bin) = isolated_laew();
     let mut target = spawn_target();

@@ -49,7 +49,7 @@ pub async fn run(browser_pid: u32, user_data_dir: &Path, keep_profile: bool) -> 
     }
 
     terminate_process(browser_pid);
-    remove_profile(user_data_dir);
+    cleanup_profile(user_data_dir, keep_profile);
     Ok(())
 }
 
