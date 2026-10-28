@@ -764,9 +764,11 @@ fn blocking_fetch(
         .collect();
     let content_type = crate::agent::browser::net::header_value(&headers, "content-type").unwrap_or_default();
     let declared = resp.content_length().unwrap_or(0) as usize;
-    if declared > MAX_FETCH_BODY {
+    // 动态经典脚本与首屏外链脚本共用同一预算;普通 fetch/XHR 仍保留较小响应上限。
+    let max_body = if is_script_load { super::max_external_bytes() } else { MAX_FETCH_BODY };
+    if declared > max_body {
         record_network(url, &method, status, &content_type, 0, started);
-        return json!({"error": format!("响应体超过上限({} MB)", MAX_FETCH_BODY / 1024 / 1024)});
+        return json!({"error": format!("响应体超过上限({} MB)", max_body / 1024 / 1024)});
     }
     let bytes = match resp.bytes() {
         Ok(b) => b.to_vec(),
@@ -775,8 +777,8 @@ fn blocking_fetch(
             return json!({"error": format!("读取响应失败:{e}")});
         }
     };
-    let truncated = bytes.len() > MAX_FETCH_BODY;
-    let bytes = if truncated { bytes[..MAX_FETCH_BODY].to_vec() } else { bytes };
+    let truncated = bytes.len() > max_body;
+    let bytes = if truncated { bytes[..max_body].to_vec() } else { bytes };
     let body = crate::agent::browser::urlutil::decode_body(&bytes, &content_type);
     // 阶段四第二步：CORS 校验（跨域响应必须有合法 Access-Control-Allow-* 头）。
     // 经典脚本装载不受 CORS 约束(script:true 时跳过)。

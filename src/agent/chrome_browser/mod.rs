@@ -392,9 +392,9 @@ impl ChromeManager {
         let profile = profile::select(self.mode);
         let dir = profile.dir;
         if profile.persistent {
-            std::fs::create_dir_all(&dir).map_err(|e| AgentError::ToolExecution {
+            profile::prepare_persistent(&dir).map_err(|e| AgentError::ToolExecution {
                 tool: "chrome_browser".into(),
-                reason: format!("创建 Chrome 持久 profile 失败({}): {e}", dir.display()),
+                reason: format!("准备 Chrome 持久 profile 失败({}): {e}", dir.display()),
             })?;
         }
         builder = builder.user_data_dir(&dir);

@@ -14,6 +14,29 @@ pub(super) struct ProfileSelection {
     pub persistent: bool,
 }
 
+/// 开启 Chrome 原生会话恢复:无过期时间的 session cookie 只在恢复上次会话时
+/// 跨浏览器重开保留。仅修改 laew 专用 profile,不导出或明文保存 Cookie。
+pub(super) fn prepare_persistent(dir: &Path) -> std::io::Result<()> {
+    let default_dir = dir.join("Default");
+    std::fs::create_dir_all(&default_dir)?;
+    let path = default_dir.join("Preferences");
+    let mut prefs = match std::fs::read_to_string(&path) {
+        Ok(raw) => serde_json::from_str::<serde_json::Value>(&raw)
+            .unwrap_or_else(|_| serde_json::json!({})),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(e),
+    };
+    if !prefs.is_object() {
+        prefs = serde_json::json!({});
+    }
+    prefs["session"]["restore_on_startup"] = serde_json::json!(1);
+    prefs["session"]["exited_cleanly"] = serde_json::json!(true);
+    prefs["profile"]["exit_type"] = serde_json::json!("Normal");
+    let tmp = default_dir.join("Preferences.laew.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&prefs)?)?;
+    std::fs::rename(tmp, path)
+}
+
 pub(super) fn select(mode: ChromeMode) -> ProfileSelection {
     if let Some(dir) = std::env::var_os("LAEW_CHROME_PROFILE")
         .map(PathBuf::from)
@@ -90,5 +113,20 @@ mod tests {
         assert_eq!(a, persistent_dir(Path::new("/tmp/work-a"), home));
         assert!(a.starts_with(home.join(".laew/chrome_profiles")));
         assert!(!a.starts_with("/tmp/work-a"));
+    }
+
+    #[test]
+    fn 持久profile开启原生会话恢复且保留既有偏好() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("Default")).unwrap();
+        std::fs::write(dir.path().join("Default/Preferences"), r#"{"homepage":"https://example.test"}"#).unwrap();
+        prepare_persistent(dir.path()).unwrap();
+        let prefs: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("Default/Preferences")).unwrap(),
+        ).unwrap();
+        assert_eq!(prefs["session"]["restore_on_startup"], 1);
+        assert_eq!(prefs["session"]["exited_cleanly"], true);
+        assert_eq!(prefs["profile"]["exit_type"], "Normal");
+        assert_eq!(prefs["homepage"], "https://example.test");
     }
 }

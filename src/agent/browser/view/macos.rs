@@ -747,12 +747,13 @@ pub fn run(width: u32, height: u32, title: &str) -> i32 {
             true,
         );
         send_void_id(window, sel(b"makeKeyAndOrderFront:\0"), std::ptr::null_mut());
-        // 默认不抢焦点(不 activate),窗口已 orderFront 可见。
-        // LAEW_BROWSER_VIEW_ACTIVATE=1:抢到前台(窗口被别的应用盖住时手动召回)。
-        if std::env::var("LAEW_BROWSER_VIEW_ACTIVATE")
-            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-            .unwrap_or(false)
-        {
+        // headed 是用户「我要看到浏览器」的明确选择:首次启动默认把查看器
+        // 带到前台,避免窗口已创建却被 Chrome/终端遮住而误以为没有启动。
+        // LAEW_BROWSER_VIEW_ACTIVATE=off 可恢复只 orderFront、不抢焦点。
+        let activate = std::env::var("LAEW_BROWSER_VIEW_ACTIVATE")
+            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no"))
+            .unwrap_or(true);
+        if activate {
             send_void_bool(nsapp, sel(b"activateIgnoringOtherApps:\0"), true);
         }
         send_void(nsapp, sel(b"run\0"));

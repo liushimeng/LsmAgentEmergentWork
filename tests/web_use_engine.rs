@@ -174,6 +174,23 @@ fn route(path: &str, with_headers: bool) -> (&'static str, String, Vec<(String, 
                 .to_string(),
             vec![],
         )
+    } else if path == "/js-large-external" {
+        (
+            "200 OK",
+            "<html><head><title>大型外链脚本页</title><script src=\"/large-app.js\"></script></head>\
+             <body><div id=\"app\">大型脚本未执行</div></body></html>"
+                .to_string(),
+            vec![],
+        )
+    } else if path == "/large-app.js" {
+        (
+            "200 OK",
+            format!(
+                "/*{}*/document.getElementById('app').textContent = '大型外链脚本已执行';",
+                "x".repeat(2 * 1024 * 1024 + 4096)
+            ),
+            vec![],
+        )
     } else if path == "/api/data" {
         (
             "200 OK",
@@ -545,6 +562,32 @@ async fn js渲染_外链脚本执行() {
     assert!(
         app["data"]["text"].as_str().unwrap_or("").contains("外链脚本已执行"),
         "外链脚本内容应生效:{app}"
+    );
+
+    exec(&tool, json!({"action": "close", "page_id": page_id})).await;
+}
+
+#[tokio::test]
+async fn js渲染_超过2mib的公共外链脚本仍可执行() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+    let open = exec(
+        &tool,
+        json!({"action": "open", "url": format!("{base}/js-large-external"), "mode": "hidden", "reuse": false}),
+    )
+    .await;
+    assert_eq!(open["code"], 0, "{open}");
+    let page_id = open["data"]["page_id"].as_str().unwrap().to_string();
+    let app = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": page_id, "info": "elements",
+                "params": {"selector": "#app"}}),
+    )
+    .await;
+    assert!(
+        app["data"]["text"].as_str().unwrap_or("").contains("大型外链脚本已执行"),
+        "超过旧 2 MiB 上限的合法公共 bundle 应完整执行:{app}"
     );
 
     exec(&tool, json!({"action": "close", "page_id": page_id})).await;

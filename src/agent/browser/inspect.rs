@@ -273,18 +273,25 @@ pub async fn inspect(
             // 该区域画不出像素。这是**内核边界**而非页面故障,如实说明,免得
             // Agent 对同一片空白反复截图/重试。
             let webgl_gap = tab.webgl_asked > 0;
-            let (diagnosis, hint) = if webgl_gap {
+            let (diagnosis, hint) = if !errors.is_empty() {
+                if blank {
+                    (
+                        "页面脚本执行失败:主内容由 JS 生成,内核脚本运行时未能完成初始化,导致内容节点保持初始隐藏态或未被创建",
+                        "先用 inspect(console) 看具体报错;若目标站点重度依赖 JS 渲染,应改用该站点的非 JS 入口(如静态接口页/服务端渲染页)完成取证",
+                    )
+                } else {
+                    (
+                        "页面已渲染出部分内容,但脚本执行存在错误,动态区域可能尚未完成初始化",
+                        "先用 inspect(console) 与 inspect(network) 定位脚本错误;静态页头/页脚可见不代表动态主内容已就绪",
+                    )
+                }
+            } else if webgl_gap {
                 (
-                    "页面已渲染出 DOM,但站点依赖 WebGL 绘制(地图/三维),该区域无像素",
-                    "内核无 WebGL:底图/三维区域画不出来。需要像素级地图请改用 MCP_Web_Chrome_Use(真 Chromium);本工具仍可读页面 DOM 文本。",
+                    "页面已渲染出 DOM,站点申请过 WebGL 上下文;对应画布区域可能无像素",
+                    "内核无 WebGL:画布/三维区域画不出来。需要这些区域的像素时请改用 MCP_Web_Chrome_Use(真 Chromium);本工具仍可读页面 DOM 文本。",
                 )
             } else if !blank {
                 ("页面已渲染出内容", "")
-            } else if !errors.is_empty() {
-                (
-                    "页面脚本执行失败:主内容由 JS 生成,内核脚本运行时未能完成初始化,导致内容节点保持初始隐藏态或未被创建",
-                    "先用 inspect(console) 看具体报错;若目标站点重度依赖 JS 渲染,应改用该站点的非 JS 入口(如静态接口页/服务端渲染页)完成取证",
-                )
             } else {
                 (
                     "页面内容为空或全部被 display:none 隐藏(内核未渲染出任何可见内容)",
@@ -670,7 +677,9 @@ fn inspect_blockers(tab: &super::TabState, doc: &Document) -> Value {
         ("captcha", &["验证码", "滑块", "人机验证", "captcha", "安全验证"]),
         ("login", &["请登录", "登录后查看", "sign in to continue"]),
         ("rate_limit", &["访问频繁", "访问过于频繁", "too many requests", "rate limit"]),
-        ("risk", &["异常访问", "风控", "risk control"]),
+        // 阻断词必须带访问/拦截语义:招聘、安全资讯等正常页面会出现
+        // 「风控算法」「风控工程师」,不能把业务名词当成站点风控页。
+        ("risk", &["异常访问", "访问异常", "风险拦截", "访问被拦截", "risk control"]),
     ];
     let mut blockers = Vec::new();
     for (kind, needles) in checks {

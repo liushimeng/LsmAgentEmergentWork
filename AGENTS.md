@@ -85,7 +85,8 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 | `LAEW_BROWSER_PATH` | Chrome/Edge 可执行文件路径 | MCP_Web_Chrome_Use 浏览器探测优先路径(缺省按平台默认安装位探测) |
 | `LAEW_WEB_SCRIPT` | `off`/`0`/`false`/`no` | 关闭页面脚本执行与 JS 线程(阶段二);`eval_js` 回退阶段一快照桥。见 `src/agent/browser/script/` |
 | `LAEW_WEB_SCRIPT_BUDGET_MS` | 正整数(默认 `10000`) | 单次页面脚本管线(导航/eval_js/事件分发)墙钟预算。见 `src/agent/browser/script/mod.rs::budget_ms` |
-| `LAEW_WEB_SCRIPT_PIPELINE_MS` | 正整数(默认 `40000`,下限 `2000`) | 整条脚本管线(多轮脚本取回执行)墙钟预算。见 `src/agent/browser/script/mod.rs::pipeline_budget_ms` |
+| `LAEW_WEB_SCRIPT_PIPELINE_MS` | 正整数(默认 `120000`,下限 `2000`) | 整条脚本管线(多轮脚本取回执行)墙钟预算;同一预算也作为整批 RunScripts 的 JS 侧 deadline。重站点(百度地图首屏 60+ 脚本)40s 会被截断,故默认值提高到 120s。见 `src/agent/browser/script/mod.rs` |
+| `LAEW_WEB_MAX_SCRIPT_BYTES` | 正整数(默认 `8388608`,下限 `1024`) | 单个经典外链脚本字节上限;首屏预取与动态 `<script src>` 共用,普通 fetch/XHR 不受此值影响。见 `src/agent/browser/script/mod.rs::max_external_bytes` |
 | `LAEW_WEB_STYLES` | `off`/`0`/`false`/`no` | 关闭外链样式表加载(内联 `<style>` 仍生效)。见 `src/agent/browser/resources.rs` |
 | `LAEW_WEB_MAX_STYLESHEETS` | 正整数(默认 `16`) | 单页外链样式表数量上限 |
 | `LAEW_WEB_MAX_CSS_BYTES` | 正整数(默认 `2097152`) | 单个外链样式表字节上限(总量 4MB) |
@@ -97,7 +98,7 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 | `LAEW_WEB_PREFERS_DARK` | `1`/`true`/`yes`/`on` | `prefers-color-scheme: dark` 求值为真(样式引擎与 `matchMedia` 共用) |
 | `LAEW_WEB_ACCEPT_LANGUAGE` | 任意 `Accept-Language` 值 | 覆盖浏览器请求头合成层的 `Accept-Language`(默认 `zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7`)。见 `src/agent/browser/reqctx.rs` |
 | `LAEW_DOM_TRACE` | `1` | 打印 JS→DOM 动作账本(kind/selector/样本),诊断「页面空白 / JS 建好的 UI 没回写」。见 `src/agent/browser/script/dom_ops.rs` |
-| `LAEW_BROWSER_VIEW_ACTIVATE` | `1`/`true`/`yes`/`on` | 有头浏览器窗口启动时抢到前台(默认只 orderFront 不抢焦点,避免打断 TUI)。见 `src/agent/browser/view/macos.rs` |
+| `LAEW_BROWSER_VIEW_ACTIVATE` | `off`/`0`/`false`/`no` | 关闭有头浏览器启动时前台激活(默认激活并把窗口带到前台,避免被 Chrome/终端遮住;关闭后只 orderFront 不抢焦点)。见 `src/agent/browser/view/macos.rs` |
 | `LAEW_BROWSER_VIEWER_BIN` | 任意可执行文件路径 | 覆盖有头查看器子进程的可执行文件(默认当前进程)。供库进程/自检拉起真正的 `laew __browser-view` 用。见 `src/agent/browser/view/mod.rs` |
 | `LAEW_PAGE_BARS` | `off`/`0`/`false`/`no` | 关闭**屏蔽页面状态栏/进度栏**(两浏览器工具同参;Chrome 注入 JS + Lsm 查看器帧合成)。见 `src/agent/chrome_browser/status.rs`、`src/agent/browser/page_bars.rs`、`docs/双浏览器工具架构/02-屏蔽页面状态栏与进度栏.md` |
 | `LAEW_WEB_CONTROL` | `off`/`0`/`false`/`no` | 关闭**整个浏览器控制权状态机**(两浏览器工具同参):不记控制权、不挂蒙层、不拦 Agent 写操作,回到改造前行为。见 `src/agent/web_control.rs` |
@@ -474,6 +475,9 @@ Markdown Prompt 模板，两级发现：**项目级** `{工作目录}/.laew/comm
   - `23-CSS2D变换与文本阴影与多背景层设计.md` — CSS 2D transform(操作序列 + Affine + 逆映射 + 回补合成)/text-shadow(多层 + 模糊)/多背景层(保序叠画)(已完成)
   - `24-CSS浮动布局与表单控件文本与XHR兼容.md` — CSS float/clear 块级+行内浮动共用行占用带/auto 宽 shrink-to-fit/表单 value 与 placeholder 绘制/XHR 事件对象与响应头(已完成)
   - `25-动态节点几何回填与事件绑定与截图落盘修复.md` — 动态(JS 建出)节点按 `data-lsm-id` 回认宿主布局几何(地图容器自量尺寸的前提)/动态节点 addEventListener 真实注册/screenshot(ocr:true) 不再吞掉落盘/position:fixed 不随滚动/z-index 沿祖先链下传(已完成)
+  - `28-zhipin站点全链路兼容与动态脚本同步装载.md` — zhipin 全链路兼容修复:window `has` 陷阱(on* 事件族)/`element.attributes` NamedNodeMap/`createHTMLDocument`/`createEvent`/`createComment`/`elementFromPoint`/`<a>` URL 反射/`__lsmDecode` 补齐/脚本管线 defer 语义(阻塞组先、defer 组后置)/动态 `<script src>` 线程内同步装载(script 语义免 CORS + data-lsm-executed 防重)/eval·dispatch·管线三处超时不再核爆持久上下文(已完成);渲染引擎优化:`calc()` 全量求值/`vw/vh/vmin/vmax` 视口单位/`box-sizing` 显式 content-box 语义(块级+flex+grid)(已完成)
+  - `29-liepin首页渲染链路四根因修复.md` — width 百分比预解/inline-flex 块级化/svg 固有尺寸/flex 条目 seq 倒序/LAEW_DUMP_DISPLAY 显示列表诊断(已完成)
+  - `30-liepin搜索页脚本启动链与有头窗口可见性修复.md` — 大 bundle 脚本预算/console.assert/NS 属性 API/动态 DOM 同批查询与删除回写/阻断误报与 page_health 诊断/macOS 有头窗口默认前台显示(已完成离线验证;真站任务按停测要求未继续)
 - `docs/Use_MCP/` — 通用 MCP 服务调用
 
 **上下文与会话**：

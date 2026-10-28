@@ -746,6 +746,48 @@ function __lsmDynMatch(el, sel) {
   }
   return false;
 }
+// 同批动态 DOM 查询:宿主快照要等本轮脚本结束才回写,而 React/Vue 的
+// commit/effect 会在同一批里立刻 querySelector 刚挂载的节点。只查快照会让
+// 这些节点短暂「不存在」,后续 getBoundingClientRect 等调用直接 ToObject。
+// 动态表按创建序遍历;已回快照收养的节点排除,避免与静态结果重复。
+function __lsmQueryDyn(sel, rootEl, mountedOnly, rootSnapshotSel) {
+  var out = [];
+  var keys = Object.keys(__lsmDynById || {});
+  for (var i = 0; i < keys.length; i++) {
+    var el = __lsmDynById[keys[i]];
+    if (!el || el === rootEl) continue;
+    if (rootEl) {
+      var scope = el;
+      while (scope && scope !== rootEl) scope = scope.__parentDyn || null;
+      if (scope !== rootEl) continue;
+    }
+    if (rootSnapshotSel) {
+      var top = el;
+      while (top && top.__parentDyn) top = top.__parentDyn;
+      var ps = top && top.__parentStatic;
+      if (!ps || String(ps.sel || "") !== String(rootSnapshotSel)) continue;
+    }
+    if (mountedOnly) {
+      var attached = el;
+      while (attached && attached.__parentDyn) attached = attached.__parentDyn;
+      if (!el.__mounted || !attached || !attached.__mounted || el.__lsm_node) continue;
+    }
+    if (__lsmDynMatch(el, sel)) out.push(el);
+  }
+  return out;
+}
+function __lsmQueryWithDyn(sel, rootIdx) {
+  var out = __lsmQuery(sel, rootIdx);
+  var rootSnapshotSel = null;
+  if (rootIdx != null && rootIdx >= 0 && __lsmNodes[rootIdx]) {
+    rootSnapshotSel = __lsmNodes[rootIdx].sel;
+  }
+  return out.concat(__lsmQueryDyn(sel, null, true, rootSnapshotSel));
+}
+function __lsmQueryOneWithDyn(sel, rootIdx) {
+  var all = __lsmQueryWithDyn(sel, rootIdx);
+  return all.length ? all[0] : null;
+}
 // ---------- element.attributes(NamedNodeMap 近似) ----------
 // 真实浏览器里每个元素都有 attributes 集合;站点库(jQuery support 检测、
 // removeAttr 遍历、表单序列化)直接下标/按名访问它。此前动态节点与快照节点
@@ -870,17 +912,21 @@ function __mk(n) {
       k = String(k);
       return Object.prototype.hasOwnProperty.call(attrs, k) ? attrs[k] : null;
     },
+    getAttributeNS: function (ns, k) { return this.getAttribute(k); },
     hasAttribute: function (k) { return Object.prototype.hasOwnProperty.call(attrs, String(k)); },
+    hasAttributeNS: function (ns, k) { return this.hasAttribute(k); },
     setAttribute: function (k, v) {
       __lsmRec("attributes", el, { attributeName: String(k), attributeOldValue: __lsmAttrOld(attrs, String(k)) });
       __push({ type: "set_attr", selector: n.sel, key: String(k), value: String(v) });
       attrs[String(k)] = String(v);
     },
+    setAttributeNS: function (ns, k, v) { this.setAttribute(k, v); },
     removeAttribute: function (k) {
       __lsmRec("attributes", el, { attributeName: String(k), attributeOldValue: __lsmAttrOld(attrs, String(k)) });
       __push({ type: "remove_attr", selector: n.sel, key: String(k) });
       delete attrs[String(k)];
     },
+    removeAttributeNS: function (ns, k) { this.removeAttribute(k); },
     click: function () {
       var res = __fire(n.sel, "click");
       __push({ type: "click", selector: n.sel });
@@ -903,7 +949,7 @@ function __mk(n) {
     },
     scrollIntoView: function () { __push({ type: "scroll_to", selector: n.sel }); },
     scrollTo: function (x, y) { __push({ type: "scroll", value: String(y || 0) }); },
-    querySelector: function (s) { return __lsmQueryOne(s, __lsmCurrentIdx(n)); },
+    querySelector: function (s) { return __lsmQueryOneWithDyn(s, __lsmCurrentIdx(n)); },
     // matches/closest:事件委托(jQuery `$(document).on('click', sel, fn)`、各框架
     // 委托)依赖 `el.matches()/el.closest()` 从 target 向上匹配委托选择器;
     // 缺失则委托 handler 一跑就抛,面板按钮「点击无反应」(实测百度地图路线按钮)。
@@ -948,10 +994,13 @@ function __mk(n) {
         return out;
       });
     },
-    querySelectorAll: function (s) { return __lsmQuery(s, __lsmCurrentIdx(n)); },
+    querySelectorAll: function (s) { return __lsmQueryWithDyn(s, __lsmCurrentIdx(n)); },
     appendChild: function (c) {
       try { __lsmRegisterScriptLoad(c); } catch (e) {}
-      if (c) dynKids.push(c);
+      if (c) {
+        c.__parentStatic = n;
+        dynKids.push(c);
+      }
       __lsmRec("childList", el, { addedNodes: c ? [c] : [] });
       if (c && c.__detached) {
         __push({ type: "append_html", selector: n.sel, value: __serEl(c) });
@@ -964,6 +1013,7 @@ function __mk(n) {
     insertBefore: function (c, ref) {
       try { __lsmRegisterScriptLoad(c); } catch (e) {}
       if (c) {
+        c.__parentStatic = n;
         var at = dynKids.indexOf(ref);
         if (at >= 0) dynKids.splice(at, 0, c); else dynKids.push(c);
       }
@@ -1282,12 +1332,16 @@ function __newEl(tag) {
       __lsmRec("attributes", el, { attributeName: String(k), attributeOldValue: __lsmAttrOld(this.__attrs, String(k)) });
       this.__attrs[String(k)] = String(v); if (k === "id") this.id = String(v); if (k === "class") this.className = String(v);
     },
+    setAttributeNS: function (ns, k, v) { this.setAttribute(k, v); },
     getAttribute: function (k) { return Object.prototype.hasOwnProperty.call(this.__attrs, String(k)) ? this.__attrs[String(k)] : null; },
+    getAttributeNS: function (ns, k) { return this.getAttribute(k); },
     hasAttribute: function (k) { return Object.prototype.hasOwnProperty.call(this.__attrs, String(k)); },
+    hasAttributeNS: function (ns, k) { return this.hasAttribute(k); },
     removeAttribute: function (k) {
       __lsmRec("attributes", el, { attributeName: String(k), attributeOldValue: __lsmAttrOld(this.__attrs, String(k)) });
       delete this.__attrs[String(k)];
     },
+    removeAttributeNS: function (ns, k) { this.removeAttribute(k); },
     appendChild: function (c) {
       this.__kids.push(c);
       if (c && c.__tag) c.__parentDyn = el;
@@ -1355,6 +1409,15 @@ function __newEl(tag) {
         var i = p.__kids.indexOf(el);
         if (i >= 0) p.__kids.splice(i, 1);
       }
+      // 脱离文档的子树不得再进入 document 查询;重新 append 时
+      // __lsmPushDynChild 会重新挂回父链并恢复 mounted 标记。
+      if (el.__mounted) {
+        var key = __lsmDynKey(el);
+        if (key) __push({ type: "remove_node", selector: '[data-lsm-id="' + key + '"]' });
+      }
+      el.__mounted = false;
+      el.__parentDyn = null;
+      el.__parentStatic = null;
       __lsmRec("childList", p || el, { removedNodes: [el] });
     },
     // 动态节点也要能绑事件:站点「建模板 → cloneNode → 挂载」出来的控件
@@ -1388,8 +1451,8 @@ function __newEl(tag) {
       }
       return d;
     },
-    querySelector: function () { return null; },
-    querySelectorAll: function () { return []; },
+    querySelector: function (s) { return __lsmQueryDyn(s, el, false, null); },
+    querySelectorAll: function (s) { return __lsmQueryDyn(s, el, false, null); },
     getBoundingClientRect: function () { return __lsmDynRect(el); }
   };
   function def(name, getter, setter) {
@@ -1771,9 +1834,9 @@ var document = {
   location: null,
   characterSet: "UTF-8",
   contentType: "text/html",
-  querySelector: __lsmQueryOne,
-  querySelectorAll: __lsmQuery,
-  getElementById: function (id) { return __lsmQueryOne("#" + id); },
+  querySelector: __lsmQueryOneWithDyn,
+  querySelectorAll: __lsmQueryWithDyn,
+  getElementById: function (id) { return __lsmQueryOneWithDyn("#" + id); },
   getElementsByTagName: function (t) {
     var tag = String(t);
     // 活集合(见 __lsmLive)。
@@ -2089,6 +2152,14 @@ var console = {
   error: function () { __clog("error", Array.prototype.map.call(arguments, function (x) { return __str(x); }).join(" ")); },
   debug: function () { __clog("debug", Array.prototype.map.call(arguments, function (x) { return __str(x); }).join(" ")); },
   trace: function () { __clog("trace", Array.prototype.map.call(arguments, function (x) { return __str(x); }).join(" ")); },
+  // console.assert 只记录失败、绝不抛错;站点初始化里的 UUID/配置自检
+  // 若因方法缺失抛 TypeError,会让整个 React 挂载链静默中断。
+  assert: function (condition) {
+    if (!condition) {
+      var detail = Array.prototype.slice.call(arguments, 1).map(function (x) { return __str(x); }).join(" ");
+      __clog("error", "Assertion failed" + (detail ? ": " + detail : ""));
+    }
+  },
   dir: function () {},
   table: function () {},
   time: function () {},

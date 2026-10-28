@@ -30,6 +30,85 @@ async fn 打开_data_页面并读取标题与正文() {
 }
 
 #[tokio::test]
+async fn 正常业务风控词不误报为页面阻断() {
+    let mgr = LsmBrowserManager::new();
+    let url = html_doc("<h1>人工智能</h1><a>风控算法</a><p>风控工程师</p>");
+    let out = mgr
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .await
+        .unwrap();
+    let v = inspect::inspect(&mgr, &out.page_id, "blockers", &serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(v["blocked"], false, "正常职位分类不应触发人工介入:{v}");
+    assert_eq!(v["blockers"].as_array().map(Vec::len), Some(0), "{v}");
+    mgr.shutdown().await;
+}
+
+#[tokio::test]
+async fn 明确异常访问仍报告页面阻断() {
+    let mgr = LsmBrowserManager::new();
+    let url = html_doc("<h1>检测到异常访问,请完成核验</h1>");
+    let out = mgr
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .await
+        .unwrap();
+    let v = inspect::inspect(&mgr, &out.page_id, "blockers", &serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(v["blocked"], true, "明确异常访问仍应阻断:{v}");
+    assert_eq!(v["blockers"][0]["kind"], "risk", "{v}");
+    mgr.shutdown().await;
+}
+
+#[tokio::test]
+async fn 页面健康诊断不被webgl申请遮蔽脚本错误() {
+    let mgr = LsmBrowserManager::new();
+    let url = html_doc("<h1>静态页头</h1>");
+    let out = mgr
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .await
+        .unwrap();
+    {
+        let mut inner = mgr.inner.lock().await;
+        let tab = inner.tabs.get_mut(&out.page_id).unwrap();
+        tab.webgl_asked = 1;
+        tab.console.push(ConsoleRecord {
+            level: "error".to_string(),
+            text: "公共脚本加载失败".to_string(),
+            at_ms: now_ms(),
+        });
+    }
+    let v = inspect::inspect(&mgr, &out.page_id, "page_health", &serde_json::json!({}))
+        .await
+        .unwrap();
+    assert!(v["diagnosis"].as_str().unwrap_or("").contains("脚本执行存在错误"), "{v}");
+    assert_eq!(v["console_errors"], 1, "{v}");
+    mgr.shutdown().await;
+}
+
+#[tokio::test]
+async fn 复用页面返回既有有头模式而非硬编码无头() {
+    let mgr = LsmBrowserManager::new();
+    let url = html_doc("<h1>P</h1>");
+    let first = mgr
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .await
+        .unwrap();
+    {
+        let mut inner = mgr.inner.lock().await;
+        inner.tabs.get_mut(&first.page_id).unwrap().mode = BrowserMode::Headed;
+    }
+    let reused = mgr
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .await
+        .unwrap();
+    assert!(reused.reused, "第二走同 URL 复用分支:{reused:?}");
+    assert_eq!(reused.mode, "headed", "复用结果必须反映既有页面真实模式");
+    mgr.shutdown().await;
+}
+
+#[tokio::test]
 async fn 点击链接导航到新页面() {
     let mgr = LsmBrowserManager::new();
     let next = html_doc("<h2>Next</h2>");

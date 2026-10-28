@@ -282,8 +282,18 @@ fn pipeline_budget_ms() -> u64 {
         .filter(|v| *v >= 2_000)
         .unwrap_or(PIPELINE_BUDGET_MS)
 }
-const MAX_EXTERNAL_BYTES: usize = 2 * 1024 * 1024;
+const DEFAULT_MAX_EXTERNAL_BYTES: usize = 8 * 1024 * 1024;
 const SCRIPT_FETCH_TIMEOUT_MS: u64 = 15_000;
+
+/// 单个经典脚本的字节预算。现代站点的公共 bundle 常超过 2 MiB,
+/// 截断后装载器不会报错重试,而是让整棵应用初始化链静默中断。
+pub(crate) fn max_external_bytes() -> usize {
+    std::env::var("LAEW_WEB_MAX_SCRIPT_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v >= 1024)
+        .unwrap_or(DEFAULT_MAX_EXTERNAL_BYTES)
+}
 
 /// 页面加载脚本管线:收集(内联+外链预取)→ 线程执行 → 动作应用 → 回写 HTML。
 ///
@@ -425,7 +435,7 @@ pub(crate) async fn run_pipeline(
             if super::cache_enabled() {
                 if let Some(entry) = inner.http_cache.get(url) {
                     let text = super::urlutil::decode_body(&entry.bytes, &super::net::header_value(&entry.headers, "content-type").unwrap_or_default());
-                    if text.len() <= MAX_EXTERNAL_BYTES && !text.trim().is_empty() {
+                    if text.len() <= max_external_bytes() && !text.trim().is_empty() {
                         out.network.push(super::NetworkRecord {
                             url: url.clone(),
                             method: "GET".to_string(),
@@ -447,7 +457,7 @@ pub(crate) async fn run_pipeline(
                 }
             }
             let mut req = super::net::FetchRequest::get(url, SCRIPT_FETCH_TIMEOUT_MS);
-            req.max_bytes = MAX_EXTERNAL_BYTES;
+            req.max_bytes = max_external_bytes();
             // 外链脚本:浏览器语义带 Referer + Sec-Fetch-*(script) 指纹头。
             // 缺 Referer 会被站点风控(百度 heicha/acs 等)判为异常请求。
             req.context = Some(super::reqctx::RequestContext::subresource(
@@ -458,7 +468,7 @@ pub(crate) async fn run_pipeline(
             match http.fetch(req, &mut inner.cookies).await {
                 Ok(resp) => {
                     let text = resp.text();
-                    if text.len() <= MAX_EXTERNAL_BYTES && !text.trim().is_empty() {
+                    if text.len() <= max_external_bytes() && !text.trim().is_empty() {
                         out.network.push(super::NetworkRecord {
                             url: url.clone(),
                             method: "GET".to_string(),

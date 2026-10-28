@@ -515,7 +515,7 @@ impl LsmBrowserManager {
                     .await
                 {
                     Ok(nav) => {
-                        let (window_id, vw, vh, webgl_asked) = inner
+                        let (window_id, vw, vh, webgl_asked, tab_mode) = inner
                             .tabs
                             .get(&pid)
                             .map(|t| {
@@ -524,15 +524,16 @@ impl LsmBrowserManager {
                                     t.viewport.width,
                                     t.viewport.height,
                                     t.webgl_asked,
+                                    t.mode,
                                 )
                             })
-                            .unwrap_or_default();
+                            .unwrap_or((String::new(), 0, 0, 0, mode));
                         return Ok(OpenOutcome {
                             page_id: pid,
                             title: nav.title,
                             final_url: nav.url,
                             request_url: nav.requested_url,
-                            mode: BrowserMode::Hidden.as_str().to_string(),
+                            mode: tab_mode.as_str().to_string(),
                             mode_hint: mode_hint(mode),
                             reused: true,
                             status: nav.status,

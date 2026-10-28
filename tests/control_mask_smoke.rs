@@ -218,7 +218,7 @@ async fn 真机_持久profile重启后保留站点存储() {
     let first_id = first["data"]["page_id"].as_str().unwrap();
     let written = McpChromeUseTool.execute(json!({
         "action":"control", "page_id":first_id, "control_action":"eval_js",
-        "params":{"script":"localStorage.setItem('laew-profile-smoke','kept'); true"}
+        "params":{"script":"localStorage.setItem('laew-profile-smoke','kept'); document.cookie='laew_session=kept; path=/; SameSite=Lax'; true"}
     })).await.unwrap();
     assert_eq!(parse(&written)["code"], 0);
     lsm_agent::agent::chrome_browser::ChromeManager::global().close_all().await;
@@ -230,6 +230,11 @@ async fn 真机_持久profile重启后保留站点存储() {
         "params":{"script":"localStorage.getItem('laew-profile-smoke')"}
     })).await.unwrap());
     assert_eq!(read["data"]["result"], "kept", "{read}");
+    let cookie = parse(&McpChromeUseTool.execute(json!({
+        "action":"control", "page_id":second_id, "control_action":"eval_js",
+        "params":{"script":"document.cookie"}
+    })).await.unwrap());
+    assert!(cookie["data"]["result"].as_str().unwrap_or("").contains("laew_session=kept"), "session cookie 应跨正常重开保留: {cookie}");
     lsm_agent::agent::chrome_browser::ChromeManager::global().close_all().await;
     assert!(dir.path().exists(), "持久 profile 不应被 watchdog/shutdown 删除");
     std::env::remove_var("LAEW_CHROME_PROFILE");

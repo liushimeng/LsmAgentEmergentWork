@@ -267,6 +267,33 @@ fn 控制台_error对象_保留名称消息和堆栈() {
 }
 
 #[test]
+fn 控制台_assert_失败只记录且不阻断初始化() {
+    let handle = JsHandle::spawn();
+    let reply = run_scripts(
+        &handle,
+        vec![r#"
+        console.assert(true, 'not an error');
+        console.assert(false, '配置检查失败');
+        document.getElementById('app').textContent = '初始化完成';
+        "#],
+        PAGE,
+        "https://a.test/",
+    );
+    assert!(reply.outcome.ok, "console.assert 不得抛错:{:?}", reply.outcome.error);
+    assert!(reply
+        .outcome
+        .actions
+        .iter()
+        .any(|a| a.kind == "set_text" && a.value.contains("初始化完成")));
+    assert!(reply
+        .outcome
+        .logs
+        .iter()
+        .any(|l| l.level == "error" && l.text.contains("配置检查失败")));
+    handle.shutdown();
+}
+
+#[test]
 fn domcontentload_listener_被派发() {
     let handle = JsHandle::spawn();
     let reply = run_scripts(
@@ -610,6 +637,51 @@ fn 动态节点挂载后再追加子节点_回写宿主dom() {
         "动态节点挂载后的追加必须回写宿主 DOM:{:?}",
         reply.outcome.actions
     );
+    handle.shutdown();
+}
+
+#[test]
+fn 动态节点同批可查且回快照后不重复() {
+    let handle = JsHandle::spawn();
+    let first = run_scripts(
+        &handle,
+        vec![r#"
+            var root = document.createElement('div');
+            root.id = 'dyn-root';
+            var child = document.createElement('span');
+            child.id = 'dyn-child';
+            root.appendChild(child);
+            document.getElementById('app').appendChild(root);
+            child.remove();
+            window.__removedCount = document.querySelectorAll('#dyn-child').length;
+            root.appendChild(child);
+            window.__counts = {
+                doc: document.querySelectorAll('#dyn-child').length,
+                root: root.querySelectorAll('#dyn-child').length,
+                scoped: document.getElementById('app').querySelectorAll('#dyn-child').length,
+                rect: document.querySelector('#dyn-child').getBoundingClientRect().width
+            };
+        "#],
+        PAGE,
+        "https://a.test/",
+    );
+    assert!(first.outcome.ok, "同批动态查询不得抛错:{:?}", first.outcome.error);
+    let doc = Document::parse(PAGE, "https://a.test/");
+    dom_ops::apply(&doc, &first.outcome.actions, "https://a.test/");
+    let html = doc.serialize_full();
+    let second = eval_on(
+        &handle,
+        "JSON.stringify({before:window.__counts,removed:window.__removedCount,after:document.querySelectorAll('#dyn-child').length})",
+        &html,
+        "https://a.test/",
+    );
+    let v = second.outcome.value;
+    assert!(v.contains("\"doc\":1"), "document 同批应查到动态子节点:{v}");
+    assert!(v.contains("\"root\":1"), "动态父节点应能查自己的子树:{v}");
+    assert!(v.contains("\"scoped\":1"), "静态父节点应能查新挂载的动态子树:{v}");
+    assert!(v.contains("\"rect\":0"), "未回布局前几何应为 0 而不是节点缺失:{v}");
+    assert!(v.contains("\"removed\":0"), "remove 后不得再出现在 document 查询:{v}");
+    assert!(v.contains("\"after\":1"), "快照收养后同一节点不得返回两次:{v}");
     handle.shutdown();
 }
 
@@ -1064,6 +1136,13 @@ fn 标准全局_NodeFilter_与_createElementNS_可用() {
         try {
             var e = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
             out.svg = String(e && e.tagName).toLowerCase();
+            e.setAttributeNS('http://www.w3.org/1999/xlink', 'xlink:href', '#icon');
+            out.nsGet = e.getAttributeNS('http://www.w3.org/1999/xlink', 'xlink:href');
+            out.nsHas = e.hasAttributeNS('http://www.w3.org/1999/xlink', 'xlink:href');
+            e.removeAttributeNS('http://www.w3.org/1999/xlink', 'xlink:href');
+            out.nsRemoved = e.getAttribute('xlink:href') === null;
+            document.body.setAttributeNS(null, 'data-ns', 'static-ok');
+            out.staticNs = document.body.getAttributeNS(null, 'data-ns');
         } catch (e2) { out.svg = 'THROW:' + String(e2); }
         return JSON.stringify(out);
         "#,
@@ -1077,6 +1156,10 @@ fn 标准全局_NodeFilter_与_createElementNS_可用() {
     assert!(v.contains("\"nodeIterator\":\"function\""), "{v}");
     assert!(v.contains("\"createNS\":\"function\""), "{v}");
     assert!(v.contains("\"svg\":\"svg\""), "{v}");
+    assert!(v.contains("\"nsGet\":\"#icon\""), "{v}");
+    assert!(v.contains("\"nsHas\":true"), "{v}");
+    assert!(v.contains("\"nsRemoved\":true"), "{v}");
+    assert!(v.contains("\"staticNs\":\"static-ok\""), "{v}");
     h.shutdown();
 }
 
