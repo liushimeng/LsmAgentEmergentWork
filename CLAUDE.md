@@ -81,6 +81,8 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 | `LAEW_TARGET_ANCHOR_BLOCK` | `off`/`0`/`false`/`no` | 仅关闭 L3 工具级阻断，保留 L1/L2/L4（观察模式） |
 | `LAEW_BROWSER_MODE` | `headed`/`hidden`/`new_headless` | LsmAgentBrowser 内核模式。`headed` = 进程内无头内核 + 独立查看器子进程(`laew __browser-view`)原生窗口显示渲染帧,查看器不可用自动回退纯无头。**未设置时默认按交互性判定**:stdin/stdout 均为 TTY 默认 `headed`(终端用户可直接看到浏览器窗口),否则 `hidden`(管道/cargo test/CI 零影响)。见 `src/agent/browser/mod.rs`、`src/agent/browser/view/` |
 | `LAEW_CHROME_MODE` | `headed`/`hidden` | MCP_Web_Chrome_Use 的 Chrome 启动形态。`headed` = 有头窗口(人工可介入);未设置时同按交互性自动判定。见 `src/agent/chrome_browser/mod.rs` |
+| `LAEW_CHROME_PROFILE` | 任意目录 | 显式指定持久专用 Chrome user-data-dir(不触碰日常默认 profile)。见 `src/agent/chrome_browser/profile.rs` |
+| `LAEW_CHROME_PROFILE_MODE` | `persistent`/`ephemeral` | 持久/一次性 profile 策略；headed 默认 persistent(按工作目录隔离、保留登录态)，hidden/CI 默认 ephemeral。会话 Cookie 退出时经 CDP 写入 Chrome 加密存储，watchdog 保留持久目录 |
 | `LAEW_CHROME_USE` | `off`/`0`/`false`/`no` | 关闭 MCP_Web_Chrome_Use 工具(回退单内核行为)。见 `src/agent/tools/mcp_chrome_use/mod.rs` |
 | `LAEW_BROWSER_PATH` | Chrome/Edge 可执行文件路径 | MCP_Web_Chrome_Use 浏览器探测优先路径(缺省按平台默认安装位探测) |
 | `LAEW_WEB_SCRIPT` | `off`/`0`/`false`/`no` | 关闭页面脚本执行与 JS 线程(阶段二);`eval_js` 回退阶段一快照桥。见 `src/agent/browser/script/` |
