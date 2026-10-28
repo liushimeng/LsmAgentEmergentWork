@@ -110,6 +110,45 @@ async fn inspect_html(
     })
 }
 
+/// inspect(page_state):与 Lsm 同名观察项对齐,读取页面全局状态与 JSON-LD。
+async fn inspect_page_state(
+    page: &chromiumoxide::Page,
+    params: &Value,
+) -> std::result::Result<Value, (i32, String)> {
+    let max_bytes = i64_arg(params, "max_bytes").unwrap_or(20_000).clamp(1, 200_000);
+    let script = r#"(() => {
+        const jsonld = [];
+        document.querySelectorAll('script[type="application/ld+json"]').forEach(el => {
+            try { jsonld.push(JSON.parse(el.textContent || '')); } catch (e) {}
+        });
+        return {
+            found: jsonld.length > 0,
+            globals: {
+                url: location.href,
+                title: document.title,
+                ready_state: document.readyState,
+                visibility_state: document.visibilityState,
+            },
+            window_globals: {
+                inner_width: window.innerWidth,
+                inner_height: window.innerHeight,
+                scroll_x: window.scrollX,
+                scroll_y: window.scrollY,
+            },
+            jsonld: jsonld,
+            dropped_paths: [],
+            truncated: false,
+            hostname: location.hostname,
+            hint: 'Chrome 实时 DOM/JSON-LD;window 全局量为当前页面真实值',
+        };
+    })()"#;
+    let mut value = chrome_browser::eval_js(page, script)
+        .await
+        .map_err(|e| (CODE_EXEC_FAILED, e.to_string()))?;
+    value["max_bytes"] = json!(max_bytes);
+    Ok(value)
+}
+
 /// inspect(elements):列出可见可交互元素,支持 `params.selector` 限定作用域、
 /// `params.text` 文本过滤、`params.max` 数量上限(默认 80,夹在 [1,200])。
 async fn inspect_elements(
@@ -394,7 +433,7 @@ impl Tool for McpChromeUseTool {
         "浏览器网页操控工具(Chrome/CDP,真 Chromium 渲染,双浏览器架构中默认优先使用)。\
 支持 headed 有头窗口(人工可直接看到并介入页面)与 hidden 无头模式(LAEW_CHROME_MODE)。\
 action=open 打开页面拿 page_id;list 列出页面;control 执行写操作(navigate/click/click_text/type|input_text/\
-key_press/eval_js/screenshot/scroll/wait/back/forward/reload);inspect 观测页面(url/title/text/html/elements/screenshot);\
+key_press/eval_js/screenshot/scroll/wait/back/forward/reload);inspect 观测页面(url/title/text/html/elements/screenshot/page_state);\
 close 释放页面(page_id=all 全关并回收 Chrome 进程)。\
 ★ **找不到选择器时先 inspect(info=\"elements\", params.text=\"路线\")**:列出可见可交互元素\
 (每项含可直接回传的 selector/tag/id/class/placeholder/text),再 click/type;不要盲猜 CSS。\
@@ -464,7 +503,7 @@ hidden/CI 默认一次性;LAEW_CHROME_PROFILE 可指定目录,LAEW_CHROME_PROFIL
                 },
                 "info": {
                     "type": "string",
-                    "enum": ["url", "title", "text", "html", "elements", "screenshot"]
+                    "enum": ["url", "title", "text", "html", "elements", "screenshot", "page_state"]
                 },
                 "params": {
                     "type": "object",
@@ -1202,6 +1241,7 @@ async fn run_inspect(args: Value) -> Result<String> {
         "text" => inspect_text(&page, params_of(&args)).await,
         "html" => inspect_html(&page, params_of(&args)).await,
         "elements" => inspect_elements(&page, params_of(&args)).await,
+        "page_state" => inspect_page_state(&page, params_of(&args)).await,
         // screenshot:与 control(screenshot) 同参(full_page / save_path)。
         "screenshot" => with_bars_suspended(&page, async {
             let ip = params_of(&args);

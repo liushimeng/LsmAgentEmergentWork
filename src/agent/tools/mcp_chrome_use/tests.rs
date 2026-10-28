@@ -55,6 +55,7 @@ fn schema_含五个基础_action() {
         .map(|v| v.as_str().unwrap())
         .collect::<Vec<_>>();
     assert!(i_enums.contains(&"elements"));
+    assert!(i_enums.contains(&"page_state"));
 }
 
 #[test]
@@ -87,6 +88,16 @@ async fn wait_visible不再被参数校验误拒() {
             "action":"control", "control_action":"wait", "page_id":"c_deadbeef",
             "params":{"selector":"li.gl-item", "state":"visible"}
         }))
+        .await
+        .unwrap();
+    assert!(!out.contains("参数校验失败"), "{out}");
+    assert!(out.contains("c_deadbeef"), "{out}");
+}
+
+#[tokio::test]
+async fn inspect_page_state不再被参数校验误拒() {
+    let out = McpChromeUseTool
+        .execute(json!({"action":"inspect", "info":"page_state", "page_id":"c_deadbeef"}))
         .await
         .unwrap();
     assert!(!out.contains("参数校验失败"), "{out}");

@@ -172,6 +172,12 @@ async fn 真机_click_text_scope根元素自身可命中() {
         "params":{"script":"1+1"}
     })).await.unwrap());
     assert_eq!(alive["data"]["result"], 2, "导航守卫后同一 page_id 必须仍可用: {alive}");
+    let state = parse(&McpChromeUseTool.execute(json!({
+        "action":"inspect", "page_id":page_id, "info":"page_state"
+    })).await.unwrap());
+    assert_eq!(state["code"], 0, "{state}");
+    assert_eq!(state["data"]["result"]["globals"]["ready_state"], "complete", "{state}");
+    assert!(state["data"]["result"]["jsonld"].is_array(), "{state}");
 
     let closed = McpChromeUseTool
         .execute(json!({"action": "close", "page_id": page_id}))
