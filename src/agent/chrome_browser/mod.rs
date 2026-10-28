@@ -23,6 +23,7 @@ use chromiumoxide::Page;
 use crate::error::{AgentError, Result};
 
 mod page;
+mod profile;
 #[cfg(test)]
 mod tests;
 /// 控制权蒙层(Agent 控制状态 ⇄ 用户控制状态),见 docs/双浏览器工具架构/03。
@@ -178,8 +179,10 @@ struct BrowserHolder {
     browser: Arc<chromiumoxide::Browser>,
     /// CDP handler 任务(浏览器关闭即退出)。
     _task: tokio::task::JoinHandle<()>,
-    /// 一次性 user-data-dir(进程退出时清理)。
+    /// user-data-dir(一次性目录退出清理;持久专用目录保留登录态)。
     user_data_dir: PathBuf,
+    /// 持久专用 profile 只回收 Chrome 进程,不删除目录。
+    keep_profile: bool,
     /// Chrome 主进程 pid(等待真正退出后再删 profile;helper 仍存活时会重建目录)。
     browser_pid: Option<u32>,
     /// 进程外 watchdog(主进程被强杀时负责回收 Chrome;正常收口时自行退出)。
@@ -187,29 +190,37 @@ struct BrowserHolder {
 }
 
 impl BrowserHolder {
-    fn shutdown(&mut self) {
-        // `Child::kill` 是异步的;回收路径在同步上下文,
-        // 用内层 tokio Child 的 `start_kill()` 发起即返回的 kill(不等待回收完成)。
-        // shutdown 时 holder 被唯一持有,Arc 可安全取 &mut。
-        if let Some(browser) = Arc::get_mut(&mut self.browser) {
-            if let Some(child) = browser.get_mut_child() {
-                if let Err(e) = child.as_mut_inner().start_kill() {
-                    tracing::warn!(error = %e, "Chrome 子进程回收失败(进程退出时 OS 会兜底回收)");
+    async fn shutdown(&mut self) {
+        // 持久 profile 必须先让 Chrome 正常退出,使 Cookie/localStorage 落盘;
+        // 旧路径直接 start_kill 会把刚完成的扫码登录留在内存里。超时再强杀兜底。
+        if self.keep_profile {
+            if let Some(browser) = Arc::get_mut(&mut self.browser) {
+                let _ = tokio::time::timeout(Duration::from_secs(5), browser.close()).await;
+                let _ = tokio::time::timeout(Duration::from_secs(5), browser.wait()).await;
+            }
+        }
+        if self.browser_pid.is_some_and(watchdog::process_alive) {
+            if let Some(browser) = Arc::get_mut(&mut self.browser) {
+                if let Some(child) = browser.get_mut_child() {
+                    if let Err(e) = child.as_mut_inner().start_kill() {
+                        tracing::warn!(error = %e, "Chrome 子进程回收失败(进程退出时 OS 会兜底回收)");
+                    }
                 }
             }
         }
-        // Chrome 退出是异步的:start_kill 只发起、不等待。helper/renderer 在
-        // 主进程死后仍可能短暂写 profile,先删会被重建(实测残留 8K Default 目录)。
-        // 先等主进程消失,再走带重试 + 静默窗确认的 remove_profile。
+        // Chrome 退出是异步的:helper/renderer 在主进程死后仍可能短暂写 profile,
+        // 先等主进程消失,再按策略清理一次性目录。
         if let Some(pid) = self.browser_pid {
             for _ in 0..50 {
                 if !watchdog::process_alive(pid) {
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(100));
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
-        watchdog::remove_profile(&self.user_data_dir);
+        if !self.keep_profile {
+            watchdog::remove_profile(&self.user_data_dir);
+        }
         // watchdog 观察 Chrome 退出即自行返回;这里只做一次非阻塞回收。
         if let Some(mut wd) = self.watchdog.take() {
             let _ = wd.try_wait();
@@ -269,6 +280,8 @@ struct PageEntry {
 pub struct PageInfo {
     pub page_id: String,
     pub url: String,
+    /// Chrome document.visibilityState == visible(该窗口当前激活 Tab)。
+    pub active: bool,
     /// 打开者(无 = 上下文外打开的无主页)。
     pub owner: Option<PageOwner>,
 }
@@ -278,6 +291,8 @@ pub struct ChromeManager {
     holder: Mutex<Option<BrowserHolder>>,
     pages: Mutex<HashMap<String, PageEntry>>,
     seq: AtomicU64,
+    /// 前台激活 + 控制动作的跨 Tab 锁:真实输入不会落到后台/错误 Tab。
+    activation: tokio::sync::Mutex<()>,
     mode: ChromeMode,
 }
 
@@ -287,6 +302,7 @@ impl ChromeManager {
             holder: Mutex::new(None),
             pages: Mutex::new(HashMap::new()),
             seq: AtomicU64::new(0),
+            activation: tokio::sync::Mutex::new(()),
             mode: ChromeMode::from_env_or_default(),
         }
     }
@@ -299,6 +315,14 @@ impl ChromeManager {
 
     pub fn mode(&self) -> ChromeMode {
         self.mode
+    }
+
+    pub fn persistent_profile(&self) -> bool {
+        self.holder
+            .lock()
+            .ok()
+            .and_then(|h| h.as_ref().map(|v| v.keep_profile))
+            .unwrap_or(false)
     }
 
     /// 取当前调用者的所有权标签(不在 Agent 任务树内 = None,无主页)。
@@ -363,13 +387,16 @@ impl ChromeManager {
                 has_touch: false,
             })
         };
-        // 一次性 user-data-dir:避免默认固定目录的 SingletonLock 冲突(并行/残留锁),
-        // 同时与用户日常 profile 隔离(历史实现同策略)。
-        let dir = std::env::temp_dir().join(format!("laew_chrome_{}", {
-            let mut b = [0u8; 4];
-            rand::Rng::fill(&mut rand::thread_rng(), &mut b);
-            b.iter().map(|x| format!("{x:02x}")).collect::<String>()
-        }));
+        // 有头交互任务默认使用按工作目录隔离的持久专用 profile:进程退出仍回收
+        // Chrome,但重开不丢扫码登录态。hidden/CI 默认一次性;均不触碰日常默认 profile。
+        let profile = profile::select(self.mode);
+        let dir = profile.dir;
+        if profile.persistent {
+            std::fs::create_dir_all(&dir).map_err(|e| AgentError::ToolExecution {
+                tool: "chrome_browser".into(),
+                reason: format!("创建 Chrome 持久 profile 失败({}): {e}", dir.display()),
+            })?;
+        }
         builder = builder.user_data_dir(&dir);
 
         let config = builder
@@ -400,7 +427,7 @@ impl ChromeManager {
         // 进程外 watchdog:主进程被 SIGKILL/强杀时,watchdog 依据 stdin pipe EOF
         // 回收 Chrome 主进程与一次性 profile(实测孤儿 Chrome 占用 100MB+/个)。
         let browser_pid = browser.get_mut_child().and_then(|c| c.as_mut_inner().id());
-        let watchdog = browser_pid.and_then(|pid| watchdog::spawn_watchdog(pid, &dir));
+        let watchdog = browser_pid.and_then(|pid| watchdog::spawn_watchdog(pid, &dir, profile.persistent));
         if watchdog.is_none() {
             tracing::warn!(
                 browser_pid,
@@ -411,6 +438,7 @@ impl ChromeManager {
             browser: Arc::new(browser),
             _task: task,
             user_data_dir: dir,
+            keep_profile: profile.persistent,
             browser_pid,
             watchdog,
         });
@@ -440,6 +468,36 @@ impl ChromeManager {
             .lock()
             .ok()
             .and_then(|pages| pages.get(page_id).map(|e| e.page.clone()))
+    }
+
+    /// 串行化一次「激活目标 Tab → 控制动作」窗口,调用方持有 guard 到动作收口。
+    /// 多 Agent 可各自操作不同 page_id,但真实焦点动作不会互相抢 Tab。
+    pub async fn activate_for_action(
+        &self,
+        page_id: &str,
+    ) -> Result<tokio::sync::MutexGuard<'_, ()>> {
+        let guard = self.activation.lock().await;
+        let page = self.get_page(page_id).ok_or_else(|| AgentError::ToolExecution {
+            tool: "chrome_browser".into(),
+            reason: format!("激活 Tab 失败:页面 {page_id} 不存在"),
+        })?;
+        tokio::time::timeout(Duration::from_secs(10), page.bring_to_front())
+            .await
+            .map_err(|_| AgentError::ToolExecution {
+                tool: "chrome_browser".into(),
+                reason: format!("激活 Tab {page_id} 超时(10s)"),
+            })?
+            .map_err(|e| AgentError::ToolExecution {
+                tool: "chrome_browser".into(),
+                reason: format!("激活 Tab {page_id} 失败: {e}"),
+            })?;
+        Ok(guard)
+    }
+
+    /// 仅激活目标页,不在人工等待期间占用跨 Agent 动作锁。
+    pub async fn bring_page_to_front(&self, page_id: &str) -> Result<()> {
+        let _guard = self.activate_for_action(page_id).await?;
+        Ok(())
     }
 
     /// 取页面所有权标签(不存在/无主页返回 None)。
@@ -568,9 +626,11 @@ impl ChromeManager {
         for (id, page, owner) in pages {
             if page::page_alive(&page).await {
                 let (url, _) = page::url_and_title(&page).await;
+                let active = page::page_visible(&page).await;
                 out.push(PageInfo {
                     page_id: id,
                     url,
+                    active,
                     owner,
                 });
             } else {
@@ -596,7 +656,7 @@ impl ChromeManager {
     /// 转移给当前调用者;拥有者仍活跃(并行兄弟在用)→ 不复用(避免互踩导航)。
     async fn adopt_orphan(&self, url: &str) -> Option<(String, String, String)> {
         for info in self.list_pages_detailed().await {
-            if info.url != url {
+            if !same_page_url(&info.url, url) {
                 continue;
             }
             let reuse = match &info.owner {
@@ -691,15 +751,29 @@ impl ChromeManager {
     }
 
     /// 关闭全部页面并回收 Chrome 子进程(`close(page_id="all")` 与进程退出路径调用)。
-    pub fn close_all(&self) {
+    pub async fn close_all(&self) {
         if let Ok(mut pages) = self.pages.lock() {
             pages.clear();
         }
-        if let Ok(mut holder) = self.holder.lock() {
-            if let Some(mut h) = holder.take() {
-                h.shutdown();
-            }
+        let holder = self
+            .holder
+            .lock()
+            .ok()
+            .and_then(|mut holder| holder.take());
+        if let Some(mut h) = holder {
+            h.shutdown().await;
         }
+    }
+}
+
+/// URL 规范化比较:浏览器会把裸域首页写成带 `/` 的绝对 URL,二者是同一页。
+fn same_page_url(current: &str, requested: &str) -> bool {
+    if current == requested {
+        return true;
+    }
+    match (url::Url::parse(current), url::Url::parse(requested)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
     }
 }
 

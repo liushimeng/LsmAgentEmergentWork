@@ -991,6 +991,13 @@ pub(super) fn build_subflow_input(
         }
         // 未声明强制工具时不注入任何工具专属批量范式,避免把选用决策写死。
     }
+    // 用户原文的显式顺序约束必须传到执行单元;不能只靠上游摘要或规划文档自觉保留。
+    if crate::agent::task_prerequisites::requires_login_first(
+        wf.original_prompt.as_deref().unwrap_or(""),
+    ) {
+        description.push_str("\n\n");
+        description.push_str(crate::agent::task_prerequisites::LOGIN_FIRST_CONSTRAINT);
+    }
     // 第 181 轮(2026-10-27 京东实测):任务级浏览器工具约束传导。
     // 实测任务原文「分别使用 Chrome 浏览器,打开京东」不含 mandated_tool 认定的
     // 「只使用/必须使用」句式,执行单元完全不知道任务指定了 Chrome——wf-2 与
@@ -1224,6 +1231,27 @@ mod browser_mandate_tests {
         assert_eq!(browser_mandate("分别用 Chrome 与 LsmAgentBrowser 对比渲染"), None);
         assert_eq!(browser_mandate("打开京东收集价格"), None);
         assert_eq!(browser_mandate(""), None);
+    }
+
+    #[test]
+    fn 显式登录前置传入执行单元() {
+        let wf = WorkFlowSpec {
+            id: "wf-2".into(),
+            name: "采集商品".into(),
+            steps: vec!["搜索显卡".into()],
+            branches: vec![],
+            loops: vec![],
+            depends_on: vec!["wf-1".into()],
+            acceptance: vec!["记录价格".into()],
+            delegate_to: AgentRole::SubAgent,
+            max_iterations: None,
+            original_prompt: Some("使用 Chrome 打开京东,必须先登录,需要人工介入;登录后搜索商品".into()),
+            pre_explore: false,
+        };
+        let input = build_subflow_input(&wf, &Default::default(), "");
+        assert!(input.description.contains("用户显式登录前置"));
+        assert!(input.description.contains("request_human"));
+        assert!(input.description.contains("不得搜索、遍历、访问评论/API"));
     }
 }
 

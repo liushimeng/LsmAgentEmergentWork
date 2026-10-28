@@ -57,6 +57,7 @@ pub mod session_fork;
 pub mod subagent_workflow;
 pub mod subagent;
 pub mod system_prompt;
+pub mod task_prerequisites;
 pub mod tool_exec;
 pub mod tool_schema_validator;
 pub mod tools;

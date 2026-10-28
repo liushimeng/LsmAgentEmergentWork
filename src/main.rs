@@ -171,8 +171,11 @@ enum Cmd {
     BrowserWatchdog {
         /// Chrome 主进程 pid。
         browser_pid: u32,
-        /// 一次性 user-data-dir 路径。
+        /// user-data-dir 路径。
         user_data_dir: std::path::PathBuf,
+        /// 只回收 Chrome 进程,保留持久专用登录环境。
+        #[arg(long, default_value_t = false)]
+        keep_profile: bool,
     },
 }
 
@@ -725,7 +728,7 @@ async fn run_one_shot(
             // (os error 232;CrashReport/crash_report_20261016_123408_737423.md)。
             lsm_agent::shutdown::terminal_restore_sync();
             lsm_agent::agent::browser::BrowserManager::global().shutdown().await;
-            lsm_agent::agent::chrome_browser::ChromeManager::global().close_all();
+            lsm_agent::agent::chrome_browser::ChromeManager::global().close_all().await;
             lsm_agent::agent::human_assist::HumanAssistHub::global().cancel_pending();
             // 第 186 轮:区分两种取消来源 —— Ctrl-C(用户中断)与 HITL 弹窗里人工
             // 点「取消任务」。后者是**有人明确喊停**,报「用户中断」会把责任与
@@ -754,7 +757,7 @@ async fn run_one_shot(
     let _ = stage_printer.await;
     // 第 78 轮:任务正常完成后,清理浏览器子进程(避免长驻会话浏览器泄漏)。
     lsm_agent::agent::browser::BrowserManager::global().shutdown().await;
-    lsm_agent::agent::chrome_browser::ChromeManager::global().close_all();
+    lsm_agent::agent::chrome_browser::ChromeManager::global().close_all().await;
 
     // debug 模式:任务结束后生成 Debug 报告(用未装饰的 llm 驱动 Debug Agent,避免自我采集递归)
     if let Some(collector) = collector {
@@ -1118,9 +1121,10 @@ async fn main() -> Result<()> {
     if let Some(Cmd::BrowserWatchdog {
         browser_pid,
         user_data_dir,
+        keep_profile,
     }) = &cli.cmd
     {
-        lsm_agent::agent::chrome_browser::watchdog::run(*browser_pid, user_data_dir)
+        lsm_agent::agent::chrome_browser::watchdog::run(*browser_pid, user_data_dir, *keep_profile)
             .await
             .map_err(|e| anyhow::anyhow!("watchdog 运行失败: {e}"))?;
         std::process::exit(0);

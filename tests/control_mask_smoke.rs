@@ -136,3 +136,101 @@ async fn 真机_控制权两态与蒙层() {
     let list2 = McpChromeUseTool.execute(json!({"action": "list"})).await.unwrap();
     println!("close 后 list = {}", parse(&list2));
 }
+
+#[tokio::test]
+#[ignore = "需真机 Chrome(本地 --ignored 跑)"]
+async fn 真机_click_text_scope根元素自身可命中() {
+    let out = McpChromeUseTool
+        .execute(json!({"action": "open", "url": "about:blank"}))
+        .await
+        .unwrap();
+    let page_id = parse(&out)["data"]["page_id"].as_str().unwrap().to_string();
+    let injected = McpChromeUseTool.execute(json!({
+        "action": "control", "page_id": page_id, "control_action": "eval_js",
+        "params": {"script": "document.body.innerHTML='<div id=\"scope\"><span id=\"target\" style=\"display:block;width:200px;height:40px;cursor:pointer\">AMD 锐龙 7 9700X</span></div>'; true"}
+    })).await.unwrap();
+    assert_eq!(parse(&injected)["code"], 0);
+
+    // selector 直指文字节点本身;回归旧实现只搜 root 后代导致 text_not_found。
+    let clicked = McpChromeUseTool.execute(json!({
+        "action": "control", "page_id": page_id, "control_action": "click_text",
+        "params": {"selector": "#target", "text": "AMD 锐龙 7 9700X", "exact": true, "mode": "real"}
+    })).await.unwrap();
+    let value = parse(&clicked);
+    assert_eq!(value["code"], 0, "{value}");
+    assert_eq!(value["data"]["result"]["hit"], true, "{value}");
+    assert_eq!(value["data"]["result"]["matched_text"], "AMD 锐龙 7 9700X", "{value}");
+
+    let closed = McpChromeUseTool
+        .execute(json!({"action": "close", "page_id": page_id}))
+        .await.unwrap();
+    assert_eq!(parse(&closed)["code"], 0);
+}
+
+#[tokio::test]
+#[ignore = "需真机 Chrome(本地 --ignored 跑)"]
+async fn 真机_控制动作自动激活目标_tab() {
+    let first = parse(&McpChromeUseTool.execute(json!({"action":"open","url":"about:blank#first"})).await.unwrap());
+    let first_id = first["data"]["page_id"].as_str().unwrap().to_string();
+    let second = parse(&McpChromeUseTool.execute(json!({"action":"open","url":"about:blank#second"})).await.unwrap());
+    let second_id = second["data"]["page_id"].as_str().unwrap().to_string();
+
+    let acted = parse(&McpChromeUseTool.execute(json!({
+        "action":"control", "page_id":first_id, "control_action":"eval_js",
+        "params":{"script":"document.title='first-active'; true"}
+    })).await.unwrap());
+    assert_eq!(acted["data"]["tab_activated"], true, "{acted}");
+    let list = parse(&McpChromeUseTool.execute(json!({"action":"list"})).await.unwrap());
+    let pages = list["data"]["pages"].as_array().unwrap();
+    let first_state = pages.iter().find(|p| p["page_id"] == first_id).unwrap();
+    let second_state = pages.iter().find(|p| p["page_id"] == second_id).unwrap();
+    assert_eq!(first_state["active"], true, "{list}");
+    assert_eq!(second_state["active"], false, "{list}");
+
+    for id in [first_id, second_id] {
+        let closed = McpChromeUseTool.execute(json!({"action":"close","page_id":id})).await.unwrap();
+        assert_eq!(parse(&closed)["code"], 0);
+    }
+}
+
+#[tokio::test]
+#[ignore = "需真机 Chrome(本地 --ignored 跑)"]
+async fn 真机_持久profile重启后保留站点存储() {
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("LAEW_CHROME_PROFILE", dir.path());
+    // localStorage 需要普通 HTTP origin;about:blank 的 opaque origin 会抛 SecurityError。
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else { continue };
+            tokio::spawn(async move {
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 39\r\nConnection: close\r\n\r\n<html><body>profile smoke</body></html>").await;
+            });
+        }
+    });
+    let url = format!("http://{addr}/");
+    let first = parse(&McpChromeUseTool.execute(json!({"action":"open","url":url})).await.unwrap());
+    assert_eq!(first["data"]["profile_persistent"], true, "{first}");
+    let first_id = first["data"]["page_id"].as_str().unwrap();
+    let written = McpChromeUseTool.execute(json!({
+        "action":"control", "page_id":first_id, "control_action":"eval_js",
+        "params":{"script":"localStorage.setItem('laew-profile-smoke','kept'); true"}
+    })).await.unwrap();
+    assert_eq!(parse(&written)["code"], 0);
+    lsm_agent::agent::chrome_browser::ChromeManager::global().close_all().await;
+
+    let second = parse(&McpChromeUseTool.execute(json!({"action":"open","url":url})).await.unwrap());
+    let second_id = second["data"]["page_id"].as_str().unwrap();
+    let read = parse(&McpChromeUseTool.execute(json!({
+        "action":"control", "page_id":second_id, "control_action":"eval_js",
+        "params":{"script":"localStorage.getItem('laew-profile-smoke')"}
+    })).await.unwrap());
+    assert_eq!(read["data"]["result"], "kept", "{read}");
+    lsm_agent::agent::chrome_browser::ChromeManager::global().close_all().await;
+    assert!(dir.path().exists(), "持久 profile 不应被 watchdog/shutdown 删除");
+    std::env::remove_var("LAEW_CHROME_PROFILE");
+}

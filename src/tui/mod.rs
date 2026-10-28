@@ -698,7 +698,7 @@ pub async fn run_with_debug(debug: bool, launch: TuiLaunch) -> Result<()> {
     // 显式收口与 `-p` 单轮模式(main.rs 的同名调用)对齐,三平台行为一致。
     crate::agent::browser::BrowserManager::global().shutdown().await;
     // 双浏览器工具架构:同步回收 Chrome 子进程(start_kill 发起即返回)。
-    crate::agent::chrome_browser::ChromeManager::global().close_all();
+    crate::agent::chrome_browser::ChromeManager::global().close_all().await;
     Ok(())
 }
 

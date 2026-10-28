@@ -428,7 +428,11 @@ params.note 可写一句给人工看的提示;用户控制状态下 Agent 的写
 page_id 仅本工具内有效,不跨工具复用。\
 当目标站点对 Chrome 风控(反复验证码/页面抹除/访问被拒)时,改用 MCP_Web_LsmAgentBrowser_Use。\
 ★ 标签页治理:同一任务内**尽量复用同一个 page_id**(换 URL 用 control(navigate),别每次都 open);\
-open 同 URL 会自动复用无主页面;list 会一并列出本工具未管理的外部标签页(人工自己开的);\
+open 同 URL 会自动复用无主页面(裸域与带 / 首页等价);list 回每页 active/visibility 与外部标签页;\
+所有 control 先自动激活目标 Tab,并以跨 Tab 动作锁防止多 Agent 的真实输入/蒙层切换互相抢焦点;\
+多 Agent 可各持 page_id 分工,只读 inspect 可并行,控制动作按目标页逐个安全执行。\
+有头模式默认使用按工作目录隔离的持久专用 profile,重开 laew 保留登录态(open 回 profile_persistent);\
+hidden/CI 默认一次性;LAEW_CHROME_PROFILE 可指定目录,LAEW_CHROME_PROFILE_MODE=ephemeral 可禁用持久。\
 用完的页面及时 close(page_id=具体 id),close(all) 会连带回收整个 Chrome 进程。\
 返回统一信封 {code,message,data};6001=任务锚点越界,3001=未检测到浏览器。"
     }
@@ -582,6 +586,8 @@ async fn run_open(args: Value) -> Result<String> {
                     "title": title,
                     "engine": "chrome",
                     "mode": if mgr.mode().is_headed() { "headed" } else { "hidden" },
+                    "profile_persistent": mgr.persistent_profile(),
+                    "login_reuse_hint": if mgr.persistent_profile() { "专用持久 profile:下次启动保留登录态,无需重复扫码" } else { "一次性 profile:进程退出后登录态不保留" },
                     "control_state": state.as_str(),
                     "control_state_label": state.label(),
                     "tool_hint": "page_id 仅 MCP_Web_Chrome_Use 内有效;另一浏览器工具的 page_id 不跨工具复用",
@@ -629,6 +635,8 @@ async fn run_list() -> Result<String> {
     let mut data = json!({ "pages": pages.iter().map(|info| json!({
         "page_id": info.page_id,
         "url": info.url,
+        "active": info.active,
+        "visibility": if info.active { "visible" } else { "hidden" },
         // 第 181 轮:所有权视图——owner_alive=true 的页面属于仍在运行的
         // (可能是并行的)单元,不要 close / 导航它。
         "owner": info.owner.as_ref().map(|o| json!({
@@ -694,7 +702,7 @@ async fn run_close(args: Value) -> Result<String> {
     if page_id == "all" {
         // 先取存活页清单(close_all 会清空注册表),逐页清掉控制权记录。
         let live: Vec<String> = mgr.list_pages().await.into_iter().map(|(pid, _)| pid).collect();
-        mgr.close_all();
+        mgr.close_all().await;
         for pid in live {
             web_control::clear(Engine::Chrome, &pid);
         }
@@ -778,6 +786,10 @@ async fn run_control(args: Value) -> Result<String> {
         };
         if !page_id.is_empty() {
             if let Ok(pg) = McpChromeUseTool::page_of(&page_id) {
+                let mgr = McpChromeUseTool::mgr();
+                if let Err(e) = mgr.bring_page_to_front(&page_id).await {
+                    return envelope(CODE_PAGE_NOT_FOUND, &e.to_string(), json!({"page_id": page_id}));
+                }
                 chrome_browser::control_mask::apply_state(&pg, ControlState::User).await;
             }
         }
@@ -828,6 +840,19 @@ async fn run_control(args: Value) -> Result<String> {
         Err(e) => {
             return envelope(
                 CODE_PAGE_NOT_FOUND,
+                &e.to_string(),
+                json!({"page_id": page_id, "control_action": control_action}),
+            )
+        }
+    };
+    // 所有控制动作先激活目标 Tab,并持有跨 Tab 锁到动作收口。多 Agent 仍可
+    // 并行执行各自的 LLM/只读观察,真实页面写操作不会落在后台或兄弟 Tab。
+    let mgr = McpChromeUseTool::mgr();
+    let _tab_guard = match mgr.activate_for_action(&page_id).await {
+        Ok(guard) => guard,
+        Err(e) => {
+            return envelope(
+                CODE_EXEC_FAILED,
                 &e.to_string(),
                 json!({"page_id": page_id, "control_action": control_action}),
             )
@@ -1141,7 +1166,7 @@ async fn run_control(args: Value) -> Result<String> {
     };
 
     match result {
-        Ok(data) => envelope(0, "ok", json!({"page_id": page_id, "page_id_auto": page_auto, "control_action": control_action, "control_state": web_control::state_of(Engine::Chrome, &page_id).as_str(), "result": data})),
+        Ok(data) => envelope(0, "ok", json!({"page_id": page_id, "page_id_auto": page_auto, "control_action": control_action, "tab_activated": true, "control_state": web_control::state_of(Engine::Chrome, &page_id).as_str(), "result": data})),
         Err((_, msg)) if evict_if_dead(&page_id, &msg) => envelope(
             CODE_PAGE_NOT_FOUND,
             &dead_page_message(&page_id, &msg),

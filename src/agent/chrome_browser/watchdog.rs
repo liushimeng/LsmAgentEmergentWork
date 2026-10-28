@@ -16,13 +16,14 @@ use std::time::Duration;
 pub const WATCHDOG_COMMAND: &str = "__browser-watchdog";
 
 /// 运行 watchdog,直到主进程 pipe EOF 或 Chrome 主进程退出。
-pub async fn run(browser_pid: u32, user_data_dir: &Path) -> anyhow::Result<()> {
+/// `keep_profile=true` 时只回收进程,保留专用持久登录环境。
+pub async fn run(browser_pid: u32, user_data_dir: &Path, keep_profile: bool) -> anyhow::Result<()> {
     use tokio::io::AsyncReadExt;
     // 目标进程已不在:直接收尾。**不要**进入 select —— `tokio::io::stdin()`
     // 会派发阻塞读线程,若 stdin 长期不关闭(测试 harness 的管道就是如此),
     // 后续 Runtime drop 会等待该阻塞任务,表现为看门狗测试永久挂起。
     if !process_alive(browser_pid) {
-        remove_profile(user_data_dir);
+        cleanup_profile(user_data_dir, keep_profile);
         return Ok(());
     }
     let mut stdin = tokio::io::stdin();
@@ -40,7 +41,7 @@ pub async fn run(browser_pid: u32, user_data_dir: &Path) -> anyhow::Result<()> {
                 // 此时主进程可能已先完成 shutdown,轮不到 EOF 分支;profile 必须
                 // 在这里清理,否则 temp 下残留 laew_chrome_*(实测 2 个)。
                 if !process_alive(browser_pid) {
-                    remove_profile(user_data_dir);
+                    cleanup_profile(user_data_dir, keep_profile);
                     return Ok(());
                 }
             }
@@ -118,6 +119,12 @@ pub fn terminate_process(pid: u32) {
     }
 }
 
+fn cleanup_profile(dir: &Path, keep: bool) {
+    if !keep {
+        remove_profile(dir);
+    }
+}
+
 /// 删除一次性浏览器 profile 目录(带重试,覆盖 Chrome 退出延迟持有的锁)。
 pub fn remove_profile(dir: &Path) {
     // Chrome 主进程退出后,helper/renderer 仍可能短暂持有 profile 内文件句柄;
@@ -145,7 +152,11 @@ pub fn remove_profile(dir: &Path) {
 ///
 /// `LAEW_BROWSER_WATCHDOG_EXE` 可覆盖 watchdog 可执行文件路径(集成测试场景下
 /// 当前可执行文件是 test harness,不认识隐藏子命令)。
-pub fn spawn_watchdog(browser_pid: u32, user_data_dir: &Path) -> Option<std::process::Child> {
+pub fn spawn_watchdog(
+    browser_pid: u32,
+    user_data_dir: &Path,
+    keep_profile: bool,
+) -> Option<std::process::Child> {
     let exe = std::env::var_os("LAEW_BROWSER_WATCHDOG_EXE")
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::current_exe().ok())?;
@@ -154,6 +165,7 @@ pub fn spawn_watchdog(browser_pid: u32, user_data_dir: &Path) -> Option<std::pro
         .arg(WATCHDOG_COMMAND)
         .arg(browser_pid.to_string())
         .arg(user_data_dir)
+        .arg(if keep_profile { "--keep-profile" } else { "--remove-profile" })
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -185,7 +197,7 @@ mod tests {
     #[tokio::test]
     async fn run_目标已消失时立即返回() {
         let dir = tempfile::tempdir().unwrap();
-        run(0, dir.path()).await.unwrap();
+        run(0, dir.path(), false).await.unwrap();
     }
 
     #[test]
@@ -196,5 +208,15 @@ mod tests {
         remove_profile(&sub);
         assert!(!sub.exists());
         remove_profile(&sub);
+    }
+
+    #[tokio::test]
+    async fn run_持久profile只回收进程不删目录() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("persistent");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(profile.join("Cookies"), b"keep").unwrap();
+        run(0, &profile, true).await.unwrap();
+        assert!(profile.join("Cookies").exists());
     }
 }

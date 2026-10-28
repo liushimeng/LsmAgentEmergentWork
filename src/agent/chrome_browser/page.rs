@@ -29,8 +29,23 @@ pub async fn navigate(page: &Page, url: &str) -> Result<()> {
     tokio::time::timeout(Duration::from_secs(NAV_BOUND_SECS), page.goto(url))
         .await
         .map_err(|_| timeout_err(&format!("page.goto({url})"), NAV_BOUND_SECS))?
-        .map_err(|e| err(&format!("page.goto({url})"), e))?;
+        .map_err(|e| navigate_err(url, &e))?;
     Ok(())
+}
+
+/// 给不可直接判因的导航错误附上恢复路径;不自动重试,也不改变失败语义。
+fn navigate_err(url: &str, e: &chromiumoxide::error::CdpError) -> AgentError {
+    let message = e.to_string();
+    let hint = navigation_recovery_hint(&message);
+    err(&format!("page.goto({url})"), format_args!("{message}{hint}"))
+}
+
+fn navigation_recovery_hint(message: &str) -> &'static str {
+    if message.contains("net::ERR_INVALID_RESPONSE") {
+        "。恢复建议:先 inspect 当前页确认登录/阻断状态;若目标是 JSON/API,保留站点页面并用 eval_js 执行 fetch(url,{credentials:'include'}),不要反复做顶层导航"
+    } else {
+        ""
+    }
 }
 
 /// 读取当前 URL 与标题(探测类,拿不到按空串处理)。
@@ -190,7 +205,10 @@ pub async fn click_text(
                 try {{ var r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; }}
                 catch (e) {{ return false; }}
             }}
-            var all = root.querySelectorAll('*');
+            // scope 命中的根元素本身也是候选:商品标题/按钮常把 selector 直接
+            // 指到文字节点,旧版只查后代会返回 text_not_found,随后同一 selector
+            // 用 click 却能成功(京东搜索页实测)。
+            var all = [root].concat(Array.from(root.querySelectorAll('*')));
             var best = null, bestScore = -1, bestLen = 1e9, bestText = '';
             for (var i = 0; i < all.length; i++) {{
                 var el = all[i];
@@ -270,6 +288,20 @@ pub async fn click_text(
     let v = eval_js(page, &js).await?;
     let raw = v.as_str().unwrap_or("{}");
     Ok(serde_json::from_str(raw).unwrap_or_else(|_| serde_json::json!({"hit": false, "raw": raw})))
+}
+
+/// 当前页面是否为其窗口的激活 Tab(后台 Tab / 最小化窗口均为 false)。
+pub async fn page_visible(page: &Page) -> bool {
+    tokio::time::timeout(
+        Duration::from_secs(CDP_BOUND_SECS),
+        page.evaluate("document.visibilityState"),
+    )
+    .await
+    .ok()
+    .and_then(|r| r.ok())
+    .and_then(|v| v.value()?.as_str().map(str::to_string))
+    .as_deref()
+        == Some("visible")
 }
 
 /// 页面存活探测:`receiver is gone`(target 被销毁/崩溃)时立即失败。
@@ -907,5 +939,13 @@ mod tests {
         assert!(js.contains(&encoded));
         // 绝不允许把未转义的选择器直接拼进 JS 串字面量。
         assert!(!js.contains("document.querySelector(input"));
+    }
+
+    #[test]
+    fn 无效响应导航错误给出登录与API恢复路径() {
+        let hint = navigation_recovery_hint("page.goto 失败: net::ERR_INVALID_RESPONSE");
+        assert!(hint.contains("确认登录/阻断状态"));
+        assert!(hint.contains("credentials:'include'"));
+        assert!(navigation_recovery_hint("net::ERR_TIMED_OUT").is_empty());
     }
 }

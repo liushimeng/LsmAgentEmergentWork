@@ -35,6 +35,13 @@ fn 反检测与证书参数在基础集中() {
 }
 
 #[test]
+fn 首页URL尾斜杠差异仍判定同页() {
+    assert!(same_page_url("https://www.jd.com/", "https://www.jd.com"));
+    assert!(same_page_url("https://www.jd.com", "https://www.jd.com/"));
+    assert!(!same_page_url("https://www.jd.com/search", "https://www.jd.com"));
+}
+
+#[test]
 fn page_id_形如_c_加八位十六进制() {
     let mgr = ChromeManager::new();
     let id = mgr.next_page_id();
