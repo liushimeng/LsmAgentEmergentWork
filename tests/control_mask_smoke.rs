@@ -190,7 +190,7 @@ async fn 真机_click_text_scope根元素自身可命中() {
 async fn 真机_控制动作自动激活目标_tab() {
     let first = parse(&McpChromeUseTool.execute(json!({"action":"open","url":"about:blank#first"})).await.unwrap());
     let first_id = first["data"]["page_id"].as_str().unwrap().to_string();
-    let second = parse(&McpChromeUseTool.execute(json!({"action":"open","url":"about:blank#second"})).await.unwrap());
+    let second = parse(&McpChromeUseTool.execute(json!({"action":"control","control_action":"new_tab","params":{"url":"about:blank#second"}})).await.unwrap());
     let second_id = second["data"]["page_id"].as_str().unwrap().to_string();
 
     let acted = parse(&McpChromeUseTool.execute(json!({
@@ -206,6 +206,21 @@ async fn 真机_控制动作自动激活目标_tab() {
     assert_eq!(second_state["active"], false, "{list}");
 
     for id in [first_id, second_id] {
+        let closed = McpChromeUseTool.execute(json!({"action":"close","page_id":id})).await.unwrap();
+        assert_eq!(parse(&closed)["code"], 0);
+    }
+}
+
+#[tokio::test]
+#[ignore = "需真机 Chrome(本地 --ignored 跑)"]
+async fn 真机_new_window创建独立受管页面() {
+    let first = parse(&McpChromeUseTool.execute(json!({"action":"control","control_action":"new_tab","params":{"url":"about:blank#first"}})).await.unwrap());
+    let second = parse(&McpChromeUseTool.execute(json!({"action":"control","control_action":"new_window","params":{"url":"about:blank#second"}})).await.unwrap());
+    assert_eq!(first["code"], 0, "{first}");
+    assert_eq!(second["code"], 0, "{second}");
+    assert_eq!(second["data"]["new_window"], true, "{second}");
+    assert_ne!(first["data"]["page_id"], second["data"]["page_id"]);
+    for id in [first["data"]["page_id"].as_str().unwrap(), second["data"]["page_id"].as_str().unwrap()] {
         let closed = McpChromeUseTool.execute(json!({"action":"close","page_id":id})).await.unwrap();
         assert_eq!(parse(&closed)["code"], 0);
     }

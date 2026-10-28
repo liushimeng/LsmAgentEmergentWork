@@ -467,7 +467,8 @@ params.note 可写一句给人工看的提示;用户控制状态下 Agent 的写
 ★ page_id 可省略:当前只有一个存活页时自动选中(信封回 page_id_auto=true);多页时须指定。\
 page_id 仅本工具内有效,不跨工具复用。\
 当目标站点对 Chrome 风控(反复验证码/页面抹除/访问被拒)时,改用 MCP_Web_LsmAgentBrowser_Use。\
-★ 标签页治理:同一任务内**尽量复用同一个 page_id**(换 URL 用 control(navigate),别每次都 open);\
+★ 标签页治理:control(new_tab|new_window, params.url=...) 可显式开受管新页(不需要 page_id),new_window 仅 headed;\
+同一任务内**尽量复用同一个 page_id**(换 URL 用 control(navigate),别每次都 open);\
 open 同 URL 会自动复用无主页面(裸域与带 / 首页等价);list 回每页 active/visibility 与外部标签页;\
 所有 control 先自动激活目标 Tab,并以跨 Tab 动作锁防止多 Agent 的真实输入/蒙层切换互相抢焦点;\
 多 Agent 可各持 page_id 分工,只读 inspect 可并行,控制动作按目标页逐个安全执行。\
@@ -494,7 +495,7 @@ hidden/CI 默认一次性;LAEW_CHROME_PROFILE 可指定目录,LAEW_CHROME_PROFIL
                 "control_action": {
                     "type": "string",
                     "enum": [
-                        "navigate", "click", "click_text", "type", "input_text",
+                        "navigate", "new_tab", "new_window", "click", "click_text", "type", "input_text",
                         "key_press", "eval_js", "screenshot", "scroll", "wait",
                         "back", "forward", "reload", "request_human",
                         "click_real", "hover", "double_click", "right_click",
@@ -575,6 +576,10 @@ hidden/CI 默认一次性;LAEW_CHROME_PROFILE 可指定目录,LAEW_CHROME_PROFIL
 // ===================== open / list / close =====================
 
 async fn run_open(args: Value) -> Result<String> {
+    run_open_inner(args, false, false).await
+}
+
+async fn run_open_inner(args: Value, new_tab: bool, new_window: bool) -> Result<String> {
     let Some(url) = str_arg(&args, "url").map(str::to_string) else {
         return envelope(CODE_PARAM_ERROR, "open 缺少 url", json!({}));
     };
@@ -582,7 +587,12 @@ async fn run_open(args: Value) -> Result<String> {
         return blocked;
     }
     let mgr = McpChromeUseTool::mgr();
-    match mgr.open(&url).await {
+    let opened = if new_tab || new_window {
+        mgr.open_new_page(&url, new_window).await
+    } else {
+        mgr.open(&url).await
+    };
+    match opened {
         Ok((page_id, final_url, title)) => {
             // 控制权:新开的页默认「Agent 控制状态」(蒙层在位 + 输入闸拦截)。
             // 同一 URL 复用既有页时沿用该页既有状态,不覆盖人工正在使用的状态。
@@ -625,6 +635,8 @@ async fn run_open(args: Value) -> Result<String> {
                     "title": title,
                     "engine": "chrome",
                     "mode": if mgr.mode().is_headed() { "headed" } else { "hidden" },
+                    "new_tab": new_tab,
+                    "new_window": new_window,
                     "profile_persistent": mgr.persistent_profile(),
                     "login_reuse_hint": if mgr.persistent_profile() { "专用持久 profile:下次启动保留登录态,无需重复扫码" } else { "一次性 profile:进程退出后登录态不保留" },
                     "control_state": state.as_str(),
@@ -861,6 +873,14 @@ async fn run_control(args: Value) -> Result<String> {
             );
         }
         return envelope(code, &message, data);
+    }
+    // 显式新 Tab / 新窗口:不依赖现有 page_id,复用 open 的注册/蒙层/台账闭环。
+    if control_action == "new_tab" || control_action == "new_window" {
+        let mut open_args = args.clone();
+        if open_args.get("url").is_none() {
+            open_args["url"] = p["url"].clone();
+        }
+        return run_open_inner(open_args, control_action == "new_tab", control_action == "new_window").await;
     }
     // 页面句柄:顶层 / params 双位置取值;缺失时唯一存活页自动选中(2026-10-26 实测
     // 漏传 page_id 曾白费一整轮 LLM 往返)。

@@ -616,12 +616,40 @@ impl ChromeManager {
         }))
     }
 
+    /// 显式新建 Tab / 独立窗口(跳过同 URL 收养),供多 Agent 分工持有不同 page_id。
+    pub async fn open_new_page(&self, url: &str, new_window: bool) -> Result<(String, String, String)> {
+        if new_window && !self.mode.is_headed() {
+            return Err(AgentError::ToolExecution {
+                tool: "chrome_browser".into(),
+                reason: "new_window 仅 headed 模式可用;hidden/CI 请用 new_tab".into(),
+            });
+        }
+        let browser = self.ensure_browser().await?;
+        let mut params = chromiumoxide::cdp::browser_protocol::target::CreateTargetParams::new(url);
+        params.new_window = Some(new_window);
+        self.open_with_params(&browser, params, url).await
+    }
+
     async fn open_once(
         &self,
         browser: &Arc<chromiumoxide::Browser>,
         url: &str,
     ) -> Result<(String, String, String)> {
-        let page = tokio::time::timeout(Duration::from_secs(20), browser.new_page(url))
+        self.open_with_params(
+            browser,
+            chromiumoxide::cdp::browser_protocol::target::CreateTargetParams::new(url),
+            url,
+        )
+        .await
+    }
+
+    async fn open_with_params(
+        &self,
+        browser: &Arc<chromiumoxide::Browser>,
+        params: chromiumoxide::cdp::browser_protocol::target::CreateTargetParams,
+        url: &str,
+    ) -> Result<(String, String, String)> {
+        let page = tokio::time::timeout(Duration::from_secs(20), browser.new_page(params))
             .await
             .map_err(|_| AgentError::ToolExecution { tool: "chrome_browser".into(), reason: "新建 Chrome 标签页超时(20s)".into()})?
             .map_err(|e| AgentError::ToolExecution { tool: "chrome_browser".into(), reason: format!("新建 Chrome 标签页失败: {e}")})?;

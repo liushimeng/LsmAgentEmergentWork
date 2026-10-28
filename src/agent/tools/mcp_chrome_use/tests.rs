@@ -38,6 +38,8 @@ fn schema_含五个基础_action() {
     // 纯文字按钮 / 真实键盘事件(第 178 轮实测:百度地图「选为终点」无稳定选择器)。
     assert!(c_enums.contains(&"click_text"));
     assert!(c_enums.contains(&"key_press"));
+    assert!(c_enums.contains(&"new_tab"));
+    assert!(c_enums.contains(&"new_window"));
     // params 含 save_path / timeout_ms / text / key / exact / max_chars。
     let props = &schema["properties"]["params"]["properties"];
     assert!(props.get("save_path").is_some());
@@ -83,6 +85,7 @@ fn schema_顶层允许动作参数直传() {
 
 #[tokio::test]
 async fn wait_visible不再被参数校验误拒() {
+    let _guard = ENV_LOCK.lock().unwrap();
     let out = McpChromeUseTool
         .execute(json!({
             "action":"control", "control_action":"wait", "page_id":"c_deadbeef",
@@ -96,6 +99,7 @@ async fn wait_visible不再被参数校验误拒() {
 
 #[tokio::test]
 async fn inspect_page_state不再被参数校验误拒() {
+    let _guard = ENV_LOCK.lock().unwrap();
     let out = McpChromeUseTool
         .execute(json!({"action":"inspect", "info":"page_state", "page_id":"c_deadbeef"}))
         .await
