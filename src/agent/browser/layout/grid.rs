@@ -126,6 +126,7 @@ pub(crate) fn layout_container(
         background: style.background,
         visible: style_visible(style),
         z_index: style.pos.z_index,
+        out_of_flow: false,
     });
     let box_idx = ctx.boxes_len() - 1;
     let content_h = layout_content(ctx, node, content_x, inner_w, style, depth + 1, cb);
@@ -556,6 +557,9 @@ fn max_content_width(ctx: &mut LayoutCtx, item: &Item) -> f64 {
                 w = w.max(l.x + lw);
             }
             for b in &frag.boxes {
+                if b.out_of_flow {
+                    continue;
+                }
                 w = w.max(b.x + b.w);
             }
             w
@@ -837,6 +841,7 @@ fn emit_item(
         background: cs.background,
         visible: style_visible(&cs),
         z_index: cs.pos.z_index,
+        out_of_flow: false,
     });
     ctx.emit_element(seq, &cs, &item.tag, x, y, used_w, used_h);
     // 阶段三第三步:图片条目按最终尺寸绘制(object-fit 决定填充方式)。

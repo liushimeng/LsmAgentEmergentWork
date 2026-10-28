@@ -20,6 +20,7 @@ fn env(url: &str) -> PageEnv {
         user_agent: "test".to_string(),
         prefers_dark: false,
         csp: None,
+        resources: Vec::new(),
     }
 }
 
@@ -1873,5 +1874,95 @@ fn 动态脚本装载只针对script元素() {
         0,
         "img 的 src 不得触发动态脚本装载"
     );
+    h.shutdown();
+}
+
+// ===================== 第 174 轮:诊断 API(TreeWalker/Range/attributes/performance) =====================
+
+/// 猎聘真机实测的探测脚本形态:TreeWalker 全文扫描 + Range 文本矩形 +
+/// `Array.from(el.attributes)`。修复前三者分别报 not-a-callable / null /
+/// getter 抛错,Agent 的登录排查被系统性带偏。
+#[test]
+fn 诊断三件套_treewalker_range_attributes() {
+    let h = JsHandle::spawn();
+    let html = concat!(
+        "<html><body><div id='wrap'>",
+        "<span id='login'>登录/注册</span>",
+        "<p>扫码登录提示文案</p>",
+        "</div></body></html>"
+    );
+    // TreeWalker:SHOW_TEXT 扫描文本节点。
+    let r = eval_on_with_rects(
+        &h,
+        "(function(){ var hits=[]; var w=document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null); \
+         var n; while((n=w.nextNode())){ if(/扫码|登录/.test(n.textContent)) hits.push(n.textContent.trim()); } \
+         return JSON.stringify(hits); })()",
+        html,
+        "https://www.liepin.com/",
+    );
+    assert!(r.outcome.ok, "TreeWalker 应可用:{:?}", r.outcome.error);
+    let v: serde_json::Value = serde_json::from_str(&r.outcome.value).unwrap_or_default();
+    assert!(
+        v.as_array().map(|a| !a.is_empty()).unwrap_or(false),
+        "TreeWalker 应扫到登录文本:{r:?}"
+    );
+
+    // Range:selectNode + getBoundingClientRect 不再 null 崩。
+    let r = eval_on_with_rects(
+        &h,
+        "(function(){ var el=document.getElementById('login'); var rg=document.createRange(); \
+         rg.selectNode(el); var b=rg.getBoundingClientRect(); return JSON.stringify({w:b.width, h:b.height}); })()",
+        html,
+        "https://www.liepin.com/",
+    );
+    assert!(r.outcome.ok, "createRange 应可用:{:?}", r.outcome.error);
+
+    // attributes 可迭代:Array.from(...).map(a=>a.name)。
+    let r = eval_on(
+        &h,
+        "(function(){ var el=document.getElementById('login'); \
+         return JSON.stringify(Array.from(el.attributes).map(function(a){return a.name;}).sort()); })()",
+        html,
+        "https://www.liepin.com/",
+    );
+    assert!(r.outcome.ok, "Array.from(el.attributes) 应可用:{:?}", r.outcome.error);
+    let v: serde_json::Value = serde_json::from_str(&r.outcome.value).unwrap_or_default();
+    assert_eq!(v.as_array().map(|a| a.len()), Some(1), "应有 id 属性:{r:?}");
+    h.shutdown();
+}
+
+/// performance.getEntriesByType('resource') 读宿主网络台账,不再是空桩
+/// (猎聘实测误判「0 个脚本加载」,实际 3.3MB bundle 已执行)。
+#[test]
+fn performance资源时序来自网络台账() {
+    let h = JsHandle::spawn();
+    let doc = Document::parse("<html><body><div>ok</div></body></html>", "https://www.liepin.com/");
+    let nodes = doc.snapshot_nodes();
+    let mut e = env("https://www.liepin.com/");
+    e.resources = vec![crate::agent::browser::NetworkRecord {
+        url: "https://concat.lietou-static.com/fe-www-pc/v6/js/common.js".to_string(),
+        method: "GET".to_string(),
+        status: 200,
+        content_type: "application/javascript".to_string(),
+        bytes: 3301380,
+        elapsed_ms: 1200,
+        redirect: false,
+        from_cache: false,
+        at_ms: 0,
+    }];
+    let script = "(function(){ var rs=performance.getEntriesByType('resource'); \
+                  return JSON.stringify({n:rs.length, name:rs[0]&&rs[0].name, size:rs[0]&&rs[0].transferSize}); })()"
+        .to_string();
+    let reply = h
+        .request(|tx| JsRequest::Eval { script, env: e, nodes, reply: tx })
+        .expect("JS 线程请求失败");
+    assert!(reply.outcome.ok, "{:?}", reply.outcome.error);
+    let v: serde_json::Value = serde_json::from_str(&reply.outcome.value).unwrap_or_default();
+    assert_eq!(v["n"].as_u64(), Some(1), "资源台账应有 1 条:{v:?}");
+    assert!(
+        v["name"].as_str().unwrap_or("").contains("common.js"),
+        "资源名应来自台账:{v:?}"
+    );
+    assert_eq!(v["size"].as_u64(), Some(3301380));
     h.shutdown();
 }

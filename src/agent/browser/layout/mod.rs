@@ -71,6 +71,13 @@ pub struct ElementBox {
     pub visible: bool,
     /// 绘制序(阶段三):`compute_with` 返回前按 z-index 稳定排序。
     pub z_index: i64,
+    /// 脱离流(position:absolute/fixed,阶段七第 174 轮):渲染照常发射,
+    /// 但**不参与任何祖先的内在尺寸聚合** —— CSS 语义里 abs 元素对
+    /// shrink-to-fit/max-content 高宽贡献恒为零。此前 flex 条目测量把
+    /// 脱流徽标(right:30px + 无宽 svg)在 MAX_CONTENT_WIDTH 语境下求出的
+    /// 盒坐标当成内容宽,后续条目被 flex 收缩压到 ~1px(猎聘「登录/注册」
+    /// 入口 0×0 根因)。
+    pub out_of_flow: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -385,7 +392,10 @@ pub(crate) fn push_border_and_shadow(
 pub(crate) fn is_replaced_tag(node: &NodeRef) -> bool {
     matches!(
         document::tag_name(node).to_ascii_lowercase().as_str(),
-        "img" | "svg"
+        // iframe(第 174 轮):按替换元素参与布局 —— 无 CSS/属性尺寸时取
+        // 浏览器建议缺省 300×150,而非塌缩 0×0(猎聘页脚 iframe 实测 0×0,
+        // 坐标点击与 inspect 全部失真)。
+        "img" | "svg" | "iframe"
     )
 }
 
@@ -823,6 +833,9 @@ impl<'a> LayoutCtx<'a> {
         let natural = src.as_ref().and_then(|u| self.images.natural(u)).or_else(|| {
             if is_svg {
                 Some(svg_natural_size(node))
+            } else if tag.eq_ignore_ascii_case("iframe") {
+                // CSS 替换元素建议缺省尺寸(真实浏览器对无尺寸 iframe 一致)。
+                Some((300.0, 150.0))
             } else {
                 None
             }
@@ -934,7 +947,9 @@ impl<'a> LayoutCtx<'a> {
                 lines: Vec::new(),
                 boxes: vec![ElementBox {
                     selector,
-                    tag: "img".to_string(),
+                    // 真实标签(img/svg/iframe):第 174 轮起 iframe 也是替换元素,
+                    // 探针/断言按 tag 定位需要真名,不再一律写 "img"。
+                    tag: document::tag_name(node).to_ascii_lowercase(),
                     x: 0.0,
                     y: 0.0,
                     w,
@@ -942,6 +957,7 @@ impl<'a> LayoutCtx<'a> {
                     background: style.background,
                     visible: style_visible(style),
                     z_index: style.pos.z_index,
+                    out_of_flow: false,
                 }],
                 paints: Vec::new(),
                 borders: Vec::new(),
@@ -1080,7 +1096,8 @@ impl<'a> LayoutCtx<'a> {
                 let seq = self.next_seq();
                 self.boxes.push(ElementBox {
                     selector,
-                    tag: "img".to_string(),
+                    // 真实标签(img/svg/iframe,第 174 轮 iframe 亦为替换元素)。
+                    tag: document::tag_name(&child).to_ascii_lowercase(),
                     x: bx + dx,
                     y: by + dy,
                     w: iw,
@@ -1088,6 +1105,7 @@ impl<'a> LayoutCtx<'a> {
                     background: style.background,
                     visible,
                     z_index: style.pos.z_index,
+                    out_of_flow: false,
                 });
                 self.emit_element(seq, &style, "img", bx + dx, by + dy, iw, ih);
                 if let Some(src) = isrc.filter(|s| self.image_loaded(s)) {
@@ -1232,6 +1250,9 @@ impl<'a> LayoutCtx<'a> {
                         right = right.max(l.x + self.font.text_width(&l.text, l.size));
                     }
                     for b in &self.boxes[mark_boxes..] {
+                        if b.out_of_flow {
+                            continue;
+                        }
                         right = right.max(b.x + b.w);
                     }
                     let need = right - bx + style.padding_right;
@@ -1255,6 +1276,7 @@ impl<'a> LayoutCtx<'a> {
                     background: style.background,
                     visible: style_visible(&style),
                     z_index: style.pos.z_index,
+                    out_of_flow: false,
                 });
                 // 边框/外阴影绘制指令(不占几何;relative 偏移需同步平移)。
                 push_border_and_shadow(self, &style, bx, start_y, bw, box_h);
@@ -1343,6 +1365,11 @@ impl<'a> LayoutCtx<'a> {
             || style.width.is_some()
             || style.height.is_some()
             || style.width_percent.is_some()
+            // 第 174 轮:带 id 的行内元素一律可寻址 —— id 是 Agent 侧最常用的
+            // 选择器锚点,猎聘登录入口 span#header-quick-menu-login 是纯
+            // display:inline 无显式尺寸,不在此列时快照矩形恒 0×0、点击坐标
+            // 落在 (1,1) 死区(近似矩形不影响流,只服务几何寻址)。
+            || document::attr(node, "id").map(|v| !v.trim().is_empty()).unwrap_or(false)
     }
 
     /// 行内盒的近似尺寸:显式 CSS 尺寸优先,其次按文本量估算。
@@ -1544,6 +1571,7 @@ impl<'a> LayoutCtx<'a> {
                     background: child_style.background,
                     visible,
                     z_index: child_style.pos.z_index,
+                    out_of_flow: false,
                 });
                 self.emit_element(seq, &child_style, "img", ix, iy, iw, ih);
                 if let Some(src) = isrc.filter(|s| self.image_loaded(s)) {
@@ -1620,6 +1648,7 @@ impl<'a> LayoutCtx<'a> {
             background: style.background,
             visible: style_visible(style),
             z_index: style.pos.z_index,
+            out_of_flow: false,
         });
         // 输入框/按钮等交互元素的边框与外阴影(绘制不占几何)。
         push_border_and_shadow(self, style, bx, by, w, h);

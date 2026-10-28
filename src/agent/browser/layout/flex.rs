@@ -158,6 +158,7 @@ pub(crate) fn layout_container(
         background: style.background,
         visible: style_visible(style),
         z_index: style.pos.z_index,
+        out_of_flow: false,
     });
     let box_idx = ctx.boxes_len() - 1;
     let content_h =
@@ -451,6 +452,12 @@ fn resolve_base(
                         max_main = max_main.max(l.x + w);
                     }
                     for b in &frag.boxes {
+                        // abs/fixed 脱流盒不参与内在尺寸(第 174 轮:脱流徽标
+                        // 在 MAX_CONTENT_WIDTH 语境下的坐标曾把 flex 条目基础宽
+                        // 推到 ~10 万,后续条目被收缩到 1px)。
+                        if b.out_of_flow {
+                            continue;
+                        }
                         max_main = max_main.max(b.x + b.w);
                     }
                     max_main + item.pads_main(row).0 + item.pads_main(row).1
@@ -486,6 +493,9 @@ fn resolve_base(
                     w = w.max(l.x + lw);
                 }
                 for b in &frag.boxes {
+                    if b.out_of_flow {
+                        continue;
+                    }
                     w = w.max(b.x + b.w);
                 }
                 (w + pb + pa).min(avail).max(1.0)
@@ -709,6 +719,7 @@ fn emit_item(ctx: &mut LayoutCtx, item: &mut Item, x: f64, y: f64, row: bool, de
         background: cs.background,
         visible: style_visible(&cs),
         z_index: cs.pos.z_index,
+        out_of_flow: false,
     });
     ctx.emit_element(seq, &cs, &item.tag, x, y, iw, ih);
     // 阶段三第三步:图片条目按最终尺寸绘制(object-fit 决定填充方式)。

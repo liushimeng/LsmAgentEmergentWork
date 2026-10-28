@@ -487,13 +487,29 @@ pub(super) async fn run_open(mut args: Value) -> Result<String> {
     // 能力缺口如实告知:站点申请过 WebGL 上下文(百度地图等三维/地图站点),
     // 而本内核无 GPU 后端 → 地图底图画不出来。不说清楚,Agent 会对同一片
     // 空白反复截图/重试,白烧好几轮。
+    // 能力缺口条目(第 174 轮起为列表:webgl + iframe)。
+    let mut gaps: Vec<Value> = Vec::new();
     if out.webgl_asked > 0 {
-        data["capability_gaps"] = json!([{
+        gaps.push(json!({
             "kind": "webgl",
             "requested": out.webgl_asked,
-            "detail": "站点申请过 WebGL 上下文(常见于地图/三维场景);LsmAgentBrowser 内核无 WebGL,                       该区域不会绘制出像素(底图留空/仅剩 DOM 控件)。",
-            "hint": "需要像素级地图底图时改用 MCP_Web_Chrome_Use(真 Chromium 渲染);                     本工具仍可用于读取页面 DOM 文本(如路线方案列表)。",
-        }]);
+            "detail": "站点申请过 WebGL 上下文(常见于地图/三维场景);LsmAgentBrowser 内核无 WebGL,该区域不会绘制出像素(底图留空/仅剩 DOM 控件)。",
+            "hint": "需要像素级地图底图时改用 MCP_Web_Chrome_Use(真 Chromium 渲染);本工具仍可用于读取页面 DOM 文本(如路线方案列表)。",
+        }));
+    }
+    // iframe 内容渲染是内核边界(第 174 轮):跨域登录/验证码 iframe 画不出,
+    // 必须显式告知,否则 Agent 会把 iframe 区域当普通空白反复重试
+    // (猎聘实测:wow.liepin.com 页脚 iframe 被误当登录弹层)。
+    if out.iframe_count > 0 {
+        gaps.push(json!({
+            "kind": "iframe",
+            "count": out.iframe_count,
+            "detail": "页面含 iframe,内核不渲染 iframe 内容(只保留占位几何);iframe 内的登录框/验证码不可见也不可交互。",
+            "hint": "需要 iframe 内容时:若是登录/验证码,改为顶层 navigate 到该 iframe 的 src 页面(同引擎可渲染);或改用 MCP_Web_Chrome_Use。",
+        }));
+    }
+    if !gaps.is_empty() {
+        data["capability_gaps"] = json!(gaps);
     }
     envelope(0, "ok", data)
 }

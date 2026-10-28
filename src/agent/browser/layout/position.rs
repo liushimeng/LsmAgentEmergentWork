@@ -56,6 +56,9 @@ fn layout_abs(
             w = w.max(l.x + lw);
         }
         for b in &frag.boxes {
+            if b.out_of_flow {
+                continue;
+            }
             w = w.max(b.x + b.w);
         }
         w.min(avail_w).max(1.0)
@@ -115,6 +118,7 @@ fn layout_abs(
         background: style.background,
         visible: style_visible(style),
         z_index: style.pos.z_index,
+        out_of_flow: true,
     });
     // 阶段三第三步:定位体系里的替换元素(<img>)同样要贴图。
     // `measure_content` 的 img 分支只产出几何、不产出绘制指令(见 layout/mod.rs),
@@ -144,6 +148,13 @@ fn layout_abs(
         }
     }
     let mark = ctx.display_len();
+    // 脱流子树的片段盒统一标记:这些盒随 abs 元素整体注入,坐标以包含块为
+    // 语境(测量语境下可能落在 MAX_CONTENT_WIDTH 远端),绝不能回流进
+    // 任何祖先的内在尺寸聚合(第 174 轮猎聘「登录/注册」0×0 根因的另一半:
+    // measure_content 替换元素捷径盒 tag=img 曾以 oof=false 注入)。
+    for b in &mut frag.boxes {
+        b.out_of_flow = true;
+    }
     super::append(ctx, frag);
     ctx.apply_group(mark, style, bx, by, bw, bh);
     if fixed {

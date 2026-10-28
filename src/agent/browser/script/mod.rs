@@ -37,6 +37,10 @@ pub struct PageEnv {
     pub prefers_dark: bool,
     /// 当前页 CSP 快照（阶段四第二步：fetch/XHR connect-src 门禁）。
     pub csp: Option<super::security::CspPolicy>,
+    /// 页面网络台账快照(第 174 轮):喂给 JS 侧 `performance.getEntriesByType`
+    /// 的资源时序数据 —— 此前该 API 是空数组桩,Agent 探测「脚本是否加载」
+    /// 被误导成 0 条(猎聘实测:jsCount=0 误判,实际 3.3MB bundle 已执行)。
+    pub resources: Vec<super::NetworkRecord>,
 }
 
 /// 脚本来源:inline 文本或宿主预取的外链内容。
@@ -240,6 +244,12 @@ pub struct PipelineOut {
     /// 页面申请过 WebGL 上下文的次数(>0 = 站点依赖 WebGL 绘制,内核无 WebGL
     /// → 该区域画不出,须如实告知调用方,别让它反复重试)。
     pub webgl_asked: u32,
+    /// 管线是否被墙钟预算截断(第 174 轮:截断必须让调用方看见。猎聘登录弹层
+    /// chunk 链在交互补齐 8s 预算内装不完,截断事实此前只进 console,
+    /// 工具结果与 page_health 均无感知 → Agent 盲探测十几分钟)。
+    pub budget_cut: bool,
+    /// 截断时仍未取回执行的脚本数(正常收敛 = 0)。
+    pub pending_scripts: usize,
 }
 
 /// 管线续跑种子。交互(eval_js / click 等)后页面可能注入新的 `<script>`
@@ -354,6 +364,16 @@ pub(crate) async fn run_pipeline(
                 text: format!("脚本管线达到墙钟预算({}ms),已停止继续取回模块", budget),
                 at_ms: super::now_ms(),
             });
+            out.budget_cut = true;
+            // 量化「还差多少」:截断时统计仍未执行的脚本数,调用方据此决定
+            // wait/重试还是换路径,不再只凭一条 console 文案猜。
+            {
+                let doc = super::document::Document::parse(&out.html, base_url);
+                let mut probe = executed.clone();
+                let mut left = dom_ops::collect_scripts(&doc, base_url, &mut probe);
+                let deferred_left = std::mem::take(&mut left.deferred);
+                out.pending_scripts = left.items.len() + deferred_left.len();
+            }
             break;
         }
         let mut collected = {
@@ -649,6 +669,7 @@ pub(crate) fn build_env(
             "1" | "true" | "yes" | "on"
         ),
         csp: csp.cloned(),
+        resources: Vec::new(),
     }
 }
 

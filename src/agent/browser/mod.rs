@@ -226,6 +226,11 @@ pub struct TabState {
     /// 页面申请过 WebGL 上下文的次数(>0 = 站点依赖 WebGL 绘制;内核无 WebGL,
     /// 该区域画不出 → 工具层据此如实告知调用方改用 MCP_Web_Chrome_Use)。
     pub webgl_asked: u32,
+    /// 最近一次脚本管线(首屏或交互补齐)是否被预算截断 + 剩余待执行脚本数
+    /// (第 174 轮观测性:eval_js/控制动作结果与 page_health 均带出,
+    /// Agent 可据此 wait/重试,不再对「组件差一口气装不上」盲探测)。
+    pub script_budget_cut: bool,
+    pub script_pending: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -279,6 +284,9 @@ pub struct OpenOutcome {
     pub viewport_height: u32,
     /// 页面申请过 WebGL 上下文(>0 = 站点依赖 WebGL 绘制,内核无 WebGL → 该区域画不出)。
     pub webgl_asked: u32,
+    /// 页面内 iframe 数量(第 174 轮:内核不渲染 iframe 内容,如实计数告知,
+    /// 免得 Agent 对 iframe 里的登录/验证码区域反复重试)。
+    pub iframe_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -528,6 +536,11 @@ impl LsmBrowserManager {
                                 )
                             })
                             .unwrap_or((String::new(), 0, 0, 0, mode));
+                        let iframe_count = inner
+                            .tabs
+                            .get(&existing)
+                            .and_then(|t| document::Document::parse(&t.html, &t.url).select("iframe").ok().map(|v| v.len()))
+                            .unwrap_or(0);
                         return Ok(OpenOutcome {
                             page_id: pid,
                             title: nav.title,
@@ -544,6 +557,7 @@ impl LsmBrowserManager {
                             viewport_width: vw,
                             viewport_height: vh,
                             webgl_asked: webgl_asked,
+                            iframe_count,
                         });
                     }
                     Err(err) => {
@@ -756,6 +770,8 @@ impl LsmBrowserManager {
             images: images_out.store,
             security: security::SecurityContext::new(),
             webgl_asked: pipeline.webgl_asked,
+            script_budget_cut: pipeline.budget_cut,
+            script_pending: pipeline.pending_scripts,
         };
         inner.tabs.insert(page_id.clone(), tab);
         // 阶段四第二步：CSP 策略与页面源写入安全上下文（供 fetch/XHR connect-src 门禁）。
@@ -790,6 +806,7 @@ impl LsmBrowserManager {
             viewport_width: viewport.width,
             viewport_height: viewport.height,
             webgl_asked: pipeline.webgl_asked,
+            iframe_count: doc.select("iframe").map(|v| v.len()).unwrap_or(0),
         })
     }
 
@@ -983,6 +1000,8 @@ impl LsmBrowserManager {
             record_network(tab, rec);
         }
         tab.js = pipeline.js;
+        tab.script_budget_cut = pipeline.budget_cut;
+        tab.script_pending = pipeline.pending_scripts;
         tab.executed_scripts = pipeline.executed.clone();
         tab.images = images_out.store;
         for rec in pipeline.network {

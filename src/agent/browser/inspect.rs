@@ -258,6 +258,7 @@ pub async fn inspect(
             // 页面健康度:把"渲染空白"这类症状翻译成可诊断的结论,
             // 避免 Agent 在一张空白截图前反复重试。
             let dom_nodes = doc.select("*").map(|v| v.len()).unwrap_or(0);
+            let iframe_count = doc.select("iframe").map(|v| v.len()).unwrap_or(0);
             let layout_text_chars = tab
                 .layout
                 .lines
@@ -273,7 +274,15 @@ pub async fn inspect(
             // 该区域画不出像素。这是**内核边界**而非页面故障,如实说明,免得
             // Agent 对同一片空白反复截图/重试。
             let webgl_gap = tab.webgl_asked > 0;
-            let (diagnosis, hint) = if !errors.is_empty() {
+            // 第 174 轮:脚本管线截断也是一等健康信号 —— 截断意味着懒加载组件
+            // (登录弹层/搜索面板)可能还没挂载,先补齐脚本再判断页面状态。
+            let script_cut = tab.script_budget_cut && tab.script_pending > 0;
+            let (diagnosis, hint) = if script_cut {
+                (
+                    "页面脚本管线被墙钟预算截断,仍有模块未装载,动态组件可能尚未挂载",
+                    "这是加载中状态而非页面故障:先 control(wait) 1-3 秒或再次执行一次轻量 eval_js 触发补齐,脚本会从上次断点继续;若持续截断可提高 LAEW_WEB_SCRIPT_INTERACT_MS",
+                )
+            } else if !errors.is_empty() {
                 if blank {
                     (
                         "页面脚本执行失败:主内容由 JS 生成,内核脚本运行时未能完成初始化,导致内容节点保持初始隐藏态或未被创建",
@@ -312,6 +321,14 @@ pub async fn inspect(
                 "first_errors": errors.iter().take(3).map(|e| e.text.clone()).collect::<Vec<_>>(),
                 "blank_page": blank,
                 "webgl_requested": tab.webgl_asked,
+                "iframe_count": iframe_count,
+                "iframe_note": if iframe_count > 0 {
+                    "内核不渲染 iframe 内容(只保留占位几何);iframe 内登录/验证码请顶层 navigate 到其 src 或改用 MCP_Web_Chrome_Use"
+                } else {
+                    ""
+                },
+                "script_budget_cut": tab.script_budget_cut,
+                "script_pending": tab.script_pending,
                 "diagnosis": diagnosis,
                 "hint": hint,
             }))

@@ -565,6 +565,20 @@ fn build_meta_json(env: &PageEnv) -> String {
         "scrollY": env.scroll_y,
         "ua": env.user_agent,
         "prefersDark": env.prefers_dark,
+        // 资源时序(第 174 轮):宿主网络台账 → JS 侧 performance API。
+        "resources": env
+            .resources
+            .iter()
+            .map(|r| {
+                json!({
+                    "name": r.url,
+                    "status": r.status,
+                    "transferSize": r.bytes,
+                    "duration": r.elapsed_ms,
+                    "contentType": r.content_type,
+                })
+            })
+            .collect::<Vec<_>>(),
         "protocol": protocol,
         "host": host,
         "hostname": hostname,
@@ -919,6 +933,7 @@ mod diag_probe {
             user_agent: "Mozilla/5.0".to_string(),
             prefers_dark: false,
             csp: None,
+            resources: Vec::new(),
         };
         let reply = rt.run_scripts(
             &[ScriptSource {

@@ -1445,3 +1445,64 @@ fn 猎聘tab行_inlineflex条目应横排() {
         distinct.len()
     );
 }
+
+// ===================== 第 174 轮:绝对定位元素不污染内在尺寸 =====================
+
+/// 猎聘头部结构复现:`position:relative` 的 flex 条目内含
+/// `position:absolute;right:30px` 的无宽 `<svg>` 徽标(NEW 角标)。
+/// 修复前:徽标在 MAX_CONTENT_WIDTH 语境下的盒坐标流进 flex 条目基础宽,
+/// 后续条目被 flex 收缩压到 ~1px —— 「登录/注册」入口 0×0、点击坐标落空,
+/// 登录链路 16 分钟未破(2026-10-28 真机)。修复后:徽标不参与内在尺寸,
+/// 后续条目按内容正常排布,徽标盒照常发射(向左溢出父盒,与真实浏览器一致)。
+#[test]
+fn 绝对定位徽标不吞噬flex后续条目() {
+    let html = concat!(
+        "<html><head><style>",
+        ".box .menu{display:flex;align-items:center;font-size:14px;line-height:22px}",
+        ".box .item{position:relative}",
+        ".box .badge{bottom:100%;position:absolute;right:30px;top:auto}",
+        "</style></head><body><div class='box'>",
+        "<ul class='menu'>",
+        "<li class='item'><a href='#'>链接甲</a><svg width='28' height='14' viewBox='0 0 28 14' class='badge'><g><path d='M4 0h23v9H4z' fill='#FF6400'></path></g></svg></li>",
+        "<li class='item'><span id='login'>登录/注册</span></li>",
+        "</ul></div></body></html>"
+    );
+    let doc = Document::parse(html, "https://a.test/");
+    let lay = compute(&doc, 1920.0, &font());
+    let li2 = lay
+        .boxes
+        .iter()
+        .find(|b| b.selector.ends_with("li:nth-of-type(2)"))
+        .expect("登录条目盒应存在");
+    assert!(
+        li2.w > 40.0,
+        "登录/注册条目不应被脱流徽标挤没:实际 {:?}",
+        (li2.x, li2.w)
+    );
+    let badge = lay
+        .boxes
+        .iter()
+        .find(|b| b.tag == "svg")
+        .expect("脱流徽标盒仍应发射(渲染不受影响)");
+    assert!((badge.w - 28.0).abs() < 0.5, "徽标宽度应取固有 28:{:?}", badge.w);
+    assert!(badge.out_of_flow, "脱流盒应带 out_of_flow 标记");
+}
+
+/// 无尺寸 `<iframe>` 按替换元素建议缺省 300×150 参与布局(真实浏览器语义),
+/// 不再塌缩 0×0 导致坐标点击/inspect 失真(猎聘页脚 iframe 实测 0×0)。
+#[test]
+fn 无尺寸iframe缺省300x150() {
+    let html = "<html><body><div><iframe src='https://wow.example/t.html'></iframe></div></body></html>";
+    let doc = Document::parse(html, "https://a.test/");
+    let lay = compute(&doc, 800.0, &font());
+    let fr = lay
+        .boxes
+        .iter()
+        .find(|b| b.tag == "iframe")
+        .expect("iframe 应作为替换元素成盒");
+    assert!(
+        (fr.w - 300.0).abs() < 1.0 && (fr.h - 150.0).abs() < 1.0,
+        "iframe 缺省几何应为 300×150,实际 {:?}",
+        (fr.w, fr.h)
+    );
+}

@@ -728,6 +728,8 @@ mod tests {
             images: Default::default(),
             security: security::SecurityContext::new(),
             webgl_asked: 0,
+            script_budget_cut: false,
+            script_pending: 0,
         };
         draw(&mut pixmap, &font, &tab);
         // 底色已画:统计非零像素(半透明深底必然改变像素)。

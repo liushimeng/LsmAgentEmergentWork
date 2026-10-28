@@ -88,6 +88,7 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 | `LAEW_WEB_SCRIPT` | `off`/`0`/`false`/`no` | 关闭页面脚本执行与 JS 线程(阶段二);`eval_js` 回退阶段一快照桥。见 `src/agent/browser/script/` |
 | `LAEW_WEB_SCRIPT_BUDGET_MS` | 正整数(默认 `10000`) | 单次页面脚本管线(导航/eval_js/事件分发)墙钟预算。见 `src/agent/browser/script/mod.rs::budget_ms` |
 | `LAEW_WEB_SCRIPT_PIPELINE_MS` | 正整数(默认 `120000`,下限 `2000`) | 整条脚本管线(多轮脚本取回执行)墙钟预算;同一预算也作为整批 RunScripts 的 JS 侧 deadline。重站点(百度地图首屏 60+ 脚本)40s 会被截断,故默认值提高到 120s。见 `src/agent/browser/script/mod.rs` |
+| `LAEW_WEB_SCRIPT_INTERACT_MS` | 正整数(默认 `30000`,下限 `2000`) | 交互后(eval/点击等)单次脚本补齐墙钟预算。重站懒加载 chunk 链(登录弹层等组件)8s 装不完;截断状态经 eval 结果与 `page_health` 的 `script_pending`/`script_budget_cut` 字段可见。见 `src/agent/browser/api.rs::interaction_budget_ms` |
 | `LAEW_WEB_MAX_SCRIPT_BYTES` | 正整数(默认 `8388608`,下限 `1024`) | 单个经典外链脚本字节上限;首屏预取与动态 `<script src>` 共用,普通 fetch/XHR 不受此值影响。见 `src/agent/browser/script/mod.rs::max_external_bytes` |
 | `LAEW_WEB_STYLES` | `off`/`0`/`false`/`no` | 关闭外链样式表加载(内联 `<style>` 仍生效)。见 `src/agent/browser/resources.rs` |
 | `LAEW_WEB_MAX_STYLESHEETS` | 正整数(默认 `16`) | 单页外链样式表数量上限 |

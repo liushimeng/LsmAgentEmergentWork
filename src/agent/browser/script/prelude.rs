@@ -825,13 +825,32 @@ function __attrMap(ownerEl, attrsRef) {
       return (idx >= 0 && idx < ks.length) ? __attrNode(ownerEl, ks[idx], a[ks[idx]]) : null;
     }
   };
+  // 可迭代(第 174 轮):NamedNodeMap 语义下 Array.from / for-of / 展开产出
+  // Attr 形状节点。此前缺迭代协议,Boa 的 Array.from 走 getter 兜底路径
+  // 直接抛错(猎聘探测脚本 `Array.from(el.attributes).map(a=>a.name)`)。
+  if (typeof Symbol === "function" && Symbol.iterator) {
+    base[Symbol.iterator] = function () {
+      var ks = Object.keys(attrsRef());
+      var i = 0;
+      return {
+        next: function () {
+          if (i >= ks.length) return { done: true, value: undefined };
+          var k = ks[i++];
+          return { done: false, value: __attrNode(ownerEl, k, attrsRef()[k]) };
+        }
+      };
+    };
+  }
   return new Proxy(base, {
     get: function (t, k) {
       if (k in t) return t[k];
       var a = attrsRef();
       if (k === "length") return Object.keys(a).length;
+      // symbol 键(如 @@iterator 探测)不得走 Number(k) —— Number(Symbol)
+      // 直接 TypeError,整个 Array.from 链路当场崩(第 174 轮猎聘真机)。
+      if (typeof k !== "string") return undefined;
       var ks; var idx = Number(k);
-      if (typeof k === "string" && String(idx) === k) {
+      if (String(idx) === k) {
         ks = Object.keys(a);
         return (idx >= 0 && idx < ks.length) ? __attrNode(ownerEl, ks[idx], a[ks[idx]]) : undefined;
       }
@@ -1820,6 +1839,186 @@ function __parseHtml(html) {
 }
 
 // ---------- document ----------
+// ---------- TreeWalker / NodeIterator / Range(第 174 轮) ----------
+// 站点库与探测脚本普遍用 createTreeWalker 做全文扫描(猎聘探测「扫码/二维码」
+// 文本节点),用 Range.selectNode + getBoundingClientRect 取文本矩形;两者
+// 缺失时 "not a callable function" / null 直接打断脚本。基于快照索引树实现:
+// root 取其 __lsm_node.i(动态元素无索引则以全树兜底);SHOW_TEXT 时在每个
+// 元素后合成伪文本节点(快照把元素文本合并存储,无法逐段还原,文档化近似)。
+function __lsmWalker(root, whatToShow, filter, treeMode) {
+  var show = (whatToShow == null ? 0xFFFFFFFF : Number(whatToShow)) >>> 0;
+  var rootIdx = -1;
+  try {
+    if (root && root !== document && root.__lsm_node && typeof root.__lsm_node.i === "number") {
+      rootIdx = root.__lsm_node.i;
+    }
+  } catch (e) { rootIdx = -1; }
+  var kidsOf = {};
+  var k, i;
+  for (k = 0; k < __lsmNodes.length; k++) {
+    var p = __lsmNodes[k].parent;
+    if (p != null && p >= 0) {
+      if (!kidsOf[p]) kidsOf[p] = [];
+      kidsOf[p].push(k);
+    }
+  }
+  // 文档序扁平序列:元素与其伪文本节点交替(元素在前,文本紧随)。
+  var flat = [];
+  function dfs(idx) {
+    var n = __lsmNodes[idx];
+    if (!n) return;
+    flat.push({ kind: 1, idx: idx });
+    var text = String(n.text || "");
+    if (text.trim()) flat.push({ kind: 3, idx: idx, text: text });
+    var kids = kidsOf[idx] || [];
+    for (var j = 0; j < kids.length; j++) dfs(kids[j]);
+  }
+  if (rootIdx >= 0) {
+    dfs(rootIdx);
+  } else {
+    // document / document.body / 动态根:全树(所有 parent 链到顶的节点)。
+    for (k = 0; k < __lsmNodes.length; k++) {
+      var par = __lsmNodes[k].parent;
+      if (par == null || par < 0) dfs(k);
+    }
+  }
+  var cache = {};
+  function wrap(entry) {
+    if (entry.kind === 3) {
+      var t = __mkTextNode(entry.text);
+      t.parentElement = wrap({ kind: 1, idx: entry.idx });
+      t.parentNode = t.parentElement;
+      return t;
+    }
+    var idx = entry.idx;
+    if (!cache[idx]) cache[idx] = __mk(__lsmNodes[idx]);
+    return cache[idx];
+  }
+  function maskOk(entry) {
+    var bit = entry.kind === 1 ? 0x1 : (entry.kind === 3 ? 0x4 : 0x80);
+    return (show & bit) !== 0;
+  }
+  function filterOk(node) {
+    if (typeof filter === "object" && filter && typeof filter.acceptNode === "function") {
+      return Number(filter.acceptNode(node)) || 1;
+    }
+    if (typeof filter === "function") {
+      return Number(filter(node)) || 1;
+    }
+    return 1;
+  }
+  // 预计算「可见」序列(通过 show+filter 的节点),游标在其上移动。
+  var visible = [];
+  for (i = 0; i < flat.length; i++) {
+    if (!maskOk(flat[i])) continue;
+    var node = wrap(flat[i]);
+    if (filterOk(node) === 2 /* REJECT */) continue;
+    visible.push({ entry: flat[i], node: node });
+  }
+  var pos = -1;
+  var walker = {
+    root: root || document,
+    whatToShow: show,
+    filter: filter || null,
+    currentNode: (visible.length ? visible[0].node : (root || document)),
+    nextNode: function () {
+      pos++;
+      if (pos >= visible.length) { pos = visible.length; return null; }
+      this.currentNode = visible[pos].node;
+      return this.currentNode;
+    },
+    previousNode: function () {
+      pos--;
+      if (pos < 0) { pos = -1; return null; }
+      this.currentNode = visible[pos].node;
+      return this.currentNode;
+    },
+    // TreeWalker 专有方向方法:按快照 parent 关系在扁平序列里就近定位。
+    parentNode: function () {
+      if (!treeMode) return null;
+      var cur = pos >= 0 && pos < visible.length ? visible[pos].entry : null;
+      if (!cur) return null;
+      var par = __lsmNodes[cur.idx].parent;
+      if (par == null || par < 0) return null;
+      for (var m = pos - 1; m >= 0; m--) {
+        if (visible[m].entry.kind === 1 && visible[m].entry.idx === par) {
+          pos = m; this.currentNode = visible[m].node; return this.currentNode;
+        }
+      }
+      return null;
+    },
+    firstChild: function () {
+      if (!treeMode) return null;
+      var cur = pos >= 0 && pos < visible.length ? visible[pos] : null;
+      if (!cur) return null;
+      var wantParent = cur.entry.idx;
+      for (var m = pos + 1; m < visible.length; m++) {
+        if (__lsmNodes[visible[m].entry.idx].parent === wantParent) {
+          pos = m; this.currentNode = visible[m].node; return this.currentNode;
+        }
+        // 越出直接子代即停(文档序扁平保证)。
+        if (__lsmNodes[visible[m].entry.idx].parent !== wantParent &&
+            __lsmNodes[visible[m].entry.idx].parent !== cur.entry.idx && visible[m].entry.idx !== cur.entry.idx) break;
+      }
+      return null;
+    },
+    nextSibling: function () {
+      if (!treeMode) return null;
+      var cur = pos >= 0 && pos < visible.length ? visible[pos].entry : null;
+      if (!cur) return null;
+      var myParent = __lsmNodes[cur.idx].parent;
+      for (var m = pos + 1; m < visible.length; m++) {
+        if (__lsmNodes[visible[m].entry.idx].parent === myParent) {
+          pos = m; this.currentNode = visible[m].node; return this.currentNode;
+        }
+      }
+      return null;
+    },
+    detach: function () {}
+  };
+  return walker;
+}
+// Range 最小实现:selectNode/selectNodeContents 记住目标,getBoundingClientRect
+// 返回目标(伪文本节点取父盒)几何 —— 文本矩形探测不再 null 崩。
+function __lsmRange() {
+  var holder = null;
+  function rectOf(node) {
+    var r = null;
+    try { if (node && node.getBoundingClientRect) r = node.getBoundingClientRect(); } catch (e) { r = null; }
+    if (!r && node && node.parentElement && node.parentElement.getBoundingClientRect) {
+      try { r = node.parentElement.getBoundingClientRect(); } catch (e) { r = null; }
+    }
+    var x = Number((r && (r.x != null ? r.x : r.left)) || 0);
+    var y = Number((r && (r.y != null ? r.y : r.top)) || 0);
+    var w = Number((r && (r.width != null ? r.width : (r && r.w))) || 0);
+    var h = Number((r && (r.height != null ? r.height : (r && r.h))) || 0);
+    return { x: x, y: y, width: w, height: h, top: y, left: x, right: x + w, bottom: y + h };
+  }
+  return {
+    collapsed: true,
+    startContainer: null, endContainer: null,
+    commonAncestorContainer: null,
+    setStart: function (n) { this.startContainer = n; this.collapsed = false; holder = holder || n; },
+    setEnd: function (n) { this.endContainer = n; this.collapsed = false; holder = holder || n; },
+    setStartBefore: function (n) { this.setStart(n && n.parentElement); },
+    setStartAfter: function (n) { this.setStart(n && n.parentElement); },
+    setEndBefore: function (n) { this.setEnd(n && n.parentElement); },
+    setEndAfter: function (n) { this.setEnd(n && n.parentElement); },
+    selectNode: function (n) { holder = n; this.startContainer = this.endContainer = n; this.collapsed = false; },
+    selectNodeContents: function (n) { holder = n; this.startContainer = this.endContainer = n; this.collapsed = false; },
+    collapse: function () { this.collapsed = true; },
+    insertNode: function () {},
+    surroundContents: function () {},
+    cloneContents: function () { return document.createDocumentFragment(); },
+    extractContents: function () { return document.createDocumentFragment(); },
+    deleteContents: function () {},
+    cloneRange: function () { return __lsmRange(); },
+    detach: function () {},
+    toString: function () { return (holder && holder.textContent) || ""; },
+    getBoundingClientRect: function () { return rectOf(holder); },
+    getClientRects: function () { var r = rectOf(holder); return r.width > 0 || r.height > 0 ? [r] : []; }
+  };
+}
 var document = {
   nodeType: 9,
   readyState: "loading",
@@ -1890,6 +2089,11 @@ var document = {
   createDocumentFragment: function () {
     return { __detached: true, __tag: "div", __attrs: {}, __kids: [], __text: "", nodeType: 11, appendChild: function (c) { this.__kids.push(c); return c; } };
   },
+  // createTreeWalker / createNodeIterator / createRange(第 174 轮):
+  // 见上方实现注释;猎聘等站点探测脚本依赖,缺失即断。
+  createTreeWalker: function (root, whatToShow, filter) { return __lsmWalker(root, whatToShow, filter, true); },
+  createNodeIterator: function (root, whatToShow, filter) { return __lsmWalker(root, whatToShow, filter, false); },
+  createRange: function () { return __lsmRange(); },
   write: function () {
     for (var i = 0; i < arguments.length; i++) __lsmWriteBuf.push(String(arguments[i]));
   },
@@ -2411,7 +2615,52 @@ var __lsmWin = {
   performance: {
     now: function () { return __lsmNow; },
     timing: {},
-    getEntriesByType: function () { return []; }
+    // 资源时序(第 174 轮):读宿主网络台账(__lsmMeta.resources,由 Rust 注入)。
+    // 此前恒返回空数组,Agent/站点探测「脚本是否加载」被系统性误导
+    // (猎聘实测 performance.getEntriesByType('resource').length === 0,
+    //  实际 3.3MB common.js 早已执行)。
+    getEntriesByType: function (type) {
+      var t = String(type == null ? "" : type);
+      var out = [];
+      if (t === "resource" || t === "response") {
+        var rs = (__lsmMeta && __lsmMeta.resources) || [];
+        for (var i = 0; i < rs.length; i++) {
+          var r = rs[i] || {};
+          out.push({
+            name: String(r.name || ""),
+            entryType: t,
+            initiatorType: "other",
+            startTime: 0,
+            duration: Number(r.duration) || 0,
+            responseEnd: Number(r.duration) || 0,
+            transferSize: Number(r.transferSize) || 0,
+            encodedBodySize: Number(r.transferSize) || 0,
+            responseStatus: Number(r.status) || 0,
+            contentType: String(r.contentType || "")
+          });
+        }
+      } else if (t === "navigation") {
+        out.push({
+          name: String((__lsmMeta && __lsmMeta.url) || ""),
+          entryType: "navigation",
+          type: "navigate",
+          startTime: 0,
+          duration: 0,
+          transferSize: 0
+        });
+      }
+      return out;
+    },
+    getEntries: function () { return __lsmWin.performance.getEntriesByType("resource"); },
+    getEntriesByName: function (n) {
+      var name = String(n);
+      return __lsmWin.performance.getEntriesByType("resource").filter(function (e) { return e.name === name; });
+    },
+    mark: function () {},
+    measure: function () {},
+    clearResourceTimings: function () {},
+    clearMarks: function () {},
+    clearMeasures: function () {}
   }
 };
 var window = __lsmWin;

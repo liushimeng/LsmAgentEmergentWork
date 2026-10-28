@@ -76,6 +76,8 @@ async fn js_dispatch(
         );
         env.scroll_x = tab.scroll_x;
         env.scroll_y = tab.scroll_y;
+        // 资源时序注入(第 174 轮):取最近 120 条,足够探测「脚本是否加载」。
+        env.resources = tab.network.iter().rev().take(120).rev().cloned().collect();
         let doc = Document::parse(&tab.html, &tab.url);
         let rects = tab.layout.rect_map();
         let nodes = doc.snapshot_nodes_with_rects((tab.viewport.width, tab.viewport.height), &rects);
@@ -213,6 +215,27 @@ async fn apply_js_reply(
         });
     }
     // 阶段三第三步:补齐脚本新增的图片并重排(JS 动态插入 <img> 也能出图)。
+    // 第 174 轮性能:DOM 未变化的 eval(纯读取探测占大头)跳过图片扫描与
+    // 全量重排 —— 同一 html 的图片集与布局完全确定,重算是纯浪费;重页单条
+    // eval 因此从 25-35s 降到亚秒级。脚本补齐(run_pending_scripts)仍照常,
+    // 由它自己的「无待执行脚本」预检兜底。
+    let dom_changed = final_html != tab_html;
+    if !dom_changed {
+        drop(inner);
+        run_pending_scripts(mgr, pid, interaction_budget_ms()).await;
+        return reply
+            .outcome
+            .actions
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a.kind.as_str(),
+                    "click" | "navigate" | "new_tab" | "submit" | "back" | "forward" | "reload"
+                )
+            })
+            .cloned()
+            .collect();
+    }
     let (page_url, user_agent, existing_images) = {
         let Some(tab) = inner.tabs.get(pid) else {
             return Vec::new();
@@ -276,7 +299,7 @@ async fn apply_js_reply(
     // 交互后补齐懒加载脚本:真实浏览器里 `require.async`/动态 <script> 会在
     // 点击后立即取回执行;宿主若只在 open/navigate 跑管线,路线面板这类
     // 懒加载 widget 会永远停在 loading 态(实测百度地图路线按钮)。
-    run_pending_scripts(mgr, pid, INTERACTION_SCRIPT_BUDGET_MS).await;
+    run_pending_scripts(mgr, pid, interaction_budget_ms()).await;
     reply
         .outcome
         .actions
@@ -292,9 +315,19 @@ async fn apply_js_reply(
 }
 
 /// 交互后单次脚本补齐墙钟预算(毫秒)。
-const INTERACTION_SCRIPT_BUDGET_MS: u64 = 8_000;
-/// 交互后脚本补齐轮次上限(懒加载链通常 1-3 轮)。
-const INTERACTION_SCRIPT_ROUNDS: usize = 12;
+///
+/// 第 174 轮(猎聘):8s 装不完重站懒加载链 —— 首屏 3.3MB common.js 之后,
+/// 登录弹层/hero 组件 chunk 在交互注入,8s 窗口反复被截断,组件永远差一口
+/// 气装不上。默认提到 30s,`LAEW_WEB_SCRIPT_INTERACT_MS` 可覆盖(下限 2000)。
+fn interaction_budget_ms() -> u64 {
+    std::env::var("LAEW_WEB_SCRIPT_INTERACT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v >= 2_000)
+        .unwrap_or(30_000)
+}
+/// 交互后脚本补齐轮次上限(懒加载链通常 1-3 轮;重站 chunk 链 12 轮不够)。
+const INTERACTION_SCRIPT_ROUNDS: usize = 24;
 
 /// 用页面当前 DOM 续跑脚本管线,只执行尚未执行过的 `<script>`。
 ///
@@ -302,10 +335,18 @@ const INTERACTION_SCRIPT_ROUNDS: usize = 12;
 /// 因此页面全局状态不丢、首屏脚本也不会重复初始化。
 async fn run_pending_scripts(mgr: &LsmBrowserManager, pid: &str, budget_ms: u64) {
     let mut inner = mgr.inner.lock().await;
-    let (html, url, ua, viewport, session, rects, seed) = {
+    let (html, url, ua, viewport, session, rects, seed, has_pending) = {
         let Some(tab) = inner.tabs.get(pid) else {
             return;
         };
+        // 廉价预检(第 174 轮性能):无待执行脚本就不进管线。此前每条 eval/事件
+        // 都空跑一遍「解析+收集+排空」,重页(猎聘 372KB DOM)单条 eval
+        // 25-35s 的大头就是它;页面无变化时这里直接归零。
+        let mut probe = tab.executed_scripts.clone();
+        let doc = Document::parse(&tab.html, &tab.url);
+        let mut collected = script::dom_ops::collect_scripts(&doc, &tab.url, &mut probe);
+        let deferred_left = std::mem::take(&mut collected.deferred);
+        let has_pending = !collected.items.is_empty() || !deferred_left.is_empty();
         (
             tab.html.clone(),
             tab.url.clone(),
@@ -319,8 +360,12 @@ async fn run_pending_scripts(mgr: &LsmBrowserManager, pid: &str, budget_ms: u64)
                 max_rounds: INTERACTION_SCRIPT_ROUNDS,
                 budget_ms,
             },
+            has_pending,
         )
     };
+    if !has_pending {
+        return;
+    }
     let pipeline = script::run_pipeline(
         &mut inner,
         &mgr.http,
@@ -341,6 +386,9 @@ async fn run_pending_scripts(mgr: &LsmBrowserManager, pid: &str, budget_ms: u64)
     if changed {
         tab.html = pipeline.html;
     }
+    // 截断观测字段(第 174 轮):管线收敛则清零,截断则带出剩余数。
+    tab.script_budget_cut = pipeline.budget_cut;
+    tab.script_pending = pipeline.pending_scripts;
     if let Some(h) = pipeline.js {
         tab.js = Some(h);
     }
@@ -441,6 +489,8 @@ async fn js_eval_thread(
         );
         env.scroll_x = tab.scroll_x;
         env.scroll_y = tab.scroll_y;
+        // 资源时序注入(第 174 轮):取最近 120 条,足够探测「脚本是否加载」。
+        env.resources = tab.network.iter().rev().take(120).rev().cloned().collect();
         let doc = Document::parse(&tab.html, &tab.url);
         let rects = tab.layout.rect_map();
         let nodes = doc.snapshot_nodes_with_rects((tab.viewport.width, tab.viewport.height), &rects);
@@ -1871,12 +1921,25 @@ async fn finish_eval(
             applied += 1;
         }
     }
+    // 第 174 轮观测性:带上脚本管线截断状态。此前「登录弹层差一口气装不上」
+    // 只在 console 里有条 warn,工具结果毫无感知,Agent 只能盲探测;
+    // 现在结果直接给 script_pending/script_budget_cut,Agent 可据此 wait/重试。
+    let (script_pending, script_budget_cut) = {
+        let inner = mgr.inner.lock().await;
+        inner
+            .tabs
+            .get(pid)
+            .map(|t| (t.script_pending, t.script_budget_cut))
+            .unwrap_or((0, false))
+    };
     let mut data = json!({
         "result": outcome.value,
         "value_type": outcome.value_type,
         "await_promise": await_promise,
         "ok": outcome.ok,
         "actions_applied": applied,
+        "script_pending": script_pending,
+        "script_budget_cut": script_budget_cut,
         "console": outcome.logs.iter().map(|l| json!({"level": l.level, "text": l.text})).collect::<Vec<_>>(),
     });
     if let Some(err) = outcome.error {

@@ -256,6 +256,9 @@ pub async fn load_images(
     let budget_ms = env_u64("LAEW_WEB_IMAGE_BUDGET_MS", IMAGE_BUDGET_MS_DEFAULT, 1_000);
     let deadline = Instant::now() + Duration::from_millis(budget_ms);
     let mut total = 0usize;
+    // 第 174 轮降噪:SVG 图片解码失败每页只记一条能力边界告警(猎聘首页
+    // 一次刷十几条「图片解码失败 data:image/svg+xml,...」长 base64 文案)。
+    let mut svg_failed = 0usize;
     for url in urls.into_iter().take(max_images) {
         if total >= MAX_TOTAL_BYTES {
             out.skipped.push("图片总量超过上限".to_string());
@@ -267,7 +270,19 @@ pub async fn load_images(
             break;
         }
         // data: 内联图片:不走网络。
-        if let Some((bytes, _mime)) = decode_data_url(&url) {
+        if let Some((bytes, mime)) = decode_data_url(&url) {
+            // 第 174 轮:@font-face 的 woff/woff2 等**非图像** data: URL 不该进
+            // 图片解码器 —— 之前每条都产「图片解码失败 data:application/font-woff,
+            // ...(巨长 base64)」告警刷屏,纯属噪音。
+            let mime_l = mime.trim().to_ascii_lowercase();
+            if !mime_l.is_empty() && !mime_l.starts_with("image/") {
+                continue;
+            }
+            // SVG 光栅化是内核能力边界:不计逐条失败,收口为一条统计告警。
+            if mime_l.starts_with("image/svg") {
+                svg_failed += 1;
+                continue;
+            }
             if bytes.len() > max_bytes {
                 out.skipped.push(format!("{url} 超过单图上限"));
                 continue;
@@ -346,6 +361,11 @@ pub async fn load_images(
                     out.skipped.push(format!("{url} 超过单图上限"));
                     continue;
                 }
+                // SVG 光栅化是内核能力边界(与 data: 路径同一收口)。
+                if ct.contains("svg") || url.to_ascii_lowercase().ends_with(".svg") {
+                    svg_failed += 1;
+                    continue;
+                }
                 total += resp.bytes.len();
                 match decode_image(&resp.bytes) {
                     Some(img) => {
@@ -377,6 +397,15 @@ pub async fn load_images(
                 });
             }
         }
+    }
+    if svg_failed > 0 {
+        out.console.push(ConsoleRecord {
+            level: "warn".to_string(),
+            text: format!(
+                "SVG 图片暂不渲染(内核无 SVG 光栅化),本页跳过 {svg_failed} 个;图标缺失属能力边界而非加载失败"
+            ),
+            at_ms: super::now_ms(),
+        });
     }
     out.sizes = ImageSizes::from_store(&out.store);
     out
