@@ -80,7 +80,7 @@ pub async fn eval_js(page: &Page, script: &str) -> Result<Value> {
     let res = tokio::time::timeout(Duration::from_secs(CDP_BOUND_SECS), page.evaluate(wrapped))
         .await
         .map_err(|_| timeout_err("eval_js", CDP_BOUND_SECS))?
-        .map_err(|e| eval_js_err(&e))?;
+        .map_err(|e| eval_js_err(script, &e))?;
     Ok(res.value().cloned().unwrap_or(Value::Null))
 }
 
@@ -99,7 +99,7 @@ fn script_requests_navigation(script: &str) -> bool {
 }
 
 /// eval_js 异常的友好格式化:提取异常类型/描述/行列号。
-fn eval_js_err(e: &chromiumoxide::error::CdpError) -> AgentError {
+fn eval_js_err(script: &str, e: &chromiumoxide::error::CdpError) -> AgentError {
     use chromiumoxide::error::CdpError;
     if let CdpError::JavascriptException(details) = e {
         let exception = details.exception.as_ref();
@@ -115,12 +115,38 @@ fn eval_js_err(e: &chromiumoxide::error::CdpError) -> AgentError {
         } else {
             ""
         };
+        let excerpt = if desc.contains("SyntaxError") {
+            format!(";出错片段: {}", script_excerpt(script, line, col))
+        } else {
+            String::new()
+        };
         return AgentError::ToolExecution {
             tool: "chrome_browser".into(),
-            reason: format!("eval_js 脚本异常: Uncaught {class}: {desc} ({line}:{col}){hint}"),
+            reason: format!("eval_js 脚本异常: Uncaught {class}: {desc} ({line}:{col}){hint}{excerpt}"),
         };
     }
     err("eval_js", e)
+}
+
+fn script_excerpt(script: &str, line: i64, col: i64) -> String {
+    let text = if line <= 0 {
+        script
+    } else {
+        script.lines().nth(line as usize).unwrap_or(script)
+    };
+    let center = col.max(0) as usize;
+    let center = center.min(text.chars().count());
+    let start = center.saturating_sub(60);
+    let segment: String = text.chars().skip(start).take(120).collect();
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
+    }
+    out.push_str(&segment);
+    if text.chars().count() > start + segment.chars().count() {
+        out.push('…');
+    }
+    out
 }
 
 /// 全页 PNG 截图,返回 base64(与 Lsm 版 `inspect(screenshot)` 信封对齐)。
@@ -995,5 +1021,14 @@ mod tests {
         assert!(!page_error_is_definitively_dead("Inspected target navigated or closed"));
         assert!(!page_error_is_definitively_dead("Execution context was destroyed"));
         assert!(!page_error_is_definitively_dead("timeout"));
+    }
+
+    #[test]
+    fn 语法错误片段定位在出错列附近且不越界() {
+        let script = format!("{}bad-token{}", "a".repeat(100), "b".repeat(100));
+        let excerpt = script_excerpt(&script, 0, 105);
+        assert!(excerpt.contains("bad-token"));
+        assert!(excerpt.chars().count() <= 122);
+        assert_eq!(script_excerpt("1+1", 0, 999).chars().count(), 3);
     }
 }
