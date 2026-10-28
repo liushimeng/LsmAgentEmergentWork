@@ -70,12 +70,32 @@ pub async fn url_and_title(page: &Page) -> (String, String) {
 /// + IIFE 提示」的简洁格式(旧报文 700+ 字符,关键信息 `SyntaxError:
 /// Illegal return statement` 埋在中段,每个新 SubAgent 会话都要重新人肉解析)。
 pub async fn eval_js(page: &Page, script: &str) -> Result<Value> {
+    if script_requests_navigation(script) {
+        return Err(AgentError::ToolExecution {
+            tool: "chrome_browser".into(),
+            reason: "eval_js 不允许用 location.href/assign/replace 跳转页面:执行上下文会在返回前销毁。请改用 control_action=navigate;批量采集应逐页 navigate→wait→eval_js".into(),
+        });
+    }
     let wrapped = crate::agent::js_preprocess::wrap_top_level_return(script);
     let res = tokio::time::timeout(Duration::from_secs(CDP_BOUND_SECS), page.evaluate(wrapped))
         .await
         .map_err(|_| timeout_err("eval_js", CDP_BOUND_SECS))?
         .map_err(|e| eval_js_err(&e))?;
     Ok(res.value().cloned().unwrap_or(Value::Null))
+}
+
+fn script_requests_navigation(script: &str) -> bool {
+    let lower = script.to_ascii_lowercase();
+    if ["location.replace(", "location.assign("]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        return true;
+    }
+    lower.match_indices("location.href").any(|(idx, needle)| {
+        let rest = lower[idx + needle.len()..].trim_start();
+        rest.starts_with('=') && !rest.starts_with("==")
+    })
 }
 
 /// eval_js 异常的友好格式化:提取异常类型/描述/行列号。
@@ -304,12 +324,21 @@ pub async fn page_visible(page: &Page) -> bool {
         == Some("visible")
 }
 
-/// 页面存活探测:`receiver is gone`(target 被销毁/崩溃)时立即失败。
+/// 页面存活探测:只有明确的 target/session 销毁才判死。
+/// 导航中的执行上下文销毁、CDP 暂时忙或超时都不是 Tab 已关闭。
 pub async fn page_alive(page: &Page) -> bool {
-    tokio::time::timeout(Duration::from_secs(5), page.evaluate("1"))
-        .await
-        .map(|r| r.is_ok())
-        .unwrap_or(false)
+    match tokio::time::timeout(Duration::from_secs(5), page.evaluate("1")).await {
+        Ok(Ok(_)) => true,
+        Ok(Err(e)) => !page_error_is_definitively_dead(&e.to_string()),
+        Err(_) => true,
+    }
+}
+
+fn page_error_is_definitively_dead(message: &str) -> bool {
+    ["receiver is gone", "Target closed", "Session closed", "target closed"]
+        .iter()
+        .any(|needle| message.contains(needle))
+        && !message.contains("navigated or closed")
 }
 
 /// 列出当前可见、可交互的元素(元素发现原语)。
@@ -947,5 +976,24 @@ mod tests {
         assert!(hint.contains("确认登录/阻断状态"));
         assert!(hint.contains("credentials:'include'"));
         assert!(navigation_recovery_hint("net::ERR_TIMED_OUT").is_empty());
+    }
+
+    #[test]
+    fn eval_js导航写入被拦截_读取与比较不受影响() {
+        assert!(script_requests_navigation("location.href=u"));
+        assert!(script_requests_navigation("window.location.href = u"));
+        assert!(script_requests_navigation("location.replace(u)"));
+        assert!(script_requests_navigation("window.location.assign(u)"));
+        assert!(!script_requests_navigation("location.href"));
+        assert!(!script_requests_navigation("location.href === u"));
+    }
+
+    #[test]
+    fn 页面判死只认明确销毁_导航瞬变不误删() {
+        assert!(page_error_is_definitively_dead("send failed because receiver is gone"));
+        assert!(page_error_is_definitively_dead("Target closed"));
+        assert!(!page_error_is_definitively_dead("Inspected target navigated or closed"));
+        assert!(!page_error_is_definitively_dead("Execution context was destroyed"));
+        assert!(!page_error_is_definitively_dead("timeout"));
     }
 }

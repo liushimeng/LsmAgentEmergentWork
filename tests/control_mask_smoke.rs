@@ -161,6 +161,18 @@ async fn 真机_click_text_scope根元素自身可命中() {
     assert_eq!(value["data"]["result"]["hit"], true, "{value}");
     assert_eq!(value["data"]["result"]["matched_text"], "AMD 锐龙 7 9700X", "{value}");
 
+    let navigation = parse(&McpChromeUseTool.execute(json!({
+        "action":"control", "page_id":page_id, "control_action":"eval_js",
+        "params":{"script":"location.href='https://example.test/'"}
+    })).await.unwrap());
+    assert_eq!(navigation["code"], 2001, "{navigation}");
+    assert!(navigation["message"].as_str().unwrap().contains("control_action=navigate"), "{navigation}");
+    let alive = parse(&McpChromeUseTool.execute(json!({
+        "action":"control", "page_id":page_id, "control_action":"eval_js",
+        "params":{"script":"1+1"}
+    })).await.unwrap());
+    assert_eq!(alive["data"]["result"], 2, "导航守卫后同一 page_id 必须仍可用: {alive}");
+
     let closed = McpChromeUseTool
         .execute(json!({"action": "close", "page_id": page_id}))
         .await.unwrap();

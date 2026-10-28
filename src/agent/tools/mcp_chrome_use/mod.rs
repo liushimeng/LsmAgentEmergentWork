@@ -409,6 +409,7 @@ close 释放页面(page_id=all 全关并回收 Chrome 进程)。\
 把「联想下拉里的规范 POI」提交出去;只输入不回车,站点会用原始文本做地理编码,\
 结果页直接报「未找到相关地点」(实测百度地图路线规划)。\
 ★ 选择器未命中会回 candidates(可见输入框 selector/placeholder),按候选改选。\
+eval_js 只做当前页求值;不要在脚本里用 location.href/assign/replace 跳转(上下文会销毁),换页用 navigate,批量采集逐页 navigate→wait→eval_js。\
 ★ screenshot 务必给 params.save_path 落盘(只回路径+尺寸);不传才会回 base64。\
 ★ **要「全景/整页」截图就加 params.full_page=true**(按整页高度裁剪,视口截图看不到视口外内容)。\
 ★ inspect(html|text) 可用 params.selector 只取目标子树,默认 20000 字符截断(params.max_chars 可调),\
