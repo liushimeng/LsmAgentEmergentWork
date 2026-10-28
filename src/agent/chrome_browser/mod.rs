@@ -189,12 +189,65 @@ struct BrowserHolder {
     watchdog: Option<std::process::Child>,
 }
 
+/// 把会话 Cookie 转为 30 天持久 Cookie,仍由 Chrome 加密存储。
+/// 返回转换数量;已有明确有效期的 Cookie 不触碰。
+async fn persist_session_cookies(browser: &chromiumoxide::Browser) -> usize {
+    use chromiumoxide::cdp::browser_protocol::{network, storage};
+    let resp = match browser.execute(storage::GetCookiesParams::default()).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::warn!(error = %e, "持久 Chrome 会话前读取 Cookie 失败");
+            return 0;
+        }
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    let expires = now + 30.0 * 24.0 * 3600.0;
+    let cookies: Vec<network::CookieParam> = resp
+        .result
+        .cookies
+        .into_iter()
+        .filter(|c| c.session)
+        .map(|c| network::CookieParam {
+            name: c.name,
+            value: c.value,
+            url: None,
+            domain: Some(c.domain),
+            path: Some(c.path),
+            secure: Some(c.secure),
+            http_only: Some(c.http_only),
+            same_site: c.same_site,
+            expires: Some(network::TimeSinceEpoch::new(expires)),
+            priority: Some(c.priority),
+            same_party: None,
+            source_scheme: Some(c.source_scheme),
+            source_port: Some(c.source_port),
+            partition_key: c.partition_key,
+        })
+        .collect();
+    let count = cookies.len();
+    if count > 0 {
+        match browser.execute(storage::SetCookiesParams::new(cookies)).await {
+            Ok(_) => tracing::info!(count, "Chrome session cookie 已写入持久加密存储"),
+            Err(e) => tracing::warn!(error = %e, count, "Chrome session cookie 持久化失败"),
+        }
+    }
+    count
+}
+
 impl BrowserHolder {
     async fn shutdown(&mut self) {
-        // 持久 profile 必须先让 Chrome 正常退出,使 Cookie/localStorage 落盘;
-        // 旧路径直接 start_kill 会把刚完成的扫码登录留在内存里。超时再强杀兜底。
+        // 持久 profile 先把 session cookie 通过 CDP 改写为带有效期的持久 cookie,
+        // 由 Chrome 自己的加密 Cookie DB 落盘;不明文导出,也不依赖恢复旧 Tab。
         if self.keep_profile {
             if let Some(browser) = Arc::get_mut(&mut self.browser) {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    persist_session_cookies(browser),
+                )
+                .await;
                 let _ = tokio::time::timeout(Duration::from_secs(5), browser.close()).await;
                 let _ = tokio::time::timeout(Duration::from_secs(5), browser.wait()).await;
             }
@@ -392,9 +445,9 @@ impl ChromeManager {
         let profile = profile::select(self.mode);
         let dir = profile.dir;
         if profile.persistent {
-            profile::prepare_persistent(&dir).map_err(|e| AgentError::ToolExecution {
+            std::fs::create_dir_all(&dir).map_err(|e| AgentError::ToolExecution {
                 tool: "chrome_browser".into(),
-                reason: format!("准备 Chrome 持久 profile 失败({}): {e}", dir.display()),
+                reason: format!("创建 Chrome 持久 profile 失败({}): {e}", dir.display()),
             })?;
         }
         builder = builder.user_data_dir(&dir);
