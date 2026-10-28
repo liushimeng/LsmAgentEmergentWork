@@ -98,6 +98,20 @@ fn is_request_human_call(args: &serde_json::Value) -> bool {
     flat == Some("request_human") || nested == Some("request_human")
 }
 
+/// LLM 偶发把 `params` 作为 JSON 对象字符串输出;先归一再做 Schema 校验。
+/// 非法 JSON 或非对象保持原值,仍由校验器给出精确类型错误。
+fn normalize_params_arg(mut args: serde_json::Value) -> serde_json::Value {
+    let parsed = args
+        .get("params")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .filter(serde_json::Value::is_object);
+    if let Some(params) = parsed {
+        args["params"] = params;
+    }
+    args
+}
+
 /// 工具调用的人读标签(活动台账用):工具名 + 首个关键参数摘要。
 /// 只取一个关键参数即可 —— 进度栏是给人看的,不是参数转储。
 fn tool_label(name: &str, args: &serde_json::Value) -> String {
@@ -161,6 +175,7 @@ impl Agent {
     ) -> ToolExec {
         // ★ 计时起点必须在 tool.execute() 之前(第 82 轮 P0-1)。
         let tool_call_started = std::time::Instant::now();
+        let args = normalize_params_arg(args);
         // 活动台账:当前工具调用标签(屏蔽页面进度栏第一行;作用域外 no-op)。
         crate::agent::web_activity::note_tool(&tool_label(name, &args));
         // 第 131 轮网页取证纪律:Bash 不得顶替 MCP_Web_LsmAgentBrowser_Use 去探/抓任务目标站点。
@@ -430,6 +445,16 @@ mod tests {
             name: name.to_string(),
             arguments: args,
         }
+    }
+
+    #[test]
+    fn 字符串化params在校验前归一为对象() {
+        let args = normalize_params_arg(json!({"params":"{\"script\":\"1+1\"}"}));
+        assert_eq!(args["params"]["script"], "1+1");
+        let invalid = normalize_params_arg(json!({"params":"not-json"}));
+        assert!(invalid["params"].is_string());
+        let array = normalize_params_arg(json!({"params":"[1,2]"}));
+        assert!(array["params"].is_string());
     }
 
     fn agent_with(reg: crate::agent::tools::ToolRegistry) -> Agent {
