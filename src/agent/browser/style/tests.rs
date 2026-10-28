@@ -609,3 +609,25 @@ fn 猎聘前缀display连写_最终flex生效() {
 
 
 
+
+// ===================== 第 175 轮:margin/padding 简写 =====================
+
+/// computed css map 应含 margin/padding 四值简写(Chrome getComputedStyle 语义)。
+/// 站点探测脚本读 `cs.margin` / `cs.padding`,缺失返回 undefined 会误导探测结论。
+#[test]
+fn css_map含margin与padding简写() {
+    let (doc, engine) = doc_engine(
+        "<head><style>#t{margin:0}</style></head>\
+         <body><div id=t>x</div><p id=pp>y</p></body>",
+        1280.0,
+    );
+    let t = style_of(&doc, &engine, "#t");
+    let map = t.to_map();
+    let m = map.get("margin").expect("margin 简写应存在");
+    assert_eq!(m, "0px 0px 0px 0px", "reset 后四值简写应全 0");
+    assert!(map.get("margin-top").unwrap() == "0px");
+    // p 元素 UA 默认上下 8px、左右 0。
+    let p = style_of(&doc, &engine, "#pp").to_map();
+    assert_eq!(p.get("margin").unwrap(), "8px 0px 8px 0px");
+    assert!(p.get("padding").unwrap().starts_with("0px"), "padding 简写应四值");
+}

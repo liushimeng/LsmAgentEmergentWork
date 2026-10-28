@@ -732,3 +732,41 @@ async fn 查看器上报尺寸_非有头页忽略() {
     drop(inner);
     mgr.shutdown().await;
 }
+
+// ===================== 第 175 轮:非 HTML 主文档合成展示页 =====================
+
+/// image/* 主文档应合成居中展示页(data: 内嵌,避免二次取回变样);
+/// HTML/空 Content-Type 返回 None 走原解析路径。
+#[test]
+fn 非html文档合成展示页() {
+    // 1×1 红色 PNG。
+    let png: &[u8] = &[
+        0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0x0d, b'I', b'H', b'D', b'R',
+        0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0, 0x90, 0x77, 0x53, 0xde, 0, 0, 0, 0x0c, b'I',
+        b'D', b'A', b'T', 0x08, 0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0xf0, 0x1f, 0x00, 0x05, 0x05,
+        0x02, 0x00, 0xfe, 0x02, 0x8f, 0xa7, 0x9d, 0, 0, 0, 0, b'I', b'E', b'N', b'D', 0xae,
+        0x42, 0x60, 0x82,
+    ];
+    let img = synthesize_non_html_document("image/png", png, "https://q.test/qr?sign=abc")
+        .expect("image/* 应合成展示页");
+    assert!(img.contains("data:image/png;base64,"), "应 data: 内嵌图片字节");
+    assert!(!img.contains("https://q.test/qr?sign=abc\" alt"), "不应外链原图二次取回");
+    assert!(img.contains("object-fit"), "应约束展示尺寸");
+
+    let txt = synthesize_non_html_document("text/plain; charset=utf-8", b"hello <world>", "https://a.test/x.txt")
+        .expect("text/plain 应合成展示页");
+    assert!(txt.contains("&lt;world&gt;"), "文本应 HTML 转义");
+
+    let js = synthesize_non_html_document("application/json", b"{\"a\":1}", "https://a.test/x.json")
+        .expect("json 应合成展示页");
+    assert!(js.contains("{&quot;a&quot;:1}") || js.contains("{\"a\":1}") || js.contains("&quot;a&quot;"), "json 主体应可见");
+
+    assert!(
+        synthesize_non_html_document("text/html; charset=utf-8", b"<html></html>", "https://a.test/").is_none(),
+        "HTML 应走原路径"
+    );
+    assert!(
+        synthesize_non_html_document("", b"anything", "https://a.test/").is_none(),
+        "空 Content-Type 应走原路径(兼容缺头服务器)"
+    );
+}

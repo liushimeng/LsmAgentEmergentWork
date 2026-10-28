@@ -610,7 +610,9 @@ impl LsmBrowserManager {
             ..Default::default()
         };
         let (resp, from_cache) = self.fetch_main(&mut inner, &requested, &ua, timeout_ms).await?;
-        let raw_html = resp.text();
+        // 第 175 轮:非 HTML 主文档(图片/纯文本/JSON)合成展示页,避免黑屏。
+        let raw_html = synthesize_non_html_document(&resp.content_type(), &resp.bytes, &resp.final_url)
+            .unwrap_or_else(|| resp.text());
         let content_type = resp.content_type();
         let empty_session = HashMap::new();
         // 阶段四第二步：解析主文档 CSP 头，供脚本管线门禁。
@@ -910,7 +912,9 @@ impl LsmBrowserManager {
                 })?;
             (resp, false)
         };
-        let raw_html = resp.text();
+        // 第 175 轮:非 HTML 主文档(图片/纯文本/JSON)合成展示页,避免黑屏。
+        let raw_html = synthesize_non_html_document(&resp.content_type(), &resp.bytes, &resp.final_url)
+            .unwrap_or_else(|| resp.text());
         let content_type = resp.content_type();
         // 阶段四第二步：解析主文档 CSP 头，供脚本管线门禁与安全上下文缓存。
         let csp_policy = parse_csp_header(&resp.headers);
@@ -1687,6 +1691,76 @@ fn cache_enabled() -> bool {
             .as_str(),
         "off" | "0" | "false" | "no"
     )
+}
+
+/// 非 HTML 主文档合成包装页(第 175 轮,真实浏览器行为)。
+///
+/// 导航到 `image/*`、`text/plain`、`application/json` 等非 HTML 资源时,
+/// 真实浏览器会合成展示页(图片居中显示 / 文本等宽呈现);此前一律把响应
+/// 字节流塞给 HTML 解析器 → 空 DOM → 渲染全黑。百度地图登录二维码接口
+/// (`passport.baidu.com/v2/api/qrcode`,Content-Type: image/png)实测黑屏,
+/// Agent「把可见浏览器窗口当二维码展示板」的路径被阻断。
+///
+/// - `image/*`(≤4MB):flex 居中 `<img>`,**data: 内嵌**——二维码等一次性
+///   资源二次网络取回会变样/失效,必须用本次响应字节;
+/// - `text/plain` / `application/json`(含 `+json`):等宽 `<pre>`(HTML 转义);
+/// - 其余明确非 HTML 类型:类型/大小/URL 说明页;
+/// - HTML / XML / 空 Content-Type:返回 None,调用方走原解析路径。
+fn synthesize_non_html_document(content_type: &str, bytes: &[u8], final_url: &str) -> Option<String> {
+    let ct = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if ct.is_empty() || ct.contains("html") || ct.contains("xml") {
+        return None;
+    }
+    let esc = |s: &str| -> String {
+        s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    };
+    let url_disp = esc(final_url);
+    if ct.starts_with("image/") && bytes.len() <= 4 * 1024 * 1024 {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+        return Some(format!(
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>{url}</title></head>\
+             <body style=\"margin:0;height:100vh;background:#f5f5f5;display:flex;align-items:center;justify-content:center\">\
+             <img style=\"max-width:100%;object-fit:contain\" src=\"data:{ct};base64,{b64}\" alt=\"image\">\
+             </body></html>",
+            url = url_disp,
+            ct = ct,
+            b64 = b64,
+        ));
+    }
+    if (ct.starts_with("text/") && ct != "text/html") || ct == "application/json" || ct.ends_with("+json") {
+        let text = urlutil::decode_body(bytes, content_type);
+        let shown = if text.chars().count() > 200_000 {
+            let mut s: String = text.chars().take(200_000).collect();
+            s.push_str("\n…(截断)");
+            s
+        } else {
+            text
+        };
+        return Some(format!(
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>{url}</title></head>\
+             <body style=\"margin:0;padding:16px;background:#fff\">\
+             <pre style=\"white-space:pre-wrap;font-family:monospace;font-size:13px;line-height:1.6;margin:0\">{text}</pre>\
+             </body></html>",
+            url = url_disp,
+            text = esc(&shown),
+        ));
+    }
+    // 图片超限或其余二进制:说明页。
+    Some(format!(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>{url}</title></head>\
+         <body style=\"margin:0;padding:32px;background:#fff;color:#333;font-size:14px\">\
+         <p><b>非 HTML 文档</b></p><p>类型:{ct}</p><p>大小:{size} 字节</p><p>URL:{url}</p>\
+         <p>内核暂不支持在页面内呈现该类型。</p></body></html>",
+        ct = esc(&ct),
+        size = bytes.len(),
+        url = url_disp,
+    ))
 }
 
 /// 解析主文档响应的 CSP 头（阶段四第二步）。

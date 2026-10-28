@@ -487,6 +487,30 @@ impl ComputedStyle {
         ] {
             out.insert(name.to_string(), format!("{}px", num(v)));
         }
+        // 第 175 轮:margin/padding 简写(Chrome getComputedStyle 语义:四值展开)。
+        // 站点探测脚本(含地图引擎登录链)常读 `cs.margin` / `cs.padding`,
+        // 缺失时返回 undefined 被当异常值处理。PRELUDE 的 getComputedStyle
+        // 逐键透传本 map,简写补在这里即对页面 JS 可见。
+        out.insert(
+            "margin".into(),
+            format!(
+                "{}px {}px {}px {}px",
+                num(self.margin_top),
+                num(self.margin_right),
+                num(self.margin_bottom),
+                num(self.margin_left)
+            ),
+        );
+        out.insert(
+            "padding".into(),
+            format!(
+                "{}px {}px {}px {}px",
+                num(self.padding_top),
+                num(self.padding_right),
+                num(self.padding_bottom),
+                num(self.padding_left)
+            ),
+        );
         out.insert("width".into(), length_text(self.width));
         out.insert("max-width".into(), length_text(self.max_width));
         out.insert("height".into(), length_text(self.height));

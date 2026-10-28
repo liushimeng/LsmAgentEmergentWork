@@ -924,6 +924,29 @@ function __mk(n) {
     offsetTop: __geo.y,
     clientLeft: 0,
     clientTop: 0,
+    // offsetParent(第 175 轮):Chrome 语义近似 —— 沿 parentNode 上行取首个
+    // 定位祖先(position ∈ absolute/relative/fixed/sticky),无则 body;
+    // 自身为 body/html 或 fixed → null。此前恒 undefined,瓦片链路这类
+    // 「沿 offsetParent 上行取容器几何」的探测/库代码走一层就断。
+    get offsetParent() {
+      try {
+        var tag = String(n.tag || "").toLowerCase();
+        if (tag === "body" || tag === "html") return null;
+        var csSelf = getComputedStyle(el);
+        if (String(csSelf && csSelf.position) === "fixed") return null;
+        var cur = el.parentNode;
+        var guard = 0;
+        while (cur && guard++ < 64) {
+          if (cur.nodeType !== 1) { cur = cur.parentNode; continue; }
+          var cs = getComputedStyle(cur);
+          var p = String((cs && cs.position) || "");
+          if (p === "absolute" || p === "relative" || p === "fixed" || p === "sticky") return cur;
+          if (String(cur.tagName || "").toLowerCase() === "body") return cur;
+          cur = cur.parentNode;
+        }
+        return null;
+      } catch (e) { return null; }
+    },
     // 滚动偏移:缺这两个值时站点的 offset() 会算出 NaN(定位全部失效)。
     scrollLeft: 0,
     scrollTop: 0,
@@ -2033,6 +2056,14 @@ var document = {
   location: null,
   characterSet: "UTF-8",
   contentType: "text/html",
+  // styleSheets(第 175 轮):最小空 StyleSheetList。此前完全缺失,
+  // `document.styleSheets.length` 直接 TypeError,整段探测脚本作废
+  // (百度地图样式核查探针实测)。真枚举内联样式表超出本轮;
+  // 空表(长度 0)比炸掉脚本更接近真相,循环消费方自然走「无表」分支。
+  styleSheets: {
+    length: 0,
+    item: function () { return null; }
+  },
   querySelector: __lsmQueryOneWithDyn,
   querySelectorAll: __lsmQueryWithDyn,
   getElementById: function (id) { return __lsmQueryOneWithDyn("#" + id); },
@@ -2585,6 +2616,16 @@ var __lsmWin = {
       var key = String(p).toLowerCase();
       return Object.prototype.hasOwnProperty.call(css, key) ? css[key] : "";
     };
+    // 第 175 轮:块级/行内块元素的 width/height 返回 used value(Chrome 语义)。
+    // css map 对 auto 给 "auto",而站点与探测脚本常直接要 px;快照 rect
+    // 有值时回填(display:inline 保持 auto,与 Chrome 一致)。
+    try {
+      var nn = el && el.__lsm_node;
+      var g = nn ? __lsmGeom(nn) : null;
+      var disp = String(out.display || "");
+      if (g && g.w > 0 && (!out.width || out.width === "auto") && disp !== "inline") out.width = g.w + "px";
+      if (g && g.h > 0 && (!out.height || out.height === "auto") && disp !== "inline") out.height = g.h + "px";
+    } catch (e) {}
     return out;
   },
   matchMedia: function (q) {

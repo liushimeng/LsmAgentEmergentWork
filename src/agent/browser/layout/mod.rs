@@ -222,7 +222,7 @@ pub fn compute_full(
         seq: 0,
         images,
         base_url: doc.base_url.clone(),
-        y: 8.0,
+        y: 0.0,
         z_floor: 0,
         fixed_depth: 0,
     };
@@ -240,8 +240,17 @@ pub fn compute_full(
         .map(|n| engine.computed(&n, &initial))
         .unwrap_or_else(|| initial.clone());
     let body_style = engine.computed(&body, &html_style);
+    // 第 175 轮:初始包含块消费**真实** body margin(UA 默认 8px 仍来自样式层
+    // 默认值,站点 reset margin:0 后布局应全幅)。此前硬编码 8/16,与
+    // ComputedStyle 脱钩 —— 百度地图 #MapHolder 被逼到 (8,27,1904×1080),
+    // 地图引擎按错误几何初始化,瓦片栅格错位且下半屏无瓦片。
+    let body_margin_top = body_style.margin_top.max(0.0);
+    let body_margin_left = body_style.margin_left.max(0.0);
+    let body_margin_right = body_style.margin_right.max(0.0);
+    let body_margin_bottom = body_style.margin_bottom.max(0.0);
+    ctx.y = body_margin_top;
     let mut buf = InlineBuf::default();
-    let content_width = ctx.width - 16.0;
+    let content_width = (ctx.width - body_margin_left - body_margin_right).max(40.0);
     // 初始包含块:整页坐标。高度传播链:视口 → html → body。
     // 百分比高度仅在包含块高度确定时生效(CSS),故 html/body 的确定高
     // 逐级解析后作为 ICB 高度;chain 任一环 auto 则 ICB 高度未知,
@@ -252,9 +261,9 @@ pub fn compute_full(
         .map(|h| (h - body_style.padding_top - body_style.padding_bottom).max(0.0))
         .unwrap_or(UNKNOWN_CB_H);
     let icb = (0.0, 0.0, ctx.width, icb_h);
-    ctx.layout_children(&body, 8.0, content_width, &mut buf, 0, &body_style, icb);
+    ctx.layout_children(&body, body_margin_left, content_width, &mut buf, 0, &body_style, icb);
     ctx.flush_inline(&mut buf, content_width);
-    let height = ctx.y + 8.0;
+    let height = ctx.y + body_margin_bottom;
     // 阶段三:按 z-index 稳定排序绘制序(同 z 保持 DOM/流内先后顺序)。
     ctx.boxes.sort_by_key(|b| b.z_index);
     // 阶段三第三步:图像绘制序(背景图先于内容图,同 z 保持先后)。
@@ -397,6 +406,44 @@ pub(crate) fn is_replaced_tag(node: &NodeRef) -> bool {
         // 坐标点击与 inspect 全部失真)。
         "img" | "svg" | "iframe"
     )
+}
+
+/// 行内子树是否含**结构性内容**(非空文本或可渲染元素)。
+///
+/// 第 175 轮:纯结构判定(不查 CSS),供 `inline_box_size` 把空行内元素
+/// 量成 0×0 —— Chrome 语义:空行内元素(如 `<a name=x></a>`、纯空白、
+/// 仅含空子元素)不产生行盒,高度 0。此前一律给 16px+ 幻影高,
+/// 百度地图 body 首子 DIV(仅含空锚点)被量出 1904×17 幽灵条带,
+/// 把 #app 与地图容器整体下推。
+pub(crate) fn has_structural_inline_content(node: &NodeRef, depth: usize) -> bool {
+    if depth > 6 {
+        // 防御性:过深按有内容处理,避免极端嵌套误判成空。
+        return true;
+    }
+    for child in node.children() {
+        if let Some(t) = child.as_text() {
+            if !t.borrow().trim().is_empty() {
+                return true;
+            }
+            continue;
+        }
+        if child.as_element().is_none() {
+            continue;
+        }
+        let tag = document::tag_name(&child).to_ascii_lowercase();
+        // 替换/控件/换行类标签一律算内容;纯结构标签递归下钻。
+        if matches!(
+            tag.as_str(),
+            "img" | "svg" | "iframe" | "canvas" | "video" | "audio" | "object" | "embed"
+                | "input" | "select" | "textarea" | "button" | "br" | "hr"
+        ) {
+            return true;
+        }
+        if has_structural_inline_content(&child, depth + 1) {
+            return true;
+        }
+    }
+    false
 }
 
 /// `<svg>` 固有尺寸:`width`/`height` 属性优先,缺省回落 `viewBox`
@@ -1377,6 +1424,20 @@ impl<'a> LayoutCtx<'a> {
     /// 百分比宽度按包含块宽度(`avail_w`)求解;百分比高度在父高未知时按 `auto`
     /// 处理(CSS 中行内元素的百分比高度同样不生效)。
     fn inline_box_size(&self, node: &NodeRef, style: &ComputedStyle, avail_w: f64) -> (f64, f64) {
+        // 第 175 轮:空行内元素(无文本、无显式尺寸、无可渲染子元素)量成 0×0 ——
+        // 不产生行盒(Chrome 语义);盒照常发射,保住第 174 轮的几何寻址诉求
+        // (Chrome 空行内元素 rect 亦为 0×0)。表单控件/替换类标签自身即有
+        // 固有尺寸(void 元素无子节点,不能按「无子内容」判空)。
+        let explicit_dim =
+            style.width.is_some() || style.height.is_some() || style.width_percent.is_some();
+        let self_replaced = matches!(
+            document::tag_name(node).to_ascii_lowercase().as_str(),
+            "input" | "select" | "textarea" | "button" | "img" | "svg" | "iframe" | "canvas"
+                | "object" | "embed" | "video" | "audio" | "hr"
+        );
+        if !self_replaced && !explicit_dim && !has_structural_inline_content(node, 0) {
+            return (0.0, 0.0);
+        }
         let text = node.text_contents();
         let text_w = self.font.text_width(&text, style.font_size);
         let w = if let Some(p) = style.width_percent {
@@ -1503,7 +1564,11 @@ impl<'a> LayoutCtx<'a> {
             let by = self.y + dy;
             tf = self.emit_inline_box(node, style, bx, by, w, h, tf);
             // 阶段七:登记当前行占用,后续行内浮动可排在它的右侧剩余带。
-            row.register(bx, by, w, h, line_x + avail_w);
+            // 第 175 轮:空行内元素 0×0 不占流(Chrome 语义)—— 只发射寻址盒,
+            // 不登记行占用、不推进游标,消灭 `<a name=x></a>` 类幽灵行高。
+            if w > 0.0 && h > 0.0 {
+                row.register(bx, by, w, h, line_x + avail_w);
+            }
             box_x = bx;
             box_w = w;
         }

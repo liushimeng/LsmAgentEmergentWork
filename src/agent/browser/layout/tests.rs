@@ -1506,3 +1506,59 @@ fn 无尺寸iframe缺省300x150() {
         (fr.w, fr.h)
     );
 }
+
+// ===================== 第 175 轮:body margin / 空行内元素 =====================
+
+/// body margin 重置为 0 后,块级内容应从视口原点全幅排布
+/// (百度地图 #MapHolder 被 (8,27) 偏移 + 1904 宽的根因回归)。
+#[test]
+fn body_margin重置后内容全幅从原点排布() {
+    let html = "<html><head><style>body{margin:0;padding:0}#app{width:100%;height:40px}</style></head>\
+                <body><div id='app'>x</div></body></html>";
+    let doc = Document::parse(html, "https://a.test/");
+    let lay = compute(&doc, 800.0, &font());
+    let app = lay.rect_for("#app").expect("#app 应有布局盒");
+    assert!(app.0.abs() < 0.5, "margin:0 后 x 应为 0,实际 {app:?}");
+    assert!((app.2 - 800.0).abs() < 1.0, "width:100% 应撑满 800,实际 {app:?}");
+}
+
+/// 无重置时维持 UA 缺省 8px 观感:布局不再硬编码,而是消费样式层真值
+/// (ua_default 给 body 四边 8px;站点 reset 后自然全幅,见上一用例)。
+#[test]
+fn 无样式时body默认margin为样式真值() {
+    let html = "<html><body><div id='only'>x</div></body></html>";
+    let doc = Document::parse(html, "https://a.test/");
+    let lay = compute(&doc, 800.0, &font());
+    let d = lay.rect_for("#only").expect("div 应有布局盒");
+    assert!((d.0 - 8.0).abs() < 0.5, "UA 缺省 margin=8,布局应从 8 起,实际 {d:?}");
+    assert!((d.2 - 784.0).abs() < 1.0, "内容宽应为 800-16,实际 {d:?}");
+}
+
+/// 空行内元素(仅含 name 属性的锚点)不产生行盒:容器高度≈0,
+/// 后续兄弟不被幽灵 17px 下推(百度地图顶部条带根因回归)。
+#[test]
+fn 空锚点不产生幽灵行高() {
+    let html = "<html><body><div id='strip'><a name='script1'></a></div>\
+                <div id='after'>y</div></body></html>";
+    let doc = Document::parse(html, "https://a.test/");
+    let lay = compute(&doc, 800.0, &font());
+    let strip = lay.rect_for("#strip").expect("strip 应有布局盒");
+    assert!(strip.3 <= 1.5, "空锚点容器高度应≈0,实际 {strip:?}");
+    let after = lay.rect_for("#after").expect("after 应有布局盒");
+    assert!(
+        (after.1 - strip.1).abs() < 4.0,
+        "后续兄弟不应被幽灵行高下推(允许 1px 最小高 + 2px margin 兜底):strip={strip:?} after={after:?}"
+    );
+    // 寻址诉求保留:空锚点仍有盒(0×0)。
+    let anchor = lay.boxes.iter().find(|b| b.tag == "a").expect("空锚点仍应发射寻址盒");
+}
+
+/// 带文本的行内元素照常建盒,不因空判定收紧。
+#[test]
+fn 带文本锚点照常建盒() {
+    let html = "<html><body><div><a id='lk' href='/x'>link</a></div></body></html>";
+    let doc = Document::parse(html, "https://a.test/");
+    let lay = compute(&doc, 800.0, &font());
+    let lk = lay.rect_for("#lk").expect("锚点应有布局盒");
+    assert!(lk.2 > 0.0 && lk.3 > 0.0, "带文本锚点应非零尺寸,实际 {lk:?}");
+}
