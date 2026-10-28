@@ -1079,18 +1079,7 @@ pub(super) fn mandated_tool(prompt: &str, tool: &str) -> bool {
 /// - 只出现 Lsm 系词 → `"lsm"`;
 /// - 两者都出现或都不出现 → `None`(不注入,选用决策留给模型)。
 pub(super) fn browser_mandate(prompt: &str) -> Option<&'static str> {
-    let lower = prompt.to_ascii_lowercase();
-    let chrome = ["chrome", "chromium", "谷歌浏览器", "谷歌内核"]
-        .iter()
-        .any(|k| lower.contains(k));
-    let lsm = ["lsmagentbrowser", "lsm 浏览器", "自研内核", "反反爬", "反-反爬"]
-        .iter()
-        .any(|k| lower.contains(k));
-    match (chrome, lsm) {
-        (true, false) => Some("chrome"),
-        (false, true) => Some("lsm"),
-        _ => None,
-    }
+    crate::agent::task_prerequisites::browser_mandate(prompt)
 }
 
 // ===================== 第 146 轮:完成单元摘要(断点续跑) =====================

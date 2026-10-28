@@ -123,13 +123,16 @@ impl PlanRunner {
         } else {
             String::new()
         };
+        let browser_block = crate::agent::task_prerequisites::browser_constraint(user_prompt)
+            .map(|s| format!("\n{s}\n"))
+            .unwrap_or_default();
         let prompt = format!(
             "【Plan 任务】\n\
              Session: {session_id}\n\
              目的: {purpose}\n\
              目标: {goal}\n\
              意图: {intent}\n\
-             分解步骤:\n{decomp}\n{retry_block}{completed_block}{user_block}{login_first_block}\n\
+             分解步骤:\n{decomp}\n{retry_block}{completed_block}{user_block}{login_first_block}{browser_block}\n\
              请先按系统提示词「探索阶段」收集足够事实,再按 Markdown 模板输出方案(完整五段)。",
             decomp = decomposition
                 .iter()
@@ -246,6 +249,9 @@ impl PlanRunner {
         } else {
             String::new()
         };
+        let browser_block = crate::agent::task_prerequisites::browser_constraint(user_prompt)
+            .map(|s| format!("\n{s}\n"))
+            .unwrap_or_default();
         let prompt = format!(
             "【Plan 再规划 / 更新规划】\n\
              Session: {session_id}\n\
@@ -260,7 +266,7 @@ impl PlanRunner {
              表单分步填写与字段核对、换路径 / 换入口、访问受限时的降级方案;\n\
              ③ 已完成单元禁止重复规划;需要其结论的步骤写「复用上轮产物:<要点>」;\n\
              ④ 仍按系统提示词 Markdown 模板输出完整方案(五段必备,可附「## 六、未决阻碍与再规划触发点」)。\n\
-             {completed_block}{user_block}{prev_block}{login_first_block}",
+             {completed_block}{user_block}{prev_block}{login_first_block}{browser_block}",
             decomp = decomposition
                 .iter()
                 .enumerate()

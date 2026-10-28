@@ -3,6 +3,37 @@
 //! 与目标锚点分工:这里只识别需要跨 Plan / Main-Work / SubAgent 保持一致的
 //! 顺序语义,不抽取目标站点,也不做工具级政策拦截。
 
+/// 用户原始提示词指定的浏览器内核;双指定/未指定交给模型选择。
+pub fn browser_mandate(prompt: &str) -> Option<&'static str> {
+    let lower = prompt.to_ascii_lowercase();
+    let chrome = ["chrome", "chromium", "谷歌浏览器", "谷歌内核"]
+        .iter()
+        .any(|k| lower.contains(k));
+    let lsm = ["lsmagentbrowser", "lsm 浏览器", "自研内核", "反反爬", "反-反爬"]
+        .iter()
+        .any(|k| lower.contains(k));
+    match (chrome, lsm) {
+        (true, false) => Some("chrome"),
+        (false, true) => Some("lsm"),
+        _ => None,
+    }
+}
+
+/// Plan/Main-Work 共用的工具指定约束,防止规划层另开无登录态内核。
+pub fn browser_constraint(prompt: &str) -> Option<&'static str> {
+    match browser_mandate(prompt) {
+        Some("chrome") => Some(
+            "【用户指定浏览器(原始输入硬约束)】本任务的规划探查与全部网页操作必须使用\
+             MCP_Web_Chrome_Use;不要改用 MCP_Web_LsmAgentBrowser_Use(登录态不共享)。",
+        ),
+        Some("lsm") => Some(
+            "【用户指定浏览器(原始输入硬约束)】本任务的规划探查与全部网页操作必须使用\
+             MCP_Web_LsmAgentBrowser_Use;不要改用 MCP_Web_Chrome_Use。",
+        ),
+        _ => None,
+    }
+}
+
 /// 用户是否明确要求「先登录,再做后续工作」。
 ///
 /// 必须同时出现登录与顺序词,普通「支持登录」「登录按钮」等界面描述不命中。
@@ -45,5 +76,16 @@ mod tests {
         for prompt in ["找到登录按钮", "页面支持账号登录", "检查登录态", ""] {
             assert!(!requires_login_first(prompt), "不应命中: {prompt}");
         }
+    }
+
+    #[test]
+    fn 指定Chrome约束同时覆盖规划与执行() {
+        let prompt = "使用 Chrome 打开京东,必须先登录再搜索";
+        assert_eq!(browser_mandate(prompt), Some("chrome"));
+        let constraint = browser_constraint(prompt).unwrap();
+        assert!(constraint.contains("规划探查"));
+        assert!(constraint.contains("MCP_Web_Chrome_Use"));
+        assert!(constraint.contains("登录态不共享"));
+        assert!(browser_constraint("分别用 Chrome 与 LsmAgentBrowser 对比").is_none());
     }
 }
