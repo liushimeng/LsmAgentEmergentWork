@@ -14,6 +14,8 @@ pub mod runtime;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_dom_insert;
 
 use std::collections::HashMap;
 use std::time::Duration;

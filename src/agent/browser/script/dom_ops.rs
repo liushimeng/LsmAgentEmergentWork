@@ -53,13 +53,22 @@ pub fn apply(doc: &Document, actions: &[JsAction], base_url: &str) -> ApplySumma
     let mut summary = ApplySummary::default();
     // LAEW_DOM_TRACE=1:诊断「页面空白/JS 建好的 UI 没回写」类问题 ——
     // 打出动作账本(kind/selector/前 N 条样本),验证完即用环境变量关掉。
-    if std::env::var("LAEW_DOM_TRACE").is_ok() {
+    // LAEW_DOM_TRACE=2:全量模式,打出本批**所有**动作(重站定位个别动态节点
+    // 的创建/样式写入链路时用;默认 25 条采样会漏掉后段动作)。
+    let dom_trace = std::env::var("LAEW_DOM_TRACE").unwrap_or_default();
+    let dom_trace_full = dom_trace == "2" || dom_trace.eq_ignore_ascii_case("full");
+    if !dom_trace.is_empty() {
         let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
         for a in actions {
             *kinds.entry(a.kind.clone()).or_default() += 1;
         }
         eprintln!("[domtrace] apply actions={} kinds={:?}", actions.len(), kinds);
-        for a in actions.iter().take(25) {
+        let sample: Vec<&JsAction> = if dom_trace_full {
+            actions.iter().collect()
+        } else {
+            actions.iter().take(25).collect()
+        };
+        for a in sample {
             eprintln!(
                 "[domtrace]   kind={} selector={} key={} value={}",
                 a.kind,

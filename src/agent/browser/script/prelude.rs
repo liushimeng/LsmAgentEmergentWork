@@ -24,6 +24,8 @@ var __lsmTimers = [];
 var __lsmScriptCbs = {};
 // 线程内已同步装载过的动态脚本 URL(去重:同一 URL 只装一次)。
 var __lsmDynLoaded = {};
+var __lsmDynOk = {};
+var __lsmChainTrace = false;
 var __lsmTimerSeq = 0;
 var __lsmNow = 0;
 var __lsmTimerRan = 0;
@@ -540,6 +542,21 @@ function __serEl(el) {
 }
 
 // ---------- CSS style Proxy ----------
+// JS 属性名 → CSS 属性名归一化(CSSStyleDeclaration IDL 语义):
+// `style.zIndex = 5` 必须落成 `z-index:5` —— 旧实现把驼峰名原样写进 style
+// 字符串,宿主 CSS 解析器不认识 `zIndex` 声明即死亡(实测百度地图
+// platform/图层的 zIndex:5/200/50 全部失效,层叠顺序丢失)。
+// 厂商前缀按 WebIDL 惯例:Moz→-moz-、Webkit→-webkit-、O→-o-、ms→-ms-
+// (ms 小写开头);cssFloat/styleFloat → float。
+function __cssPropName(p) {
+  p = String(p == null ? "" : p);
+  if (p === "cssFloat" || p === "styleFloat") return "float";
+  var kebab = p.replace(/([A-Z])/g, "-$1").toLowerCase();
+  // ms 前缀小写开头,普通转换不会补前导短横,WebIDL 语义需要 -ms-*;
+  // Moz/Webkit/O 大写开头,通用转换天然给出 -moz-*/-webkit-*/-o-*。
+  if (/^ms-/.test(kebab)) return "-" + kebab;
+  return kebab;
+}
 function __cssGet(css, prop) {
   var m = String(css || "").match(new RegExp("(?:^|;)\\s*" + String(prop).replace(/[-]/g, "\\-") + "\\s*:\\s*([^;]+)", "i"));
   return m ? m[1].trim() : "";
@@ -557,17 +574,17 @@ function __cssSet(css, prop, val) {
 }
 function __mkStyle(getCss, setCss) {
   if (typeof Proxy !== "function") {
-    return { cssText: getCss(), getPropertyValue: function (p) { return __cssGet(getCss(), p); } };
+    return { cssText: getCss(), getPropertyValue: function (p) { return __cssGet(getCss(), __cssPropName(p)); } };
   }
   var store = {};
   return new Proxy(store, {
     get: function (t, k) {
       if (k === "cssText") return getCss();
-      if (k === "getPropertyValue") return function (p) { return __cssGet(getCss(), p); };
+      if (k === "getPropertyValue") return function (p) { return __cssGet(getCss(), __cssPropName(p)); };
       if (k === "setProperty") {
-        return function (p, v) { setCss(__cssSet(getCss(), String(p), String(v))); };
+        return function (p, v) { setCss(__cssSet(getCss(), __cssPropName(p), String(v))); };
       }
-      return __cssGet(getCss(), String(k));
+      return __cssGet(getCss(), __cssPropName(k));
     },
     set: function (t, k, v) {
       // `cssText` 语义 = **整体替换**声明块(不是新增一条名为 cssText 的声明)。
@@ -580,7 +597,7 @@ function __mkStyle(getCss, setCss) {
         setCss(String(v == null ? "" : v));
         return true;
       }
-      setCss(__cssSet(getCss(), String(k), String(v)));
+      setCss(__cssSet(getCss(), __cssPropName(k), String(v)));
       return true;
     }
   });
@@ -617,6 +634,10 @@ function __lsmRegisterScriptLoad(el) {
   if (tag !== "script") return;
   var url = __lsmScriptKey(el.__attrs.src || "");
   if (!url) return;
+  if (__lsmChainTrace) { try { console.error("[chain] register " + url.slice(0, 90)); } catch (e9) {} }
+  // 同一元素只发一次 load 信号:「先 appendChild 后设 src」与「先设 src 后
+  // appendChild」两种装载序都只 fire 一次(真实浏览器 onload 语义)。
+  if (el.__lsmLoadNotified) return;
   if (!__lsmScriptCbs[url]) __lsmScriptCbs[url] = [];
   __lsmScriptCbs[url].push(el);
   // 线程内同步装载:webpack/rspack 的 chunk 装载器注入 <script src> 后
@@ -628,10 +649,22 @@ function __lsmRegisterScriptLoad(el) {
 }
 function __lsmLoadDynScript(el, url) {
   url = String(url || "");
-  if (!url || __lsmDynLoaded[url]) return;
+  if (__lsmChainTrace) { try { console.error("[chain] load-entry " + url.slice(0, 90) + " loaded=" + String(!!__lsmDynLoaded[url])); } catch (e8) {} }
+  if (!url) return;
+  // 已装载(缓存命中):立即补发 load 信号——真实浏览器对已缓存的脚本照样
+  // 触发 onload。「先设 src(同步装载并 fire,当时无注册方)后 appendChild
+  // (注册)」的装载序此前在此直接 return,元素的 onload 永远不会被调用,
+  // 站点的装载 Promise 永不 resolve(实测 zhipin verify 页 dynamicLoadJs:
+  // captcha-sdk 装载成功但 .then 构造链整条饿死)。
+  if (__lsmDynLoaded[url]) {
+    if (__lsmDynOk[url]) __lsmFireScriptLoad(url);
+    else __lsmFireScriptError(url);
+    return;
+  }
   // 非 http(s) 目标(about:/data: 占位)直接当空载成功,不进网络层。
   if (!/^https?:/i.test(url)) {
     __lsmDynLoaded[url] = true;
+    __lsmDynOk[url] = true;
     return;
   }
   __lsmDynLoaded[url] = true;
@@ -655,20 +688,35 @@ function __lsmLoadDynScript(el, url) {
   try {
     if (el && el.__attrs) el.__attrs["data-lsm-executed"] = "1";
   } catch (e4) {}
-  if (ok) __lsmFireScriptLoad(url);
-  else {
+  if (ok) { __lsmDynOk[url] = true; __lsmFireScriptLoad(url); }
+  else __lsmFireScriptError(url);
+}
+function __lsmFireScriptError(url) {
+  // 失败只派发 onerror,不删注册表、不标记已通知:线程内取回失败不代表
+  // 宿主侧也失败(管线预取的外链脚本页面可能再引用,宿主执行完照样 fire
+  // load——注册表是唯一送达通道,删了就永远收不到)。
+  var key = __lsmScriptKey(url);
+  var list = __lsmScriptCbs[key];
+  if (!list || !list.length) return;
+  for (var i = 0; i < list.length; i++) {
+    var el = list[i];
+    if (el.__lsmErrNotified) continue;
+    el.__lsmErrNotified = true;
     try {
-      if (el && typeof el.onerror === "function") el.onerror({ type: "error", target: el });
+      if (typeof el.onerror === "function") el.onerror({ type: "error", target: el });
     } catch (e5) {}
   }
 }
 function __lsmFireScriptLoad(url) {
   var key = __lsmScriptKey(url);
+  if (__lsmChainTrace) { try { console.error("[chain] fire " + key.slice(0, 90) + " cbs=" + String((__lsmScriptCbs[key] || []).length)); } catch (e7) {} }
   var list = __lsmScriptCbs[key];
   if (!list || !list.length) return;
   delete __lsmScriptCbs[key];
   for (var i = 0; i < list.length; i++) {
     var el = list[i];
+    if (el.__lsmLoadNotified) continue;
+    el.__lsmLoadNotified = true;
     try { el.readyState = "complete"; } catch (e) {}
     try {
       if (typeof el.onreadystatechange === "function") el.onreadystatechange({ type: "readystatechange", target: el });
@@ -1087,8 +1135,29 @@ function __mk(n) {
     insertAdjacentHTML: function (pos, html) {
       var p = String(pos || "beforeend").toLowerCase();
       var h = String(html == null ? "" : html);
-      // 本地覆盖层同步记账:插入的 HTML 用伪元素占位,`t.lastChild` 等
-      // 立即可读可写(co 辅助函数 `insertAdjacentHTML + lastChild` 模式)。
+      // 顶层节点**直接入子**(不再裹伪元素壳):`co` 辅助函数模式
+      // (`insertAdjacentHTML("beforeEnd", html)` + `t.lastChild` 取刚插入的
+      // 节点,百度地图瓦片原点层即此)必须取到真元素——壳会把页面对真元素的
+      // 样式写落到无 position 的壳上,瓦片坐标系原点塌到 (0,0)。
+      var kids = null;
+      try { kids = __parseHtml(h); } catch (e) { kids = null; }
+      if (kids && kids.length) {
+        var frag = "";
+        for (var i = 0; i < kids.length; i++) {
+          var k = kids[i];
+          frag += (k && k.nodeType === 3) ? __escHtml(k.textContent || "") : __serEl(k);
+          try { __lsmRegisterScriptLoad(k); } catch (e) {}
+          k.__parentStatic = n;
+          __lsmMarkMounted(k);
+        }
+        if (p === "afterbegin") { for (var ii = kids.length - 1; ii >= 0; ii--) dynKids.unshift(kids[ii]); }
+        else { for (var jj = 0; jj < kids.length; jj++) dynKids.push(kids[jj]); }
+        __lsmRec("childList", el, { addedNodes: kids });
+        if (p === "afterbegin") __push({ type: "insert_html", selector: n.sel, value: frag });
+        else __push({ type: "append_html", selector: n.sel, value: frag });
+        return;
+      }
+      // 空/不可解析:退回伪元素占位(原文保真)。
       var pseudo = __newEl("div");
       pseudo.__pendingHtml = h;
       __lsmRec("childList", el, { addedNodes: [pseudo] });
@@ -1408,8 +1477,26 @@ function __newEl(tag) {
     },
     insertAdjacentHTML: function (pos, html) {
       var p = String(pos || "beforeend").toLowerCase();
+      var h = String(html == null ? "" : html);
+      // 顶层节点**直接入子**(不裹伪元素壳),理由见快照路径同名方法注释:
+      // `co` 模式的 `t.lastChild` 必须取到真元素(百度地图瓦片原点层)。
+      var kids = null;
+      try { kids = __parseHtml(h); } catch (e) { kids = null; }
+      if (kids && kids.length) {
+        for (var i = 0; i < kids.length; i++) {
+          var k = kids[i];
+          if (k && k.__tag) k.__parentDyn = el;
+          try { __lsmRegisterScriptLoad(k); } catch (e) {}
+          __lsmRec("childList", el, { addedNodes: [k] });
+          // 父已挂载则逐个回写宿主(带 data-lsm-id);未挂载随父序列化。
+          __lsmPushDynChild(el, k, p === "afterbegin");
+        }
+        if (p === "afterbegin") { for (var ii = kids.length - 1; ii >= 0; ii--) this.__kids.unshift(kids[ii]); }
+        else { for (var jj = 0; jj < kids.length; jj++) this.__kids.push(kids[jj]); }
+        return;
+      }
       var pseudo = __newEl("div");
-      pseudo.__pendingHtml = String(html == null ? "" : html);
+      pseudo.__pendingHtml = h;
       if (p === "afterbegin" && this.__kids.length) this.insertBefore(pseudo, this.__kids[0]);
       else this.appendChild(pseudo);
     },
@@ -1541,10 +1628,12 @@ function __newEl(tag) {
     def(p, function () { return el.__attrs[p] == null ? "" : String(el.__attrs[p]); },
       function (v) {
         el.__attrs[p] = String(v);
-        // 「先 appendChild 再设 src」的装载模式(webpack chunk 加载器即如此):
-        // 注册时无 src 是空操作,src 落定这一刻触发同步装载。
+        // 「先 appendChild 再设 src」(webpack chunk 加载器)与「先设 src 再
+        // appendChild」(zhipin dynamicLoadJs)两种装载序都必须恰好 fire 一次:
+        // src 落定这一刻走注册路径(注册+装载一体,fire 时回调必已在表),
+        // appendChild 侧靠 __lsmLoadNotified 去重。
         if (p === "src" && t === "script") {
-          try { __lsmLoadDynScript(el, __lsmScriptKey(el.__attrs.src || "")); } catch (e) {}
+          try { __lsmRegisterScriptLoad(el); } catch (e) {}
         }
       });
   });
@@ -2455,7 +2544,7 @@ function XMLHttpRequest() {
   this.responseType = ""; this.responseURL = "";
   this.onload = null; this.onerror = null; this.onreadystatechange = null;
   this._url = ""; this._method = "GET"; this._headers = {}; this._listeners = {};
-  this._respHeaders = {};
+  this._respHeaders = {}; this._sync = false; this._aborted = false;
 }
 // 真实浏览器派发回调时一定带 Event 实参;此前裸调用导致站点回调里
 // 读 `e.target` / 对事件对象做 ToObject 时抛 "cannot convert 'null' or
@@ -2466,9 +2555,10 @@ function __lsmXhrEvent(type, xhr) {
            preventDefault: function () { this.defaultPrevented = true; },
            stopPropagation: function () {} };
 }
-XMLHttpRequest.prototype.open = function (m, u) {
+XMLHttpRequest.prototype.open = function (m, u, async) {
   this._method = String(m || "GET").toUpperCase();
   this._url = String(u);
+  this._sync = (async === false);
   this.readyState = 1;
   this.__rs();
 };
@@ -2492,32 +2582,43 @@ XMLHttpRequest.prototype.send = function (body) {
   var r = {};
   try { r = JSON.parse(raw); } catch (e3) { r = { error: "原生 fetch 返回非法结构" }; }
   if (r.setCookie && r.setCookie.length) __lsmCookieApply(r.setCookie);
-  if (r.error) {
-    this.readyState = 4; this.status = 0;
-    this.__rs();
-    if (this.onerror) { try { this.onerror.call(this, __lsmXhrEvent("error", this)); } catch (e4) {} }
-    this.__fire("error");
-    return;
-  }
-  this.readyState = 2; this.__rs();
-  this.readyState = 3; this.__rs();
-  this.readyState = 4;
-  this.status = r.status || 0;
-  this.statusText = String(r.statusText || "");
-  this.responseText = r.body == null ? "" : String(r.body);
-  this.response = this.responseText;
-  // 响应头/最终 URL 回填:`getResponseHeader` 此前永远拿到 null(_respHeaders 从不赋值)。
-  this._respHeaders = r.headers || {};
-  this.responseURL = String(r.url || this._url);
-  if (this.responseType === "json") {
-    try { this.response = this.responseText === "" ? null : JSON.parse(this.responseText); }
-    catch (e6) { this.response = null; }
-  }
-  this.__rs();
-  if (this.onload) { try { this.onload.call(this, __lsmXhrEvent("load", this)); } catch (e5) { __cerror("xhr load: " + String(e5)); } }
-  this.__fire("load");
+  // 回调派发:显式同步 XHR(open 第三参 false)保持同步;异步 XHR(缺省)推迟到
+  // 微任务。真实浏览器 send 先返回、调用方随后挂的超时保险丝定时器此时真实
+  // 存在,rs4 回调里的 clearTimeout 才能取消;此前内核同步派发,rs4 在 send 内
+  // 就触发,send 之后才挂的定时器永远清不掉,5 秒后必发一次伪 fail(实测
+  // zhipin captcha-sdk m() 与页面 HTTP.ajax 的「获取白名单配置失败: timeOut」)。
+  var self = this;
+  var deliver = function () {
+    if (self._aborted) return;
+    if (r.error) {
+      self.readyState = 4; self.status = 0;
+      self.__rs();
+      if (self.onerror) { try { self.onerror.call(self, __lsmXhrEvent("error", self)); } catch (e4) {} }
+      self.__fire("error");
+      return;
+    }
+    self.readyState = 2; self.__rs();
+    self.readyState = 3; self.__rs();
+    self.readyState = 4;
+    self.status = r.status || 0;
+    self.statusText = String(r.statusText || "");
+    self.responseText = r.body == null ? "" : String(r.body);
+    self.response = self.responseText;
+    // 响应头/最终 URL 回填:`getResponseHeader` 此前永远拿到 null(_respHeaders 从不赋值)。
+    self._respHeaders = r.headers || {};
+    self.responseURL = String(r.url || self._url);
+    if (self.responseType === "json") {
+      try { self.response = self.responseText === "" ? null : JSON.parse(self.responseText); }
+      catch (e6) { self.response = null; }
+    }
+    self.__rs();
+    if (self.onload) { try { self.onload.call(self, __lsmXhrEvent("load", self)); } catch (e5) { __cerror("xhr load: " + String(e5)); } }
+    self.__fire("load");
+  };
+  if (this._sync) { deliver(); return; }
+  Promise.resolve().then(deliver);
 };
-XMLHttpRequest.prototype.abort = function () {};
+XMLHttpRequest.prototype.abort = function () { this._aborted = true; };
 XMLHttpRequest.prototype.getResponseHeader = function (k) {
   return (this._respHeaders && this._respHeaders[String(k).toLowerCase()]) || null;
 };

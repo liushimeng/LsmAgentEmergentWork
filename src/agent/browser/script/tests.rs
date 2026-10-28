@@ -6,7 +6,7 @@ use super::dom_ops;
 use super::{JsHandle, JsRequest, JsReply, PageEnv, ScriptSource};
 use crate::agent::browser::document::Document;
 
-fn env(url: &str) -> PageEnv {
+pub(super) fn env(url: &str) -> PageEnv {
     PageEnv {
         url: url.to_string(),
         title: "T".to_string(),
@@ -35,7 +35,7 @@ fn action(kind: &str, selector: &str, key: &str, value: &str) -> super::JsAction
     }
 }
 
-fn eval_on(handle: &JsHandle, script: &str, doc_html: &str, url: &str) -> JsReply {
+pub(super) fn eval_on(handle: &JsHandle, script: &str, doc_html: &str, url: &str) -> JsReply {
     let doc = Document::parse(doc_html, url);
     let nodes = doc.snapshot_nodes();
     let script = script.to_string();
@@ -1378,7 +1378,7 @@ fn document_nodeType_为9_使Sizzle类选择器引擎可用() {
 // addEventListener 空实现 —— 地图读到 0×0 不装载、面板按钮点了没反应。
 // 宿主其实已把这些节点重新解析进 DOM 并参与布局,几何就在快照 rect 里。
 
-const DYN_STAGE_PAGE: &str = "<html><body><p>stage</p></body></html>";
+pub(super) const DYN_STAGE_PAGE: &str = "<html><body><p>stage</p></body></html>";
 
 #[test]
 fn 动态元素几何由宿主快照回填() {
@@ -1964,5 +1964,240 @@ fn performance资源时序来自网络台账() {
         "资源名应来自台账:{v:?}"
     );
     assert_eq!(v["size"].as_u64(), Some(3301380));
+    h.shutdown();
+}
+
+/// 回归(第 176 轮,zhipin 安全验证页滑块构建链卡死):定时器回调里排入的
+/// 微任务必须在**同一次请求的 event_loop 内**推进。此前排水只在 tick 前,
+/// 最后一轮定时器触发的「脚本装载 onload → Promise 链」在 pending==0 提前
+/// 退出时永远滞留,open 之后的 inspect/screenshot/request_human 全是宿主侧
+/// 动作不触碰 JS 线程,站点构建链无限期挂起(用户面对空白验证页)。
+#[test]
+fn 定时器回调排入的微任务同请求内推进() {
+    let h = JsHandle::spawn();
+    let r = eval_on(
+        &h,
+        r##"(function(){
+            setTimeout(function(){
+                Promise.resolve().then(function(){
+                    console.error("CHAIN_RAN");
+                });
+            }, 10);
+            return "ok";
+        })()"##,
+        r##"<html><body><div id="app">x</div></body></html>"##,
+        "https://example.com/",
+    );
+    assert!(r.outcome.ok, "求值应成功:{r:?}");
+    let ran = r
+        .outcome
+        .logs
+        .iter()
+        .any(|l| l.text.contains("CHAIN_RAN"));
+    assert!(
+        ran,
+        "定时器回调排入的微任务应在同一请求内被排水推进(修复前滞留到下一次请求):{:?}",
+        r.outcome.logs
+    );
+    h.shutdown();
+}
+
+/// 回归(第 176 轮):站点普遍的「超时保险丝」模式 `xhr.send(); timer=setTimeout(fail)`。
+/// 真实浏览器 XHR 异步:send 先返回,timer 真实存在,rs4 回调里的 clearTimeout
+/// 能取消它。内核此前同步派发,rs4 在 send 内就触发,clearTimeout 清空、5 秒后
+/// 伪 fail 必发(实测 zhipin captcha-sdk m() 的 fail("timeOut") 覆盖真实成功)。
+/// 修复:异步 XHR(缺省)回调推迟到微任务派发。about:blank 走错误路径(不联网)。
+#[test]
+fn xhr异步派发清除send后挂的超时保险丝() {
+    let h = JsHandle::spawn();
+    let r = eval_on(
+        &h,
+        r##"(function(){
+            var out = { ok: 0, fails: 0, timer: 0 };
+            var x = new XMLHttpRequest();
+            x.onreadystatechange = function () {
+                if (this.readyState === 4) { clearTimeout(out.timer); out.ok++; }
+            };
+            x.open("GET", "about:blank");
+            x.send();
+            out.timer = setTimeout(function () { out.fails++; }, 50);
+            window.__fuseOut = out;
+            return "sent";
+        })()"##,
+        r##"<html><body></body></html>"##,
+        "https://example.com/",
+    );
+    assert!(r.outcome.ok, "求值应成功:{r:?}");
+    // 第二次求值:event_loop 已排水微任务派发 + tick 过虚拟时钟,保险丝应被清除。
+    let r2 = eval_on(
+        &h,
+        r##"JSON.stringify({ok: window.__fuseOut.ok, fails: window.__fuseOut.fails})"##,
+        r##"<html><body></body></html>"##,
+        "https://example.com/",
+    );
+    let v: serde_json::Value = serde_json::from_str(&r2.outcome.value).unwrap_or_default();
+    assert_eq!(v["ok"].as_u64(), Some(1), "rs4 应恰好派发一次:{v}");
+    assert_eq!(v["fails"].as_u64(), Some(0), "send 后挂的超时保险丝应被 rs4 的 clearTimeout 取消,不得伪 fail:{v}");
+    h.shutdown();
+}
+
+/// 显式同步 XHR(open 第三参 false)保持同步派发——真实浏览器同步 XHR 语义。
+#[test]
+fn xhr显式同步模式仍同步派发() {
+    let h = JsHandle::spawn();
+    let r = eval_on(
+        &h,
+        r##"(function(){
+            var x = new XMLHttpRequest();
+            x.open("GET", "about:blank", false);
+            x.send();
+            return JSON.stringify({ rs: x.readyState, st: x.status });
+        })()"##,
+        r##"<html><body></body></html>"##,
+        "https://example.com/",
+    );
+    assert!(r.outcome.ok, "求值应成功:{r:?}");
+    let v: serde_json::Value = serde_json::from_str(&r.outcome.value).unwrap_or_default();
+    assert_eq!(v["rs"].as_u64(), Some(4), "同步 XHR 应在 send 内同步推进到 rs4:{v}");
+    h.shutdown();
+}
+
+/// abort 抑制异步派发:微任务派发前 abort,回调不再触发(浏览器语义)。
+#[test]
+fn xhr微任务派发前abort则不触发回调() {
+    let h = JsHandle::spawn();
+    let r = eval_on(
+        &h,
+        r##"(function(){
+            var out = { ok: 0 };
+            var x = new XMLHttpRequest();
+            x.onreadystatechange = function () { if (this.readyState === 4) out.ok++; };
+            x.open("GET", "about:blank");
+            x.send();
+            x.abort();
+            window.__abortOut = out;
+            return "sent";
+        })()"##,
+        r##"<html><body></body></html>"##,
+        "https://example.com/",
+    );
+    assert!(r.outcome.ok, "求值应成功:{r:?}");
+    let r2 = eval_on(
+        &h,
+        r##"String(window.__abortOut.ok)"##,
+        r##"<html><body></body></html>"##,
+        "https://example.com/",
+    );
+    assert_eq!(r2.outcome.value.trim(), "0", "abort 后微任务派发应被抑制");
+    h.shutdown();
+}
+
+/// 管线内(run_scripts)发起的异步 XHR:deliver 微任务必须在脚本间排水或
+/// event_loop 内推进(zhipin 安全验证页 getredirect/白名单 XHR 全部静默丢失
+/// 的复现用例)。
+#[test]
+fn 管线内xhr的deliver微任务会推进() {
+    let h = JsHandle::spawn();
+    let doc = Document::parse(
+        r##"<html><body><div id="app">x</div></body></html>"##,
+        "https://example.com/",
+    );
+    let nodes = doc.snapshot_nodes();
+    let scripts = vec![ScriptSource {
+        kind: "inline",
+        content: r##"(function(){
+            var x = new XMLHttpRequest();
+            x.onreadystatechange = function () {
+                if (this.readyState === 4) console.error("PIPELINE_DELIVERED");
+            };
+            x.open("GET", "about:blank");
+            x.send();
+        })()"##
+            .to_string(),
+        src_url: String::new(),
+    }];
+    let reply = h
+        .request(|tx| JsRequest::RunScripts {
+            scripts,
+            env: env("https://example.com/"),
+            nodes,
+            reply: tx,
+            budget_ms: 0,
+        })
+        .expect("JS 线程请求失败");
+    let delivered = reply
+        .outcome
+        .logs
+        .iter()
+        .any(|l| l.text.contains("PIPELINE_DELIVERED"));
+    assert!(
+        delivered,
+        "管线内 XHR 的 deliver 微任务应被排水推进(修复前 getredirect/白名单链整条静默丢失):{:?}",
+        reply.outcome.logs
+    );
+    h.shutdown();
+}
+
+/// 管线 event_loop 内:定时器回调里排入的 Promise 微任务必须被 post-tick 排水
+/// 推进(zhipin 验证页 interval → dynamicLoadJs onload → .then 构造链的最小复现)。
+#[test]
+fn 管线event_loop内定时器promise链推进() {
+    let h = JsHandle::spawn();
+    let doc = Document::parse(
+        r##"<html><body><div id="app">x</div></body></html>"##,
+        "https://example.com/",
+    );
+    let nodes = doc.snapshot_nodes();
+    let scripts = vec![ScriptSource {
+        kind: "inline",
+        content: r##"(function(){
+            setTimeout(function () {
+                Promise.resolve().then(function () {
+                    console.error("TIMER_THEN_RAN");
+                });
+            }, 10);
+        })()"##
+            .to_string(),
+        src_url: String::new(),
+    }];
+    let reply = h
+        .request(|tx| JsRequest::RunScripts {
+            scripts,
+            env: env("https://example.com/"),
+            nodes,
+            reply: tx,
+            budget_ms: 0,
+        })
+        .expect("JS 线程请求失败");
+    let ran = reply
+        .outcome
+        .logs
+        .iter()
+        .any(|l| l.text.contains("TIMER_THEN_RAN"));
+    assert!(
+        ran,
+        "管线 event_loop 内定时器→Promise 链应被推进(post-tick 排水):{:?}",
+        reply.outcome.logs
+    );
+    h.shutdown();
+}
+
+/// 诊断:前一个微任务抛错是否会饿死后续微任务(Boa run_jobs 的 clear 语义)。
+#[test]
+fn 诊断_前序微任务异常是否饿死后续() {
+    let h = JsHandle::spawn();
+    let r = eval_on(
+        &h,
+        r##"(function(){
+            Promise.resolve().then(function(){ throw new Error("FIRST_BOOM"); });
+            Promise.resolve().then(function(){ console.error("SECOND_RAN"); });
+            return "queued";
+        })()"##,
+        r##"<html><body></body></html>"##,
+        "https://example.com/",
+    );
+    let ran = r.outcome.logs.iter().any(|l| l.text.contains("SECOND_RAN"));
+    let boom = r.outcome.logs.iter().any(|l| l.text.contains("FIRST_BOOM"));
+    println!("SECOND_RAN={ran} FIRST_BOOM可见={boom} logs={:?}", r.outcome.logs);
     h.shutdown();
 }

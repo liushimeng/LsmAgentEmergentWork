@@ -85,6 +85,7 @@ macro_rules! msg {
 
 msg!(send_id, () -> Id);
 msg!(send_id_id, (arg: Id) -> Id);
+msg!(send_id_id_id_id, (a: Id, b: Id, c: Id) -> Id);
 msg!(send_id_cstr, (arg: *const c_char) -> Id);
 msg!(send_id_ptr_usize, (ptr: *const c_void, len: usize) -> Id);
 msg!(send_id_ptr, () -> *const c_char);
@@ -465,6 +466,73 @@ unsafe fn make_button(
     btn
 }
 
+/// 菜单项(标题/动作/快捷键;无修饰键时 AppKit 默认按 ⌘ 解析)。
+struct MenuItem {
+    title: &'static str,
+    action: &'static [u8],
+    key: &'static str,
+}
+
+/// 构建一个 NSMenu:返回挂好 submenu 的顶层菜单项。
+unsafe fn build_menu(title: &str, items: &[MenuItem]) -> Id {
+    let sub = send_id_id(
+        send_id(cls(b"NSMenu\0"), sel(b"alloc\0")),
+        sel(b"initWithTitle:\0"),
+        ns_str(title),
+    );
+    for it in items {
+        let item = send_id_id_id_id(
+            send_id(cls(b"NSMenuItem\0"), sel(b"alloc\0")),
+            sel(b"initWithTitle:action:keyEquivalent:\0"),
+            ns_str(it.title),
+            sel(it.action).cast_mut(),
+            ns_str(it.key),
+        );
+        send_void_id(sub, sel(b"addItem:\0"), item);
+    }
+    let parent = send_id_id_id_id(
+        send_id(cls(b"NSMenuItem\0"), sel(b"alloc\0")),
+        sel(b"initWithTitle:action:keyEquivalent:\0"),
+        ns_str(title),
+        std::ptr::null_mut(),
+        ns_str(""),
+    );
+    send_void_id(parent, sel(b"setSubmenu:\0"), sub);
+    parent
+}
+
+/// 装主菜单:地址栏复制/粘贴/编辑的**系统路径**(与 `human_ui` 弹窗同款)。
+///
+/// 查看器此前完全没有 NSMenu:⌘C/⌘V/⌘X/⌘A 的 key equivalent 依赖
+/// 「菜单项 → responder chain → first responder(地址栏)」这条路径,
+/// 无菜单条时这些快捷键行为不可预期,人工没法往地址栏粘贴网址。
+unsafe fn install_main_menu() {
+    let menu = send_id_id(
+        send_id(cls(b"NSMenu\0"), sel(b"alloc\0")),
+        sel(b"initWithTitle:\0"),
+        ns_str("MainMenu"),
+    );
+    let app_item = build_menu(
+        "LAEW 浏览器",
+        &[MenuItem { title: "关于浏览器", action: b"orderFrontStandardAboutPanel:\0", key: "" }],
+    );
+    send_void_id(menu, sel(b"addItem:\0"), app_item);
+    let edit_item = build_menu(
+        "编辑",
+        &[
+            MenuItem { title: "剪切", action: b"cut:\0", key: "x" },
+            MenuItem { title: "复制", action: b"copy:\0", key: "c" },
+            MenuItem { title: "粘贴", action: b"paste:\0", key: "v" },
+            MenuItem { title: "全选", action: b"selectAll:\0", key: "a" },
+        ],
+    );
+    send_void_id(menu, sel(b"addItem:\0"), edit_item);
+    let app = send_id(cls(b"NSApplication\0"), sel(b"sharedApplication\0"));
+    if !app.is_null() {
+        send_void_id(app, sel(b"setMainMenu:\0"), menu);
+    }
+}
+
 /// 查看器主入口:阻塞运行至 stdin EOF / 'c' 帧 / 用户关窗。
 pub fn run(width: u32, height: u32, title: &str) -> i32 {
     unsafe {
@@ -483,6 +551,8 @@ pub fn run(width: u32, height: u32, title: &str) -> i32 {
             sel(b"setActivationPolicy:\0"),
             NS_APPLICATION_ACTIVATION_POLICY_REGULAR,
         );
+        // 主菜单:地址栏 ⌘C/⌘V/⌘X/⌘A 的系统路径(无菜单条这些快捷键不可用)。
+        install_main_menu();
         let pool = {
             let a = send_id(cls(b"NSAutoreleasePool\0"), sel(b"alloc\0"));
             send_id(a, sel(b"init\0"))
