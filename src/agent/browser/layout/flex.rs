@@ -136,6 +136,10 @@ pub(crate) fn layout_container(
     if let Some(mw) = style.max_width {
         bw = bw.min(mw.max(1.0));
     }
+    // min-width 地板(在 max-width 之后:冲突时 max 优先,与 CSS 钳序一致)。
+    if let Some(mn) = style.min_width {
+        bw = bw.max(mn);
+    }
     // 显式 content-box:width 即内容盒宽,padding 加回边框盒(见 mod.rs 同名注释)。
     if style.box_sizing_content && style.width.is_some() {
         bw += style.padding_left + style.padding_right;
@@ -164,6 +168,8 @@ pub(crate) fn layout_container(
     let content_h =
         layout_content(ctx, node, content_x, inner_w, style, depth + 1, cb);
     let box_h = (ctx.cursor_y() - start_y + content_h).max(1.0);
+    // min-height 地板:flex 容器同样生效(见 mod.rs 同名注释)。
+    let box_h = style.min_height.map(|m| box_h.max(m)).unwrap_or(box_h);
     ctx.set_box_height(box_idx, box_h);
     // 阶段六:组效果回补 + 自身视觉发射(含多层背景图,修复 flex 容器边框/阴影缺口)。
     let tag = document::tag_name(node);
@@ -214,12 +220,22 @@ pub(crate) fn layout_content(
     let inner_main = if row {
         content_w.max(0.0)
     } else {
-        style
+        // 列方向主轴可用尺寸:height 优先,min-height 作地板参与(内容超过地板时
+        // 由内容撑开,分布 free=0 自然退化,不破坏既有语义)。此前 min-height 完全
+        // 不参与:column flex 的 justify-content:center 在「min-height 撑起容器」的
+        // 场景(实测 zhipin `.page-verify{min-height:100vh;justify-content:center}`)
+        // free 恒 0,垂直居中永不发生。
+        let h = style
             .height
             .map(|h| (h - style.padding_top - style.padding_bottom).max(0.0))
-            .unwrap_or(0.0)
+            .unwrap_or(0.0);
+        let mh = style
+            .min_height
+            .map(|m| (m - style.padding_top - style.padding_bottom).max(0.0))
+            .unwrap_or(0.0);
+        h.max(mh)
     };
-    let definite_main = !row && style.height.is_some();
+    let definite_main = !row && (style.height.is_some() || style.min_height.is_some());
     let definite_cross: Option<f64> = if row {
         style
             .height
@@ -501,6 +517,18 @@ fn resolve_base(
                 (w + pb + pa).min(avail).max(1.0)
             }
         });
+        // 钳序与块级一致:min-width 地板在 max-width 上限之后(冲突时 max 优先)。
+        // 此前列方向交叉宽完全无视 max-width:实测 zhipin 验证页
+        // `.verify-container{width:100%;max-width:520px}` 在 column flex 容器里
+        // 被解成 1824px 全宽(卡片占满视口、视觉布局整页散架)。
+        let width = cs
+            .max_width
+            .map(|mw| width.min(mw.max(1.0)))
+            .unwrap_or(width);
+        let width = cs
+            .min_width
+            .map(|mn| width.max(mn))
+            .unwrap_or(width);
         item.final_cross = width.max(1.0);
         let inner_cross = (item.final_cross - pb - pa).max(1.0);
         if let Some(node) = &item.node {

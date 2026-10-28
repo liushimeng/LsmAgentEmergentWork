@@ -72,6 +72,8 @@ pub struct ComputedStyle {
     pub padding_left: f64,
     pub width: Option<f64>,
     pub max_width: Option<f64>,
+    pub min_width: Option<f64>,
+    pub min_height: Option<f64>,
     pub height: Option<f64>,
     /// `width` 的百分比原值(`50%` → 50.0);布局层按父内容宽二次求解。
     ///
@@ -386,6 +388,8 @@ impl Default for ComputedStyle {
             padding_left: 0.0,
             width: None,
             max_width: None,
+            min_width: None,
+            min_height: None,
             height: None,
             width_percent: None,
             height_percent: None,
@@ -513,6 +517,8 @@ impl ComputedStyle {
         );
         out.insert("width".into(), length_text(self.width));
         out.insert("max-width".into(), length_text(self.max_width));
+        out.insert("min-width".into(), length_text(self.min_width));
+        out.insert("min-height".into(), length_text(self.min_height));
         out.insert("height".into(), length_text(self.height));
         out.insert("opacity".into(), num(self.opacity));
         // 定位体系(阶段三)
@@ -1018,6 +1024,13 @@ pub fn apply_declaration(
                 st.max_width = parse_length(value, st.font_size, ctx).filter(|v| *v > 0.0);
             }
         }
+        "min-width" => {
+            st.min_width = parse_length(value, st.font_size, ctx).filter(|v| *v > 0.0);
+        }
+        "min-height" => {
+            // 百分比 min-height 同 height 的处理:不在此预估,父高已知时布局层求解。
+            st.min_height = parse_length(value, st.font_size, ctx).filter(|v| *v > 0.0);
+        }
         "height" => {
             st.height_percent = parse_percent(value);
             // 百分比高度的粗估值按视口宽算没有意义(视口宽≠高),交给布局层按父高求解;
@@ -1442,10 +1455,12 @@ fn apply_initial(st: &mut ComputedStyle, key: &str, root: &ComputedStyle) {
             "padding-bottom" => st.padding_bottom = 0.0,
             _ => st.padding_left = 0.0,
         },
-        "width" | "height" | "max-width" => match key {
+        "width" | "height" | "max-width" | "min-width" | "min-height" => match key {
             "width" => st.width = None,
             "height" => st.height = None,
-            _ => st.max_width = None,
+            "max-width" => st.max_width = None,
+            "min-width" => st.min_width = None,
+            _ => st.min_height = None,
         },
         "background" | "background-color" => st.background = None,
         "object-fit" => st.object_fit = "fill".to_string(),

@@ -2539,6 +2539,44 @@ function fetch(url, opts) {
     return resp;
   });
 }
+// ---------- Annex B 遗留全局:escape / unescape ----------
+// Chrome 至今保留这对遗留编解码函数,大量老站点代码与第三方 SDK(实测 geetest
+// fullpage 的 JSONP 回调链)直接调用;Boa 未实现,缺了就是 ReferenceError,
+// 整条回调链被打断(表现为「SDK 已装载但验证码永不出现」的静默断链)。
+function escape(s) {
+  s = String(s == null ? "" : s);
+  var out = "", SAFE = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789@*_+-./";
+  for (var i = 0; i < s.length; i++) {
+    var c = s.charAt(i), code = s.charCodeAt(i);
+    if (SAFE.indexOf(c) >= 0) out += c;
+    else if (code < 256) out += "%" + (code < 16 ? "0" : "") + code.toString(16).toUpperCase();
+    else out += "%u" + (code < 4096 ? "0" : "") + code.toString(16).toUpperCase();
+  }
+  return out;
+}
+function unescape(s) {
+  s = String(s == null ? "" : s);
+  var out = "";
+  var i = 0;
+  while (i < s.length) {
+    var c = s.charAt(i);
+    if (c === "%" && i + 2 < s.length + 1) {
+      if (s.charAt(i + 1) === "u" && i + 5 < s.length + 1 && /^[0-9a-fA-F]{4}$/.test(s.substr(i + 2, 4))) {
+        out += String.fromCharCode(parseInt(s.substr(i + 2, 4), 16));
+        i += 6;
+        continue;
+      }
+      if (/^[0-9a-fA-F]{2}$/.test(s.substr(i + 1, 2))) {
+        out += String.fromCharCode(parseInt(s.substr(i + 1, 2), 16));
+        i += 3;
+        continue;
+      }
+    }
+    out += c;
+    i += 1;
+  }
+  return out;
+}
 function XMLHttpRequest() {
   this.readyState = 0; this.status = 0; this.statusText = ""; this.responseText = ""; this.response = "";
   this.responseType = ""; this.responseURL = "";

@@ -191,6 +191,14 @@ impl ThreadRuntime {
         .map_err(|e| format!("调试开关初始化失败:{e}"))?;
         ctx.eval(Source::from_bytes(PRELUDE.as_bytes()))
             .map_err(|e| format!("PRELUDE 初始化失败:{e}"))?;
+        // LAEW_JS_CHAIN_TRACE=1:动态脚本装载链(register/load/fire)逐环打点,
+        // 定位「SDK 已装载但 onload→Promise 链不推进」类静默断链。
+        let chain_trace = std::env::var("LAEW_JS_CHAIN_TRACE")
+            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+        let _ = ctx.eval(Source::from_bytes(
+            format!("globalThis.__lsmChainTrace = {chain_trace};").as_bytes(),
+        ));
         // LAEW_JS_DIAG=1 时装 define 陷阱:站点装载器安装全局 define 时被包裹,
         // 原始首次执行(站点装载器调用约定)即被记录——重放不复现的根因是
         // 装载器注册表跳过重复 define,只有首跑能观测。
@@ -305,15 +313,50 @@ impl ThreadRuntime {
         let deadline = REQ_ENV.with(|c| c.borrow().deadline);
         let mut total_ran: u64 = 0;
         let mut last_pending = 0usize;
+        let loop_trace = std::env::var("LAEW_JS_LOOP_TRACE").is_ok();
+        if loop_trace {
+            eprintln!("[looptrace] === event_loop 开始 ===");
+        }
         loop {
             self.drain_jobs();
             let tick = self
                 .eval_string("__lsmTick()")
                 .unwrap_or_else(|_| "{\"pending\":0,\"ran\":0}".to_string());
             let (pending, ran) = parse_tick(&tick);
+            if loop_trace {
+                eprintln!(
+                    "[looptrace] tick pending={pending} ran={ran} total={total_ran} enqueued={}",
+                    self.queue.enqueued.get()
+                );
+            }
             last_pending = pending as usize;
             total_ran += ran;
-            if pending == 0 || total_ran >= MAX_TIMER_CALLBACKS {
+            // 定时器回调排入的微任务当场推进:脚本装载 onload → Promise 链是
+            // 站点构建链的通用推进方式,此前排水只在 tick 前,最后一轮定时器
+            // (如 200ms 轮询)触发的微任务在 pending==0 提前退出时永远滞留,
+            // 直到下一次 eval/dispatch 才被推进——而 open 之后的
+            // inspect/screenshot/request_human 全是宿主侧动作不触碰 JS 线程,
+            // 构建链无限期挂起(实测 zhipin 安全验证页滑块整链卡死、用户面对
+            // 空白验证页只能取消任务)。真实浏览器微任务先于下一个定时器执行。
+            self.drain_jobs();
+            if pending == 0 {
+                // 排水后的微任务可能又注册了新定时器:pending 读数已过期,
+                // 重读定时器表,双双静默才真正退出(受 total_ran/deadline 约束)。
+                let recount = self
+                    .eval_string("__lsmTimers.length")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .unwrap_or(0);
+                if recount == 0 {
+                    break;
+                }
+                last_pending = recount as usize;
+                if total_ran >= MAX_TIMER_CALLBACKS || Instant::now() >= deadline {
+                    break;
+                }
+                continue;
+            }
+            if total_ran >= MAX_TIMER_CALLBACKS {
                 break;
             }
             if Instant::now() >= deadline {

@@ -143,6 +143,13 @@ fn route(path: &str, with_headers: bool) -> (&'static str, String, Vec<(String, 
                 .to_string(),
             vec![],
         )
+    } else if path == "/jsonp-call.js" {
+        // JSONP 模拟:调用页面先注册的全局回调(gt.js 模式)。
+        (
+            "200 OK",
+            "geetest_probe9({ok: 1});".to_string(),
+            vec![("Content-Type".to_string(), "text/javascript".to_string())],
+        )
     } else if path == "/app.js" {
         (
             "200 OK",
@@ -1238,6 +1245,51 @@ async fn 富视觉页面_渐变圆角阴影与溢出裁剪截图() {
 }
 
 #[tokio::test]
+async fn 动态脚本调用跨脚本注册的全局回调() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+    let open = exec(&tool, json!({"action": "open", "url": base, "mode": "hidden", "reuse": false})).await;
+    assert_eq!(open["code"], 0, "{open}");
+    let page_id = open["data"]["page_id"].as_str().unwrap().to_string();
+
+    // 步骤1:模拟 gt.js 经 (0,eval) 全局求值后注册 JSONP 回调(计算键)。
+    let reg = exec(
+        &tool,
+        json!({"action": "control", "page_id": page_id, "control_action": "eval_js",
+               "params": {"expression": "(function(){ (0, eval)(\"window['geetest_probe9'] = function(d){ window.__jpHit = JSON.stringify(d); }\"); return typeof window['geetest_probe9']; })()"}}),
+    )
+    .await;
+    assert!(reg["data"]["result"].as_str().unwrap_or("").contains("function"), "回调应已注册:{reg}");
+
+    // 步骤2:动态脚本元素装载 jsonp-call.js → __lsmLoadDynScript eval → 调用回调。
+    let expr = format!(
+        "(function(){{ var s = document.createElement('script'); s.src = '{base}/jsonp-call.js'; document.body.appendChild(s); return 'loaded'; }})()"
+    );
+    let load = exec(
+        &tool,
+        json!({"action": "control", "page_id": page_id, "control_action": "eval_js",
+               "params": {"expression": expr}}),
+    )
+    .await;
+    assert!(load["data"]["ok"].as_bool().unwrap_or(false), "{load}");
+
+    // 步骤3:回调应被调用(引用计数无 ReferenceError)。
+    let check = exec(
+        &tool,
+        json!({"action": "control", "page_id": page_id, "control_action": "eval_js",
+               "params": {"expression": "window.__jpHit || 'NOT_HIT'"}}),
+    )
+    .await;
+    assert!(
+        check["data"]["result"].as_str().unwrap_or("").contains("\"ok\":1"),
+        "动态脚本应能调用跨脚本注册的全局回调(geetest JSONP 链):{check}"
+    );
+
+    exec(&tool, json!({"action": "close", "page_id": page_id})).await;
+}
+
+#[tokio::test]
 async fn xhr_回调带事件对象与响应头可读() {
     allow_loopback();
     let base = start_site().await;
@@ -1245,36 +1297,46 @@ async fn xhr_回调带事件对象与响应头可读() {
     let open = exec(&tool, json!({"action": "open", "url": base, "mode": "hidden", "reuse": false})).await;
     assert_eq!(open["code"], 0, "{open}");
     let page_id = open["data"]["page_id"].as_str().unwrap().to_string();
+    // 异步 XHR(缺省):send 后回调推迟到微任务派发(浏览器语义),结果落
+    // window 后由第二次 eval 读回——与真实浏览器一致的异步消费方式。
     let probe = exec(
         &tool,
         json!({
             "action": "control", "page_id": page_id, "control_action": "eval_js",
             "params": {"expression": format!(r#"(function(){{
-                var out={{}};
+                window.__xhrOut={{}};
                 var x=new XMLHttpRequest();
                 x.open("GET","{base}/");
-                var rsEvent=null;
                 x.onreadystatechange=function(e){{
                     if(this.readyState===4){{
-                        rsEvent = e ? String(e.type) : "missing";
-                        out.rsTarget = !!(e && e.target===this);
-                        out.ct = this.getResponseHeader("content-type");
-                        out.all = this.getAllResponseHeaders().length>0;
-                        out.url = this.responseURL;
-                        out.status = this.status;
+                        window.__xhrOut.rsEvent = e ? String(e.type) : "missing";
+                        window.__xhrOut.rsTarget = !!(e && e.target===this);
+                        window.__xhrOut.ct = this.getResponseHeader("content-type");
+                        window.__xhrOut.all = this.getAllResponseHeaders().length>0;
+                        window.__xhrOut.url = this.responseURL;
+                        window.__xhrOut.status = this.status;
                     }}
                 }};
-                x.addEventListener("load",function(e){{ out.loadType = e ? String(e.type) : "missing"; }});
+                x.addEventListener("load",function(e){{ window.__xhrOut.loadType = e ? String(e.type) : "missing"; }});
                 x.send();
-                out.rsEvent = rsEvent;
-                return JSON.stringify(out);
+                return "sent";
             }})()"#)}
         }),
     )
     .await;
-    let result = probe["data"]["result"].as_str().unwrap_or("");
+    assert!(probe["data"]["ok"].as_bool().unwrap_or(false), "发送应成功:{probe}");
+    // 第二次 eval:第一次的 event_loop 已排水派发微任务,回调应已落地。
+    let readback = exec(
+        &tool,
+        json!({
+            "action": "control", "page_id": page_id, "control_action": "eval_js",
+            "params": {"expression": "JSON.stringify(window.__xhrOut)"}
+        }),
+    )
+    .await;
+    let result = readback["data"]["result"].as_str().unwrap_or("");
     let v: Value = serde_json::from_str(result)
-        .unwrap_or_else(|e| panic!("XHR 探针返回非 JSON:{e};raw={probe}"));
+        .unwrap_or_else(|e| panic!("XHR 探针返回非 JSON:{e};raw={readback}"));
     assert_eq!(v["rsEvent"], "readystatechange", "onreadystatechange 应带事件对象:{v}");
     assert_eq!(v["rsTarget"], true, "事件 target 应为当前 XHR:{v}");
     assert_eq!(v["loadType"], "load", "load 监听器应带事件对象:{v}");

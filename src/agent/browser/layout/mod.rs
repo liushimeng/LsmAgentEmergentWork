@@ -1227,6 +1227,10 @@ impl<'a> LayoutCtx<'a> {
                 if let Some(mw) = style.max_width {
                     bw = bw.min(mw.max(1.0));
                 }
+                // min-width 地板(在 max-width 之后:冲突时 max 优先,与 CSS 钳序一致)。
+                if let Some(mw) = style.min_width {
+                    bw = bw.max(mw);
+                }
                 if explicit_content_w {
                     bw += style.padding_left + style.padding_right;
                 }
@@ -1312,6 +1316,10 @@ impl<'a> LayoutCtx<'a> {
                 } else {
                     (content_h + style.padding_top + style.padding_bottom).max(1.0)
                 };
+                // min-height 地板:显式与 auto 高最终都不得低于它(实测 zhipin 验证页
+                // `.page-verify{min-height:100vh}` 此前整体缺失 → 页面不满视口、
+                // 垂直居中语境不存在)。
+                let box_h = style.min_height.map(|m| box_h.max(m)).unwrap_or(box_h);
                 self.y = start_y + box_h + style.margin_bottom.max(2.0);
                 self.boxes.push(ElementBox {
                     selector,
