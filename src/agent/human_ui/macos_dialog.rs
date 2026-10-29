@@ -1,6 +1,6 @@
 //! macOS 弹窗后端:Rust FFI 直调 AppKit / ObjC runtime(第 137 轮原生重构)。
 //!
-//! 设计见 `docs/MCP_Web_LsmAgentBrowser_Use/03-人工介入弹窗原生UI方案.md` §6。要点:
+//! 设计要点见 `src/agent/human_ui/mod.rs` 模块文档头。要点:
 //! - 本模块**只在 `laew __hitl-dialog` 子进程内运行**(见 `dialog_main.rs`),事件循环
 //!   `NSApp.run()` 跑在子进程主线程,满足 AppKit 的主线程要求;
 //! - `objc_msgSend` 按具体参数形状逐个包装(tauri/tao 验证过的做法),x86_64 的

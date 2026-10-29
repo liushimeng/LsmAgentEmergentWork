@@ -14,7 +14,7 @@ pub mod agent_loop;
 pub mod agent_message;
 pub mod attachments;
 /// LsmAgentBrowser:进程内自研浏览器内核(无 Chrome / 无 CDP)。
-/// 设计见 `docs/自定义浏览器和V8引擎/`。
+/// 设计见 `docs/MCP_Web_LsmAgentBrowser_Use/`。
 pub mod browser;
 pub mod cancel;
 pub mod chrome_browser;

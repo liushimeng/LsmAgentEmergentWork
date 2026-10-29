@@ -1,5 +1,5 @@
 //! human_ui 纯函数与弹窗子进程链路单测(不触达真实弹窗窗口/Hub)。
-//! 设计见 `docs/MCP_Web_LsmAgentBrowser_Use/03-人工介入弹窗原生UI方案.md` §10。
+//! 设计见 `src/agent/human_ui/mod.rs` 模块文档头。
 
 use super::*;
 use crate::agent::human_assist::HumanAssistDisplay;

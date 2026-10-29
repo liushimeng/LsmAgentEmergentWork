@@ -1,7 +1,7 @@
 //! 人工介入(HITL)枢纽 —— Agent 工具与呈现前端(弹窗 UI / TUI)之间的「提问 → 人答」闭环。
 //!
-//! 设计见 `docs/MCP_Web_LsmAgentBrowser_Use/02-人工介入与窗口可视化方案.md`(2026-09-20 第 100 轮)
-//! 与 `docs/MCP_Web_LsmAgentBrowser_Use/03-人工介入弹窗UI动态加载方案.md`(2026-10-08 第 130 轮)。
+//! 人工介入可见性总览见 `docs/MCP_Web_LsmAgentBrowser_Use/05-窗口交互与页面观察/37-GeeTest自愈循环可观测与HITL可见性守卫.md`。
+//! 原生弹窗 UI 设计细节见 `src/agent/human_ui/mod.rs` 模块文档头(原独立设计文档已并入该处)。
 //!
 //! 背景:MCP_Web_LsmAgentBrowser_Use 遇到图形/滑块验证码、短信验证码、扫码登录等无法自动跳过的
 //! 流程时,需要把控制权临时交还人类。Tool trait 无法感知调用方是否处于 TUI 上下文,

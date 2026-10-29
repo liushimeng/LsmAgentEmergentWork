@@ -1,6 +1,6 @@
 //! 人工介入(HITL)桌面弹窗 UI 呈现层 —— macOS/Windows 弹窗优先,TUI 兜底。
 //!
-//! 设计见 `docs/MCP_Web_LsmAgentBrowser_Use/03-人工介入弹窗原生UI方案.md`(2026-10-09 第 137 轮全量重构)。
+//! 原生弹窗 UI 设计要点见本模块文档头(2026-10-09 第 137 轮全量重构)。
 //!
 //! 职责边界:本模块只负责「把 [`HumanAssistDisplay`] 呈现给人 + 把人的应答收敛为
 //! [`UiResult`]」,pending 槽位 / oneshot / 超时 / 四态结局全部仍在
@@ -42,7 +42,7 @@ mod macos_dialog;
 #[cfg(target_os = "windows")]
 mod windows_dialog;
 /// 2026-10-14:Windows 弹窗 macOS 风格主题(观感唯一真源;新弹窗一律接入,
-/// 见 `windows_theme.rs` 模块文档与 docs/MCP_Web_LsmAgentBrowser_Use/27)。
+/// 见 `windows_theme.rs` 模块文档。
 #[cfg(target_os = "windows")]
 mod windows_theme;
 

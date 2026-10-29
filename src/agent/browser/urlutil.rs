@@ -1,7 +1,7 @@
 //! URL 与文本编码辅助:LsmAgentBrowser 的纯函数层。
 //!
 //! 所有函数不依赖 DOM/网络,便于单元测试。设计见
-//! `docs/自定义浏览器和V8引擎/02-LsmAgentBrowser内核架构设计.md`。
+//! `docs/MCP_Web_LsmAgentBrowser_Use/01-总体设计与架构/02-LsmAgentBrowser内核架构设计.md`。
 
 use url::Url;
 

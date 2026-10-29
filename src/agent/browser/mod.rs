@@ -3,7 +3,7 @@
 //! 取代 Chrome + CDP:窗口/标签页、网络栈、DOM、布局、渲染、JS 执行全部在本进程。
 //! `MCP_Web_LsmAgentBrowser_Use` 的对外契约由 `tools/mcp_web_lsm_browser_use` 兼容层保持不变。
 //!
-//! 设计见 `docs/自定义浏览器和V8引擎/`。
+//! 设计见 `docs/MCP_Web_LsmAgentBrowser_Use/`。
 
 pub mod api;
 pub mod cache;

@@ -16,7 +16,7 @@ use crate::llm::{ChatMessage, ContentBlock};
 /// 8 个 Agent 角色(2026-09-18 第 84 轮:删除 WindowUse,窗口操控能力降级为
 /// SubAgent-Work 的 MCP_Window_Use 工具;第 89 轮:删除 Chromium-WebUse,
 /// 浏览器操控能力降级为 SubAgent-Work 的 MCP_Web_LsmAgentBrowser_Use 工具,
-/// 见 docs/MCP_Web_LsmAgentBrowser_Use/01-设计与解决方案.md)。
+/// 见 docs/MCP_Web_LsmAgentBrowser_Use/01-总体设计与架构/03-MCP_Web_LsmAgentBrowser_Use兼容层设计.md)。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentRole {

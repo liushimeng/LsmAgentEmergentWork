@@ -9,7 +9,7 @@
 //!
 //! 像素管线:`Layout::display`(非空)→ 直接光栅化;为空(手构 Layout/旧路径)
 //! → `display::build_legacy` 按旧通道顺序合成,输出与重构前一致。
-//! 设计见 `docs/MCP_Web_LsmAgentBrowser_Use/22-专业渲染引擎重构设计与实现.md`。
+//! 设计见 `docs/MCP_Web_LsmAgentBrowser_Use/03-布局与渲染引擎/22-专业渲染引擎重构设计与实现.md`。
 
 pub mod display;
 mod blur;

@@ -2,7 +2,7 @@
 //!
 //! 每个标签页一条专用 JS 线程持有持久 Boa Context(全局变量跨 `eval_js` 保留);
 //! DOM 仍在宿主侧(kuchikiki),结构性修改以 action 回传,由 `dom_ops` 应用后
-//! 重新序列化回 `tab.html`。设计见 `docs/自定义浏览器和V8引擎/05-阶段二页面脚本与动态DOM设计.md`。
+//! 重新序列化回 `tab.html`。设计见 `docs/MCP_Web_LsmAgentBrowser_Use/02-脚本运行时与样式引擎/05-阶段二页面脚本与动态DOM设计.md`。
 
 pub mod amd_fill;
 pub mod canvas_js;

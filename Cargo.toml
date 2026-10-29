@@ -48,7 +48,7 @@ zeroize = "1"
 url = "2.5"
 
 # LsmAgentBrowser:进程内自研浏览器内核(无 Chrome / 无 CDP)。
-# 设计见 docs/自定义浏览器和V8引擎/01-LsmAgentBrowser总体设计与分阶段路线图.md
+# 设计见 docs/MCP_Web_LsmAgentBrowser_Use/01-总体设计与架构/01-LsmAgentBrowser总体设计与分阶段路线图.md
 kuchikiki = "0.8"       # html5ever DOM + CSS 选择器(可变节点树)
 boa_engine = "0.22"     # 默认 JS 引导后端(纯 Rust,离线可编译)
 boa_parser = "0.22"    # JS 词法真源:诊断拆分器的 regex/division 消歧(离线可用,与 boa_engine 同版本)

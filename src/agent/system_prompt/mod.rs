@@ -1045,7 +1045,7 @@ open → inspect 或 ocr(理解界面)→ control/input_batch/chat_send/chat_loo
 //
 // MCP_Web_LsmAgentBrowser_Use 作业规范:SubAgent-Work 的浏览器工具说明,本段全平台追加到
 // SubAgent-Work 系统提示词(内核三平台一致,错误返回结构化信封,无需平台门控)。
-// 设计与契约见 `docs/自定义浏览器和V8引擎/03-MCP_Web_LsmAgentBrowser_Use兼容层设计.md`。
+// 设计与契约见 `docs/MCP_Web_LsmAgentBrowser_Use/01-总体设计与架构/03-MCP_Web_LsmAgentBrowser_Use兼容层设计.md`。
 
 /// SubAgent-Work 浏览器操控补充说明(全平台注入)。
 const MCP_WEB_USE_PROMPT_SECTION: &str = r##"

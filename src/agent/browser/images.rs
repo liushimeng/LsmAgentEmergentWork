@@ -5,7 +5,7 @@
 //! 随标签页生命周期存在,进程退出即销毁。
 //!
 //! 布局层按固有尺寸排版替换元素(`<img>`),渲染层按 `object-fit` 绘制。
-//! 设计见 `docs/自定义浏览器和V8引擎/10-阶段三第三步图片渲染与替换元素设计.md`。
+//! 设计见 `docs/MCP_Web_LsmAgentBrowser_Use/03-布局与渲染引擎/10-阶段三第三步图片渲染与替换元素设计.md`。
 
 use std::collections::HashMap;
 use std::sync::Arc;

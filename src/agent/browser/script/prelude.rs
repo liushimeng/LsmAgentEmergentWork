@@ -2,7 +2,7 @@
 //!
 //! 由 Rust 在 Context 创建后一次性求值;之后每次请求经 `__lsmRefresh` 注入最新
 //! DOM 快照与页面元信息。与阶段一快照桥(v1)的差异见
-//! `docs/自定义浏览器和V8引擎/05-阶段二页面脚本与动态DOM设计.md` 第四节。
+//! `docs/MCP_Web_LsmAgentBrowser_Use/02-脚本运行时与样式引擎/05-阶段二页面脚本与动态DOM设计.md` 第四节。
 
 /// 原生函数由 Rust 注册(`__lsmFetchNative`/`atob`/`btoa`/`__lsmCanvasPng`),此处只做 JS 侧装配。
 const PRELUDE_BODY: &str = r##"
@@ -3139,7 +3139,7 @@ function __fireDocument(type) {
 // 站点前端框架(Vue/React/Ant Design/Element)普遍用 MutationObserver 驱动
 // 二次渲染;此前 env_js 里的桩实现回调永不触发,页面会停在「等 DOM 变化」状态。
 // 这里按标准语义真实派发:节点稳定键 → 记账 → 选项过滤 → 微任务检查点投递。
-// 设计见 docs/自定义浏览器和V8引擎/17-阶段五第一步页面观察与就绪判定设计.md
+// 设计见 docs/MCP_Web_LsmAgentBrowser_Use/05-窗口交互与页面观察/17-阶段五第一步页面观察与就绪判定设计.md
 
 // 节点稳定键:快照节点按索引(s<i>),动态节点按自增 uid(d<uid>)。
 // 快照每轮 refresh 重建包装器,对象同一性跨轮不可用,一律按键比较。

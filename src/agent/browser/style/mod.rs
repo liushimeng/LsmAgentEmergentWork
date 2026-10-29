@@ -2,7 +2,7 @@
 //!
 //! 输入是宿主侧 `Document`(短生命周期局部值),输出是纯数据 `ComputedStyle`;
 //! 布局、渲染、JS 快照与 inspect 共用同一份计算样式真源。
-//! 设计见 `docs/自定义浏览器和V8引擎/06-阶段二第二步CSS级联与外链样式加载设计.md`。
+//! 设计见 `docs/MCP_Web_LsmAgentBrowser_Use/02-脚本运行时与样式引擎/06-阶段二第二步CSS级联与外链样式加载设计.md`。
 
 pub mod gradient;
 pub mod selector;

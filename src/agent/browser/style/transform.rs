@@ -2,7 +2,7 @@
 //!
 //! `transform` 的百分比平移相对元素**自身盒尺寸**,样式层无从得知,故解析为
 //! **操作序列**(`TransformOp`),布局期按盒尺寸求解为 `Affine`;`transform-origin`
-//! 同理留到布局期求解。设计见 `docs/MCP_Web_LsmAgentBrowser_Use/23-*.md`。
+//! 同理留到布局期求解。设计见 `docs/MCP_Web_LsmAgentBrowser_Use/03-布局与渲染引擎/23-CSS2D变换与文本阴影与多背景层设计.md`。
 
 use super::values::{parse_length, parse_percent, ValueCtx};
 

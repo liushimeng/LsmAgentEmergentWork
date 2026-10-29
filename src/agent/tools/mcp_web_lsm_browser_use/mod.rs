@@ -8,7 +8,7 @@
 //! - `page_id` 全生命周期:open 获取,control/inspect 复用,派生页经 `spawned_page_id` 回传;
 //! - 所有动作返回 `{code,message,data}`;错误码供 Agent 机械决策。
 //!
-//! 设计见 `docs/自定义浏览器和V8引擎/03-MCP_Web_LsmAgentBrowser_Use兼容层设计.md`。
+//! 设计见 `docs/MCP_Web_LsmAgentBrowser_Use/01-总体设计与架构/03-MCP_Web_LsmAgentBrowser_Use兼容层设计.md`。
 
 use async_trait::async_trait;
 use serde_json::{json, Value};

@@ -102,7 +102,7 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 | `LAEW_WEB_ACCEPT_LANGUAGE` | 任意 `Accept-Language` 值 | 覆盖浏览器请求头合成层的 `Accept-Language`(默认 `zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7`)。见 `src/agent/browser/reqctx.rs` |
 | `LAEW_DOM_TRACE` | `1` / `2`(`full`) | 打印 JS→DOM 动作账本(kind/selector/样本),诊断「页面空白 / JS 建好的 UI 没回写」。`1`=每批前 25 条采样;`2`/`full`=全量(定位个别动态节点的创建/样式写入链路)。见 `src/agent/browser/script/dom_ops.rs` |
 | `LAEW_JS_CHAIN_TRACE` | `1`/`true`/`yes`/`on` | 动态脚本装载链逐环打点(register/load-entry/style/fire),定位「SDK 已装载但 onload→Promise 链不推进」类静默断链。见 `src/agent/browser/script/runtime.rs` |
-| `LAEW_JS_CB_TRACE` | `1`/`true`/`yes`/`on` | 第三方 SDK 初始化入口(initGeetest 等)的用户回调异常透传陷阱:SDK 内部 catch 吞掉的原始异常/堆栈以 `[cbtrap]` 进 console 台账。默认关闭。见 `src/agent/browser/script/prelude.rs`、`docs/MCP_Web_LsmAgentBrowser_Use/37-GeeTest自愈循环可观测与HITL可见性守卫.md` |
+| `LAEW_JS_CB_TRACE` | `1`/`true`/`yes`/`on` | 第三方 SDK 初始化入口(initGeetest 等)的用户回调异常透传陷阱:SDK 内部 catch 吞掉的原始异常/堆栈以 `[cbtrap]` 进 console 台账。默认关闭。见 `src/agent/browser/script/prelude.rs`、`docs/MCP_Web_LsmAgentBrowser_Use/05-窗口交互与页面观察/37-GeeTest自愈循环可观测与HITL可见性守卫.md` |
 | `LAEW_BROWSER_VIEW_ACTIVATE` | `off`/`0`/`false`/`no` | 关闭有头浏览器启动时前台激活(默认激活并把窗口带到前台,避免被 Chrome/终端遮住;关闭后只 orderFront 不抢焦点)。见 `src/agent/browser/view/macos.rs` |
 | `LAEW_BROWSER_VIEWER_BIN` | 任意可执行文件路径 | 覆盖有头查看器子进程的可执行文件(默认当前进程)。供库进程/自检拉起真正的 `laew __browser-view` 用。见 `src/agent/browser/view/mod.rs` |
 | `LAEW_PAGE_BARS` | `off`/`0`/`false`/`no` | 关闭**屏蔽页面状态栏/进度栏**(两浏览器工具同参;Chrome 注入 JS + Lsm 查看器帧合成)。见 `src/agent/chrome_browser/status.rs`、`src/agent/browser/page_bars.rs`、`docs/双浏览器工具架构/02-屏蔽页面状态栏与进度栏.md` |
@@ -146,16 +146,16 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 - **终端守卫**：`src/tui/term_guard.rs`。终端窗口关闭后 crossterm `event::read` 永久 hang，通过独立看门狗线程轮询 `POLLHUP` + 0 超时挂断探测根治。
 - **LsmAgentBrowser 内核**：`src/agent/browser/` 是进程内自研浏览器——窗口/标签页、HTTP(S) 网络栈、DOM、布局、软件渲染、JS 执行全部在本进程，**不存在外部浏览器进程、调试端口或 CDP 协议**。设计见 `docs/MCP_Web_LsmAgentBrowser_Use/`。`mode=headed` 由独立查看器子进程 `laew __browser-view` 以原生窗口显示软件渲染帧(macOS AppKit/Windows Win32,stdin 长度前缀帧协议,查看器退出自动回退纯无头);引擎线程零 UI 依赖。
 - **Chrome/CDP 驱动（`MCP_Web_Chrome_Use` 底层）**：`src/agent/chrome_browser/` 拉起本机 Chrome/Edge/Chromium 子进程(chromiumoxide 0.9)并做 CDP 操控；**进程外 watchdog**（隐藏子命令 `laew __browser-watchdog`）在主进程被强杀时依据 stdin pipe EOF 回收 Chrome 主进程与一次性 profile（否则残留孤儿 Chrome 占用 100MB+/个）。截图走 `params.save_path` 落盘（只回路径+尺寸），**不得回 base64**（实测 1.7MB/张会撑爆上下文并拖死推理）。设计见 `docs/MCP_Web_Chrome_Use/`（含实测结论 41-）。
-- **有头浏览器窗口 = 真浏览器形态**：窗口含**工具栏(后退/前进/刷新/首页)+ 地址栏 + 页面画面**。宿主→查看器走帧协议(`'i'` 帧 / `'t'` 标题 / `'u'` 地址栏状态 / `'c'` 关闭)；查看器→宿主走 stdout 按行 JSON 命令(`navigate`/`back`/`forward`/`reload`/`home`)，引擎据此做真实导航与历史栈操作，地址栏内容按当前页 URL 同步。设计见 `docs/MCP_Web_LsmAgentBrowser_Use/20-浏览器窗口交互化与地图页白屏根因.md`。
+- **有头浏览器窗口 = 真浏览器形态**：窗口含**工具栏(后退/前进/刷新/首页)+ 地址栏 + 页面画面**。宿主→查看器走帧协议(`'i'` 帧 / `'t'` 标题 / `'u'` 地址栏状态 / `'c'` 关闭)；查看器→宿主走 stdout 按行 JSON 命令(`navigate`/`back`/`forward`/`reload`/`home`)，引擎据此做真实导航与历史栈操作，地址栏内容按当前页 URL 同步。设计见 `docs/MCP_Web_LsmAgentBrowser_Use/05-窗口交互与页面观察/20-浏览器窗口交互化与地图页白屏根因.md`。
 - **屏蔽页面状态栏 / 屏蔽页面进度栏（两浏览器工具统一告知栏）**：Agent 打开浏览器窗口后页面覆盖区的两条常驻告知栏——**状态栏**（右上角：`LAEW Agent 控制中 · 具体Agent名` + 档位行 + **静态注意事项** + `guard_note`）与**进度栏**（左下角：**动态**当前动作 / 迭代·会话·耗时 + 进度条 / 任务摘要 / 最近 6 条事件时间线，长文本截断）。数据唯一真源 = `src/agent/web_activity.rs` 活动台账（task_local，并行 SubAgent 各读各的快照）；Chrome 侧注入 JS（`src/agent/chrome_browser/status.rs`，closed Shadow DOM + 顶层 frame 门 + 截图避让），Lsm 侧查看器帧合成（`src/agent/browser/page_bars.rs`，不进截图取证路径 + 1Hz 心跳重绘）。开关 `LAEW_PAGE_BARS=off`。设计见 `docs/双浏览器工具架构/02-屏蔽页面状态栏与进度栏.md`。
 - **布局/渲染能力边界**：布局引擎支持百分比高度(视口→html→body 确定高传播,父高 auto 时按 CSS 语义退化)与 **CSS 浮动**(`float:left/right`+`clear`:块级/行内浮动共用行占用带、auto 宽 shrink-to-fit、容器 auto 高收编,近似不含文字环绕,见 `layout/float.rs`)、**`calc()` 长度函数**(加减乘除/括号/一元负号/内嵌 calc 展开/全单位,`%` 按视口宽近似)、**`vw/vh/vmin/vmax` 视口单位**、**`box-sizing`**(默认 border-box 语义;显式 `content-box` 时宽高按内容盒还原,块级/flex/grid 三路);渲染走**显示列表架构**(布局期 DFS 发射带 `(z,layer,seq,rank)` 排序键的自包含绘制项——`layer` 区分常规流/定位元素(CSS 2.1 附录 E 第 8 步:定位元素及其子树在常规流之上);祖先 `opacity`/`overflow`/`transform` 组效果在发射期折叠进项;`clip` 裁剪窗口随项 transform 一起变换;空列表回退旧五表管线):背景/边框/圆角(`border-radius` 含 %)/`linear+radial-gradient` 渐变/外阴影(blur 真实生效,三趟盒式模糊近似高斯)/图像/文字/连续透明度/溢出裁剪/**CSS 2D transform**(`translate/rotate/scale/skew/matrix` + `transform-origin`,逐项仿射 + 子树回补合成,光栅化逆映射)/**text-shadow**(多层 + 模糊)/**多背景层**(`url()`/`gradient()` 混排保序,首层在上)与**半透明背景色**(`rgba/hsla` 的 alpha 保留到绘制期按已绘底层合成,不在计算样式阶段压白底;`getComputedStyle` 同步输出 `rgba(...)`);表单控件有 UA 默认描边与 value/placeholder 文本绘制;flex/grid/absolute 元素边框与阴影全量发射;`position:fixed` 子树带标记、光栅化不受滚动量影响;z-index 沿祖先链下传(层叠上下文最大值近似,不含负 z 压父背景语义);`screenshot(ocr:true)` 与落盘并存、`full_page` 不再叠加滚动偏移;动态(JS 建出)节点经 `data-lsm-id` 回认宿主布局几何并可真实绑定事件(见 `script/prelude.rs`)。Canvas 2D 已支持基础 RGBA 像素(矩形/像素读写/Canvas 间贴图)与真实 PNG 截图回写;路径/文字/渐变、远程图片入 Canvas、WebGL、文本整形未实现(GPU 后端与增量光栅列路线图)。
-- **图片子资源（`browser/images.rs`）**：宿主预取 `<img src>` 与 CSS `url(...)` 背景图并解码为 RGBA8 **全内存**缓存（随标签页生命周期，进程退出即销毁）；布局层按固有尺寸排版替换元素（`<img>`），渲染层按 `object-fit` 贴图；开关/限额见 `LAEW_WEB_IMAGES` / `LAEW_WEB_MAX_IMAGES` / `LAEW_WEB_MAX_IMAGE_BYTES`。设计见 `docs/MCP_Web_LsmAgentBrowser_Use/10-阶段三第三步图片渲染与替换元素设计.md`
+- **图片子资源（`browser/images.rs`）**：宿主预取 `<img src>` 与 CSS `url(...)` 背景图并解码为 RGBA8 **全内存**缓存（随标签页生命周期，进程退出即销毁）；布局层按固有尺寸排版替换元素（`<img>`），渲染层按 `object-fit` 贴图；开关/限额见 `LAEW_WEB_IMAGES` / `LAEW_WEB_MAX_IMAGES` / `LAEW_WEB_MAX_IMAGE_BYTES`。设计见 `docs/MCP_Web_LsmAgentBrowser_Use/03-布局与渲染引擎/10-阶段三第三步图片渲染与替换元素设计.md`
 - **样式引擎（`browser/style/`）**：CSS 解析/级联/继承/单位/媒体查询/自定义属性唯一真源；外链 `<link rel=stylesheet>` 由 `browser/resources.rs` 宿主预取并**原位内联**为 `<style data-lsm-href=...>`（保持级联顺序），布局、渲染、JS `getComputedStyle`、`inspect(stylesheets)` 共用同一份 `ComputedStyle`。
 - **页面模型**：`page_id` 格式 `p_` + 8 位十六进制；窗口/标签页、历史栈、Cookie Jar、localStorage/sessionStorage 全部内存驻留，`close(page_id="all")` 或进程退出即销毁。`open` 支持同 URL/同站复用，`new_tab`/`_blank` 返回 `spawned_page_id`。
 - **JS 引擎**：`JsRuntime` 抽象；阶段一默认 `boa_engine` **0.22**（纯 Rust，离线可编译；需 rustc 1.91+，见 `rust-toolchain.toml`；0.20/0.21 的直接 eval 闭包 panic 与重复 eval `var` 缺陷会阻断百度地图异步模块装载），DOM 通过快照桥暴露 `document/window/location/storage`；`rusty_v8` 作为可选目标后端（`v8-backend` 特性），上层接口不变。
-- **页面观察与就绪判定**：`MutationObserver`/`IntersectionObserver`/`ResizeObserver` 在 PRELUDE 层**真实派发**（记账点/选项过滤/子树/旧值/阈值）；宿主侧变更经快照 diff 合成 mutation 记录（Agent 侧动作对页面脚本可见）。`control(wait)` 是就绪判定原语：`selector`+`state`(visible/hidden/attached/detached)、`text`、`js`、`network_idle` 可组合取「与」，超时返 2002。设计见 `docs/MCP_Web_LsmAgentBrowser_Use/17-阶段五第一步页面观察与就绪判定设计.md`。
+- **页面观察与就绪判定**：`MutationObserver`/`IntersectionObserver`/`ResizeObserver` 在 PRELUDE 层**真实派发**（记账点/选项过滤/子树/旧值/阈值）；宿主侧变更经快照 diff 合成 mutation 记录（Agent 侧动作对页面脚本可见）。`control(wait)` 是就绪判定原语：`selector`+`state`(visible/hidden/attached/detached)、`text`、`js`、`network_idle` 可组合取「与」，超时返 2002。设计见 `docs/MCP_Web_LsmAgentBrowser_Use/05-窗口交互与页面观察/17-阶段五第一步页面观察与就绪判定设计.md`。
 - **页面能力与安全**：网络请求走本进程 `reqwest`（rustls），沿用 `LAEW_TLS_INSECURE` 与 SSRF 私网拦截；任务锚点 6001 继续在显式 URL 动作入口生效；页面脚本执行、原生窗口、资源加载器分别在阶段二/三/四补齐。
-- **DOM 集合语义**：`getElementsByTagName`/`getElementsByClassName`/`getElementsByName` 返回**活集合**（`Proxy` 实时重查，浏览器语义）；曾返回一次性数组快照，导致站点「取集合→改 DOM→再读集合[0]」读到 `undefined` 直接炸链（实测百度地图 `require.loadCss` 的 CSS 注入器 → `dataCopyRight` 模块工厂失败 → 地图初始化链断掉 → 地图/路线面板全不出图）。见 `docs/MCP_Web_LsmAgentBrowser_Use/26-`。
+- **DOM 集合语义**：`getElementsByTagName`/`getElementsByClassName`/`getElementsByName` 返回**活集合**（`Proxy` 实时重查，浏览器语义）；曾返回一次性数组快照，导致站点「取集合→改 DOM→再读集合[0]」读到 `undefined` 直接炸链（实测百度地图 `require.loadCss` 的 CSS 注入器 → `dataCopyRight` 模块工厂失败 → 地图初始化链断掉 → 地图/路线面板全不出图）。见 `docs/MCP_Web_LsmAgentBrowser_Use/03-布局与渲染引擎/26-活集合语义与视口高度根因修复.md`。
 - **内核能力缺口如实上报**：站点申请过 WebGL 上下文（`canvas.getContext('webgl')`）时，内核无 GPU 后端 → 该区域画不出像素；`open` 回 `capability_gaps`、`inspect(info=page_health)` 直说「需要像素级地图请改用 `MCP_Web_Chrome_Use`」，免得 Agent 对同一片空白反复截图重试。
 - **人工介入**：`control(request_human)` 桥接 `human_assist`（桌面原生弹窗 / TUI），返回 0/4001/4002；取消任务同时置位进程级旗标。弹窗实现见 `src/agent/human_ui/`。
 
@@ -193,7 +193,7 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 |------|------|----------|----------|
 | **MCP_Window_Use** | 桌面窗口操控：`action` 枚举分发（`open`/`list`/`find`/`inspect`/`control`/`ocr`/`screenshot`）；双路线（Windows UIA Pattern 优先 + Win32 消息 + 物理鼠标键盘兜底；macOS AX 控件树 + 物理输入；Linux wmctrl/xdotool 物理层） | **仅 macOS/Windows** 运行时注册；Linux 走物理层兜底 | `docs/MCP_Window_Use/01-设计与解决方案.md` |
 | **MCP_Web_Chrome_Use** | 浏览器操控（Chrome/CDP，chromiumoxide 0.9，真 Chromium 渲染，headed 窗口支持人工介入；**日常 80-90% 网页任务默认优先**）：`action` 枚举分发（`open`/`list`/`close`/`control`/`inspect` 基础集）；截图支持 `params.save_path` 落盘（只回路径+尺寸，防 base64 撑爆上下文）；`wait` 支持 selector 就绪判定；**控制权**：`control(set_control_state)` 切 Agent/用户两态（蒙层 + 输入闸），`request_human` 自动移交用户态 | 跨 Windows/macOS/Linux；需本机装 Chrome/Edge/Chromium/Brave（`LAEW_BROWSER_PATH` 可指路径） | `docs/双浏览器工具架构/01-设计与解决方案.md`、`docs/MCP_Web_Chrome_Use/`（实测结论见 41-） |
-| **MCP_Web_LsmAgentBrowser_Use** | 浏览器操控（LsmAgentBrowser 进程内内核，**反-反爬专用**）：`action` 枚举分发（`open`/`list`/`close`/`control`/`inspect`/`sequence`/`batch`/`explore`）；`control_action` 48 个写操作（含 `set_control_state` 控制权切换）；`inspect` 23 个观察维度；单步 + 连续（`sequence` ≤24 steps）；HTTP(S) + DOM + 布局 + 软件渲染 + Boa JS；全内存 Cookie/存储 | 跨 Windows/macOS/Linux；无外部浏览器进程 | `docs/MCP_Web_LsmAgentBrowser_Use/03-MCP_Web_LsmAgentBrowser_Use兼容层设计.md` |
+| **MCP_Web_LsmAgentBrowser_Use** | 浏览器操控（LsmAgentBrowser 进程内内核，**反-反爬专用**）：`action` 枚举分发（`open`/`list`/`close`/`control`/`inspect`/`sequence`/`batch`/`explore`）；`control_action` 48 个写操作（含 `set_control_state` 控制权切换）；`inspect` 23 个观察维度；单步 + 连续（`sequence` ≤24 steps）；HTTP(S) + DOM + 布局 + 软件渲染 + Boa JS；全内存 Cookie/存储 | 跨 Windows/macOS/Linux；无外部浏览器进程 | `docs/MCP_Web_LsmAgentBrowser_Use/01-总体设计与架构/03-MCP_Web_LsmAgentBrowser_Use兼容层设计.md` |
 | **Use_MCP** | 通用 MCP（Model Context Protocol）服务调用统一入口：**真 MCP 协议客户端**（JSON-RPC 2.0），连接外部 MCP server（stdio 子进程 / Streamable HTTP）；单工具 `action` 枚举分发 | 跨平台（由外部 MCP server 决定能力） | `docs/Use_MCP/01-设计与解决方案.md` |
 
 ### 自感知动态子 Agent（Self-Awareness SubAgent）
@@ -468,26 +468,13 @@ Markdown Prompt 模板，两级发现：**项目级** `{工作目录}/.laew/comm
 - `docs/双浏览器工具架构/` — Chrome × LsmAgentBrowser 双浏览器工具总设计(命名映射/选用决策/分阶段路线图);`02-屏蔽页面状态栏与进度栏.md` — 两条告知栏双引擎统一落地(术语定名/内容规格/Chrome 注入 × Lsm 帧合成/埋点);`03-浏览器控制权状态机与视口自适应.md` — 控制权两态(Agent/用户互斥)+ 蒙层/输入闸 + 1080p 视口自适应 + 标签页治理
 - `docs/MCP_Web_Chrome_Use/` — Chrome/CDP 工具知识库(46 篇,含 HITL/反检测/站点治理系列) + `CDP技术方案-Rust操作Chrome浏览器.md`(CDP 完整技术方案) + `reference实现归档/`(历史实现 47 文件)
 - `docs/MCP_Window_Use/` — 桌面窗口操控
-- `docs/MCP_Web_LsmAgentBrowser_Use/` — LsmAgentBrowser 内核、兼容层与阶段路线图
-  - `08-阶段三布局引擎Flex与定位设计.md` — Flex + 定位体系(已完成)与 Phase 3 后续
-  - `12-阶段四第二步缓存与安全接入主管线设计.md` — HttpCache/CSP/CORS 接入主管线 + clip 区域截图(已完成)
-  - `13-JS运行时兼容性与页面诊断能力.md` — 选择器引擎/AMD 装载/动态脚本 load/`page_health` 诊断(已完成)
-  - `14-有头帧查看器与真实站点JS启动链路修复.md` — 有头帧查看器子进程 + 真实站点 JS 启动链路七处根治(已完成)
-  - `15-百分比高度边框阴影绘制与日志降噪.md` — 百分比高度求解/边框与外阴影绘制/表单控件 UA 描边/DEBUG 日志第三方降噪(已完成)
-  - `18-百度地图白屏根因与脚本DOM兼容性修复.md` — 脚本文档序执行/FIS 同步 define 兼容/交互后懒加载脚本/detached innerHTML 子树/定位父百分比高度(已完成)
-  - `19-浏览器请求头合成层与抗风控指纹补齐.md` — 按请求目的地合成 UA/Referer/Origin/Accept/Sec-Fetch-*(缺 Referer 被风控 403 的根因)/CSS `background` 简写丢 `url(...)` 与精灵图位置/window 代理只读访问器赋值抛错/缺失标准全局(NodeFilter/createElementNS)/事件委托 matches/closest/inspect 可访问名 label/WorkFlow 未知依赖降级(已完成)
-  - `20-浏览器窗口交互化与地图页白屏根因.md` — 有头窗口升级为真浏览器(工具栏 + 地址栏 + 命令通道)/`location.protocol` 缺冒号导致协议相对地址 404/已有节点 appendChild 丢子树/游离元素 className 与 cloneNode 序列化缺陷/canvas 区域占位渲染/百度地图风控脚本失败的完整根因链(已完成)
-  - `22-专业渲染引擎重构设计与实现.md` — 显示列表架构(参考技术方案映射与取舍)+ 圆角/渐变/模糊阴影/透明度/溢出裁剪 + flex/grid/absolute 边框阴影缺口修复 + 渲染层目录拆分(已完成)
-  - `23-CSS2D变换与文本阴影与多背景层设计.md` — CSS 2D transform(操作序列 + Affine + 逆映射 + 回补合成)/text-shadow(多层 + 模糊)/多背景层(保序叠画)(已完成)
-  - `24-CSS浮动布局与表单控件文本与XHR兼容.md` — CSS float/clear 块级+行内浮动共用行占用带/auto 宽 shrink-to-fit/表单 value 与 placeholder 绘制/XHR 事件对象与响应头(已完成)
-  - `25-动态节点几何回填与事件绑定与截图落盘修复.md` — 动态(JS 建出)节点按 `data-lsm-id` 回认宿主布局几何(地图容器自量尺寸的前提)/动态节点 addEventListener 真实注册/screenshot(ocr:true) 不再吞掉落盘/position:fixed 不随滚动/z-index 沿祖先链下传(已完成)
-  - `28-zhipin站点全链路兼容与动态脚本同步装载.md` — zhipin 全链路兼容修复:window `has` 陷阱(on* 事件族)/`element.attributes` NamedNodeMap/`createHTMLDocument`/`createEvent`/`createComment`/`elementFromPoint`/`<a>` URL 反射/`__lsmDecode` 补齐/脚本管线 defer 语义(阻塞组先、defer 组后置)/动态 `<script src>` 线程内同步装载(script 语义免 CORS + data-lsm-executed 防重)/eval·dispatch·管线三处超时不再核爆持久上下文(已完成);渲染引擎优化:`calc()` 全量求值/`vw/vh/vmin/vmax` 视口单位/`box-sizing` 显式 content-box 语义(块级+flex+grid)(已完成)
-  - `29-liepin首页渲染链路四根因修复.md` — width 百分比预解/inline-flex 块级化/svg 固有尺寸/flex 条目 seq 倒序/LAEW_DUMP_DISPLAY 显示列表诊断(已完成)
-  - `30-liepin搜索页脚本启动链与有头窗口可见性修复.md` — 大 bundle 脚本预算/console.assert/NS 属性 API/动态 DOM 同批查询与删除回写/阻断误报与 page_health 诊断/macOS 有头窗口默认前台显示(已完成离线验证;真站任务按停测要求未继续)
-  - `33-瓦片原点层塌陷与样式驼峰归一化修复.md` — insertAdjacentHTML 伪元素壳吞真元素(`co` 模式 lastChild 取到壳,百度地图瓦片坐标系原点塌到 (0,0))/style 驼峰名归一化(zIndex→z-index,厂商前缀)/查看器主菜单(地址栏 ⌘C⌘V)/LAEW_DOM_TRACE=2 全量账本(已完成)
-  - `35-渲染引擎块级堆叠语义与跨平台字体回退链.md` — 块级堆叠语义(相邻兄弟外边距折叠/空块零高/height:0 确定高)/行内共享行盒(b/span/a 不再竖排)/文本 x 基准删除 text_base:8 硬编码/窄宽块换行宽修复/FontSet 跨平台回退链(Linux CJK 候选提前)+字形栅格缓存/layout 机械拆分 inline.rs+measure.rs(已完成)
-  - `36-验证页布局弹层与Canvas截图保真修复.md` — Flex column 主轴高度/inset 百分比包含块/max-height 与脱流盒模型/Latin-1 Base64/静态固有尺寸/Canvas 2D 真实 RGBA 与 PNG 截图/等待与截图前同步持久 JS(已完成离线验证;真站按停测要求未复测)
-  - `38-猎聘页头空白与登录页白屏五根因修复.md` — 动态 `<link rel=stylesheet>` 装载与 onload(webpack CSS chunk 不装载→React 永不 mount 的登录页白屏)/半透明背景色保留 alpha 并绘制期合成(页头压白底)/内在尺寸测量不对齐偏移(居中把条目撑到 5 万)/快照节点补 `style` + 动态元素查自身 innerHTML 子树/定位元素绘制层与裁剪随 transform/绝对定位元素背景早于子树/缺失标准全局(MessageChannel·DOMRect·AbortController·File·Worker·customElements·WebSocket·EventSource)/工具契约对齐(inspect html、elements 列表模式、explore 形状)/弹窗意外关闭不再误判「人工取消」(已完成)
+- `docs/MCP_Web_LsmAgentBrowser_Use/` — LsmAgentBrowser 进程内内核知识库（**按功能分六册**，每册 `README.md` 有全量文件索引；总索引见目录根部 `README.md`）
+  - `01-总体设计与架构/` — 总体路线图 / 内核架构 / 工具兼容层契约(8 action·48 control_action·23 inspect) / 能力矩阵 / V8 后端选型
+  - `02-脚本运行时与样式引擎/` — 脚本管线 / CSS 级联与外链样式 / Boa JS 引擎 / Sizzle 选择器 / 请求头合成(缺 Referer 被风控 403 根因)
+  - `03-布局与渲染引擎/` — Flex·Grid·定位 / 图片子资源 / 显示列表渲染架构 / 2D transform / float / 整像素对齐 / 块级堆叠与字体回退
+  - `04-资源加载与安全/` — 资源加载器 / 全内存缓存 + CSP·CORS 主管线 / 安全验证页 `open` 阻断
+  - `05-窗口交互与页面观察/` — 有头查看器与真浏览器窗口 / Observer 与 `wait` 就绪判定 / GeeTest 自愈循环与 HITL 可见性
+  - `06-站点实战根因/` — 百度地图 / 猎聘 liepin / BOSS直聘 zhipin 逐轮根因链（**真站跑不通先搜这里**）
 - `docs/Use_MCP/` — 通用 MCP 服务调用
 
 **上下文与会话**：
