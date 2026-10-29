@@ -19,6 +19,8 @@ mod tests;
 
 pub use display::{BgFill, ClipRect, DisplayItem, DisplayKind};
 
+use std::collections::HashMap;
+use std::sync::Mutex;
 use std::path::Path;
 
 use fontdue::{Font, FontSettings};
@@ -28,53 +30,134 @@ use super::images::ImageStore;
 use super::layout::Layout;
 
 pub struct FontSet {
-    font: Option<Font>,
+    /// 字体回退链:主字体在前,按 `pick` 的字形覆盖逐字选字。
+    /// TTC 字体集合由 fontdue `collection_index` 取第 0 面,天然可用。
+    fonts: Vec<Font>,
     pub path: String,
+    /// 字形栅格缓存((char, size 位模式) → 度量+位图):重绘热点
+    /// (page_bars 1Hz 重绘 / 截图重渲染),命中免曲线展平。
+    glyph_cache: Mutex<HashMap<(char, u64), (fontdue::Metrics, Vec<u8>)>>,
+    /// 字宽缓存((char, size 位模式) → advance):换行循环逐字查度量的热点。
+    width_cache: Mutex<HashMap<(char, u64), f64>>,
 }
 
+/// 字形/字宽缓存容量上限:超出整体清空(条目小、简单有界即可)。
+const FONT_CACHE_CAP: usize = 4096;
+
 impl FontSet {
+    /// 跨平台加载:按候选序构建回退链,**覆盖探针达标即停**
+    /// (主字体已有拉丁+CJK 时只载一个,零额外启动开销;Linux 首选
+    /// DejaVu 无 CJK 时继续载入 Noto/文泉驿等补齐,根治中文豆腐块)。
     pub fn load() -> Self {
-        for path in candidate_fonts() {
-            if let Ok(bytes) = std::fs::read(&path) {
-                if let Some(font) = Font::from_bytes(bytes, FontSettings::default()).ok() {
-                    return Self {
-                        font: Some(font),
-                        path,
-                    };
+        let mut fonts: Vec<Font> = Vec::new();
+        let mut path = String::new();
+        for p in candidate_fonts() {
+            if fonts.len() >= 3 {
+                break;
+            }
+            let Ok(bytes) = std::fs::read(&p) else {
+                continue;
+            };
+            if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
+                if path.is_empty() {
+                    path = p;
+                }
+                let covered = font.lookup_glyph_index('A') != 0
+                    && font.lookup_glyph_index('中') != 0;
+                fonts.push(font);
+                if covered {
+                    break;
                 }
             }
         }
-        Self::fallback()
+        Self {
+            fonts,
+            path,
+            glyph_cache: Mutex::new(HashMap::new()),
+            width_cache: Mutex::new(HashMap::new()),
+        }
     }
 
     pub fn fallback() -> Self {
         Self {
-            font: None,
+            fonts: Vec::new(),
             path: String::new(),
+            glyph_cache: Mutex::new(HashMap::new()),
+            width_cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 仅测试用:按给定字体序构建回退链。
+    #[cfg(test)]
+    pub(crate) fn from_fonts(fonts: Vec<Font>, path: String) -> Self {
+        Self {
+            fonts,
+            path,
+            glyph_cache: Mutex::new(HashMap::new()),
+            width_cache: Mutex::new(HashMap::new()),
         }
     }
 
     pub fn has_font(&self) -> bool {
-        self.font.is_some()
+        !self.fonts.is_empty()
+    }
+
+    /// 链上是否有任一字体覆盖该字符(诊断/测试用)。
+    #[cfg(test)]
+    pub(crate) fn covers(&self, ch: char) -> bool {
+        self.pick(ch).is_some()
+    }
+
+    /// 按字形覆盖选字:首个 `lookup_glyph_index != 0` 的字体。
+    fn pick(&self, ch: char) -> Option<&Font> {
+        self.fonts
+            .iter()
+            .find(|f| f.lookup_glyph_index(ch) != 0)
     }
 
     pub fn char_width(&self, ch: char, size: f64) -> f64 {
-        if let Some(font) = &self.font {
-            let m = font.metrics(ch, size as f32);
-            if m.advance_width > 0.0 {
-                return m.advance_width as f64;
-            }
+        let key = (ch, size.to_bits());
+        if let Some(w) = self.width_cache.lock().unwrap().get(&key) {
+            return *w;
         }
-        fallback_char_width(ch, size)
+        let w = match self.pick(ch) {
+            Some(font) => {
+                let m = font.metrics(ch, size as f32);
+                if m.advance_width > 0.0 {
+                    m.advance_width as f64
+                } else {
+                    fallback_char_width(ch, size)
+                }
+            }
+            None => fallback_char_width(ch, size),
+        };
+        let mut cache = self.width_cache.lock().unwrap();
+        if cache.len() >= FONT_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(key, w);
+        w
     }
 
     pub fn text_width(&self, text: &str, size: f64) -> f64 {
         text.chars().map(|c| self.char_width(c, size)).sum()
     }
 
-    /// 单字形栅格化(光栅化器用;无字体返回 None,调用方已用 `has_font` 预判)。
+    /// 单字形栅格化(光栅化器用):回退链选字 + 栅格缓存;
+    /// 全链无覆盖返回 None(调用方跳过绘制,不再画 tofu 框)。
     pub(crate) fn rasterize_glyph(&self, ch: char, size: f32) -> Option<(fontdue::Metrics, Vec<u8>)> {
-        self.font.as_ref().map(|f| f.rasterize(ch, size))
+        let key = (ch, (size as f64).to_bits());
+        if let Some(v) = self.glyph_cache.lock().unwrap().get(&key) {
+            return Some((v.0, v.1.clone()));
+        }
+        let font = self.pick(ch)?;
+        let (metrics, bitmap) = font.rasterize(ch, size);
+        let mut cache = self.glyph_cache.lock().unwrap();
+        if cache.len() >= FONT_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(key, (metrics, bitmap.clone()));
+        Some((metrics, bitmap))
     }
 
     /// 合成层文本行(屏蔽页面状态栏/进度栏专用,`page_bars.rs` 调用):
@@ -111,7 +194,7 @@ impl FontSet {
                 break;
             }
         }
-        let Some(font) = &self.font else {
+        if !self.has_font() {
             // 无字体:占位色条,宽度反映文本长度(截断后)。
             fill_rect(
                 pixmap,
@@ -122,11 +205,15 @@ impl FontSet {
                 color,
             );
             return used;
-        };
+        }
         let baseline = y + size;
         let mut pen_x = x;
         for ch in kept.chars() {
-            let (metrics, bitmap) = font.rasterize(ch, size);
+            // 回退链逐字选字;全链无覆盖按启发式宽度推进,不画 tofu。
+            let Some((metrics, bitmap)) = self.rasterize_glyph(ch, size) else {
+                pen_x += self.char_width(ch, size as f64) as f32;
+                continue;
+            };
             if metrics.width > 0 && metrics.height > 0 {
                 let gx = pen_x + metrics.xmin as f32;
                 let gy = baseline - metrics.height as f32 - metrics.ymin as f32;
@@ -279,6 +366,8 @@ fn fallback_char_width(ch: char, size: f64) -> f64 {
     }
 }
 
+/// 各平台候选字体序(主字体 → CJK 回退 → 一般拉丁回退):
+/// 覆盖探针达标即停,通常只载 1 个;Linux 首选无 CJK 时继续补齐。
 fn candidate_fonts() -> Vec<String> {
     let mut out = Vec::new();
     match std::env::consts::OS {
@@ -295,13 +384,73 @@ fn candidate_fonts() -> Vec<String> {
             out.push("C:\\Windows\\Fonts\\arial.ttf".into());
         }
         _ => {
+            // 首选(Debian/Ubuntu 与 Fedora/Arch 两种安装位)。
             out.push("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf".into());
-            out.push("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf".into());
+            out.push("/usr/share/fonts/dejavu/DejaVuSans.ttf".into());
+            // CJK 回退(此前排在拉丁备选之后,永远加载不到 → 中文豆腐块根因)。
             out.push("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc".into());
+            out.push("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc".into());
+            out.push("/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc".into());
+            out.push("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc".into());
+            out.push("/usr/share/fonts/wqy-zenhei/wqy-zenhei.ttc".into());
+            out.push("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc".into());
+            out.push("/usr/share/fonts/wenquanyi/wqy-zenhei/wqy-zenhei.ttc".into());
+            out.push("/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf".into());
+            // 一般拉丁回退。
+            out.push("/usr/share/fonts/liberation/LiberationSans-Regular.ttf".into());
+            out.push("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf".into());
             out.push("/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf".into());
+            // 发行版安装位兜底(硬编码未命中时按目录扫描补)。
+            out.extend(scan_font_dirs());
         }
     }
     out
+}
+
+/// Linux 字体目录兜底扫描:有界(深度≤3、最多 48 个文件),
+/// CJK 偏好名优先(回退链按序取用,越靠前越早补齐覆盖)。
+#[cfg(target_os = "linux")]
+fn scan_font_dirs() -> Vec<String> {
+    fn walk(dir: &Path, depth: u32, out: &mut Vec<String>) {
+        if depth > 3 || out.len() >= 48 {
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut entries: Vec<_> = rd.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, depth + 1, out);
+            } else if matches!(
+                p.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase().as_str(),
+                "ttf" | "otf" | "ttc"
+            ) {
+                out.push(p.to_string_lossy().into_owned());
+            }
+        }
+    }
+    let mut files = Vec::new();
+    for root in ["/usr/share/fonts", "/usr/local/share/fonts"] {
+        walk(Path::new(root), 0, &mut files);
+    }
+    files.sort_by_key(|p| {
+        let lower = p.to_ascii_lowercase();
+        let score = if lower.contains("cjk") || lower.contains("wqy") || lower.contains("droid") {
+            0
+        } else {
+            1
+        };
+        (score, p.clone())
+    });
+    files
+}
+
+#[cfg(not(target_os = "linux"))]
+fn scan_font_dirs() -> Vec<String> {
+    Vec::new()
 }
 
 /// 把 `data:`/绝对/相对路径的图片读取为 PNG/JPEG 原始字节(阶段一只用于下载与展示)。

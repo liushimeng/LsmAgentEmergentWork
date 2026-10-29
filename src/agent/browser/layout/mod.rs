@@ -7,12 +7,17 @@
 
 mod flex;
 mod float;
+mod inline;
+mod measure;
 mod grid;
 mod position;
 #[cfg(test)]
 mod tests;
 
 use std::collections::HashMap;
+
+use inline::InlineBuf;
+pub(crate) use measure::{append, translate, Fragment};
 
 use kuchikiki::NodeRef;
 
@@ -212,7 +217,6 @@ pub fn compute_full(
         font,
         width: viewport_width.max(320.0),
         viewport_h: media.viewport_height.max(1.0),
-        text_base: 8.0,
         lines: Vec::new(),
         boxes: Vec::new(),
         paints: Vec::new(),
@@ -225,6 +229,7 @@ pub fn compute_full(
         y: 0.0,
         z_floor: 0,
         fixed_depth: 0,
+        pending_margin_bottom: 0.0,
     };
     let body = doc
         .root()
@@ -263,7 +268,14 @@ pub fn compute_full(
     let icb = (0.0, 0.0, ctx.width, icb_h);
     ctx.layout_children(&body, body_margin_left, content_width, &mut buf, 0, &body_style, icb);
     ctx.flush_inline(&mut buf, content_width);
-    let height = ctx.y + body_margin_bottom;
+    // body 末子块穿出的 margin_bottom 与 body 自身边距折叠(CSS 2.1 8.3.1);
+    // body 有 padding-bottom/下边框/overflow 时收编进内容高。
+    if contains_child_margins(&body_style) {
+        ctx.y += ctx.pending_margin_bottom;
+        ctx.pending_margin_bottom = 0.0;
+    }
+    let escaped = std::mem::take(&mut ctx.pending_margin_bottom);
+    let height = ctx.y + collapse_margin(escaped, body_margin_bottom);
     // 阶段三:按 z-index 稳定排序绘制序(同 z 保持 DOM/流内先后顺序)。
     ctx.boxes.sort_by_key(|b| b.z_index);
     // 阶段三第三步:图像绘制序(背景图先于内容图,同 z 保持先后)。
@@ -290,55 +302,6 @@ pub fn compute_full(
     }
 }
 
-/// 局部布局片段:一次内容测量的产出,可整体平移后注入全局结果。
-#[derive(Default)]
-pub(crate) struct Fragment {
-    pub height: f64,
-    pub lines: Vec<TextLine>,
-    pub boxes: Vec<ElementBox>,
-    pub paints: Vec<PaintBox>,
-    pub borders: Vec<BorderDraw>,
-    pub shadows: Vec<ShadowDraw>,
-    /// 片段内发射的显示项(阶段六):随片段整体平移注入。
-    pub display: Vec<DisplayItem>,
-}
-
-/// 平移片段内全部几何。
-pub(crate) fn translate(fragment: &mut Fragment, dx: f64, dy: f64) {
-    for l in &mut fragment.lines {
-        l.x += dx;
-        l.y += dy;
-    }
-    for b in &mut fragment.boxes {
-        b.x += dx;
-        b.y += dy;
-    }
-    for p in &mut fragment.paints {
-        p.x += dx;
-        p.y += dy;
-    }
-    for bd in &mut fragment.borders {
-        bd.x += dx;
-        bd.y += dy;
-    }
-    for s in &mut fragment.shadows {
-        s.x += dx;
-        s.y += dy;
-    }
-    for it in &mut fragment.display {
-        it.translate(dx, dy);
-    }
-}
-
-/// 片段注入全局结果。
-pub(crate) fn append(ctx: &mut LayoutCtx, fragment: Fragment) {
-    ctx.lines.extend(fragment.lines);
-    ctx.boxes.extend(fragment.boxes);
-    ctx.paints.extend(fragment.paints);
-    ctx.borders.extend(fragment.borders);
-    ctx.shadows.extend(fragment.shadows);
-    ctx.display.extend(fragment.display);
-}
 
 /// 解析四边边框颜色:currentColor 代入文字色。
 fn resolved_border_colors(style: &ComputedStyle) -> [([u8; 3], u8); 4] {
@@ -489,13 +452,30 @@ pub(crate) fn relative_offset(style: &ComputedStyle) -> (f64, f64) {
     }
 }
 
+/// 相邻兄弟外边距折叠(CSS 2.1 8.3.1 简化):两者皆非负取 max;任一为负直接相加
+/// (负边距不折叠,按叠加语义近似)。
+fn collapse_margin(a: f64, b: f64) -> f64 {
+    if a >= 0.0 && b >= 0.0 {
+        a.max(b)
+    } else {
+        a + b
+    }
+}
+
+/// 子块 `margin_bottom` 是否折叠穿出本盒(CSS 2.1 8.3.1):
+/// 有 padding-bottom / 下边框 / overflow 裁剪(建 BFC)时收编进内容高,
+/// 否则穿出本盒、与本盒自身 margin 折叠(经典 `<section><p>` 段距语义)。
+fn contains_child_margins(style: &ComputedStyle) -> bool {
+    style.padding_bottom > 0.0
+        || (style.border_drawn[2] && style.border_widths[2] > 0.0)
+        || style.overflow_clip
+}
+
 pub(crate) struct LayoutCtx<'a> {
     engine: &'a StyleEngine,
     font: &'a FontSet,
     width: f64,
     viewport_h: f64,
-    /// 行内文本的 x 基准:块级流为 body 左边距 8.0,局部测量为 0.0。
-    text_base: f64,
     lines: Vec<TextLine>,
     boxes: Vec<ElementBox>,
     paints: Vec<PaintBox>,
@@ -518,6 +498,10 @@ pub(crate) struct LayoutCtx<'a> {
     /// `position: fixed` 子树深度:>0 时发射的项带 `fixed` 标记,
     /// 光栅化侧据此跳过滚动偏移(固定控件不得随页面滚动平移)。
     fixed_depth: usize,
+    /// 相邻兄弟外边距折叠暂存(CSS 2.1 8.3.1 简化):前一个块级兄弟的
+    /// `margin_bottom` 尚未落地,与下一个兄弟的 `margin_top` 取折叠值;
+    /// 仅参与块级流,行内行盒/替换元素出现时收编,浮动与绝对定位子树不消费。
+    pending_margin_bottom: f64,
 }
 
 impl<'a> LayoutCtx<'a> {
@@ -975,99 +959,6 @@ impl<'a> LayoutCtx<'a> {
         })
     }
 
-    /// 在局部坐标(原点 0,0)下测量节点内容,返回片段;全局游标与已产出
-    /// 几何零副作用。`content_width` 为内容盒宽度(调用方已扣除 padding)。
-    /// 节点自身是 flex/grid 容器时走对应格式化上下文(嵌套容器的子树几何正确)。
-    pub(crate) fn measure_content(
-        &mut self,
-        node: &NodeRef,
-        content_width: f64,
-        style: &ComputedStyle,
-        depth: usize,
-    ) -> Fragment {
-        // 阶段三第三步:替换元素(<img>/<svg>)没有子内容,直接按固有尺寸成盒。
-        if is_replaced_tag(node) {
-            let (w, h, _src) = self.replaced_size(node, style, content_width, None);
-            let selector = Document::stable_selector(node);
-            return Fragment {
-                height: h,
-                lines: Vec::new(),
-                boxes: vec![ElementBox {
-                    selector,
-                    // 真实标签(img/svg/iframe):第 174 轮起 iframe 也是替换元素,
-                    // 探针/断言按 tag 定位需要真名,不再一律写 "img"。
-                    tag: document::tag_name(node).to_ascii_lowercase(),
-                    x: 0.0,
-                    y: 0.0,
-                    w,
-                    h,
-                    background: style.background,
-                    visible: style_visible(style),
-                    z_index: style.pos.z_index,
-                    out_of_flow: false,
-                }],
-                paints: Vec::new(),
-                borders: Vec::new(),
-                shadows: Vec::new(),
-                display: Vec::new(),
-            };
-        }
-        let y0 = self.y;
-        let lines0 = self.lines.len();
-        let boxes0 = self.boxes.len();
-        let paints0 = self.paints.len();
-        let borders0 = self.borders.len();
-        let shadows0 = self.shadows.len();
-        let display0 = self.display.len();
-        let base0 = self.text_base;
-        self.y = 0.0;
-        self.text_base = 0.0;
-        let height = if style.display == "flex" {
-            // flex/grid 格式化上下文不推进全局游标,高度取返回值。
-            flex::layout_content(
-                self,
-                node,
-                0.0,
-                content_width.max(1.0),
-                style,
-                depth,
-                (0.0, 0.0, content_width.max(1.0), UNKNOWN_CB_H),
-            )
-        } else if style.display == "grid" {
-            grid::layout_content(
-                self,
-                node,
-                0.0,
-                content_width.max(1.0),
-                style,
-                depth,
-                (0.0, 0.0, content_width.max(1.0), UNKNOWN_CB_H),
-            )
-        } else {
-            let mut buf = InlineBuf::default();
-            let cb = (0.0, 0.0, content_width.max(1.0), UNKNOWN_CB_H);
-            self.layout_children(node, 0.0, content_width, &mut buf, depth, style, cb);
-            self.flush_inline(&mut buf, content_width);
-            self.y
-        };
-        let lines = self.lines.split_off(lines0);
-        let boxes = self.boxes.split_off(boxes0);
-        let paints = self.paints.split_off(paints0);
-        let borders = self.borders.split_off(borders0);
-        let shadows = self.shadows.split_off(shadows0);
-        let display_items = self.display.split_off(display0);
-        self.y = y0;
-        self.text_base = base0;
-        Fragment {
-            height,
-            lines,
-            boxes,
-            paints,
-            borders,
-            shadows,
-            display: display_items,
-        }
-    }
 
     fn layout_children(
         &mut self,
@@ -1094,7 +985,14 @@ impl<'a> LayoutCtx<'a> {
                 if !raw.trim().is_empty() {
                     // 块级文本:变换由本块 `apply_group` 回补,run 不带变换;
                     // text-shadow 随 run 带到 flush(块级文本无行内样式承载)。
-                    buf.push_styled(&raw, current, self.text_base, None, current.text_shadow.clone());
+                    // x 基准 = 本容器 margin-box x(文本起点 = 容器内容盒 x)。
+                    buf.push_styled(
+                        &raw,
+                        current,
+                        x - current.margin_left - current.padding_left,
+                        None,
+                        current.text_shadow.clone(),
+                    );
                 }
                 continue;
             }
@@ -1112,12 +1010,18 @@ impl<'a> LayoutCtx<'a> {
             }
             // 阶段三:Flex 格式化上下文。
             if style.display == "flex" {
+                // flex/grid 容器边距不参与兄弟折叠(近似:收编前置 pending,
+                // 保持求和语义),容器内部亦不得消费外层 pending。
+                self.y += self.pending_margin_bottom;
+                self.pending_margin_bottom = 0.0;
                 self.flush_inline(buf, width);
                 flex::layout_container(self, &child, x, width, depth, &style, cb);
                 continue;
             }
             // 阶段三第二步:Grid 格式化上下文。
             if style.display == "grid" {
+                self.y += self.pending_margin_bottom;
+                self.pending_margin_bottom = 0.0;
                 self.flush_inline(buf, width);
                 grid::layout_container(self, &child, x, width, depth, &style, cb);
                 continue;
@@ -1128,7 +1032,10 @@ impl<'a> LayoutCtx<'a> {
                 let avail_h = (cb.3 != UNKNOWN_CB_H).then_some(cb.3);
                 let (iw, ih, isrc) = self.replaced_size(&child, &style, width, avail_h);
                 let bx = x + style.margin_left;
-                let by = self.y + style.margin_top;
+                // 与块级兄弟同样参与外边距折叠。
+                let gap = collapse_margin(self.pending_margin_bottom, style.margin_top);
+                self.pending_margin_bottom = 0.0;
+                let by = self.y + gap;
                 let visible = style_visible(&style);
                 // relative/sticky 整体偏移(不影响占位)。
                 let (dx, dy) = if matches!(style.pos.position.as_str(), "relative" | "sticky") {
@@ -1173,7 +1080,8 @@ impl<'a> LayoutCtx<'a> {
                     self.emit_image(&paint, style.opacity, img_tf);
                     self.paints.push(paint);
                 }
-                self.y = by + ih + style.margin_bottom.max(0.0);
+                self.y = by + ih;
+                self.pending_margin_bottom = style.margin_bottom.max(0.0);
                 continue;
             }
             // 阶段七:`clear` 在布置本盒前把游标推到相应浮动底边之下。
@@ -1193,6 +1101,13 @@ impl<'a> LayoutCtx<'a> {
                 }
             }
             if style.is_block() {
+                // 浮动盒不参与外边距折叠:整支路存还 pending(流内游标亦由
+                // float::finish 收还,浮动 margin 不影响后续兄弟的折叠间隙)。
+                let float_saved_pending = if style.float != "none" {
+                    std::mem::take(&mut self.pending_margin_bottom)
+                } else {
+                    0.0
+                };
                 self.flush_inline(buf, width);
                 // 阶段七:浮动盒求带/定位,或非浮动 auto 宽盒在浮动旁收窄。
                 let placement = float::place(self, &child, &style, x, width, depth, &mut floats, &mut inline_row);
@@ -1204,7 +1119,10 @@ impl<'a> LayoutCtx<'a> {
                 // 阶段六:元素先序 seq 与子树显示项标记(组效果回补区间)。
                 let seq = self.next_seq();
                 let mark_display = self.display.len();
-                self.y += style.margin_top;
+                // 相邻兄弟外边距折叠(CSS 2.1 8.3.1):间隙取折叠值而非求和。
+                let gap = collapse_margin(self.pending_margin_bottom, style.margin_top);
+                self.pending_margin_bottom = 0.0;
+                self.y += gap;
                 let bx = x + style.margin_left;
                 // 盒宽(border box,不含 margin):auto 时撑满父内容宽减 margin;
                 // 百分比按父内容宽求解;显式长度直接采用。
@@ -1242,20 +1160,23 @@ impl<'a> LayoutCtx<'a> {
                 // content-box 显式高度同样按内容盒语义(padding 加回)。
                 let own_definite_h = style.height.is_some()
                     || (style.height_percent.is_some() && cb.3 != UNKNOWN_CB_H);
-                let box_h = match style.height {
+                // 显式/百分比高度是**确定**高(height:0 合法,内容溢出不算),
+                // auto 高(None)才在子代布局后按内容回填。
+                let explicit_h = match style.height {
                     Some(h) => {
-                        let h = h.max(1.0);
+                        let h = h.max(0.0);
                         if style.box_sizing_content {
-                            h + style.padding_top + style.padding_bottom
+                            Some(h + style.padding_top + style.padding_bottom)
                         } else {
-                            h
+                            Some(h)
                         }
                     }
                     None => match style.height_percent {
-                        Some(p) if cb.3 != UNKNOWN_CB_H => ((p / 100.0) * cb.3).max(1.0),
-                        _ => 0.0, // auto:子代布局后回填
+                        Some(p) if cb.3 != UNKNOWN_CB_H => Some(((p / 100.0) * cb.3).max(0.0)),
+                        _ => None, // auto:子代布局后回填
                     },
                 };
+                let box_h = explicit_h.unwrap_or(0.0);
                 // 子代包含块:定位元素为后代 absolute 建立新的包含块(padding 盒),
                 // 高度布局期未知,bottom 锚定退化(见 UNKNOWN_CB_H);
                 // 非定位子代的百分比高度以本盒内容高为包含块高 —— 仅当本盒高度
@@ -1285,8 +1206,20 @@ impl<'a> LayoutCtx<'a> {
                     &style,
                     child_cb,
                 );
-                self.flush_inline(buf, width);
-                let content_h = (self.y - (start_y + style.padding_top)).max(1.0);
+                // 尾部行内按**本盒内容宽**换行(此前误传外层可用宽,
+                // 显式窄宽块里的文本不换行、直接横向溢出)。
+                self.flush_inline(buf, content_w);
+                // 末子块 margin-bottom 穿出/收编判定(CSS 2.1 8.3.1):
+                // 本盒收编边界(padding-bottom/下边框/overflow)收编进内容高,
+                // 否则穿出、在 1326 与本盒自身 margin 折叠。
+                if contains_child_margins(&style) {
+                    self.y += self.pending_margin_bottom;
+                    self.pending_margin_bottom = 0.0;
+                }
+                // 内容高按真实游标推进量;空块/纯空白块为 0(CSS 语义)。
+                // 此前 .max(1.0) 把空块顶成 1px,与相邻块2px假间隙叠加,
+                // 全页逐块累积漂移(SPA 空壳页面尤甚)。
+                let content_h = (self.y - (start_y + style.padding_top)).max(0.0);
                 // max-content 测量语境(可用宽取 MAX_CONTENT_WIDTH 哨兵)下,
                 // auto 宽块级盒按内容需求收缩(shrink-to-fit),不撑满测量宽
                 // —— 否则条目内部任何块级子元素(如 tab 文本 div)都会把
@@ -1311,16 +1244,20 @@ impl<'a> LayoutCtx<'a> {
                         bw = need.max(40.0);
                     }
                 }
-                let box_h = if box_h > 0.0 {
-                    box_h
-                } else {
-                    (content_h + style.padding_top + style.padding_bottom).max(1.0)
+                let box_h = match explicit_h {
+                    Some(h) => h,
+                    None => (content_h + style.padding_top + style.padding_bottom).max(0.0),
                 };
                 // min-height 地板:显式与 auto 高最终都不得低于它(实测 zhipin 验证页
                 // `.page-verify{min-height:100vh}` 此前整体缺失 → 页面不满视口、
                 // 垂直居中语境不存在)。
                 let box_h = style.min_height.map(|m| box_h.max(m)).unwrap_or(box_h);
-                self.y = start_y + box_h + style.margin_bottom.max(2.0);
+                // 游标停在盒底;本盒 margin_bottom 先折叠暂存,与下一兄弟
+                // margin_top 取折叠值落地(CSS 2.1 8.3.1)。此前
+                // `.max(2.0)` 给每块强加 2px 下边距,全页逐块累积漂移。
+                self.y = start_y + box_h;
+                self.pending_margin_bottom =
+                    collapse_margin(self.pending_margin_bottom, style.margin_bottom);
                 self.boxes.push(ElementBox {
                     selector,
                     tag: document::tag_name(&child),
@@ -1372,6 +1309,9 @@ impl<'a> LayoutCtx<'a> {
                 self.emit_element(seq, &style, &tag, bx + rdx, start_y + rdy, bw, box_h);
                 // 阶段七:浮动盒登记并恢复流式游标(非浮动为 no-op)。
                 float::finish(self, placement, &mut floats, &mut inline_row);
+                if style.float != "none" {
+                    self.pending_margin_bottom = float_saved_pending;
+                }
                 continue;
             }
             // 行内元素:递归收集文本,保留自身样式(祖先链无行内变换)。
@@ -1398,7 +1338,10 @@ impl<'a> LayoutCtx<'a> {
             self.y = inline_bottom;
         }
         if !deferred.is_empty() {
+            // 绝对/固定定位子树脱流:不得消费流内 pending,其内边距亦不外泄。
+            let saved_pending = std::mem::take(&mut self.pending_margin_bottom);
             position::layout_deferred(self, deferred, cb, depth);
+            self.pending_margin_bottom = saved_pending;
         }
     }
 
@@ -1565,6 +1508,9 @@ impl<'a> LayoutCtx<'a> {
         let own_box = self.inline_box_worthy(node, style);
         let mut box_x = line_x;
         let mut box_w = avail_w;
+        // 子代 x 基准 = 本元素 **margin-box x**(text/img/嵌套各自由此加
+        // 自身 margin+padding 得内容起点);own_box 盒需回退自身偏移。
+        let mut inner_x = line_x;
         if own_box {
             let (w, h) = self.inline_box_size(node, style, avail_w);
             let (dx, dy) = relative_offset(style);
@@ -1579,12 +1525,13 @@ impl<'a> LayoutCtx<'a> {
             }
             box_x = bx;
             box_w = w;
+            inner_x = bx - style.margin_left - style.padding_left;
         }
         // 行内块/控件盒为子代建立独立行内上下文(浮动不越出该盒),子代几何
         // 也相对自身盒求解(此前一律沿用祖先 line_x/avail_w)。
         let mut inner_row = float::InlineRow::default();
         let child_row: &mut float::InlineRow = if own_box { &mut inner_row } else { row };
-        self.collect_inline_children(node, style, buf, depth, box_x, box_w, child_row, tf);
+        self.collect_inline_children(node, style, buf, depth, inner_x, box_w, child_row, tf);
         if own_box {
             let bottom = inner_row.content_bottom();
             if bottom > self.y {
@@ -1610,7 +1557,9 @@ impl<'a> LayoutCtx<'a> {
             if let Some(text) = child.as_text() {
                 let raw = text.borrow();
                 if !raw.trim().is_empty() {
-                    buf.push_styled(&raw, style, self.text_base, tf, style.text_shadow.clone());
+                    // line_x = 本元素 margin-box x;push_styled 再加自身
+                    // margin+padding 得文本内容起点。
+                    buf.push_styled(&raw, style, line_x, tf, style.text_shadow.clone());
                 }
                 continue;
             }
@@ -1673,8 +1622,10 @@ impl<'a> LayoutCtx<'a> {
                 continue;
             }
             // 阶段七:行内浮动排在当前行剩余带(输入框+按钮/图标+文字经典浮动行)。
+            // 子级 margin-box 起点 = 本元素内容盒 x(margin-box + 自身 margin+padding)。
+            let child_x = line_x + style.margin_left + style.padding_left;
             if child_style.float != "none" {
-                self.layout_inline_float(&child, &child_style, buf, depth, line_x, avail_w, row, tf);
+                self.layout_inline_float(&child, &child_style, buf, depth, child_x, avail_w, row, tf);
                 continue;
             }
             // 非浮动行内内容:当前行已有浮动时下沉到浮动之下(不做文字环绕)。
@@ -1687,7 +1638,7 @@ impl<'a> LayoutCtx<'a> {
             }
             // 交互类行内元素的矩形由 `collect_inline` 入口统一建盒(元素自身),
             // 此处只负责继续收集其子树文本。
-            self.collect_inline(&child, &child_style, buf, depth + 1, line_x, avail_w, tf, row);
+            self.collect_inline(&child, &child_style, buf, depth + 1, child_x, avail_w, tf, row);
         }
     }
 
@@ -1758,198 +1709,4 @@ impl<'a> LayoutCtx<'a> {
         self.y = by;
     }
 
-    fn flush_inline(&mut self, buf: &mut InlineBuf, max_w: f64) {
-        let max_w = max_w.max(80.0);
-        for run in buf.runs.drain(..) {
-            // 阶段三第三步:占位 run(替换元素预留高度)只推进游标,不产出文本行。
-            if run.text.is_empty() {
-                self.y += run.line_height;
-                continue;
-            }
-            let size = run.size.max(8.0);
-            let line_height = run.line_height.max(size * 1.35);
-            let mut current = String::new();
-            let mut current_w = 0.0;
-            for ch in run.text.chars() {
-                if ch == '\n' {
-                    self.push_line(
-                        &current,
-                        run.x,
-                        &run,
-                        line_height,
-                        current_w,
-                        max_w,
-                    );
-                    current.clear();
-                    current_w = 0.0;
-                    continue;
-                }
-                let w = self.font.char_width(ch, size);
-                if run.wrap && current_w + w > max_w && !current.is_empty() {
-                    self.push_line(
-                        &current,
-                        run.x,
-                        &run,
-                        line_height,
-                        current_w,
-                        max_w,
-                    );
-                    current.clear();
-                    current_w = 0.0;
-                }
-                current.push(ch);
-                current_w += w;
-            }
-            if !current.is_empty() && (run.preserve || !current.trim().is_empty()) {
-                self.push_line(&current, run.x, &run, line_height, current_w, max_w);
-            }
-        }
-        buf.chars = 0;
-    }
-
-    fn push_line(
-        &mut self,
-        text: &str,
-        x: f64,
-        run: &InlineRun,
-        line_height: f64,
-        line_w: f64,
-        max_w: f64,
-    ) {
-        let content = if run.preserve {
-            text.trim_end_matches('\n').to_string()
-        } else {
-            text.trim().to_string()
-        };
-        if content.is_empty() {
-            return;
-        }
-        let offset = match run.align.as_str() {
-            "center" => ((max_w - line_w) / 2.0).max(0.0),
-            "right" => (max_w - line_w).max(0.0),
-            _ => 0.0,
-        };
-        let line = TextLine {
-            text: content,
-            x: x + offset,
-            y: self.y,
-            size: run.size,
-            color: run.color,
-            bold: run.bold,
-            visible: run.visible,
-        };
-        // 阶段六:文本显示项(flush 时取新 seq → 与前后块级兄弟正确分层)。
-        self.emit_text(&line, run.transform, &run.text_shadow);
-        self.lines.push(line);
-        self.y += line_height;
-    }
-}
-
-#[derive(Default)]
-pub(crate) struct InlineBuf {
-    runs: Vec<InlineRun>,
-    chars: usize,
-}
-
-struct InlineRun {
-    text: String,
-    x: f64,
-    size: f64,
-    color: [u8; 3],
-    bold: bool,
-    line_height: f64,
-    visible: bool,
-    align: String,
-    wrap: bool,
-    preserve: bool,
-    /// 行内元素自身变换(块级文本为 `None`,由 `apply_group` 回补)。
-    transform: Option<Affine>,
-    /// 行内样式携带的 text-shadow 层。
-    text_shadow: Vec<TextShadow>,
-}
-
-impl InlineBuf {
-    pub(crate) fn push_styled(
-        &mut self,
-        text: &str,
-        st: &ComputedStyle,
-        x_base: f64,
-        transform: Option<Affine>,
-        text_shadow: Vec<TextShadow>,
-    ) {
-        self.chars += text.chars().count();
-        let size = st.font_size;
-        let bold = st.font_weight >= 600;
-        let visible = st.visibility != "hidden" && st.visibility != "collapse" && st.opacity > 0.0;
-        let x = x_base + st.margin_left + st.padding_left;
-        let preserve = matches!(st.white_space.as_str(), "pre" | "pre-wrap" | "break-spaces");
-        let wrap = !matches!(st.white_space.as_str(), "pre" | "nowrap");
-        if let Some(last) = self.runs.last_mut() {
-            if (last.size - size).abs() < 0.1
-                && last.color == st.color
-                && last.bold == bold
-                && last.visible == visible
-                && last.x == x
-                && last.align == st.text_align
-                && last.wrap == wrap
-                && last.preserve == preserve
-                && last.transform == transform
-                && last.text_shadow == text_shadow
-            {
-                last.text.push_str(text);
-                return;
-            }
-        }
-        self.runs.push(InlineRun {
-            text: text.to_string(),
-            x,
-            size,
-            color: st.color,
-            bold,
-            line_height: if st.line_height > 0.0 {
-                st.line_height
-            } else {
-                size * 1.45
-            },
-            visible,
-            align: st.text_align.clone(),
-            wrap,
-            preserve,
-            transform,
-            text_shadow,
-        });
-    }
-
-    fn force_break(&mut self) {
-        if let Some(last) = self.runs.last_mut() {
-            last.text.push('\n');
-        }
-    }
-
-    /// 预留行高(阶段三第三步:行内替换元素撑开所在行)。
-    ///
-    /// 无可用 run 时插入一个空文本占位 run,`flush_inline` 只按其高度推进游标。
-    pub(crate) fn reserve_height(&mut self, h: f64) {
-        if h <= 0.0 {
-            return;
-        }
-        if let Some(last) = self.runs.last_mut() {
-            last.line_height = last.line_height.max(h);
-            return;
-        }
-        self.runs.push(InlineRun {
-            text: String::new(),
-            x: 0.0,
-            size: 8.0,
-            color: [0, 0, 0],
-            bold: false,
-            line_height: h,
-            visible: true,
-            align: "left".to_string(),
-            wrap: false,
-            preserve: false,
-            transform: None,
-            text_shadow: Vec::new(),
-        });
-    }
 }

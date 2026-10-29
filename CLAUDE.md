@@ -483,6 +483,7 @@ Markdown Prompt 模板，两级发现：**项目级** `{工作目录}/.laew/comm
   - `29-liepin首页渲染链路四根因修复.md` — width 百分比预解/inline-flex 块级化/svg 固有尺寸/flex 条目 seq 倒序/LAEW_DUMP_DISPLAY 显示列表诊断(已完成)
   - `30-liepin搜索页脚本启动链与有头窗口可见性修复.md` — 大 bundle 脚本预算/console.assert/NS 属性 API/动态 DOM 同批查询与删除回写/阻断误报与 page_health 诊断/macOS 有头窗口默认前台显示(已完成离线验证;真站任务按停测要求未继续)
   - `33-瓦片原点层塌陷与样式驼峰归一化修复.md` — insertAdjacentHTML 伪元素壳吞真元素(`co` 模式 lastChild 取到壳,百度地图瓦片坐标系原点塌到 (0,0))/style 驼峰名归一化(zIndex→z-index,厂商前缀)/查看器主菜单(地址栏 ⌘C⌘V)/LAEW_DOM_TRACE=2 全量账本(已完成)
+  - `35-渲染引擎块级堆叠语义与跨平台字体回退链.md` — 块级堆叠语义(相邻兄弟外边距折叠/空块零高/height:0 确定高)/行内共享行盒(b/span/a 不再竖排)/文本 x 基准删除 text_base:8 硬编码/窄宽块换行宽修复/FontSet 跨平台回退链(Linux CJK 候选提前)+字形栅格缓存/layout 机械拆分 inline.rs+measure.rs(已完成)
 - `docs/Use_MCP/` — 通用 MCP 服务调用
 
 **上下文与会话**：

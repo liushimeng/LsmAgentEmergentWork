@@ -1238,15 +1238,27 @@ fn z_index_沿祖先链下传给子树() {
     );
     let layout = compute(&doc, 800.0, &font());
     let zs = layout.display.iter().map(|i| (i.x, i.y, i.z, i.w)).collect::<Vec<_>>();
-    // parent 区(首行):背景盒 + 文本项的 z 都必须 ≥ 50(祖先下限)。
-    let parent_items: Vec<_> = layout.display.iter().filter(|it| it.y < 40.0).collect();
+    // 分区按真实盒矩形划分(布局语义修正后不再有 2px/1px 累积漂移,
+    // 硬编码 y 边界会把兄弟首项误判进父区)。
+    let parent_rect = layout.rect_for("#parent").expect("parent 应有布局盒");
+    let sib_rect = layout.rect_for("#sibling").expect("sibling 应有布局盒");
+    // parent 区:背景盒 + 文本项的 z 都必须 ≥ 50(祖先下限)。
+    let parent_items: Vec<_> = layout
+        .display
+        .iter()
+        .filter(|it| it.y >= parent_rect.1 && it.y < parent_rect.1 + parent_rect.3)
+        .collect();
     assert!(!parent_items.is_empty(), "父区应有绘制项:{zs:?}");
     assert!(
         parent_items.iter().all(|it| it.z >= 50),
         "父级 z-index:50 应下传到子树全部项:{zs:?}"
     );
-    // 兄弟区(次行):自身 z=1 生效。
-    let sib_items: Vec<_> = layout.display.iter().filter(|it| it.y >= 40.0).collect();
+    // 兄弟区:自身 z=1 生效。
+    let sib_items: Vec<_> = layout
+        .display
+        .iter()
+        .filter(|it| it.y >= sib_rect.1 && it.y < sib_rect.1 + sib_rect.3)
+        .collect();
     assert!(!sib_items.is_empty(), "兄弟区应有绘制项:{zs:?}");
     assert!(
         sib_items.iter().all(|it| it.z == 1),
@@ -1565,3 +1577,104 @@ fn 带文本锚点照常建盒() {
 
 
 
+
+// ===================== 块级堆叠语义(外边距折叠 / 空块零高 / 行内共享行盒) =====================
+// 语义修正回归:此前块级盒有 1px 高度地板 + 2px margin 兜底(全页逐块累积漂移),
+// 行内样式段各占一行竖排,文本 x 硬编码 body 边距 8 —— 以下用例钉死 CSS 应然。
+
+/// 相邻兄弟外边距折叠取最大值(CSS 2.1 8.3.1):d1(margin-bottom:30) 与
+/// d2(margin-top:10) 间隙 = max(30,10) = 30,不是求和 40;margin:0 相邻块无缝。
+#[test]
+fn 相邻兄弟外边距折叠取最大值() {
+    let html = "<body style='margin:0'>\
+        <div id='d0' style='height:10px'></div>\
+        <div id='d1' style='height:10px;margin-bottom:30px'></div>\
+        <div id='d2' style='height:10px;margin-top:10px'></div>\
+        <div id='d3' style='height:10px'></div></body>";
+    let doc = Document::parse(html, "https://a.test/");
+    let lay = compute(&doc, 800.0, &font());
+    let d = |id: &str| lay.rect_for(id).unwrap_or_else(|| panic!("{id} 应有布局盒"));
+    assert!((d("#d0").1 - 0.0).abs() < 0.5, "d0 应贴顶:{:?}", d("#d0"));
+    assert!((d("#d1").1 - 10.0).abs() < 0.5, "margin:0 相邻块应无缝:{:?}", d("#d1"));
+    assert!(
+        (d("#d2").1 - 50.0).abs() < 0.5,
+        "折叠间隙应为 max(30,10)=30(实际 top 应 50):{:?}",
+        d("#d2")
+    );
+    assert!((d("#d3").1 - 60.0).abs() < 0.5, "d3 无缝衔接:{:?}", d("#d3"));
+}
+
+/// 空块 / height:0 / 纯空白块高度全部为 0(CSS):1px 高度地板会逐块累积漂移。
+#[test]
+fn 空块与零高块不产生幽灵高度() {
+    let html = "<body style='margin:0'>\
+        <div id='e'></div>\
+        <div id='z' style='height:0'></div>\
+        <div id='w'> </div>\
+        <div id='t'>x</div></body>";
+    let doc = Document::parse(html, "https://a.test/");
+    let lay = compute(&doc, 800.0, &font());
+    let d = |id: &str| lay.rect_for(id).unwrap_or_else(|| panic!("{id} 应有布局盒"));
+    assert!((d("#e").3 - 0.0).abs() < 0.5, "空块高应 0:{:?}", d("#e"));
+    assert!((d("#z").3 - 0.0).abs() < 0.5, "height:0 应为 0:{:?}", d("#z"));
+    assert!((d("#w").3 - 0.0).abs() < 0.5, "纯空白块高应 0:{:?}", d("#w"));
+    assert!(d("#t").3 > 8.0, "有文本的块应有行盒高:{:?}", d("#t"));
+    assert!((d("#t").1 - 0.0).abs() < 0.5, "零高前置块不应下推文本块:{:?}", d("#t"));
+}
+
+/// 负 margin-bottom 参与折叠(CSS:负边距不折叠、按叠加语义),兄弟整体上移。
+#[test]
+fn 负下边距把兄弟上移() {
+    let html = "<body style='margin:0'>\
+        <div id='a' style='height:10px;margin-bottom:-5px'></div>\
+        <div id='b' style='height:10px'></div></body>";
+    let doc = Document::parse(html, "https://a.test/");
+    let lay = compute(&doc, 800.0, &font());
+    let b = lay.rect_for("#b").expect("#b 应有布局盒");
+    assert!((b.1 - 5.0).abs() < 0.5, "margin-bottom:-5 应把兄弟上移到 y=5:实际 {b:?}");
+}
+
+/// 行内样式段共享同一行盒:`<p>hello <b>world</b>!</p>` 三段同一视觉行、
+/// x 连续流动 —— 此前每 run 各占一行竖排。
+#[test]
+fn 行内样式段共享同一行盒() {
+    let html = "<body style='margin:0'><p id='p1'>hello <b>world</b>!</p></body>";
+    let doc = Document::parse(html, "https://a.test/");
+    let lay = compute(&doc, 800.0, &font());
+    assert_eq!(lay.lines.len(), 3, "三个样式段:{:?}", lay.lines);
+    let y0 = lay.lines[0].y;
+    assert!(
+        lay.lines.iter().all(|l| (l.y - y0).abs() < 0.5),
+        "三段应在同一视觉行:{:?}",
+        lay.lines
+    );
+    assert!(
+        lay.lines[0].x < lay.lines[1].x && lay.lines[1].x < lay.lines[2].x,
+        "段 x 应连续流动:{:?}",
+        lay.lines
+    );
+    // 单 run 换行不受影响:长文本按可用宽断行,行高一致。
+    let html2 = "<body style='margin:0'><div style='width:120px'>\
+        aaaa bbbb cccc dddd eeee ffff gggg</div></body>";
+    let doc2 = Document::parse(html2, "https://a.test/");
+    let lay2 = compute(&doc2, 800.0, &font());
+    assert!(lay2.lines.len() >= 2, "窄容器长文本应换行:{:?}", lay2.lines);
+    let ys: Vec<f64> = lay2.lines.iter().map(|l| l.y).collect();
+    for w in ys.windows(2) {
+        assert!(w[1] > w[0], "换行后的行 y 应递增:{:?}", lay2.lines);
+    }
+}
+
+/// 嵌套块文本 x 按包含块内容盒累积定位(body margin:0 下不得再有 +8 漂移)。
+#[test]
+fn 嵌套块文本x按包含块内容盒定位() {
+    let html = "<body style='margin:0'>\
+        <div id='outer' style='margin-left:200px'><div id='inner' style='margin-left:50px'>B</div></div>\
+        <div style='margin-left:200px'>A</div></body>";
+    let doc = Document::parse(html, "https://a.test/");
+    let lay = compute(&doc, 800.0, &font());
+    let line_b = lay.lines.iter().find(|l| l.text.contains('B')).expect("应有 B 文本");
+    assert!((line_b.x - 250.0).abs() < 0.5, "B 文本 x 应 250(200+50):{:?}", line_b);
+    let line_a = lay.lines.iter().find(|l| l.text.contains('A')).expect("应有 A 文本");
+    assert!((line_a.x - 200.0).abs() < 0.5, "A 文本 x 应 200:{:?}", line_a);
+}

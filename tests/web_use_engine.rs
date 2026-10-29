@@ -1191,35 +1191,35 @@ async fn 富视觉页面_渐变圆角阴影与溢出裁剪截图() {
 
     let img = image::load_from_memory(&bytes).unwrap().to_rgba8();
     let px = |x: u32, y: u32| *img.get_pixel(x, y);
-    // 渐变横幅(body 默认 8px 边距,banner (8,8)-(408,68)):
+    // 渐变横幅(body margin:0,banner (0,0)-(400,60)):
     // 左端红、右端蓝、中点混合。
     let left = px(12, 30);
     assert!(left[0] > 200 && left[2] < 60, "横幅左端应红:{left:?}");
-    let right = px(403, 30);
+    let right = px(397, 30);
     assert!(right[2] > 200 && right[0] < 60, "横幅右端应蓝:{right:?}");
     let mid = px(207, 30);
     assert!(
         (90..170).contains(&mid[0]) && (90..170).contains(&mid[2]),
         "横幅中点应约紫:{mid:?}"
     );
-    // 圆角卡片(y∈[88,168),x∈[8,128),r=20):角外白、中心黑。
-    let corner = px(12, 92);
+    // 圆角卡片(布局 (0,80)-(120,160),r=20):角外白、中心黑。
+    let corner = px(2, 82);
     assert!(corner[0] > 200, "卡片左上角外应白:{corner:?}");
-    let center = px(68, 128);
+    let center = px(60, 120);
     assert!(center[0] < 50, "卡片中心应黑:{center:?}");
-    // 溢出裁剪(y∈[188,218),x∈[8,68)):容器内绿、越界白。
+    // 溢出裁剪(容器 (0,180)-(60,210)):容器内绿、越界白。
     let inside = px(30, 200);
     assert!(inside[1] > 200 && inside[0] < 60, "裁剪容器内应绿:{inside:?}");
     let beyond = px(100, 200);
     assert!(beyond[0] > 200 && beyond[1] > 200, "水平越界应被裁白:{beyond:?}");
-    // 模糊阴影:卡片右缘外侧(卡片 x∈[8,128))应出现半透明灰(20..235)。
-    let shadow_px = px(135, 120);
+    // 模糊阴影:卡片右缘外侧(卡片 x∈[0,120),阴影 x≤126)应出现半透明灰。
+    let shadow_px = px(127, 120);
     assert!(
         shadow_px[0] > 20 && shadow_px[0] < 235,
         "模糊阴影区应半透明:{shadow_px:?}"
     );
-    // 阶段六第二步:CSS 2D transform —— tf 盒 (8,238)-(88,318) 平移 (100,0)
-    // → 绘制在 (108,238)-(188,318)。
+    // 阶段六第二步:CSS 2D transform —— tf 盒 (0,230)-(80,310) 平移 (100,0)
+    // → 绘制在 (100,230)-(180,310)。
     let tf_inside = px(120, 260);
     assert!(
         tf_inside[2] > 200 && tf_inside[0] < 60,
@@ -1230,7 +1230,7 @@ async fn 富视觉页面_渐变圆角阴影与溢出裁剪截图() {
         tf_outside[0] > 200 && tf_outside[2] > 200,
         "transform 原位置应白:{tf_outside:?}"
     );
-    // 多背景层:首层(红)在上 → ml 盒 (8,338)-(108,388) 应红。
+    // 多背景层:首层(红)在上 → ml 盒 (0,330)-(100,380) 应红。
     let ml = px(50, 360);
     assert!(ml[0] > 200 && ml[2] < 60, "多背景层首层应在上(红):{ml:?}");
     // text-shadow:应出现品红阴影像素。

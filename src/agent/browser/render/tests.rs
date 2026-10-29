@@ -481,3 +481,79 @@ fn transform_flex条目_整体随变换() {
     let outside = pixel(&img, 20, 50);
     assert!(outside[0] > 200, "平移前应白:{outside:?}");
 }
+
+// ============ 字体回退链 / 缓存(跨平台文本一致性) ============
+
+/// 空链(`FontSet::fallback`):启发式宽度不 panic、栅格返回 None。
+#[test]
+fn 无字体链退化为启发式宽度() {
+    let f = FontSet::fallback();
+    assert!(!f.has_font());
+    assert!(f.char_width('中', 16.0) > 0.0);
+    assert!(f.text_width("abc", 16.0) > 0.0);
+    assert!(f.rasterize_glyph('A', 16.0).is_none());
+}
+
+/// 回退链按覆盖逐字选字:主字体缺 CJK 时 `中` 落到后续字体
+/// (Windows/Linux 中文豆腐块根因回归)。依赖本机字体文件,缺失即跳过。
+#[test]
+fn 回退链缺字形字符落到后续字体() {
+    #[cfg(target_os = "macos")]
+    let paths = [
+        "/System/Library/Fonts/Menlo.ttc",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    ];
+    #[cfg(target_os = "windows")]
+    let paths = [
+        "C:\\Windows\\Fonts\\segoeui.ttf",
+        "C:\\Windows\\Fonts\\msyh.ttc",
+    ];
+    #[cfg(target_os = "linux")]
+    let paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    ];
+    let fonts: Vec<fontdue::Font> = paths
+        .iter()
+        .filter_map(|p| std::fs::read(p).ok())
+        .filter_map(|b| fontdue::Font::from_bytes(b, fontdue::FontSettings::default()).ok())
+        .collect();
+    if fonts.len() < 2 {
+        // 本机字体不齐(裁剪环境/精简容器):跳过,不误伤。
+        return;
+    }
+    let chain = FontSet::from_fonts(fonts, String::new());
+    assert!(chain.covers('A'), "拉丁应被主字体覆盖");
+    assert!(
+        chain.covers('中'),
+        "'中' 应由回退字体补齐(单字体实现恒 tofu)"
+    );
+    let w1 = chain.char_width('中', 16.0);
+    let w2 = chain.char_width('中', 16.0);
+    assert!((w1 - w2).abs() < 1e-9, "字宽缓存命中应一致:{w1} vs {w2}");
+}
+
+/// 平台主链加载:CJK 覆盖达标(macOS Arial Unicode / Windows msyh / Linux Noto/文泉驿)。
+#[test]
+fn 平台字体链覆盖中英文() {
+    let f = FontSet::load();
+    assert!(f.has_font(), "桌面平台应至少有一个可用字体");
+    assert!(f.covers('A'), "拉丁覆盖");
+    assert!(
+        f.covers('中'),
+        "CJK 覆盖(Linux 此前首选 DejaVu 无 CJK → 中文豆腐块)"
+    );
+}
+
+/// 字形栅格缓存命中一致性:两次栅格化逐字节相同。
+#[test]
+fn 字形栅格缓存命中一致() {
+    let f = FontSet::load();
+    if !f.has_font() {
+        return;
+    }
+    let a = f.rasterize_glyph('M', 16.0).expect("应能栅格化 M");
+    let b = f.rasterize_glyph('M', 16.0).expect("缓存命中应返回字形");
+    assert_eq!(a.0, b.0, "度量应一致");
+    assert_eq!(a.1, b.1, "位图应逐字节一致");
+}
