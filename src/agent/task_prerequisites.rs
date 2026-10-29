@@ -36,13 +36,34 @@ pub fn browser_constraint(prompt: &str) -> Option<&'static str> {
 
 /// 用户是否明确要求「先登录,再做后续工作」。
 ///
-/// 必须同时出现登录与顺序词,普通「支持登录」「登录按钮」等界面描述不命中。
+/// 「登录后」必须接续明确的后续动作;「登录后的网站有更多功能」这类能力说明
+/// 不是顺序约束,不能据此阻断搜索或路线规划。
 pub fn requires_login_first(prompt: &str) -> bool {
     let compact: String = prompt.chars().filter(|c| !c.is_whitespace()).collect();
-    compact.contains("登录")
-        && ["先登录", "登录后", "登录之后", "登录完成后再", "登录成功后"]
-            .iter()
-            .any(|kw| compact.contains(kw))
+    if compact.contains("先登录") {
+        return true;
+    }
+    const ACTIONS: &[&str] = &[
+        "开始", "随后", "然后", "继续", "执行", "搜索", "采集", "遍历", "查看", "规划",
+        "操作", "访问", "获取", "保存", "截图", "生成", "点击", "输入", "提交", "下载",
+        "使用", "打开", "进入",
+    ];
+    for marker in ["登录完成后", "登录成功后", "登录之后", "登录后"] {
+        for (start, _) in compact.match_indices(marker) {
+            let after = &compact[start + marker.len()..];
+            let after = after.trim_start_matches(|c: char| {
+                matches!(c, '，' | ',' | '。' | '、' | '；' | ';' | '：' | ':' | '！' | '!')
+            });
+            let after = after
+                .strip_prefix('再')
+                .or_else(|| after.strip_prefix('才'))
+                .unwrap_or(after);
+            if ACTIONS.iter().any(|action| after.starts_with(action)) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Plan 专用约束:规划层识别并编排前置,但不能越权执行真实登录。
@@ -73,7 +94,15 @@ mod tests {
 
     #[test]
     fn 普通登录描述不误判为顺序约束() {
-        for prompt in ["找到登录按钮", "页面支持账号登录", "检查登录态", ""] {
+        for prompt in [
+            "找到登录按钮",
+            "页面支持账号登录",
+            "检查登录态",
+            "登录后的网站，才有一些复杂功能。",
+            "登录之后可使用更多功能",
+            "登录成功后会显示用户昵称",
+            "",
+        ] {
             assert!(!requires_login_first(prompt), "不应命中: {prompt}");
         }
     }

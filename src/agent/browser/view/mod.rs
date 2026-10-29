@@ -145,6 +145,11 @@ impl ViewSink {
         })
     }
 
+    /// 写通道是否仍可交互;人工关窗导致写失败后允许宿主重建查看器。
+    pub fn is_alive(&self) -> bool {
+        self.stdin.lock().map(|g| g.is_some()).unwrap_or(false)
+    }
+
     fn send(&self, kind: u8, payload: &[u8]) {
         if let Ok(mut guard) = self.stdin.lock() {
             if let Some(w) = guard.as_mut() {
@@ -256,6 +261,14 @@ mod tests {
         );
         assert_eq!(parse_command(r#"{"cmd":"reload"}"#), Some(ViewCommand::Reload));
         assert_eq!(parse_command(r#"{"cmd":"home"}"#), Some(ViewCommand::Home));
+    }
+
+    #[test]
+    fn 已关闭写通道报告查看器不可用() {
+        let sink = ViewSink {
+            stdin: std::sync::Mutex::new(None),
+        };
+        assert!(!sink.is_alive());
     }
 
     #[test]

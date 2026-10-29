@@ -636,6 +636,10 @@ impl LsmBrowserManager {
             layout::compute_full(&pre_doc, viewport.width as f64, &self.font, &pre_media, &pre_sizes)
                 .rect_map()
         };
+        // 重站点脚本管线可能达到分钟级:先显示加载首帧,再执行脚本并替换为真实页面。
+        if mode.is_headed() {
+            self.ensure_loading_view(&resp.final_url, viewport.width, viewport.height);
+        }
         let pipeline = script::run_pipeline(
             &mut inner,
             &self.http,

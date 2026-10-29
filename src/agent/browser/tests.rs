@@ -29,6 +29,19 @@ async fn 打开_data_页面并读取标题与正文() {
     mgr.shutdown().await;
 }
 
+#[test]
+fn 加载首帧在脚本执行前即可渲染() {
+    let mgr = LsmBrowserManager::new();
+    let png = mgr
+        .loading_view_png("https://a.test/search?a=1&b=<x>", 640, 360)
+        .expect("加载首帧应生成 PNG");
+    let image = image::load_from_memory(&png)
+        .expect("加载首帧应是有效 PNG")
+        .to_rgba8();
+    assert_eq!((image.width(), image.height()), (640, 360));
+    assert!(png.len() > 1_000, "加载首帧不应是空白图: {} bytes", png.len());
+}
+
 #[tokio::test]
 async fn 正常业务风控词不误报为页面阻断() {
     let mgr = LsmBrowserManager::new();
