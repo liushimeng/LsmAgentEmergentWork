@@ -169,14 +169,23 @@ pub fn collect_image_urls(html: &str, base_url: &str) -> Vec<String> {
             out.push(abs);
         }
     }
-    // Canvas 2D 的真实 PNG 由 JS 线程写入内部属性;复用 data: 图片解码与缓存,
-    // 截图/查看器不再面对一个永远透明的像素缓冲。
+    out
+}
+
+/// Canvas 在图片缓存中的稳定键;同一画布逐帧覆盖,不按变化的 data URL 累积旧帧。
+pub fn canvas_key(selector: &str) -> String {
+    format!("lsm-canvas:{selector}")
+}
+
+fn collect_canvas_images(html: &str, base_url: &str) -> Vec<(String, String)> {
+    let doc = Document::parse(html, base_url);
+    let mut out = Vec::new();
     for node in doc.select("canvas[data-lsm-canvas]").unwrap_or_default() {
         let Some(src) = document::attr(&node, "data-lsm-canvas") else {
             continue;
         };
-        if src.starts_with("data:image/png;base64,") && !out.contains(&src) {
-            out.push(src.to_string());
+        if src.starts_with("data:image/png;base64,") {
+            out.push((canvas_key(&Document::stable_selector(&node)), src));
         }
     }
     out
@@ -250,6 +259,37 @@ pub async fn load_images(
         out.skipped.push("LAEW_WEB_IMAGES=off".to_string());
         return out;
     }
+    let max_images = env_usize("LAEW_WEB_MAX_IMAGES", MAX_IMAGES_DEFAULT, 1);
+    let max_bytes = env_usize("LAEW_WEB_MAX_IMAGE_BYTES", MAX_IMAGE_BYTES_DEFAULT, 1024);
+    let budget_ms = env_u64("LAEW_WEB_IMAGE_BUDGET_MS", IMAGE_BUDGET_MS_DEFAULT, 1_000);
+    let canvases = collect_canvas_images(html, base_url);
+    let active_canvas_keys: std::collections::HashSet<String> =
+        canvases.iter().map(|(key, _)| key.clone()).collect();
+    // 画布被移除时回收对应缓存;同一 key 的新帧随后覆盖旧帧,避免动画无界增长。
+    out.store.retain(|key, _| {
+        !key.starts_with("lsm-canvas:") || active_canvas_keys.contains(key)
+    });
+    for (key, data_url) in canvases.into_iter().take(max_images) {
+        let Some((bytes, _)) = decode_data_url(&data_url) else {
+            continue;
+        };
+        if bytes.len() > max_bytes {
+            out.skipped.push(format!("{key} 超过单图上限"));
+            continue;
+        }
+        if let Some(img) = decode_image(&bytes) {
+            out.loaded.push(LoadedImage {
+                url: key.clone(),
+                bytes: bytes.len(),
+                status: 200,
+                width: img.width,
+                height: img.height,
+                inline: true,
+            });
+            out.sizes.sizes.insert(key.clone(), (img.width as f64, img.height as f64));
+            out.store.insert(key, Arc::new(img));
+        }
+    }
     let mut urls = collect_image_urls(html, base_url);
     for u in collect_css_image_urls(html, base_url) {
         if !urls.contains(&u) {
@@ -261,9 +301,6 @@ pub async fn load_images(
         out.sizes = ImageSizes::from_store(&out.store);
         return out;
     }
-    let max_images = env_usize("LAEW_WEB_MAX_IMAGES", MAX_IMAGES_DEFAULT, 1);
-    let max_bytes = env_usize("LAEW_WEB_MAX_IMAGE_BYTES", MAX_IMAGE_BYTES_DEFAULT, 1024);
-    let budget_ms = env_u64("LAEW_WEB_IMAGE_BUDGET_MS", IMAGE_BUDGET_MS_DEFAULT, 1_000);
     let deadline = Instant::now() + Duration::from_millis(budget_ms);
     let mut total = 0usize;
     // 第 174 轮降噪:SVG 图片解码失败每页只记一条能力边界告警(猎聘首页

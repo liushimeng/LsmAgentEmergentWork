@@ -912,8 +912,8 @@ fn draw_canvas_note(
         py += dash * 2.0;
     }
     // 居中说明文字(宽度不足时只留短句)。
-    let full = "canvas 区域:内核未实现 2D/WebGL 像素渲染(此区域无内容)";
-    let short = "canvas 区域:内核未实现像素渲染";
+    let full = "canvas 区域:当前无像素,或使用了未实现的 2D 路径/WebGL 能力";
+    let short = "canvas 区域:当前无像素或能力未实现";
     let label = if bw >= 420.0 { full } else { short };
     let size = 13.0f64;
     let est_w = label.chars().count() as f64 * size * 0.62;

@@ -567,9 +567,10 @@ impl<'a> LayoutCtx<'a> {
         if !document::tag_name(node).eq_ignore_ascii_case("canvas") || !style_visible(style) {
             return;
         }
-        let Some(src) = document::attr(node, "data-lsm-canvas") else {
+        if document::attr(node, "data-lsm-canvas").is_none() {
             return;
-        };
+        }
+        let src = super::images::canvas_key(&Document::stable_selector(node));
         self.display.push(DisplayItem {
             kind: DisplayKind::Image { src, fit: "fill".to_string(), off_x: 0.0, off_y: 0.0 },
             x,

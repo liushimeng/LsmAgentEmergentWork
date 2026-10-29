@@ -56,7 +56,7 @@ pub enum DisplayKind {
         color: [u8; 3],
         blur: f64,
     },
-    /// canvas 区域占位说明块(内核未实现 2D/WebGL 像素渲染)。
+    /// canvas 区域占位说明块(尚无像素,或使用的 2D 路径/WebGL 能力未实现)。
     /// `pale`:元素自身无背景时先铺淡底(与旧渲染一致)。
     CanvasNote { pale: bool },
 }

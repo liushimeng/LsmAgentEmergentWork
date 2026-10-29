@@ -3,7 +3,7 @@
 //! 覆盖:主轴/交叉轴方向、grow/shrink/basis、justify-content、
 //! align-items/align-self/stretch、wrap 多行 + align-content、gap、匿名文本条目。
 //! 已知边界(见设计文档 08):baseline 按 flex-start;column 方向不支持 wrap;
-//! 匿名盒按文本段合并;min-width 未建模;auto 外边距按 0。
+//! 匿名盒按文本段合并;auto 外边距按 0。
 
 use kuchikiki::NodeRef;
 

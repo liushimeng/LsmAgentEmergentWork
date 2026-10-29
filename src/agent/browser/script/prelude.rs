@@ -4,7 +4,7 @@
 //! DOM 快照与页面元信息。与阶段一快照桥(v1)的差异见
 //! `docs/自定义浏览器和V8引擎/05-阶段二页面脚本与动态DOM设计.md` 第四节。
 
-/// 原生函数由 Rust 注册(`__lsmFetchNative`/`atob`/`btoa`),此处只做 JS 侧装配。
+/// 原生函数由 Rust 注册(`__lsmFetchNative`/`atob`/`btoa`/`__lsmCanvasPng`),此处只做 JS 侧装配。
 const PRELUDE_BODY: &str = r##"
 var __lsmNodes = [];
 var __lsmMeta = {};
