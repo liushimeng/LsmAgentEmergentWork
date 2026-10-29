@@ -101,6 +101,17 @@ fn route(path: &str, with_headers: bool) -> (&'static str, String, Vec<(String, 
                 .to_string(),
             vec![],
         )
+    } else if path == "/verify" {
+        (
+            "200 OK",
+            "<html><head><title>安全验证</title></head><body>\
+             <h1>安全验证</h1><p>为了您的账户安全，请完成以下验证</p>\
+             <button>点击按钮进行验证</button><canvas id=\"c\"></canvas>\
+             <script>document.getElementById('c').getContext('webgl');</script>\
+             </body></html>"
+                .to_string(),
+            vec![],
+        )
     } else if path == "/image-page" {
         (
             "200 OK",
@@ -381,6 +392,9 @@ async fn open_读取_点击链接_表单提交闭环() {
     assert_eq!(open["code"], 0, "{open}");
     let page_id = open["data"]["page_id"].as_str().unwrap().to_string();
     assert_eq!(open["data"]["title"], "首页", "标题应来自 <title>");
+    assert_eq!(open["data"]["blockers"]["blocked"], false, "{open}");
+    assert_eq!(open["data"]["next_steps"][0]["control_action"], "input_text");
+    assert_eq!(open["data"]["next_steps"][0]["page_id"], page_id);
 
     let title = exec(
         &tool,
@@ -449,6 +463,34 @@ async fn open_读取_点击链接_表单提交闭环() {
         "GET 表单应带上输入值:{body}"
     );
 
+    exec(&tool, json!({"action": "close", "page_id": page_id})).await;
+}
+
+#[tokio::test]
+async fn open_安全验证页直接返回阻断与人工引导() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+    let open = exec(
+        &tool,
+        json!({"action": "open", "url": format!("{base}/verify"), "mode": "hidden", "reuse": false}),
+    )
+    .await;
+    assert_eq!(open["code"], 0, "{open}");
+    let page_id = open["data"]["page_id"].as_str().unwrap().to_string();
+    assert_eq!(open["data"]["blockers"]["blocked"], true, "{open}");
+    assert_eq!(open["data"]["blockers"]["blockers"][0]["kind"], "captcha");
+    assert_eq!(open["data"]["blockers"]["suggested_action"], "request_human");
+    assert_eq!(open["data"]["next_steps"][0]["control_action"], "request_human");
+    assert_eq!(open["data"]["next_steps"][0]["page_id"], page_id);
+    assert_eq!(open["data"]["next_steps"][0]["params"]["reason"], "captcha");
+    assert_eq!(open["data"]["next_steps"][1]["info"], "blockers");
+    let webgl_detail = open["data"]["capability_gaps"][0]["detail"].as_str().unwrap();
+    assert!(webgl_detail.contains("验证题面"), "{webgl_detail}");
+    assert!(!open["data"]["capability_gaps"][0]["hint"]
+        .as_str()
+        .unwrap()
+        .contains("地图底图"));
     exec(&tool, json!({"action": "close", "page_id": page_id})).await;
 }
 

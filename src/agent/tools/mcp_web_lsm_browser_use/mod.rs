@@ -146,12 +146,35 @@ pub fn extract_page_id_from_text(text: &str) -> Option<String> {
     None
 }
 
-fn open_next_steps() -> Value {
+fn open_next_steps(page_id: &str, blockers: Option<&Value>) -> Value {
+    let blocked = blockers
+        .and_then(|v| v.get("blocked"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if blocked {
+        let kind = blockers
+            .and_then(|v| v.get("blockers"))
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .and_then(|v| v.get("kind"))
+            .and_then(Value::as_str)
+            .unwrap_or("manual_verify");
+        let reason = match kind {
+            "captcha" => "captcha",
+            "login" => "login",
+            _ => "manual_verify",
+        };
+        return json!([
+            {"step": 1, "action": "control", "control_action": "request_human", "page_id": page_id,
+             "params": {"reason": reason, "message": "页面需要人工完成验证或登录;完成后由 Agent 复查页面状态再继续"}},
+            {"step": 2, "action": "inspect", "info": "blockers", "page_id": page_id, "params": {}},
+        ]);
+    }
     json!([
-        {"step": 1, "action": "control", "control_action": "input_text", "params": {"selector": "输入框选择器", "text": "关键词"}},
-        {"step": 2, "action": "control", "control_action": "click", "params": {"selector": "搜索/提交按钮选择器"}},
-        {"step": 3, "action": "control", "control_action": "wait", "params": {"selector": "结果条目选择器", "state": "visible", "network_idle": 800}},
-        {"step": 4, "action": "inspect", "info": "elements", "params": {"selector": "结果条目选择器"}},
+        {"step": 1, "action": "control", "control_action": "input_text", "page_id": page_id, "params": {"selector": "输入框选择器", "text": "关键词"}},
+        {"step": 2, "action": "control", "control_action": "click", "page_id": page_id, "params": {"selector": "搜索/提交按钮选择器"}},
+        {"step": 3, "action": "control", "control_action": "wait", "page_id": page_id, "params": {"selector": "结果条目选择器", "state": "visible", "network_idle": 800}},
+        {"step": 4, "action": "inspect", "info": "elements", "page_id": page_id, "params": {"selector": "结果条目选择器"}},
     ])
 }
 
@@ -457,6 +480,17 @@ pub(super) async fn run_open(mut args: Value) -> Result<String> {
         str_arg(&args, "guard_note"),
         "open",
     );
+    // open 直接复用 inspect(blockers) 的同一套判定:验证/登录页不再返回
+    // 「输入关键词→搜索」的误导性固定引导,Agent 无需再花一轮 explore 才能发现阻断。
+    let blocker_report = crate::agent::browser::inspect::inspect(
+        &mgr,
+        &out.page_id,
+        "blockers",
+        &json!({}),
+    )
+    .await
+    .ok();
+    let next_steps = open_next_steps(&out.page_id, blocker_report.as_ref());
     let mut data = json!({
         "page_id": out.page_id,
         "title": out.title,
@@ -490,8 +524,11 @@ pub(super) async fn run_open(mut args: Value) -> Result<String> {
             "requested": {"width": width, "height": height},
             "effective": {"width": out.viewport_width, "height": out.viewport_height},
         },
-        "next_steps": open_next_steps(),
+        "next_steps": next_steps,
     });
+    if let Some(report) = blocker_report {
+        data["blockers"] = report;
+    }
     if let Some(hint) = out.mode_hint {
         data["mode_hint"] = json!(hint);
     }
@@ -501,17 +538,17 @@ pub(super) async fn run_open(mut args: Value) -> Result<String> {
     if out.final_url.trim().eq_ignore_ascii_case("about:blank") {
         data["page_health"] = json!({"blank": true, "hint": "落地为空白页;可检查 URL 或重新 open"});
     }
-    // 能力缺口如实告知:站点申请过 WebGL 上下文(百度地图等三维/地图站点),
-    // 而本内核无 GPU 后端 → 地图底图画不出来。不说清楚,Agent 会对同一片
-    // 空白反复截图/重试,白烧好几轮。
+    // 能力缺口如实告知:站点申请过 WebGL 上下文(地图、三维场景、验证码/指纹脚本等),
+    // 而本内核无 GPU 后端 → 对应画布画不出来。不说清楚,Agent 会对同一片
+    // 空白反复截图/重试,白烧好几轮;但申请 WebGL 不等于主画面一定依赖它。
     // 能力缺口条目(第 174 轮起为列表:webgl + iframe)。
     let mut gaps: Vec<Value> = Vec::new();
     if out.webgl_asked > 0 {
         gaps.push(json!({
             "kind": "webgl",
             "requested": out.webgl_asked,
-            "detail": "站点申请过 WebGL 上下文(常见于地图/三维场景);LsmAgentBrowser 内核无 WebGL,该区域不会绘制出像素(底图留空/仅剩 DOM 控件)。",
-            "hint": "需要像素级地图底图时改用 MCP_Web_Chrome_Use(真 Chromium 渲染);本工具仍可用于读取页面 DOM 文本(如路线方案列表)。",
+            "detail": "站点申请过 WebGL 上下文;LsmAgentBrowser 内核无 WebGL,对应画布区域不会绘制出像素(地图底图、三维场景或验证题面可能留空)。",
+            "hint": "仅当任务依赖该画布区域的像素时改用 MCP_Web_Chrome_Use(真 Chromium 渲染);不依赖画布时仍可使用本工具读取 DOM 文本。",
         }));
     }
     // iframe 内容渲染是内核边界(第 174 轮):跨域登录/验证码 iframe 画不出,
