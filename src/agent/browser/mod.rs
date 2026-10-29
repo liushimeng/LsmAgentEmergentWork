@@ -1424,6 +1424,8 @@ impl LsmBrowserManager {
 
     /// 截图。`params` 见兼容层文档。
     pub async fn screenshot(&self, page_id: &str, params: &Value) -> EngineResult<Value> {
+        // 先让持久 JS 线程把定时器/微任务与 Canvas 像素回写到宿主,再取布局帧。
+        api::sync_page(self, page_id).await;
         let inner = self.inner.lock().await;
         let tab = inner
             .tabs

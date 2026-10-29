@@ -169,6 +169,16 @@ pub fn collect_image_urls(html: &str, base_url: &str) -> Vec<String> {
             out.push(abs);
         }
     }
+    // Canvas 2D 的真实 PNG 由 JS 线程写入内部属性;复用 data: 图片解码与缓存,
+    // 截图/查看器不再面对一个永远透明的像素缓冲。
+    for node in doc.select("canvas[data-lsm-canvas]").unwrap_or_default() {
+        let Some(src) = document::attr(&node, "data-lsm-canvas") else {
+            continue;
+        };
+        if src.starts_with("data:image/png;base64,") && !out.contains(&src) {
+            out.push(src.to_string());
+        }
+    }
     out
 }
 

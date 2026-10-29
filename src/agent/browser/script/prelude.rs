@@ -1368,10 +1368,9 @@ function __mk(n) {
       return __ancestorChain(oi).indexOf(self) >= 0;
     };
   } catch (e) {}
+  if (String(n.tag || "").toLowerCase() === "canvas") __lsmAttachCanvas(el, n.sel);
   return el;
 }
-
-// ---------- URL 解析(供 <a> 反射;GLOBALS_JS 的 URL 不可跨作用域复用) ----------
 // 真实浏览器给 <a> 设置 href 后自动反射 protocol/host/pathname/search/hash
 // 等解析结果;axios 的 URL 判同模块在装载期就调用 `a.pathname.charAt(0)`,
 // 缺失反射 = undefined.charAt 当场 ToObject 崩、整库装不上
@@ -1761,29 +1760,8 @@ function __newEl(tag) {
   };
   def("innerText", function () { return el.__text; }, function (v) { el.__text = String(v); el.__kids = []; });
   def("value", function () { return el.__attrs.value || ""; }, function (v) { el.__attrs.value = String(v); });
-  // canvas:2D 上下文以「可调用的空实现」提供,让重度依赖 canvas 的页面
-  // (百度地图矢量渲染)完成初始化与事件绑定;像素内容暂不绘制。
-  if (t === "canvas") {
-    el.width = 300;
-    el.height = 150;
-    el.getContext = function (kind) {
-      var k = String(kind || "").toLowerCase();
-      if (k.indexOf("2d") !== 0) {
-        // WebGL / experimental-webgl:内核没有 GPU 后端,一律给 null(与真实
-        // 无 WebGL 环境一致)。但**记一笔**:站点据此判定能力并(如百度地图)
-        // 直接放弃整个地图渲染,页面只剩空壳。记下来如实告知调用方,免得
-        // Agent 反复重试一个内核根本画不出来的区域。
-        if (k.indexOf("webgl") === 0) window.__lsmWebGLAsked = (window.__lsmWebGLAsked || 0) + 1;
-        return null;
-      }
-      if (!el.__ctx2d) el.__ctx2d = __mkCanvas2d(el);
-      return el.__ctx2d;
-    };
-    el.toDataURL = function () { return "data:image/png;base64,"; };
-    el.getBoundingClientRect = function () {
-      return { x: 0, y: 0, top: 0, left: 0, right: el.width, bottom: el.height, width: el.width, height: el.height };
-    };
-  }
+  // 静态与动态 Canvas 共用真实 RGBA8 像素实现(canvas_js.rs)。
+  if (t === "canvas") __lsmAttachCanvas(el, null);
   // children 反射 __kids:createElement+appendChild 建出的子树立即被父节点可见
   // (百度地图 render() 容器 → platform = t.children[0] 链路依赖此语义)。
   // children 只含元素节点(浏览器语义);childNodes 含文本节点。
@@ -1804,47 +1782,6 @@ function __newEl(tag) {
   // 必须回写宿主 DOM,否则宿主永远停在挂载时的属性值。
   el.__attrs = __mkDynAttrs(el);
   return el;
-}
-
-// canvas 2D 上下文空实现(初始化兼容层,不产生像素)。
-function __mkCanvas2d(canvas) {
-  var noop = function () {};
-  var ctx = {
-    canvas: canvas,
-    fillStyle: "#000000", strokeStyle: "#000000", lineWidth: 1, lineCap: "butt", lineJoin: "miter",
-    miterLimit: 10, font: "10px sans-serif", textAlign: "start", textBaseline: "alphabetic",
-    globalAlpha: 1, globalCompositeOperation: "source-over", imageSmoothingEnabled: true,
-    shadowBlur: 0, shadowColor: "rgba(0,0,0,0)", shadowOffsetX: 0, shadowOffsetY: 0,
-    save: noop, restore: noop, beginPath: noop, closePath: noop, moveTo: noop, lineTo: noop,
-    quadraticCurveTo: noop, bezierCurveTo: noop, arc: noop, arcTo: noop, ellipse: noop, rect: noop,
-    fill: noop, stroke: noop, clip: noop, fillRect: noop, strokeRect: noop, clearRect: noop,
-    translate: noop, rotate: noop, scale: noop, transform: noop, setTransform: noop, resetTransform: noop,
-    drawImage: noop, putImageData: noop, setLineDash: noop, getLineDash: function () { return []; },
-    fillText: noop, strokeText: noop,
-    measureText: function (t) {
-      var size = parseFloat(ctx.font) || 10;
-      return { width: String(t == null ? "" : t).length * size * 0.55 };
-    },
-    createLinearGradient: function () { return { addColorStop: noop }; },
-    createRadialGradient: function () { return { addColorStop: noop }; },
-    createPattern: function () { return {}; },
-    createImageData: function (w, h) {
-      w = Math.max(0, w | 0); h = Math.max(0, h | 0);
-      var data;
-      try { data = new Uint8ClampedArray(w * h * 4); } catch (e) { data = []; }
-      return { width: w, height: h, data: data };
-    },
-    getImageData: function (x, y, w, h) {
-      w = Math.max(0, w | 0); h = Math.max(0, h | 0);
-      var data;
-      try { data = new Uint8ClampedArray(w * h * 4); } catch (e) { data = []; }
-      return { width: w, height: h, data: data };
-    },
-    isPointInPath: function () { return false; },
-    isPointInStroke: function () { return false; },
-    getContextAttributes: function () { return {}; }
-  };
-  return ctx;
 }
 
 // ---------- detached innerHTML 轻量解析 ----------
@@ -3769,6 +3706,8 @@ function __lsmCollect(ov) {
   ov = ov || {};
   // 请求收口派发观察者:回调产生的 DOM 动作在本轮动作表里,宿主一次回写。
   __lsmFlushObservers();
+  // Canvas 像素先写内部 data-lsm-canvas;动态属性随后在同一轮统一回写宿主。
+  __lsmFlushCanvases();
   // 动态节点挂载后的属性变更合并下发(每元素每属性每轮一条)。
   __lsmFlushDynAttrs();
   return JSON.stringify({
@@ -3792,8 +3731,9 @@ __lsmFatal = null;
 /// 避免两套 PRELUDE 各改各的、行为悄悄漂移(历史上阶段二丢了 `el.title`)。
 pub static PRELUDE: once_cell::sync::Lazy<String> = once_cell::sync::Lazy::new(|| {
     format!(
-        "{}\n{}\n{}",
+        "{}\n{}\n{}\n{}",
         PRELUDE_BODY,
+        super::canvas_js::CANVAS_JS,
         super::env_js::SELECTOR_JS,
         super::env_js::GLOBALS_JS
     )

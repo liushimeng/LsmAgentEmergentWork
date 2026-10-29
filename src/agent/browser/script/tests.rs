@@ -69,7 +69,7 @@ fn eval_on_with_rects(handle: &JsHandle, script: &str, doc_html: &str, url: &str
         .expect("JS 线程请求失败")
 }
 
-fn run_scripts(handle: &JsHandle, scripts: Vec<&str>, doc_html: &str, url: &str) -> JsReply {
+pub(super) fn run_scripts(handle: &JsHandle, scripts: Vec<&str>, doc_html: &str, url: &str) -> JsReply {
     let doc = Document::parse(doc_html, url);
     let nodes = doc.snapshot_nodes();
     let sources = scripts

@@ -10,7 +10,7 @@ use kuchikiki::NodeRef;
 use super::super::document::{self, Document};
 use super::super::style::{ComputedStyle, FlexWrap};
 use super::{
-    append, style_visible, translate, ElementBox, Fragment, LayoutCtx, PaintBox, PaintKind,
+    append, constrain_height, style_visible, translate, ElementBox, Fragment, LayoutCtx, PaintBox, PaintKind,
     MAX_CONTENT_WIDTH,
 };
 
@@ -168,12 +168,12 @@ pub(crate) fn layout_container(
     let content_h =
         layout_content(ctx, node, content_x, inner_w, style, depth + 1, cb);
     let box_h = (ctx.cursor_y() - start_y + content_h).max(1.0);
-    // min-height 地板:flex 容器同样生效(见 mod.rs 同名注释)。
-    let box_h = style.min_height.map(|m| box_h.max(m)).unwrap_or(box_h);
+    // min/max-height:flex 容器同样按 CSS 钳序生效。
+    let box_h = constrain_height(style, box_h);
     ctx.set_box_height(box_idx, box_h);
     // 阶段六:组效果回补 + 自身视觉发射(含多层背景图,修复 flex 容器边框/阴影缺口)。
     let tag = document::tag_name(node);
-    ctx.finish_container(seq, dmark, style, &tag, bx, start_y, bw, box_h);
+    ctx.finish_container(seq, dmark, node, style, &tag, bx, start_y, bw, box_h);
     ctx.advance_y(content_h + style.padding_bottom + style.margin_bottom.max(2.0));
 }
 
@@ -279,6 +279,7 @@ pub(crate) fn layout_content(
                     .height
                     .or(pct_h)
                     .unwrap_or(frag.height + item.pads_cross(row).0 + item.pads_cross(row).1);
+                item.final_cross = constrain_height(&item.style, item.final_cross);
                 item.frag = Some(std::mem::take(&mut frag));
             }
             // column 方向:final_cross 已在 resolve_base 决定。
@@ -368,7 +369,25 @@ pub(crate) fn layout_content(
         );
         super::position::layout_deferred(ctx, deferred, pad_cb, depth);
     }
-    container_cross.max(0.0)
+    if row {
+        container_cross.max(0.0)
+    } else {
+        // column 的交叉轴是宽度,绝不能把 container_cross(内容宽)当成容器高度。
+        // 主轴有显式 height 时取确定值;仅 min-height 时允许内容超过地板继续撑开。
+        let used_main = lines
+            .iter()
+            .map(|line| {
+                line.iter().map(|&i| items[i].outer_main(row)).sum::<f64>()
+                    + gap_main * line.len().saturating_sub(1) as f64
+            })
+            .sum::<f64>()
+            + gap_main * lines.len().saturating_sub(1) as f64;
+        if style.height.is_some() {
+            inner_main.max(0.0)
+        } else {
+            inner_main.max(used_main).max(0.0)
+        }
+    }
 }
 
 /// 收集条目与脱离流定位元素。
@@ -517,7 +536,7 @@ fn resolve_base(
                 (w + pb + pa).min(avail).max(1.0)
             }
         });
-        // 钳序与块级一致:min-width 地板在 max-width 上限之后(冲突时 max 优先)。
+        // 钳序与块级一致:max-width 上限后再应用 min-width(冲突时 min 优先)。
         // 此前列方向交叉宽完全无视 max-width:实测 zhipin 验证页
         // `.verify-container{width:100%;max-width:520px}` 在 column flex 容器里
         // 被解成 1824px 全宽(卡片占满视口、视觉布局整页散架)。
@@ -541,6 +560,7 @@ fn resolve_base(
             let lh = cs.line_height.max(cs.font_size * 1.35);
             item.base_main = explicit.unwrap_or(lh).max(0.0);
         }
+        item.base_main = constrain_height(cs, item.base_main);
     }
 }
 
@@ -750,6 +770,9 @@ fn emit_item(ctx: &mut LayoutCtx, item: &mut Item, x: f64, y: f64, row: bool, de
         out_of_flow: false,
     });
     ctx.emit_element(seq, &cs, &item.tag, x, y, iw, ih);
+    if let Some(node) = item.node.as_ref() {
+        ctx.emit_canvas_pixels(node, &cs, seq, x, y, iw, ih);
+    }
     // 阶段三第三步:图片条目按最终尺寸绘制(object-fit 决定填充方式)。
     if let Some(src) = item.image.clone().filter(|s| ctx.image_loaded(s)) {
         let cw = (iw - cs.padding_left - cs.padding_right).max(0.0);

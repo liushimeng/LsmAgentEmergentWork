@@ -180,6 +180,12 @@ impl ThreadRuntime {
             NativeFunction::from_fn_ptr(native_btoa),
         )
         .map_err(|e| format!("注册 btoa 失败:{e}"))?;
+        ctx.register_global_callable(
+            js_string!("__lsmCanvasPng"),
+            3,
+            NativeFunction::from_fn_ptr(native_canvas_png),
+        )
+        .map_err(|e| format!("注册 Canvas PNG 原生函数失败:{e}"))?;
         // ToObject 调试探针必须在 PRELUDE 求值前决定是否安装(默认不安装,
         // 包装内建方法会改变属性身份,不能常驻)。
         let trace_to_obj = std::env::var("LAEW_JS_TRACE_TOOBJ")
@@ -701,23 +707,100 @@ fn native_fetch(
 
 fn native_atob(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     use base64::Engine as _;
-    let s = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
-    let out = base64::engine::general_purpose::STANDARD
-        .decode(s.as_bytes())
-        .map(|b| String::from_utf8_lossy(&b).into_owned())
+    let input = args.get_or_undefined(0).to_string(ctx)?;
+    // HTML forgiving-base64:忽略 ASCII 空白,允许末尾省略 padding。
+    // 解码结果是「每字节一个 U+0000..U+00FF 码元」的二进制字符串,
+    // 不是 UTF-8 文本;from_utf8_lossy 会把图片/指纹字节永久改成 U+FFFD。
+    let mut encoded = String::new();
+    for unit in js_code_units(&input) {
+        let ch = char::from_u32(unit as u32).unwrap_or('\u{fffd}');
+        if !matches!(ch, '\t' | '\n' | '\u{0c}' | '\r' | ' ') {
+            encoded.push(ch);
+        }
+    }
+    if encoded.len() % 4 == 1 {
+        return Err(boa_engine::JsError::from_native(
+            boa_engine::JsNativeError::error().with_message("atob 失败:Base64 长度非法"),
+        ));
+    }
+    while encoded.len() % 4 != 0 {
+        encoded.push('=');
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded.as_bytes())
         .map_err(|e| {
             boa_engine::JsError::from_native(
                 boa_engine::JsNativeError::error().with_message(format!("atob 失败:{e}")),
             )
         })?;
-    Ok(JsValue::from(JsString::from(out)))
+    let units: Vec<u16> = bytes.into_iter().map(u16::from).collect();
+    Ok(JsValue::from(JsString::from(&units[..])))
 }
 
 fn native_btoa(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     use base64::Engine as _;
-    let s = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
-    let out = base64::engine::general_purpose::STANDARD.encode(s.as_bytes());
+    let input = args.get_or_undefined(0).to_string(ctx)?;
+    // 浏览器 btoa 接受的是 Latin-1 二进制字符串,不是 UTF-8 文本。
+    // 任何 >0xFF 的码元都必须抛错,否则静默换码会破坏验证码/图片字节。
+    let mut bytes = Vec::with_capacity(input.len());
+    for unit in js_code_units(&input) {
+        let Ok(byte) = u8::try_from(unit) else {
+            return Err(boa_engine::JsError::from_native(
+                boa_engine::JsNativeError::error()
+                    .with_message("btoa 失败:字符串含 Latin-1 范围外字符"),
+            ));
+        };
+        bytes.push(byte);
+    }
+    let out = base64::engine::general_purpose::STANDARD.encode(bytes);
     Ok(JsValue::from(JsString::from(out)))
+}
+
+fn js_code_units(value: &JsString) -> Vec<u16> {
+    (0..value.len()).filter_map(|i| value.code_unit_at(i)).collect()
+}
+
+/// 把页面 Canvas 的 RGBA8 像素编码成真实 PNG data URL。
+/// JS 侧只维护像素与绘制语义,PNG 压缩复用宿主既有 `png` 依赖。
+fn native_canvas_png(
+    _this: &JsValue,
+    args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    use base64::Engine as _;
+    let width = args.get_or_undefined(0).to_number(ctx)? as u32;
+    let height = args.get_or_undefined(1).to_number(ctx)? as u32;
+    let encoded = args.get_or_undefined(2).to_string(ctx)?.to_std_string_escaped();
+    let rgba = base64::engine::general_purpose::STANDARD
+        .decode(encoded.as_bytes())
+        .map_err(|e| canvas_error(format!("RGBA Base64 非法:{e}")))?;
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(4))
+        .filter(|n| *n <= 64 * 1024 * 1024)
+        .ok_or_else(|| canvas_error("画布尺寸超过 16M 像素上限".to_string()))?;
+    if width == 0 || height == 0 || rgba.len() != expected {
+        return Err(canvas_error(format!(
+            "RGBA 长度不匹配:期望 {expected},实际 {}",
+            rgba.len()
+        )));
+    }
+    let mut png = Vec::new();
+    {
+        use image::ImageEncoder as _;
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&rgba, width, height, image::ExtendedColorType::Rgba8)
+            .map_err(|e| canvas_error(format!("PNG 像素编码失败:{e}")))?;
+    }
+    let url = format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(png)
+    );
+    Ok(JsValue::from(JsString::from(url)))
+}
+
+fn canvas_error(message: String) -> boa_engine::JsError {
+    boa_engine::JsError::from_native(boa_engine::JsNativeError::error().with_message(message))
 }
 
 /// 线程内阻塞 HTTP(页面 fetch/XHR 通道)。SSRF/TLS 策略与主网络栈一致。

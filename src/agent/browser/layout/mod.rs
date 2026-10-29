@@ -12,6 +12,8 @@ mod measure;
 mod grid;
 mod position;
 #[cfg(test)]
+mod position_tests;
+#[cfg(test)]
 mod tests;
 
 use std::collections::HashMap;
@@ -440,13 +442,20 @@ pub(crate) fn style_visible(style: &ComputedStyle) -> bool {
     style.visibility != "hidden" && style.visibility != "collapse" && style.opacity > 0.0
 }
 
+/// CSS 高度钳序:先 max-height,再 min-height(冲突时 min 胜出)。
+pub(crate) fn constrain_height(style: &ComputedStyle, height: f64) -> f64 {
+    let capped = style.max_height.map(|max| height.min(max)).unwrap_or(height);
+    style.min_height.map(|min| capped.max(min)).unwrap_or(capped)
+}
+
 /// `position:relative|sticky` 的整体偏移(不改变占位)。
-pub(crate) fn relative_offset(style: &ComputedStyle) -> (f64, f64) {
+pub(crate) fn relative_offset(
+    style: &ComputedStyle,
+    containing_width: f64,
+    containing_height: f64,
+) -> (f64, f64) {
     if matches!(style.pos.position.as_str(), "relative" | "sticky") {
-        (
-            style.pos.left.unwrap_or(0.0) - style.pos.right.unwrap_or(0.0),
-            style.pos.top.unwrap_or(0.0) - style.pos.bottom.unwrap_or(0.0),
-        )
+        style.pos.relative_offsets(containing_width, containing_height)
     } else {
         (0.0, 0.0)
     }
@@ -531,6 +540,7 @@ impl<'a> LayoutCtx<'a> {
         &mut self,
         seq: u64,
         mark: usize,
+        node: &NodeRef,
         style: &ComputedStyle,
         tag: &str,
         x: f64,
@@ -540,6 +550,40 @@ impl<'a> LayoutCtx<'a> {
     ) {
         self.apply_group(mark, style, x, y, w, h);
         self.emit_element(seq, style, tag, x, y, w, h);
+        self.emit_canvas_pixels(node, style, seq, x, y, w, h);
+    }
+
+    /// Canvas 已有真实 PNG 时覆盖能力占位;未产生像素时仍保留 CanvasNote。
+    fn emit_canvas_pixels(
+        &mut self,
+        node: &NodeRef,
+        style: &ComputedStyle,
+        seq: u64,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+    ) {
+        if !document::tag_name(node).eq_ignore_ascii_case("canvas") || !style_visible(style) {
+            return;
+        }
+        let Some(src) = document::attr(node, "data-lsm-canvas") else {
+            return;
+        };
+        self.display.push(DisplayItem {
+            kind: DisplayKind::Image { src, fit: "fill".to_string(), off_x: 0.0, off_y: 0.0 },
+            x,
+            y,
+            w,
+            h,
+            radius: style.border_radius,
+            z: style.pos.z_index.max(self.z_floor),
+            seq,
+            opacity: style.opacity,
+            clip: None,
+            transform: self.own_transform(style, x, y, w, h),
+            fixed: self.fixed_depth > 0,
+        });
     }
 
     /// 元素视觉发射器(阶段六):按 shadow→背景(色/渐变)→边框→canvas 占位
@@ -1039,10 +1083,7 @@ impl<'a> LayoutCtx<'a> {
                 let visible = style_visible(&style);
                 // relative/sticky 整体偏移(不影响占位)。
                 let (dx, dy) = if matches!(style.pos.position.as_str(), "relative" | "sticky") {
-                    (
-                        style.pos.left.unwrap_or(0.0) - style.pos.right.unwrap_or(0.0),
-                        style.pos.top.unwrap_or(0.0) - style.pos.bottom.unwrap_or(0.0),
-                    )
+                    relative_offset(&style, width, if cb.3 == UNKNOWN_CB_H { 0.0 } else { cb.3 })
                 } else {
                     (0.0, 0.0)
                 };
@@ -1248,10 +1289,8 @@ impl<'a> LayoutCtx<'a> {
                     Some(h) => h,
                     None => (content_h + style.padding_top + style.padding_bottom).max(0.0),
                 };
-                // min-height 地板:显式与 auto 高最终都不得低于它(实测 zhipin 验证页
-                // `.page-verify{min-height:100vh}` 此前整体缺失 → 页面不满视口、
-                // 垂直居中语境不存在)。
-                let box_h = style.min_height.map(|m| box_h.max(m)).unwrap_or(box_h);
+                // min/max-height:显式与 auto 高统一按 CSS 钳序求解。
+                let box_h = constrain_height(&style, box_h);
                 // 游标停在盒底;本盒 margin_bottom 先折叠暂存,与下一兄弟
                 // margin_top 取折叠值落地(CSS 2.1 8.3.1)。此前
                 // `.max(2.0)` 给每块强加 2px 下边距,全页逐块累积漂移。
@@ -1275,10 +1314,7 @@ impl<'a> LayoutCtx<'a> {
                 // 阶段三:relative/sticky 整体偏移(不影响占位):先平移子树几何,
                 // 再以**偏移后**盒矩形做组回补与自身发射 —— 变换原点随之正确。
                 let (rdx, rdy) = if matches!(style.pos.position.as_str(), "relative" | "sticky") {
-                    (
-                        style.pos.left.unwrap_or(0.0) - style.pos.right.unwrap_or(0.0),
-                        style.pos.top.unwrap_or(0.0) - style.pos.bottom.unwrap_or(0.0),
-                    )
+                    relative_offset(&style, width, if cb.3 == UNKNOWN_CB_H { 0.0 } else { cb.3 })
                 } else {
                     (0.0, 0.0)
                 };
@@ -1307,6 +1343,7 @@ impl<'a> LayoutCtx<'a> {
                 self.apply_group(mark_display, &style, bx + rdx, start_y + rdy, bw, box_h);
                 let tag = document::tag_name(&child);
                 self.emit_element(seq, &style, &tag, bx + rdx, start_y + rdy, bw, box_h);
+                self.emit_canvas_pixels(&child, &style, seq, bx + rdx, start_y + rdy, bw, box_h);
                 // 阶段七:浮动盒登记并恢复流式游标(非浮动为 no-op)。
                 float::finish(self, placement, &mut floats, &mut inline_row);
                 if style.float != "none" {
@@ -1513,7 +1550,7 @@ impl<'a> LayoutCtx<'a> {
         let mut inner_x = line_x;
         if own_box {
             let (w, h) = self.inline_box_size(node, style, avail_w);
-            let (dx, dy) = relative_offset(style);
+            let (dx, dy) = relative_offset(style, avail_w, self.viewport_h);
             let bx = line_x + style.margin_left + style.padding_left + dx;
             let by = self.y + dy;
             tf = self.emit_inline_box(node, style, bx, by, w, h, tf);
@@ -1678,6 +1715,7 @@ impl<'a> LayoutCtx<'a> {
         push_border_and_shadow(self, style, bx, by, w, h);
         let tag = document::tag_name(node);
         self.emit_element(seq, style, &tag, bx, by, w, h);
+        self.emit_canvas_pixels(node, style, seq, bx, by, w, h);
         // 阶段七:表单控件的 value/placeholder 文本(此前只画背景+边框,
         // 输入框在截图里是没有任何提示文字的灰盒)。
         self.emit_form_control_text(node, style, &tag, bx, by, w, h, tf);

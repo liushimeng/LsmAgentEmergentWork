@@ -47,8 +47,11 @@ fn layout_abs(
     let avail_h_known = ch != UNKNOWN_CB_H;
     let avail_h = if avail_h_known { (ch - pad_t - pad_b).max(1.0) } else { f64::MAX };
 
-    // 宽度:显式 width ?? 收缩适配(max-content 受可用宽约束)。
-    let content_w = style.width.unwrap_or_else(|| {
+    // 宽度按 border-box 求解;显式 content-box 再把 padding 加回。
+    // auto 仍走 shrink-to-fit,最后统一应用 min/max 约束。
+    let mut bw = if let Some(w) = style.width.or(style.width_percent.map(|p| p / 100.0 * avail_w)) {
+        if style.box_sizing_content { w + pad_l + pad_r } else { w }
+    } else {
         let frag = ctx.measure_content(node, super::MAX_CONTENT_WIDTH, style, depth);
         let mut w = 0.0f64;
         for l in &frag.lines {
@@ -61,31 +64,48 @@ fn layout_abs(
             }
             w = w.max(b.x + b.w);
         }
-        w.min(avail_w).max(1.0)
-    });
-    let content_h = style
-        .height
-        .unwrap_or_else(|| {
-            let frag = ctx.measure_content(node, content_w, style, depth);
-            frag.height.max(1.0)
-        })
-        .min(if avail_h_known { avail_h } else { f64::MAX })
-        .max(1.0);
+        w.min(avail_w).max(1.0) + pad_l + pad_r
+    };
+    if let Some(max) = style.max_width {
+        bw = bw.min(max);
+    }
+    if let Some(min) = style.min_width {
+        bw = bw.max(min);
+    }
+    let content_w = (bw - pad_l - pad_r).max(1.0);
+    bw = content_w + pad_l + pad_r;
 
-    let bw = content_w + pad_l + pad_r;
-    let bh = content_h + pad_t + pad_b;
-    // 水平:left 优先;否则 right 锚定;都无则贴包含块左缘(静态位置简化)。
-    let bx = if let Some(l) = style.pos.left {
+    let mut bh = if let Some(h) = style.height.or_else(|| {
+        avail_h_known.then(|| style.height_percent.map(|p| p / 100.0 * avail_h)).flatten()
+    }) {
+        if style.box_sizing_content { h + pad_t + pad_b } else { h }
+    } else {
+        ctx.measure_content(node, content_w, style, depth).height.max(1.0) + pad_t + pad_b
+    };
+    if avail_h_known {
+        bh = bh.min(avail_h + pad_t + pad_b);
+    }
+    if let Some(max) = style.max_height {
+        bh = bh.min(max);
+    }
+    if let Some(min) = style.min_height {
+        bh = bh.max(min);
+    }
+    let content_h = (bh - pad_t - pad_b).max(1.0);
+    bh = content_h + pad_t + pad_b;
+
+    // 水平:left/right 百分比相对包含块宽;都无则贴左缘(静态位置简化)。
+    let bx = if let Some(l) = style.pos.resolved_left(cw) {
         cx + l + style.margin_left
-    } else if let Some(r) = style.pos.right {
+    } else if let Some(r) = style.pos.resolved_right(cw) {
         cx + cw - r - style.margin_right - bw
     } else {
         cx + style.margin_left
     };
-    // 垂直:top 优先;否则 bottom 锚定(包含块高度未知时退化);都无则贴包含块上缘。
-    let by = if let Some(t) = style.pos.top {
+    // 垂直:top/bottom 百分比相对包含块高,不能复用视口宽近似。
+    let by = if let Some(t) = style.pos.resolved_top(ch) {
         cy + t + style.margin_top
-    } else if let Some(b) = style.pos.bottom {
+    } else if let Some(b) = style.pos.resolved_bottom(ch) {
         if avail_h_known {
             cy + ch - b - style.margin_bottom - bh
         } else {
@@ -108,6 +128,7 @@ fn layout_abs(
     let seq = ctx.next_seq();
     let tag = document::tag_name(node);
     ctx.emit_element(seq, style, &tag, bx, by, bw, bh);
+    ctx.emit_canvas_pixels(node, style, seq, bx, by, bw, bh);
     ctx.push_box(ElementBox {
         selector: Document::stable_selector(node),
         tag: document::tag_name(node),

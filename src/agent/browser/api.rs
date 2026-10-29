@@ -517,6 +517,23 @@ async fn js_eval_thread(
     }
 }
 
+/// 截图/等待前同步页面:复用持久 JS Context 推进微任务与定时器,应用 DOM/Canvas
+/// 动作并按需重排。无脚本页面零成本;绝不为了取一帧重建页面全局状态。
+pub(crate) async fn sync_page(mgr: &LsmBrowserManager, pid: &str) -> bool {
+    let has_js = {
+        let inner = mgr.inner.lock().await;
+        inner.tabs.get(pid).and_then(|tab| tab.js.as_ref()).is_some()
+    };
+    if !has_js {
+        return false;
+    }
+    let Some(reply) = js_eval_thread(mgr, pid, "undefined").await else {
+        return false;
+    };
+    apply_js_reply(mgr, pid, &reply).await;
+    true
+}
+
 /// 执行一个 control_action。
 pub async fn control(
     mgr: &LsmBrowserManager,
@@ -1592,20 +1609,30 @@ async fn act_wait(
         });
     let total = timeout_ms(params, top, 30_000).min(120_000);
 
-    // 无任何条件:纯等待(旧语义保持)。
+    // 无任何条件:等待期间仍推进页面事件循环;纯 sleep 会让动态弹层/验证组件
+    // 在没有任何新 <script> 可装载时永远停在旧 DOM。
     if selector.is_none() && js_cond.is_none() && idle_ms.is_none() {
         let ms = p_u64(params, "duration_ms")
             .or_else(|| p_u64(params, "ms"))
             .or_else(|| p_u64(params, "wait_ms"))
             .unwrap_or(500)
             .min(30_000);
-        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        let started = std::time::Instant::now();
+        loop {
+            sync_page(mgr, pid).await;
+            let elapsed = started.elapsed().as_millis() as u64;
+            if elapsed >= ms {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis((ms - elapsed).min(100))).await;
+        }
         return Ok(json!({"slept_ms": ms}));
     }
 
     let started = std::time::Instant::now();
     let mut last = json!({});
     loop {
+        sync_page(mgr, pid).await;
         let mut cond = serde_json::Map::new();
         let mut ok = true;
         if let Some(sel) = &selector {

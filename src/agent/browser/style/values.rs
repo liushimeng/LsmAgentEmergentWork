@@ -74,6 +74,7 @@ pub struct ComputedStyle {
     pub max_width: Option<f64>,
     pub min_width: Option<f64>,
     pub min_height: Option<f64>,
+    pub max_height: Option<f64>,
     pub height: Option<f64>,
     /// `width` 的百分比原值(`50%` → 50.0);布局层按父内容宽二次求解。
     ///
@@ -163,6 +164,11 @@ pub struct PositionStyle {
     pub right: Option<f64>,
     pub bottom: Option<f64>,
     pub left: Option<f64>,
+    /// inset 百分比原值:水平相对包含块宽、垂直相对包含块高,布局期求解。
+    pub top_percent: Option<f64>,
+    pub right_percent: Option<f64>,
+    pub bottom_percent: Option<f64>,
+    pub left_percent: Option<f64>,
     /// `auto` 归一为 0;绘制序稳定排序使用。
     pub z_index: i64,
 }
@@ -175,6 +181,10 @@ impl Default for PositionStyle {
             right: None,
             bottom: None,
             left: None,
+            top_percent: None,
+            right_percent: None,
+            bottom_percent: None,
+            left_percent: None,
             z_index: 0,
         }
     }
@@ -184,6 +194,32 @@ impl PositionStyle {
     /// 是否建立新的绝对定位包含块(static 之外的所有定位)。
     pub fn is_positioned(&self) -> bool {
         self.position != "static"
+    }
+
+    pub fn resolved_left(&self, containing_width: f64) -> Option<f64> {
+        self.left.or(self.left_percent.map(|p| p / 100.0 * containing_width))
+    }
+
+    pub fn resolved_right(&self, containing_width: f64) -> Option<f64> {
+        self.right.or(self.right_percent.map(|p| p / 100.0 * containing_width))
+    }
+
+    pub fn resolved_top(&self, containing_height: f64) -> Option<f64> {
+        self.top.or(self.top_percent.map(|p| p / 100.0 * containing_height))
+    }
+
+    pub fn resolved_bottom(&self, containing_height: f64) -> Option<f64> {
+        self.bottom.or(self.bottom_percent.map(|p| p / 100.0 * containing_height))
+    }
+
+    /// relative/sticky 偏移同样遵循水平取宽、垂直取高。
+    pub fn relative_offsets(&self, containing_width: f64, containing_height: f64) -> (f64, f64) {
+        (
+            self.resolved_left(containing_width).unwrap_or(0.0)
+                - self.resolved_right(containing_width).unwrap_or(0.0),
+            self.resolved_top(containing_height).unwrap_or(0.0)
+                - self.resolved_bottom(containing_height).unwrap_or(0.0),
+        )
     }
 }
 
@@ -390,6 +426,7 @@ impl Default for ComputedStyle {
             max_width: None,
             min_width: None,
             min_height: None,
+            max_height: None,
             height: None,
             width_percent: None,
             height_percent: None,
@@ -519,17 +556,21 @@ impl ComputedStyle {
         out.insert("max-width".into(), length_text(self.max_width));
         out.insert("min-width".into(), length_text(self.min_width));
         out.insert("min-height".into(), length_text(self.min_height));
+        out.insert("max-height".into(), length_text(self.max_height));
         out.insert("height".into(), length_text(self.height));
         out.insert("opacity".into(), num(self.opacity));
         // 定位体系(阶段三)
         out.insert("position".into(), self.pos.position.clone());
-        for (name, v) in [
-            ("top", self.pos.top),
-            ("right", self.pos.right),
-            ("bottom", self.pos.bottom),
-            ("left", self.pos.left),
+        for (name, v, pct) in [
+            ("top", self.pos.top, self.pos.top_percent),
+            ("right", self.pos.right, self.pos.right_percent),
+            ("bottom", self.pos.bottom, self.pos.bottom_percent),
+            ("left", self.pos.left, self.pos.left_percent),
         ] {
-            out.insert(name.to_string(), length_text(v));
+            out.insert(
+                name.to_string(),
+                pct.map(|p| format!("{}%", num(p))).unwrap_or_else(|| length_text(v)),
+            );
         }
         out.insert("z-index".into(), self.pos.z_index.to_string());
         // Flex(阶段三)
@@ -1031,6 +1072,13 @@ pub fn apply_declaration(
             // 百分比 min-height 同 height 的处理:不在此预估,父高已知时布局层求解。
             st.min_height = parse_length(value, st.font_size, ctx).filter(|v| *v > 0.0);
         }
+        "max-height" => {
+            if value.eq_ignore_ascii_case("none") {
+                st.max_height = None;
+            } else {
+                st.max_height = parse_length(value, st.font_size, ctx).filter(|v| *v > 0.0);
+            }
+        }
         "height" => {
             st.height_percent = parse_percent(value);
             // 百分比高度的粗估值按视口宽算没有意义(视口宽≠高),交给布局层按父高求解;
@@ -1057,12 +1105,25 @@ pub fn apply_declaration(
             }
         }
         "top" | "right" | "bottom" | "left" => {
-            let v = parse_length(value, st.font_size, ctx);
+            let percent = parse_percent(value);
+            let v = if percent.is_some() { None } else { parse_length(value, st.font_size, ctx) };
             match key.as_str() {
-                "top" => st.pos.top = v,
-                "right" => st.pos.right = v,
-                "bottom" => st.pos.bottom = v,
-                _ => st.pos.left = v,
+                "top" => {
+                    st.pos.top = v;
+                    st.pos.top_percent = percent;
+                }
+                "right" => {
+                    st.pos.right = v;
+                    st.pos.right_percent = percent;
+                }
+                "bottom" => {
+                    st.pos.bottom = v;
+                    st.pos.bottom_percent = percent;
+                }
+                _ => {
+                    st.pos.left = v;
+                    st.pos.left_percent = percent;
+                }
             }
         }
         "z-index" => {
@@ -1455,12 +1516,13 @@ fn apply_initial(st: &mut ComputedStyle, key: &str, root: &ComputedStyle) {
             "padding-bottom" => st.padding_bottom = 0.0,
             _ => st.padding_left = 0.0,
         },
-        "width" | "height" | "max-width" | "min-width" | "min-height" => match key {
+        "width" | "height" | "max-width" | "min-width" | "min-height" | "max-height" => match key {
             "width" => st.width = None,
             "height" => st.height = None,
             "max-width" => st.max_width = None,
             "min-width" => st.min_width = None,
-            _ => st.min_height = None,
+            "min-height" => st.min_height = None,
+            _ => st.max_height = None,
         },
         "background" | "background-color" => st.background = None,
         "object-fit" => st.object_fit = "fill".to_string(),

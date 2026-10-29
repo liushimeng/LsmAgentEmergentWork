@@ -591,6 +591,8 @@ pub fn common_attrs(node: &NodeRef) -> HashMap<String, String> {
         "id", "class", "name", "type", "value", "href", "src", "alt", "title", "placeholder",
         "role", "style", "checked", "selected", "disabled", "readonly", "aria-label",
         "aria-hidden", "data-testid", "data-id", "for", "action", "method", "rel", "target",
+        // 替换元素固有尺寸:静态 Canvas/图片的 JS 包装同样需要真实 width/height。
+        "width", "height",
     ];
     for n in names {
         if let Some(v) = attr(node, n) {

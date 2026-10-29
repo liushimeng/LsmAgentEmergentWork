@@ -12,7 +12,7 @@ use super::super::document::{self, Document};
 use super::super::style::{ComputedStyle, GridFlow, GridLine, TrackSize};
 use super::flex::text_fragment;
 use super::{
-    append, style_visible, translate, ElementBox, Fragment, LayoutCtx, PaintBox, PaintKind,
+    append, constrain_height, style_visible, translate, ElementBox, Fragment, LayoutCtx, PaintBox, PaintKind,
     MAX_CONTENT_WIDTH,
 };
 
@@ -130,11 +130,11 @@ pub(crate) fn layout_container(
     });
     let box_idx = ctx.boxes_len() - 1;
     let content_h = layout_content(ctx, node, content_x, inner_w, style, depth + 1, cb);
-    let box_h = (ctx.cursor_y() - start_y + content_h).max(1.0);
+    let box_h = constrain_height(style, (ctx.cursor_y() - start_y + content_h).max(1.0));
     ctx.set_box_height(box_idx, box_h);
     // 阶段六:组效果回补 + 自身视觉发射(含多层背景图,修复 grid 容器边框/阴影缺口)。
     let tag = document::tag_name(node);
-    ctx.finish_container(seq, dmark, style, &tag, bx, start_y, bw, box_h);
+    ctx.finish_container(seq, dmark, node, style, &tag, bx, start_y, bw, box_h);
     ctx.advance_y(content_h + style.padding_bottom + style.margin_bottom.max(2.0));
 }
 
@@ -803,6 +803,7 @@ fn emit_item(
             (frag_h + pt + pb).max(1.0)
         }
     });
+    let used_h = constrain_height(&item.style, used_h);
     let free_w = (max_w - used_w).max(0.0);
     let free_h = (max_h - used_h).max(0.0);
     let x = area_x
@@ -844,6 +845,9 @@ fn emit_item(
         out_of_flow: false,
     });
     ctx.emit_element(seq, &cs, &item.tag, x, y, used_w, used_h);
+    if let Some(node) = item.node.as_ref() {
+        ctx.emit_canvas_pixels(node, &cs, seq, x, y, used_w, used_h);
+    }
     // 阶段三第三步:图片条目按最终尺寸绘制(object-fit 决定填充方式)。
     if let Some(src) = item.image.clone().filter(|s| ctx.image_loaded(s)) {
         let cw = (used_w - pl - item.style.padding_right).max(0.0);
