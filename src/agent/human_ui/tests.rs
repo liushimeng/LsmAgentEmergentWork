@@ -386,3 +386,13 @@ fn parse_relay_line_shapes() {
     .is_none());
     assert!(crate::agent::human_ui::parse_relay_line("garbage").is_none());
 }
+
+#[test]
+fn 弹窗意外关闭_不等于人工取消() {
+    // 无人值守/无头环境下弹窗可能意外消失(run 循环提前返回、窗口被回收),
+    // 若报「取消」,编排器会把整个任务判死(实测猎聘任务 request_human
+    // 52s 后返 4002 人工取消,实际无人操作)。应是「未收到应答」。
+    assert_eq!(parse_result("{\"status\":\"closed\"}"), UiResult::Error("弹窗意外关闭(未收到应答)".into()));
+    // 显式取消仍然是取消。
+    assert_eq!(parse_result("{\"status\":\"cancel\"}"), UiResult::Cancelled);
+}

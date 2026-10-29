@@ -137,6 +137,9 @@ impl<'a> LayoutCtx<'a> {
             }
             emitted += 1;
             let offset = match seg.run.align.as_str() {
+                // 内在尺寸(max-content)测量语境:对齐偏移不参与宽度计算,
+                // 否则居中文字的行起点会落到 ~5 万处,被当成内容宽。
+                _ if self.intrinsic => 0.0,
                 "center" => ((max_w - line_w) / 2.0).max(0.0),
                 "right" => (max_w - line_w).max(0.0),
                 _ => 0.0,

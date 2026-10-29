@@ -83,6 +83,7 @@ impl<'a> LayoutCtx<'a> {
                     w,
                     h,
                     background: style.background,
+                    background_alpha: style.background_alpha,
                     visible: style_visible(style),
                     z_index: style.pos.z_index,
                     out_of_flow: false,
@@ -94,6 +95,10 @@ impl<'a> LayoutCtx<'a> {
             };
         }
         let y0 = self.y;
+        // 内在尺寸(max-content)测量:以 MAX_CONTENT_WIDTH 为语境时,行内对齐
+        // 偏移不参与宽度计算(见 LayoutCtx::intrinsic 注释)。
+        let prev_intrinsic = self.intrinsic;
+        self.intrinsic = prev_intrinsic || content_width >= super::MAX_CONTENT_WIDTH;
         let lines0 = self.lines.len();
         let boxes0 = self.boxes.len();
         let paints0 = self.paints.len();
@@ -136,6 +141,7 @@ impl<'a> LayoutCtx<'a> {
         let shadows = self.shadows.split_off(shadows0);
         let display_items = self.display.split_off(display0);
         self.y = y0;
+        self.intrinsic = prev_intrinsic;
         Fragment {
             height,
             lines,

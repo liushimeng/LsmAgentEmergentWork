@@ -199,6 +199,43 @@ pub fn apply(doc: &Document, actions: &[JsAction], base_url: &str) -> ApplySumma
                 }
                 summary.applied += 1;
             }
+            // 动态样式表:运行期创建的 <link rel=stylesheet> 取回后原位内联成
+            // <style data-lsm-href=…>(与静态外链样式同一真源、同层级联序)。
+            // 少了这一步,webpack 5 的 CSS chunk 装载 Promise 永不 resolve,
+            // 入口模块永不执行,React 应用永不 mount(实测猎聘登录页整页白屏)。
+            "append_style" => {
+                let href = if action.key.is_empty() {
+                    action.url.as_str()
+                } else {
+                    action.key.as_str()
+                };
+                let css = action.value.replace("</style", "<\\/style");
+                let style_html = format!(
+                    "<style data-lsm-href=\"{}\">{}</style>",
+                    escape_attr(href),
+                    css
+                );
+                let fragments = parse_fragment_nodes(&style_html);
+                if fragments.is_empty() {
+                    summary.failed += 1;
+                    continue;
+                }
+                // 插到 <head> 末尾:动态样式晚于静态样式,与浏览器级联序一致。
+                let head = doc.first("head").ok().flatten();
+                match head {
+                    Some(h) => {
+                        for frag in fragments {
+                            h.append(frag);
+                        }
+                    }
+                    None => {
+                        for frag in fragments {
+                            doc.root().append(frag);
+                        }
+                    }
+                }
+                summary.applied += 1;
+            }
             "remove_node" => {
                 let Some(node) = find(doc, &action.selector) else {
                     summary.failed += 1;
@@ -270,9 +307,16 @@ fn find(doc: &Document, selector: &str) -> Option<NodeRef> {
     doc.first(selector).ok().flatten()
 }
 
+/// 属性值转义(写进 `<style data-lsm-href="…">` 之类标记时用)。
+fn escape_attr(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 fn set_attr_value(node: &NodeRef, key: &str, value: &str) {
-    if let Some(el) = node.as_element() {
-        // html5ever 解析时属性名统一小写,写入侧保持一致。
+    if let Some(el) = node.as_element() {        // html5ever 解析时属性名统一小写,写入侧保持一致。
         el.attributes
             .borrow_mut()
             .insert(key.trim().to_ascii_lowercase(), value.to_string());

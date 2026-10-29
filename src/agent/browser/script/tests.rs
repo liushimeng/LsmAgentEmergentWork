@@ -2201,3 +2201,118 @@ fn 诊断_前序微任务异常是否饿死后续() {
     println!("SECOND_RAN={ran} FIRST_BOOM可见={boom} logs={:?}", r.outcome.logs);
     h.shutdown();
 }
+
+// ---------- 动态样式表(<link rel=stylesheet>)装载 ----------
+
+#[test]
+fn 动态link样式表_装载并派发onload() {
+    // webpack 5 的 CSS chunk 装载完全依赖运行期动态创建的 <link>:
+    // 入口 `Promise.all([... c.e("xxx_css") ...])` 依赖 <link> 的 onload。
+    // 内核此前只处理动态 <script>,<link> 既不取回也不派发 onload,
+    // Promise.all 永不 resolve → React 应用永不 mount → 整页白屏。
+    let handle = JsHandle::spawn();
+    let reply = run_scripts(
+        &handle,
+        vec![r#"
+            globalThis.__lsmFetchNative = function (url, opts) {
+              window.__fetchedUrl = String(url);
+              return JSON.stringify({ ok: true, status: 200, body: ".a{color:red}" });
+            };
+            var link = document.createElement('link');
+            link.rel = 'stylesheet';
+            link.onload = function (e) { window.__loaded = 1; window.__loadedType = e && e.type; };
+            link.href = '//cdn.test/pkg/login.css';
+            document.head.appendChild(link);
+        "#],
+        "<html><head></head><body></body></html>",
+        "https://a.test/",
+    );
+    assert!(reply.outcome.ok, "脚本不得抛错:{:?}", reply.outcome.error);
+    let probe = eval_on(
+        &handle,
+        "JSON.stringify({url: window.__fetchedUrl || '', loaded: window.__loaded || 0, type: window.__loadedType || ''})",
+        "<html><head></head><body></body></html>",
+        "https://a.test/",
+    );
+    let v = probe.outcome.value.to_string();
+    assert!(v.contains("cdn.test/pkg/login.css"), "应取回样式表: {v}");
+    assert!(v.contains("\"loaded\":1"), "应派发 onload: {v}");
+    // 样式文本以 append_style 动作交宿主内联。
+    let css_action = reply
+        .outcome
+        .actions
+        .iter()
+        .find(|a| a.kind == "append_style")
+        .expect("应有 append_style 动作");
+    assert!(css_action.value.contains("color:red"), "样式文本应带回来");
+    assert!(css_action.key.contains("login.css"), "动作应带样式表 URL");
+    handle.shutdown();
+}
+
+#[test]
+fn 动态元素可查自身innerHTML子树() {
+    // detached 元素(innerHTML 建出的子树)此前完全查不到:
+    // nprogress 的 `t.querySelector('#nprogress .bar')` 返 null,
+    // 随后 `bar.style[...] = v` 抛「cannot convert 'null' or 'undefined' to object」,
+    // 页面初始化链断掉(实测猎聘登录页整页白屏)。
+    let handle = JsHandle::spawn();
+    let reply = run_scripts(
+        &handle,
+        vec![r#"
+            var box = document.createElement('div');
+            box.innerHTML = '<div class="bar"><span class="txt">X</span></div>';
+            window.__q = {
+              bar: box.querySelector('.bar') ? 1 : 0,
+              txt: box.querySelector('.txt') ? 1 : 0,
+              all: box.querySelectorAll('.bar').length,
+              htmlKids: (box.__htmlKids || []).length
+            };
+        "#],
+        "<html><head></head><body></body></html>",
+        "https://a.test/",
+    );
+    assert!(reply.outcome.ok, "脚本不得抛错:{:?}", reply.outcome.error);
+    let probe = eval_on(
+        &handle,
+        "JSON.stringify(window.__q || {})",
+        "<html><head></head><body></body></html>",
+        "https://a.test/",
+    );
+    let v = probe.outcome.value.to_string();
+    assert!(v.contains("\"bar\":1"), "自身子树应可查: {v}");
+    assert!(v.contains("\"txt\":1"), "孙级节点应可查: {v}");
+    assert!(v.contains("\"all\":1"), "querySelectorAll 应返回 1 个: {v}");
+    handle.shutdown();
+}
+
+#[test]
+fn 快照节点补齐style对象() {
+    // 快照节点此前没有 style 属性,`document.body.style` / `el.style.x = v`
+    // 直接炸(库代码极常见)。
+    let handle = JsHandle::spawn();
+    let reply = run_scripts(
+        &handle,
+        vec![r#"
+            window.__styleChecks = {
+              bodyStyle: typeof document.body.style,
+              htmlStyle: typeof document.documentElement.style,
+              elStyle: typeof document.getElementById('box').style,
+              setOk: (function () { document.getElementById('box').style.color = 'red'; return document.getElementById('box').style.color; })()
+            };
+        "#],
+        "<html><head></head><body><div id='box'>X</div></body></html>",
+        "https://a.test/",
+    );
+    assert!(reply.outcome.ok, "脚本不得抛错:{:?}", reply.outcome.error);
+    let probe = eval_on(
+        &handle,
+        "JSON.stringify(window.__styleChecks || {})",
+        "<html><head></head><body><div id='box'>X</div></body></html>",
+        "https://a.test/",
+    );
+    let v = probe.outcome.value.to_string();
+    assert!(v.contains("\"bodyStyle\":\"object\""), "body.style 应可用: {v}");
+    assert!(v.contains("\"elStyle\":\"object\""), "元素 style 应可用: {v}");
+    assert!(v.contains("\"setOk\":\"red\""), "style 赋值应可读回: {v}");
+    handle.shutdown();
+}

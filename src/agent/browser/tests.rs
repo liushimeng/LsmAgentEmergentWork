@@ -783,3 +783,48 @@ fn 非html文档合成展示页() {
         "空 Content-Type 应走原路径(兼容缺头服务器)"
     );
 }
+
+#[tokio::test]
+async fn inspect_html_返回整页源码() {
+    // 工具描述一直宣传 inspect(info=html),但枚举此前没有它 —— 模型按描述
+    // 调用会被参数校验拒绝(实测猎聘任务白费三轮 LLM 往返)。
+    let mgr = LsmBrowserManager::new();
+    let url = html_doc("<h1>Hello</h1>");
+    let out = mgr
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .await
+        .unwrap();
+    let v = inspect::inspect(&mgr, &out.page_id, "html", &serde_json::json!({}))
+        .await
+        .unwrap();
+    let html = v["html"].as_str().unwrap_or("");
+    assert!(html.contains("Hello"), "应返回整页 HTML:{html}");
+    assert_eq!(v["ok"], true);
+    mgr.shutdown().await;
+}
+
+#[tokio::test]
+async fn inspect_elements_列表模式返回全部匹配项() {
+    // 此前 elements 只回 nth 命中的**单个**元素 + count,模型想看「有哪些
+    // 匹配项」只能一轮一个元素地试(实测猎聘任务连续多轮误判「弹层不存在」)。
+    let mgr = LsmBrowserManager::new();
+    let url = html_doc("<a class='x'>A</a><a class='x'>B</a><a class='x'>C</a>");
+    let out = mgr
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .await
+        .unwrap();
+    let v = inspect::inspect(
+        &mgr,
+        &out.page_id,
+        "elements",
+        &serde_json::json!({"selector": "a.x", "list": true}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["mode"], "list");
+    assert_eq!(v["count"], 3);
+    assert_eq!(v["items"].as_array().map(|a| a.len()), Some(3));
+    let first_text = v["items"][0]["text"].as_str().unwrap_or("");
+    assert!(first_text.contains('A'), "首项文本:{first_text}");
+    mgr.shutdown().await;
+}

@@ -48,11 +48,29 @@ impl Scissor {
     }
 }
 
-/// 项级裁剪窗口:项自带 clip(页坐标)平移滚动量后与画布取交。
+/// 项级裁剪窗口:项自带 clip(与项盒同一坐标系)变换后平移滚动量再与画布取交。
+///
+/// ★ clip 必须随项的 transform 一起变换:clip 记录的是**变换前**的裁剪窗口,
+/// 项的画布位置却由 transform 决定 —— 两者不同步时,变换后的内容会被留在
+/// 原位的裁剪窗口整个裁掉(实测猎聘登录框 `translate(-50%,-50%)` 后白色
+/// 面板整块消失,只剩边框)。
 fn scissor_for(item: &DisplayItem, scroll_y: f64, pw: i64, ph: i64) -> Scissor {
     let mut sc = Scissor::full(pw, ph);
     if let Some((cx, cy, cw, ch)) = item.clip {
-        sc = sc.intersect_rect(cx, cy - scroll_y, cw, ch);
+        let (x0, y0, x1, y1) = match item.transform.as_ref() {
+            Some(t) => {
+                let p0 = t.apply(cx, cy);
+                let p1 = t.apply(cx + cw, cy + ch);
+                (
+                    p0.0.min(p1.0),
+                    p0.1.min(p1.1),
+                    p0.0.max(p1.0),
+                    p0.1.max(p1.1),
+                )
+            }
+            None => (cx, cy, cx + cw, cy + ch),
+        };
+        sc = sc.intersect_rect(x0, y0 - scroll_y, x1 - x0, y1 - y0);
     }
     sc
 }
@@ -296,8 +314,12 @@ fn draw_background(pixmap: &mut Pixmap, sc: &Scissor, mapper: &Mapper, item: &Di
     let w = pixmap.width() as i64;
     let pixels = pixmap.pixels_mut();
     match fill {
-        BgFill::Solid(rgb) => {
-            let a = (item.opacity * 255.0).round().clamp(0.0, 255.0) as u8;
+        BgFill::Solid(rgb, alpha) => {
+            // 背景色自带 alpha:与已绘制的底层背景合成(半透明页头/卡片/遮罩
+            // 都靠这一层还原真实浏览器观感)。
+            let a = ((*alpha as f64 / 255.0) * item.opacity * 255.0)
+                .round()
+                .clamp(0.0, 255.0) as u8;
             for py in rect.y0..rect.y1 {
                 for px in rect.x0..rect.x1 {
                     let (lx, ly) = mapper.local(px, py);

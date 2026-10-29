@@ -631,3 +631,45 @@ fn css_map含margin与padding简写() {
     assert_eq!(p.get("margin").unwrap(), "8px 0px 8px 0px");
     assert!(p.get("padding").unwrap().starts_with("0px"), "padding 简写应四值");
 }
+
+#[test]
+fn 半透明背景保留alpha_不在计算样式阶段压白底() {
+    // 站点页头常用 `rgba(33,35,41,.05)` 盖在深色 banner 上;若在计算样式
+    // 阶段按白底合成,会得到不透明浅灰 #f4f4f4,把 banner 整条盖住,
+    // 白字页头直接看不见(实测猎聘首页页头空白)。
+    let (doc, engine) = doc_engine(
+        "<head><style>
+            .head { background-color: rgba(33,35,41,.05); }
+            .card { background: rgba(0,0,0,.2); }
+            .plain { background-color: #212329; }
+         </style></head><body><div class='head'>A</div><div class='card'>B</div><div class='plain'>C</div></body>",
+        1280.0,
+    );
+    let head = style_of(&doc, &engine, ".head");
+    assert_eq!(head.background, Some([33, 35, 41]));
+    assert!(
+        head.background_alpha < 32,
+        "rgba(...,05) 的 alpha 应保留为 ~13,实际 {}",
+        head.background_alpha
+    );
+    // 简写同样保留 alpha。
+    let card = style_of(&doc, &engine, ".card");
+    assert_eq!(card.background, Some([0, 0, 0]));
+    assert!(card.background_alpha < 64, "简写 alpha 丢失:{}", card.background_alpha);
+    // 不透明色 alpha 恒 255。
+    let plain = style_of(&doc, &engine, ".plain");
+    assert_eq!(plain.background, Some([33, 35, 41]));
+    assert_eq!(plain.background_alpha, 255);
+}
+
+#[test]
+fn getComputedStyle_背景色输出rgba() {
+    let (doc, engine) = doc_engine(
+        "<head><style>.h { background-color: rgba(33,35,41,.05); }</style></head><body><div class='h'>A</div></body>",
+        1280.0,
+    );
+    let st = style_of(&doc, &engine, ".h");
+    let m = st.to_map();
+    let bg = m.get("background-color").cloned().unwrap_or_default();
+    assert!(bg.starts_with("rgba("), "半透明背景应输出 rgba(...):{bg}");
+}

@@ -773,6 +773,65 @@ function __lsmFireScriptLoad(url) {
   }
 }
 
+// ---------- 动态样式表(<link rel=stylesheet>)的装载 ----------
+//
+// webpack 5 的 CSS chunk 装载完全依赖运行期动态创建的 <link>:
+//   var c = document.createElement("link"); c.rel="stylesheet";
+//   c.onerror = c.onload = function(_){ "load"===_.type ? resolve() : reject(...) };
+//   c.href = cssUrl; document.head.appendChild(c);
+// 入口的 Promise.all 里含 c.e("src_common_css_antd-common_less"),该 promise
+// 依赖 <link> 的 onload —— 内核此前只处理动态 <script>,<link> 既不取回也不
+// 派发 onload,于是 Promise.all 永不 resolve,入口模块永不执行,
+// React 应用永不 mount,页面整页白屏(实测猎聘登录页)。
+//
+// 修法:与动态脚本同构 —— 线程内取回 CSS → 交宿主原位内联成
+// <style data-lsm-href=…>(与静态外链样式同一真源、同层级联序)→ 派发 onload。
+function __lsmRegisterStyleLoad(el) {
+  if (!el || !el.__attrs) return;
+  var tag = String(el.__tag || el.tagName || "").toLowerCase();
+  if (tag !== "link") return;
+  var rel = String(el.__attrs.rel || "").toLowerCase();
+  if (rel.indexOf("stylesheet") < 0) return;
+  var url = __lsmScriptKey(el.__attrs.href || "");
+  if (!url) return;
+  // 同一元素只装载一次(真实浏览器一个 <link> 只触发一次 load)。
+  if (el.__lsmStyleNotified) return;
+  el.__lsmStyleNotified = true;
+  if (__lsmChainTrace) { try { console.error("[chain] style " + url.slice(0, 90)); } catch (e8) {} }
+  var ok = false;
+  try {
+    var raw = __lsmFetchNative(url, JSON.stringify({ method: "GET", cookies: __lsmCookie, style: true }));
+    var r = {};
+    try { r = JSON.parse(raw); } catch (e2) { r = { error: "原生 fetch 返回非法结构" }; }
+    if (r.setCookie && r.setCookie.length) __lsmCookieApply(r.setCookie);
+    if (r.error) {
+      __cerror("动态样式取回失败 " + url + ": " + String(r.error));
+    } else {
+      var css = String(r.body == null ? "" : r.body);
+      if (css.trim()) {
+        // 交宿主原位内联(保持 <head> 末尾的级联序)。
+        __push({ type: "append_style", selector: "", key: url, url: url, value: css });
+      }
+      ok = true;
+    }
+  } catch (e) { __cerror("动态样式装载异常 " + url + ": " + String(e)); }
+  try { el.readyState = "complete"; } catch (e1) {}
+  try {
+    if (typeof el.onreadystatechange === "function") el.onreadystatechange({ type: "readystatechange", target: el });
+  } catch (e2b) {}
+  // 浏览器语义:load 与 error **互斥**(webpack 的 `c.onerror = c.onload = fn`
+  // 靠 _.type 区分,两者都发会让 chunk 装载既 resolve 又 reject)。
+  if (ok) {
+    try {
+      if (typeof el.onload === "function") el.onload({ type: "load", target: el });
+    } catch (e3) { __cerror("link onload 失败: " + String((e3 && e3.stack) || e3)); }
+  } else {
+    try {
+      if (typeof el.onerror === "function") el.onerror({ type: "error", target: el });
+    } catch (e4) {}
+  }
+}
+
 // ---------- 元素工厂 ----------
 // 从快照节点求几何属性组:rect 缺失时 html 兜底视口、其余取 0。
 // BMap 等地图/组件库初始化读容器 clientWidth/Height,undefined 会让 NaN
@@ -844,8 +903,33 @@ function __lsmDynMatch(el, sel) {
 // commit/effect 会在同一批里立刻 querySelector 刚挂载的节点。只查快照会让
 // 这些节点短暂「不存在」,后续 getBoundingClientRect 等调用直接 ToObject。
 // 动态表按创建序遍历;已回快照收养的节点排除,避免与静态结果重复。
-function __lsmQueryDyn(sel, rootEl, mountedOnly, rootSnapshotSel) {
+// 动态元素**自身子树**的查询:innerHTML 解析出的 __htmlKids 与 appendChild
+// 建出的 __kids 都要覆盖。
+//
+// 此前动态元素的 querySelector 只查「已挂载动态节点注册表」(__lsmDynById),
+// detached 元素(以及它 innerHTML 出来的子树)完全查不到 ——
+// nprogress 的 `t.querySelector('#nprogress .bar')` 返 null,随后
+// `bar.style[...] = v` 抛「cannot convert 'null' or 'undefined' to object」,
+// 页面初始化链断掉(实测猎聘登录页 React 渲染期抛错 → 整页白屏)。
+function __lsmDynSubtreeQuery(sel, rootEl) {
   var out = [];
+  function walk(node) {
+    if (!node) return;
+    var groups = [node.__htmlKids || [], node.__kids || []];
+    for (var g = 0; g < groups.length; g++) {
+      var ks = groups[g];
+      for (var i = 0; i < ks.length; i++) {
+        var k = ks[i];
+        if (!k) continue;
+        if (k.nodeType === 1 && __lsmDynMatch(k, sel)) out.push(k);
+        walk(k);
+      }
+    }
+  }
+  walk(rootEl);
+  return out;
+}
+function __lsmQueryDyn(sel, rootEl, mountedOnly, rootSnapshotSel) {  var out = [];
   var keys = Object.keys(__lsmDynById || {});
   for (var i = 0; i < keys.length; i++) {
     var el = __lsmDynById[keys[i]];
@@ -997,6 +1081,22 @@ function __mk(n) {
     disabled: !!attrs.disabled,
     selected: !!attrs.selected,
     dataset: {},
+    // 行内样式对象(CSSStyleDeclaration 语义):站点/库代码极常见
+    // `el.style.xxx = v` / `document.body.style` / `"transform" in el.style`。
+    // 此前快照节点**没有 style 属性**(只有 __newEl 造的动态节点有),
+    // 于是 nprogress 这类库在 `apply(document.documentElement, {...})` 处
+    // 直接抛「cannot convert 'null' or 'undefined' to object」,
+    // 页面初始化链断掉(实测猎聘登录页 React 渲染期抛错 → 整页白屏)。
+    style: __mkStyle(
+      function () { return String(attrs["style"] || ""); },
+      function (css) {
+        try {
+          __lsmRec("attributes", el, { attributeName: "style", attributeOldValue: __lsmAttrOld(attrs, "style") });
+          __push({ type: "set_attr", selector: n.sel, key: "style", value: String(css) });
+          attrs["style"] = String(css);
+        } catch (e) {}
+      }
+    ),
     children: [],
     childNodes: [],
     parentNode: null,
@@ -1133,6 +1233,7 @@ function __mk(n) {
     querySelectorAll: function (s) { return __lsmQueryWithDyn(s, __lsmCurrentIdx(n)); },
     appendChild: function (c) {
       try { __lsmRegisterScriptLoad(c); } catch (e) {}
+      try { __lsmRegisterStyleLoad(c); } catch (e) {}
       if (c) {
         c.__parentStatic = n;
         dynKids.push(c);
@@ -1148,6 +1249,7 @@ function __mk(n) {
     },
     insertBefore: function (c, ref) {
       try { __lsmRegisterScriptLoad(c); } catch (e) {}
+      try { __lsmRegisterStyleLoad(c); } catch (e) {}
       if (c) {
         c.__parentStatic = n;
         var at = dynKids.indexOf(ref);
@@ -1502,6 +1604,7 @@ function __newEl(tag) {
       this.__kids.push(c);
       if (c && c.__tag) c.__parentDyn = el;
       try { __lsmRegisterScriptLoad(c); } catch (e) {}
+      try { __lsmRegisterStyleLoad(c); } catch (e) {}
       __lsmRec("childList", el, { addedNodes: c ? [c] : [] });
       __lsmPushDynChild(el, c, false);
       return c;
@@ -1510,6 +1613,7 @@ function __newEl(tag) {
       this.__kids.push(c);
       if (c && c.__tag) c.__parentDyn = el;
       try { __lsmRegisterScriptLoad(c); } catch (e) {}
+      try { __lsmRegisterStyleLoad(c); } catch (e) {}
       __lsmRec("childList", el, { addedNodes: c ? [c] : [] });
       __lsmPushDynChild(el, c, true);
       return c;
@@ -1625,8 +1729,29 @@ function __newEl(tag) {
       }
       return d;
     },
-    querySelector: function (s) { return __lsmQueryDyn(s, el, false, null); },
-    querySelectorAll: function (s) { return __lsmQueryDyn(s, el, false, null); },
+    querySelector: function (s) {
+      // 自身子树(innerHTML 解析出的 __htmlKids + appendChild 的 __kids)优先,
+      // 再查已挂载动态节点注册表。
+      var own = __lsmDynSubtreeQuery(s, el);
+      if (own.length) return own[0];
+      var dyn = __lsmQueryDyn(s, el, false, null);
+      return dyn.length ? dyn[0] : null;
+    },
+    querySelectorAll: function (s) {
+      // 自身子树优先,再补「已挂载动态节点注册表」里命中但不在子树内的节点;
+      // 两路结果可能指向同一节点(子树节点同时也在注册表里),按对象同一性去重。
+      var out = __lsmDynSubtreeQuery(s, el);
+      var dyn = __lsmQueryDyn(s, el, false, null);
+      for (var i = 0; i < dyn.length; i++) {
+        var d = dyn[i];
+        var dup = false;
+        for (var j = 0; j < out.length; j++) {
+          if (out[j] === d) { dup = true; break; }
+        }
+        if (!dup) out.push(d);
+      }
+      return out;
+    },
     getBoundingClientRect: function () { return __lsmDynRect(el); }
   };
   function def(name, getter, setter) {
@@ -1679,6 +1804,11 @@ function __newEl(tag) {
         // appendChild 侧靠 __lsmLoadNotified 去重。
         if (p === "src" && t === "script") {
           try { __lsmRegisterScriptLoad(el); } catch (e) {}
+        }
+        // 动态样式表:href 落定即装载(webpack CSS chunk 的装载序是
+        // rel → onload → href → appendChild,href 落定时回调已在位)。
+        if (p === "href" && t === "link") {
+          try { __lsmRegisterStyleLoad(el); } catch (e) {}
         }
       });
   });
@@ -2887,7 +3017,7 @@ try {
   });
 } catch (e) {}
 // 把 window 的能力同步到全局对象(裸 `performance` / `innerWidth` 等全局标识符)。
-(function () {
+function __lsmExportGlobals() {
   if (typeof globalThis === "undefined") return;
   var keys = Object.getOwnPropertyNames(__lsmWin);
   for (var i = 0; i < keys.length; i++) {
@@ -2899,7 +3029,8 @@ try {
       }
     } catch (e) {}
   }
-})();
+}
+__lsmExportGlobals();
 
 // ---------- 事件系统 ----------
 function __mkEvent(type) {
@@ -3514,6 +3645,157 @@ try {
   __lsmWin.IntersectionObserver = IntersectionObserver;
   __lsmWin.ResizeObserver = ResizeObserver;
 } catch (e) {}
+
+// ---------- 缺失的标准全局补齐 ----------
+// 站点与主流库普遍直接 `new MessageChannel()` / `new DOMRect()` /
+// `new AbortController()` / `new File()`;内核此前一个都没有,页面初始化链
+// 直接抛「MessageChannel is not defined」这类 TypeError,整页白屏。
+// 缺口的共同特征:**库只做存在性探测就直接用**,补一个语义够用的最小实现
+// 就能让初始化链继续(比在站点脚本里打补丁通用得多)。
+//
+// MessageChannel:postMessage 入队,由事件循环每轮排空(与 setTimeout 同源,
+// 保证 React 18 scheduler 的异步调度能真正跑起来)。
+var __lsmMsgPorts = [];
+function MessagePort() {
+  var self = this;
+  this.onmessage = null;
+  this.onmessageerror = null;
+  this.__peer = null;
+  this.__queue = [];
+  this.postMessage = function (data) {
+    var peer = self.__peer;
+    if (!peer) return;
+    peer.__queue.push(data);
+    if (__lsmMsgPorts.indexOf(peer) < 0) __lsmMsgPorts.push(peer);
+  };
+  this.start = function () {};
+  this.close = function () {};
+  this.addEventListener = function () {};
+  this.removeEventListener = function () {};
+  this.dispatchEvent = function () { return true; };
+}
+function MessageChannel() {
+  this.port1 = new MessagePort();
+  this.port2 = new MessagePort();
+  this.port1.__peer = this.port2;
+  this.port2.__peer = this.port1;
+}
+function __lsmDrainMessages() {
+  if (!__lsmMsgPorts.length) return;
+  var ports = __lsmMsgPorts;
+  __lsmMsgPorts = [];
+  for (var i = 0; i < ports.length; i++) {
+    var port = ports[i];
+    var msgs = port.__queue;
+    port.__queue = [];
+    for (var j = 0; j < msgs.length; j++) {
+      try {
+        if (typeof port.onmessage === "function") {
+          port.onmessage({ type: "message", data: msgs[j], target: port, currentTarget: port });
+        }
+      } catch (e) { __cerror("MessagePort onmessage 失败: " + String((e && e.stack) || e)); }
+    }
+  }
+}
+function DOMRect(x, y, w, h) {
+  this.x = Number(x) || 0;
+  this.y = Number(y) || 0;
+  this.width = Number(w) || 0;
+  this.height = Number(h) || 0;
+  this.top = this.y;
+  this.left = this.x;
+  this.right = this.x + this.width;
+  this.bottom = this.y + this.height;
+}
+DOMRect.prototype.toJSON = function () {
+  return { x: this.x, y: this.y, width: this.width, height: this.height,
+           top: this.top, right: this.right, bottom: this.bottom, left: this.left };
+};
+function DOMRectReadOnly(x, y, w, h) { return new DOMRect(x, y, w, h); }
+function AbortSignal() {
+  this.aborted = false;
+  this.reason = undefined;
+  this.onabort = null;
+  this.__listeners = [];
+}
+AbortSignal.prototype.addEventListener = function (t, fn) {
+  if (t === "abort" && typeof fn === "function") this.__listeners.push(fn);
+};
+AbortSignal.prototype.removeEventListener = function () {};
+AbortSignal.prototype.dispatchEvent = function () { return true; };
+function AbortController() { this.signal = new AbortSignal(); }
+AbortController.prototype.abort = function (reason) {
+  if (this.signal.aborted) return;
+  this.signal.aborted = true;
+  this.signal.reason = reason;
+  var ev = { type: "abort", target: this.signal };
+  try { if (typeof this.signal.onabort === "function") this.signal.onabort(ev); } catch (e) {}
+  for (var i = 0; i < this.signal.__listeners.length; i++) {
+    try { this.signal.__listeners[i](ev); } catch (e2) {}
+  }
+};
+function File(bits, name, opts) {
+  this.name = String(name == null ? "" : name);
+  this.size = 0;
+  this.type = String((opts && opts.type) || "");
+  this.lastModified = Number((opts && opts.lastModified) || Date.now());
+}
+function Blob(bits, opts) {
+  this.size = 0;
+  this.type = String((opts && opts.type) || "");
+}
+function Worker(url) {
+  this.url = String(url == null ? "" : url);
+  this.onmessage = null;
+  this.onerror = null;
+  this.postMessage = function () {
+    __cerror("Worker 未实现:内核无独立执行环境,消息被丢弃(" + this.url + ")");
+  };
+  this.terminate = function () {};
+  this.addEventListener = function () {};
+  this.removeEventListener = function () {};
+}
+var customElements = {
+  get: function (name) { return undefined; },
+  define: function (name, ctor) { __cerror("customElements.define 未实现:" + String(name)); },
+  whenDefined: function (name) { return Promise.resolve(); },
+  upgrade: function () {}
+};
+function WebSocket(url) {
+  this.url = String(url == null ? "" : url);
+  this.readyState = 0;
+  this.onopen = null; this.onmessage = null; this.onerror = null; this.onclose = null;
+  this.send = function () { __cerror("WebSocket 未实现:内核无网络套接字(" + this.url + ")"); };
+  this.close = function () {};
+  this.addEventListener = function () {};
+  this.removeEventListener = function () {};
+}
+function EventSource(url) {
+  this.url = String(url == null ? "" : url);
+  this.readyState = 0;
+  this.onmessage = null; this.onerror = null; this.onopen = null;
+  this.close = function () {};
+  this.addEventListener = function () {};
+  this.removeEventListener = function () {};
+}
+function CanvasRenderingContext2D() {}
+try {
+  __lsmWin.MessageChannel = MessageChannel;
+  __lsmWin.MessagePort = MessagePort;
+  __lsmWin.DOMRect = DOMRect;
+  __lsmWin.DOMRectReadOnly = DOMRectReadOnly;
+  __lsmWin.AbortController = AbortController;
+  __lsmWin.AbortSignal = AbortSignal;
+  __lsmWin.File = File;
+  __lsmWin.Blob = Blob;
+  __lsmWin.Worker = Worker;
+  __lsmWin.customElements = customElements;
+  __lsmWin.WebSocket = WebSocket;
+  __lsmWin.EventSource = EventSource;
+  __lsmWin.CanvasRenderingContext2D = CanvasRenderingContext2D;
+} catch (e) {}
+// 新增全局同样要能以裸标识符访问(库代码常直接写 `new MessageChannel()`)。
+try { __lsmExportGlobals(); } catch (e) {}
 
 // ---------- 宿主驱动入口 ----------
 function __lsmErrText(e) {

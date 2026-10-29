@@ -249,6 +249,9 @@ pub fn parse_result(stdout: &str) -> UiResult {
             "answer" if !text.is_empty() => UiResult::Answered(text),
             "answer" => UiResult::Error("弹窗返回空应答".into()),
             "cancel" => UiResult::Cancelled,
+            // 弹窗意外关闭(未收到应答):**不等于人工取消**。报 Cancelled 会让
+            // 编排器把整个任务判死(实测无人值守场景 52s 后误取消)。
+            "closed" => UiResult::Error("弹窗意外关闭(未收到应答)".into()),
             "timeout" => UiResult::Timeout,
             "error" => UiResult::Error(if text.is_empty() {
                 "弹窗进程报错".into()

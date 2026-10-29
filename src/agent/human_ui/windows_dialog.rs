@@ -922,6 +922,8 @@ fn finish(kind: &str, tag: i64) {
         st.done = true;
         let result = if kind == "timeout" {
             ("timeout".to_string(), String::new())
+        } else if kind == "closed" {
+            ("closed".to_string(), String::new())
         } else if kind == "cancel" {
             ("cancel".to_string(), String::new())
         } else {
@@ -1320,12 +1322,13 @@ unsafe fn run_win32(p: &DialogPayload) -> (String, String) {
     }
 
     // ---- 收尾(进程即将退出,清理以防御性为主) ----
+    // 意外返回不得报「人工取消」(会误杀整个任务);兜底为 closed。
     let result = {
         let mut guard = state();
         guard
             .as_mut()
             .and_then(|st| st.result.take())
-            .unwrap_or_else(|| ("cancel".to_string(), String::new()))
+            .unwrap_or_else(|| ("closed".to_string(), String::new()))
     };
     let font_handles = (font_normal, font_bold);
     *state() = None;

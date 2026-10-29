@@ -334,6 +334,11 @@ impl ThreadRuntime {
         }
         loop {
             self.drain_jobs();
+            // MessageChannel 消息队列:postMessage 入队,事件循环每轮排空
+            // (真实浏览器是独立任务队列;内核无任务队列,借事件循环近似)。
+            // React 18 scheduler 走 MessageChannel 通道,不清它则并发渲染
+            // 永远排在定时器之外。
+            self.eval_quiet("__lsmDrainMessages()");
             let tick = self
                 .eval_string("__lsmTick()")
                 .unwrap_or_else(|_| "{\"pending\":0,\"ran\":0}".to_string());
@@ -864,8 +869,13 @@ fn blocking_fetch(
     // __lsmLoadDynScript):请求头按 script 目的地合成(无 Origin),
     // 响应不做 CORS 校验——经典脚本本就不受 CORS 约束。
     let is_script_load = opts.get("script").and_then(Value::as_bool).unwrap_or(false);
+    // 动态样式表(`<link rel=stylesheet>`):请求头按 style 目的地合成
+    // (Referer + Sec-Fetch-Dest: style),与静态外链样式同一指纹通道。
+    let is_style_load = opts.get("style").and_then(Value::as_bool).unwrap_or(false);
     let dest = if is_script_load {
         super::super::reqctx::Dest::Script
+    } else if is_style_load {
+        super::super::reqctx::Dest::Style
     } else {
         super::super::reqctx::Dest::Xhr
     };
@@ -914,7 +924,13 @@ fn blocking_fetch(
     let content_type = crate::agent::browser::net::header_value(&headers, "content-type").unwrap_or_default();
     let declared = resp.content_length().unwrap_or(0) as usize;
     // 动态经典脚本与首屏外链脚本共用同一预算;普通 fetch/XHR 仍保留较小响应上限。
-    let max_body = if is_script_load { super::max_external_bytes() } else { MAX_FETCH_BODY };
+    // 动态脚本与动态样式表共用外部资源预算(站点 CSS chunk 动辄数百 KB,
+    // 用 XHR 的 2MB 上限会把大样式表截断成半截 CSS)。
+    let max_body = if is_script_load || is_style_load {
+        super::max_external_bytes()
+    } else {
+        MAX_FETCH_BODY
+    };
     if declared > max_body {
         record_network(url, &method, status, &content_type, 0, started);
         return json!({"error": format!("响应体超过上限({} MB)", max_body / 1024 / 1024)});
@@ -930,8 +946,8 @@ fn blocking_fetch(
     let bytes = if truncated { bytes[..max_body].to_vec() } else { bytes };
     let body = crate::agent::browser::urlutil::decode_body(&bytes, &content_type);
     // 阶段四第二步：CORS 校验（跨域响应必须有合法 Access-Control-Allow-* 头）。
-    // 经典脚本装载不受 CORS 约束(script:true 时跳过)。
-    if !is_script_load {
+    // 经典脚本与样式表装载不受 CORS 约束(script/style:true 时跳过)。
+    if !is_script_load && !is_style_load {
         if let Some(err) = check_cors(&base_url, target.as_str(), &method, &headers) {
             record_network(url, &method, status, &content_type, 0, started);
             return json!({"error": err});

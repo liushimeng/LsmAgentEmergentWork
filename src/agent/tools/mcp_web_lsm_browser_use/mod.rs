@@ -175,9 +175,14 @@ impl Tool for McpWebLsmBrowserUseTool {
 action=open 打开页面拿 page_id;list 列出页面;control 执行写操作(click/input_text/key_press/\
 scroll/navigate/back/forward/reload/wait/eval_js/screenshot/download/set_cookie/set_storage/\
 new_tab/new_window/close_tab/bring_to_front/request_human 等);inspect 观测页面(title/url/text/\
-html/elements/links/forms/cookies/localstorage/network/console/viewport/extract/extract_links/\
-page_state/blockers/screenshot/ocr 等);close 释放页面;sequence/batch 连续执行 ≤24 步;\
-explore 一次做 ≤8 个观测。\
+html/elements/dom/extract/extract_links/page_meta/viewport/cookies/localstorage/sessionstorage/\
+network/console/page_state/page_health/stylesheets/coverage/blockers/screenshot/ocr 等);\
+close 释放页面;sequence/batch 连续执行 ≤24 步;explore 一次做 ≤8 个观测(queries 每项 {info, params})。\
+★ inspect(elements) 默认只返回**单个**元素(用 params.nth 指定第几个);\
+要一次看全部匹配元素用 params.list=true(可配 params.max 控条数),\
+否则只能一轮一个元素地试,极易误判「目标不存在」。\
+★ inspect(info=html) 直接给整页 HTML 源码(params.selector 可限子树),\
+不必再退回 Bash grep 落盘文件。\
 wait 是就绪判定原语:可给 selector+state(visible/hidden/attached/detached)、text(元素文本包含)、\
 js(页面表达式为真)、network_idle(网络静默毫秒),多条件取「与」,超时返回 2002。\
 ★ 搜地址/填地点时,input_text 建议带 params.submit=true:输入后自动回车,\
@@ -244,17 +249,29 @@ control_action=set_control_state,params.state=\"user\"(交人工)或 \"agent\"(�
                 "info": {
                     "type": "string",
                     "enum": [
-                        "console", "network", "elements", "dom", "localstorage", "sessionstorage",
+                        "console", "network", "elements", "dom", "html", "localstorage", "sessionstorage",
                         "cookies", "screenshot", "page_meta", "viewport", "url", "title", "ping",
                         "image_urls", "ocr", "blockers", "visibility", "extract_links", "extract",
                         "page_state", "stylesheets", "coverage", "text", "page_health"
-                    ]
+                    ],
+                    "description": "观测维度。**elements** 默认只返回 nth 命中的单个元素(配 params.nth);要一次看全部匹配项用 params.list=true(+ params.max)。**html** 返回整页 HTML 源码(params.selector 可限定到子树,params.max_bytes 控长度)。**dom** 返回 DOM 树(params.max_depth/node_count_limit)或指定选择器的 outerHTML。**extract** 按 item_selector+fields 抽字段列表(探选择器用 params.probe=true)。**page_health** 给页面健康诊断(空白/脚本错误/未完成初始化)。"
                 },
                 "params": { "type": "object", "description": "control/inspect 的动作参数" },
                 "execution_mode": { "type": "string", "enum": ["single_step", "continuous"], "default": "single_step" },
                 "steps": { "type": "array", "minItems": 1, "maxItems": 24, "items": { "type": "object" } },
                 "stop_on_error": { "type": "boolean", "default": true },
-                "queries": { "type": "array", "minItems": 1, "maxItems": 8, "items": { "type": "object" } },
+                "queries": {
+                    "type": "array", "minItems": 1, "maxItems": 8,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "info": { "type": "string", "description": "观测维度,取值同 inspect 的 info 枚举" },
+                            "params": { "type": "object", "description": "该维度的参数(如 selector/max/list)" }
+                        },
+                        "required": ["info"]
+                    },
+                    "description": "explore 的批量观测清单,每项形如 {\"info\":\"elements\",\"params\":{\"selector\":\"...\"}};1..=8 项,逐项独立执行并汇总 ok/err 计数"
+                },
                 "summary_hint": { "type": "string" },
                 "summary": { "type": "string" },
                 "message": { "type": "string", "maxLength": 600, "description": "control(request_human) 展示给人工的现场说明" },
@@ -825,7 +842,17 @@ fn step_args_page(current: &str) -> Option<String> {
 
 async fn run_explore(args: Value) -> Result<String> {
     let Some(queries) = args.get("queries").and_then(Value::as_array).cloned() else {
-        return envelope(1001, "explore 需要 queries", json!({}));
+        // 自纠正文案:给出形状示例,模型下一轮即可拼对(此前只说「需要 queries」,
+        // 模型反复只传 url,白费 LLM 往返 —— 实测猎聘任务第一轮即踩)。
+        return envelope(
+            1001,
+            "explore 需要 queries(1..=8 个观测项)",
+            json!({
+                "required": "queries",
+                "shape": [{"info": "elements", "params": {"selector": ".header"}}],
+                "hint": "queries 每项形如 {info, params};info 取值同 inspect 的 info 枚举。                         若只是想打开页面并观测,直接用 action=open 再 action=inspect。",
+            }),
+        );
     };
     if queries.is_empty() || queries.len() > 8 {
         return envelope(

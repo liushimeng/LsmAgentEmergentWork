@@ -868,7 +868,7 @@ fn 显示列表_组透明度回补子树() {
     let child_bg = layout
         .display
         .iter()
-        .find(|i| matches!(i.kind, DisplayKind::Background { fill: super::super::render::display::BgFill::Solid(rgb) } if rgb == [0u8, 0, 0]))
+        .find(|i| matches!(i.kind, DisplayKind::Background { fill: super::super::render::display::BgFill::Solid(rgb, _) } if rgb == [0u8, 0, 0]))
         .expect("子黑盒背景项");
     assert!(
         (child_bg.opacity - 0.5).abs() < 1e-9,
@@ -887,7 +887,7 @@ fn 显示列表_溢出裁剪回补子树() {
     let child_bg = layout
         .display
         .iter()
-        .find(|i| matches!(i.kind, DisplayKind::Background { fill: super::super::render::display::BgFill::Solid(rgb) } if rgb == [255u8, 0, 0]))
+        .find(|i| matches!(i.kind, DisplayKind::Background { fill: super::super::render::display::BgFill::Solid(rgb, _) } if rgb == [255u8, 0, 0]))
         .expect("子红盒背景项");
     let clip = child_bg.clip.expect("子项应带裁剪矩形");
     assert!(
@@ -1677,4 +1677,124 @@ fn 嵌套块文本x按包含块内容盒定位() {
     assert!((line_b.x - 250.0).abs() < 0.5, "B 文本 x 应 250(200+50):{:?}", line_b);
     let line_a = lay.lines.iter().find(|l| l.text.contains('A')).expect("应有 A 文本");
     assert!((line_a.x - 200.0).abs() < 0.5, "A 文本 x 应 200:{:?}", line_a);
+}
+
+// ===================== 内在尺寸(max-content)测量 =====================
+
+#[test]
+fn 内在尺寸测量_居中文字不撑大条目宽度() {
+    // flex 条目的基础宽在 MAX_CONTENT_WIDTH(10 万)语境下量 max-content。
+    // 若行内居中偏移参与宽度计算,文字行起点会落到 ~5 万处,
+    // 条目宽度被撑到 5 万(实测猎聘登录页 tab 条目 50034px),
+    // 后续布局全歪。此处断言条目宽度落在「文字宽」量级。
+    let doc = Document::parse(
+        "<head><style>
+            .tabs { display:flex; width:348px; }
+            .tab { flex-shrink:0; text-align:center; margin-right:40px; }
+         </style></head><body><div class='tabs'><div class='tab'>登录/注册</div></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 1920.0, &font());
+    let tab = layout
+        .boxes
+        .iter()
+        .find(|b| b.tag == "div" && b.w > 1.0 && b.h > 1.0 && b.w < 5000.0)
+        .expect("应存在 tab 盒");
+    assert!(
+        tab.w < 500.0,
+        "居中文字条目宽度被内在尺寸测量撑大:{}",
+        tab.w
+    );
+}
+
+#[test]
+fn 绝对定位元素_宽度auto走shrink_to_fit() {
+    // `position:absolute; left:50%` 且 width:auto → 宽度按内容收缩,
+    // 不是填满包含块(填满会把整块登录框推出屏幕右侧)。
+    let doc = Document::parse(
+        "<head><style>
+            .panel { position:absolute; left:50%; top:50%; display:flex; }
+            .a { width:278px; } .b { width:460px; }
+         </style></head><body><div class='panel'><div class='a'></div><div class='b'></div></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 1920.0, &font());
+    let panel = layout
+        .boxes
+        .iter()
+        .find(|b| b.tag == "div" && b.w > 700.0 && b.w < 1200.0)
+        .expect("应存在 panel 盒");
+    assert!(
+        panel.w <= 800.0,
+        "绝对定位元素应按内容收缩宽度,实际 {}",
+        panel.w
+    );
+}
+
+// ===================== 绘制层(定位元素在常规流之上) =====================
+
+#[test]
+fn 定位元素绘制在常规流内容之上() {
+    // CSS 2.1 附录 E 第 8 步:定位元素及其子树绘制在常规流内容之上。
+    // 此前只按 (z, seq) 排序,定位元素若在 DOM 顺序上靠前,会被后面的
+    // 常规流背景/图片整块盖住(实测猎聘登录框被 hero 背景图覆盖)。
+    let doc = Document::parse(
+        "<head><style>
+            .abs { position:absolute; left:0; top:0; width:200px; height:100px; background:#fff; }
+            .flow { width:1920px; height:600px; background:#000642; }
+         </style></head><body><div class='abs'></div><div class='flow'></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 1920.0, &font());
+    let abs_seq = layout
+        .display
+        .iter()
+        .find(|i| matches!(i.kind, super::super::render::display::DisplayKind::Background { .. }) && i.layer == 1)
+        .map(|i| i.seq);
+    let flow_seq = layout
+        .display
+        .iter()
+        .find(|i| matches!(i.kind, super::super::render::display::DisplayKind::Background { .. }) && i.layer == 0 && i.w > 1000.0)
+        .map(|i| i.seq);
+    assert!(abs_seq.is_some(), "应存在定位元素的背景绘制项");
+    assert!(flow_seq.is_some(), "应存在常规流背景绘制项");
+    assert!(
+        abs_seq > flow_seq,
+        "定位元素应排在常规流内容之后绘制(定位 {:?} 常规流 {:?})",
+        abs_seq,
+        flow_seq
+    );
+}
+
+#[test]
+fn 绝对定位元素背景画在自身子树之下() {
+    // 元素背景必须画在**子树内容之下**(浏览器语义)。此前绝对定位元素的
+    // 自身视觉在测量子树之后才发射,seq 更大 → 画在子树之上,把子树整块
+    // 盖住(实测猎聘首页登录弹层白色背景把整张表单盖成白板)。
+    let doc = Document::parse(
+        "<head><style>
+            .panel { position:absolute; left:0; top:0; width:200px; height:100px; background:#ffffff; }
+            .inner { color:#ff0000; }
+         </style></head><body><div class='panel'><span class='inner'>表单</span></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 1920.0, &font());
+    let bg_seq = layout
+        .display
+        .iter()
+        .find(|i| matches!(i.kind, super::super::render::display::DisplayKind::Background { .. }))
+        .map(|i| i.seq);
+    let text_seq = layout
+        .display
+        .iter()
+        .find(|i| matches!(i.kind, super::super::render::display::DisplayKind::Text { .. }))
+        .map(|i| i.seq);
+    assert!(bg_seq.is_some(), "应存在背景绘制项");
+    assert!(text_seq.is_some(), "应存在文本绘制项");
+    assert!(
+        bg_seq < text_seq,
+        "背景应早于子树文本绘制(背景 {:?} 文本 {:?})",
+        bg_seq,
+        text_seq
+    );
 }

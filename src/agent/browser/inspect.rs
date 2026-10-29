@@ -95,6 +95,29 @@ pub async fn inspect(
             }))
         }
         "elements" => inspect_elements(tab, &doc, params),
+        // `html`:整页 HTML 源码(工具描述里一直宣传该维度,但枚举此前没有它,
+        // 模型按描述调用会被参数校验拒绝 —— 实测猎聘任务白费三轮 LLM 往返)。
+        "html" => {
+            let max = p_u64(params, "max_bytes").unwrap_or(200_000).min(2_000_000) as usize;
+            let sel = p_str(params, "selector");
+            let html = match sel {
+                Some(s) if !s.is_empty() && s != "html" => {
+                    let nodes = doc.select(s).map_err(EngineError::action_failed)?;
+                    match nodes.first() {
+                        Some(n) => document::outer_html(n),
+                        None => String::new(),
+                    }
+                }
+                _ => doc.serialize_full(),
+            };
+            Ok(json!({
+                "ok": true,
+                "selector": sel.unwrap_or("html"),
+                "byte_size": html.len(),
+                "truncated": html.len() > max,
+                "html": document::truncate_chars(&html, max),
+            }))
+        }
         "stylesheets" => {
             let engine = style_engine(tab, &doc);
             let sheets: Vec<Value> = engine
@@ -431,6 +454,44 @@ fn inspect_elements(
             return Ok(json!({"ok": false, "count": 0, "index": 0, "error": e}));
         }
     };
+    // 列表模式:一次返回全部匹配元素(此前只回 `nth` 命中的**单个**元素 +
+    // count,模型想看「有哪些匹配项」只能一轮一个元素地试 —— 实测猎聘任务
+    // 连续多轮 inspect(elements) 都只拿到一个元素,反复误判「弹层不存在」)。
+    if p_bool(params, "list", false) {
+        let limit = p_u64(params, "max").unwrap_or(60).clamp(1, 500) as usize;
+        let engine = style_engine(tab, doc);
+        let mut items = Vec::new();
+        for (i, node) in nodes.iter().enumerate() {
+            if i >= limit {
+                break;
+            }
+            let stable = Document::stable_selector(node);
+            let rect = tab.layout.rect_for(&stable);
+            let mut v = doc.element_json(node, i, nodes.len(), rect, &tab.form_values);
+            let computed = engine.computed_chain(node);
+            let visible = engine.is_rendered(node)
+                && computed.display != "none"
+                && computed.visibility != "hidden"
+                && computed.visibility != "collapse"
+                && computed.opacity > 0.0;
+            v["visible"] = json!(visible);
+            if let Some(obj) = v.get_mut("rect").and_then(Value::as_object_mut) {
+                obj.insert("visible".to_string(), json!(visible));
+                obj.insert("laid_out".to_string(), json!(rect.is_some()));
+            }
+            items.push(v);
+        }
+        return Ok(json!({
+            "ok": true,
+            "mode": "list",
+            "selector": selector,
+            "count": nodes.len(),
+            "returned": items.len(),
+            "truncated": nodes.len() > items.len(),
+            "items": items,
+            "hint": "list=true 返回全部匹配元素;每项含 tag/id/class/rect/text/visible",
+        }));
+    }
     let idx = p_u64(params, "nth").unwrap_or(0) as usize;
     let count = nodes.len();
     let Some(node) = nodes.get(idx) else {

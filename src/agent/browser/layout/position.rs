@@ -115,6 +115,11 @@ fn layout_abs(
         cy + style.margin_top
     };
 
+    // 自身视觉的绘制序必须**早于**子树内容(浏览器语义:元素背景画在内容之下)。
+    // seq 在测量子树**之前**预分配:此前在测量之后才取,绝对定位元素自己的
+    // 背景 seq 更大 → 画在子树之上,把子树整块盖住(实测猎聘首页登录弹层
+    // `.home-banner-login-container` 的白色背景把整张登录表单盖成白板)。
+    let seq = ctx.next_seq();
     // 内容片段按最终宽度重排并平移注入。
     let mut frag = ctx.measure_content(node, content_w, style, depth);
     translate(&mut frag, bx + pad_l, by + pad_t);
@@ -125,7 +130,6 @@ fn layout_abs(
     }
     // 阶段六:定位元素视觉发射(修复 absolute/fixed 边框/阴影/渐变缺口);
     // 自身视觉先于子树标记,子树组效果回补。
-    let seq = ctx.next_seq();
     let tag = document::tag_name(node);
     ctx.emit_element(seq, style, &tag, bx, by, bw, bh);
     ctx.emit_canvas_pixels(node, style, seq, bx, by, bw, bh);
@@ -137,6 +141,7 @@ fn layout_abs(
         w: bw,
         h: bh,
         background: style.background,
+        background_alpha: style.background_alpha,
         visible: style_visible(style),
         z_index: style.pos.z_index,
         out_of_flow: true,

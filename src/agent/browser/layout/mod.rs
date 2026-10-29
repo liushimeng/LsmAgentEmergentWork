@@ -75,6 +75,9 @@ pub struct ElementBox {
     pub w: f64,
     pub h: f64,
     pub background: Option<[u8; 3]>,
+    /// 背景色 alpha(0..=255,默认 255)。半透明背景在绘制期与已绘制的
+    /// 底层背景合成(不在计算样式阶段按白底压平,见 `style::values`)。
+    pub background_alpha: u8,
     pub visible: bool,
     /// 绘制序(阶段三):`compute_with` 返回前按 z-index 稳定排序。
     pub z_index: i64,
@@ -232,6 +235,8 @@ pub fn compute_full(
         z_floor: 0,
         fixed_depth: 0,
         pending_margin_bottom: 0.0,
+        intrinsic: false,
+        positioned_layer: 0,
     };
     let body = doc
         .root()
@@ -511,9 +516,29 @@ pub(crate) struct LayoutCtx<'a> {
     /// `margin_bottom` 尚未落地,与下一个兄弟的 `margin_top` 取折叠值;
     /// 仅参与块级流,行内行盒/替换元素出现时收编,浮动与绝对定位子树不消费。
     pending_margin_bottom: f64,
+    /// 内在尺寸(max-content)测量模式:行内文本对齐偏移**不参与**宽度计算。
+    ///
+    /// max-content 宽度与 text-align 无关(居中文字不会把块的固有宽度撑大),
+    /// 但布局在 MAX_CONTENT_WIDTH(10 万)语境下按居中偏移摆放 → 行起点
+    /// 落到 ~5 万处,再被 flex 基础宽/abs 收缩宽度取 `l.x + 文本宽` 当内容宽,
+    /// 条目宽度被撑到 5 万,后续布局全歪(实测猎聘登录页 tab 条目 50034px、
+    /// 登录框容器撑满 1920px 被推出屏幕右侧)。
+    pub(crate) intrinsic: bool,
+    /// 绘制层:定位元素(position != static)及其子树按 CSS 2.1 附录 E 第 8 步
+    /// 绘制在常规流内容之上。布局子树时置 1,离开后还原。
+    pub(crate) positioned_layer: u8,
 }
 
 impl<'a> LayoutCtx<'a> {
+    /// 当前元素的绘制层:定位元素自身为 1;其子树沿用 `positioned_layer`。
+    pub(crate) fn layer_for(&self, style: &ComputedStyle) -> u8 {
+        if style.pos.position != "static" {
+            1
+        } else {
+            self.positioned_layer
+        }
+    }
+
     /// 分配一个 DFS 先序序号(元素视觉发射 / 文本行 flush 各取各的)。
     pub(crate) fn next_seq(&mut self) -> u64 {
         self.seq += 1;
@@ -584,6 +609,7 @@ impl<'a> LayoutCtx<'a> {
             clip: None,
             transform: self.own_transform(style, x, y, w, h),
             fixed: self.fixed_depth > 0,
+            layer: self.layer_for(style),
         });
     }
 
@@ -610,6 +636,7 @@ impl<'a> LayoutCtx<'a> {
         // 两者都先取到局部量:闭包会借用 self,而 push 需要 &mut self。
         let z = style.pos.z_index.max(self.z_floor);
         let is_fixed = self.fixed_depth > 0;
+        let layer = self.layer_for(style);
         let base = |kind| DisplayItem {
             kind,
             x,
@@ -623,6 +650,7 @@ impl<'a> LayoutCtx<'a> {
             clip: None,
             transform: tf,
             fixed: is_fixed,
+            layer,
         };
         for layer in &style.box_shadow {
             self.display.push(base(DisplayKind::Shadow {
@@ -637,7 +665,7 @@ impl<'a> LayoutCtx<'a> {
         // (先发射者先画、被后画者覆盖),故声明序的最后一层先画、首层最后画。
         if let Some(bg) = style.background {
             self.display.push(base(DisplayKind::Background {
-                fill: BgFill::Solid(bg),
+                fill: BgFill::Solid(bg, style.background_alpha),
             }));
         }
         for layer in style.background_layers.iter().rev() {
@@ -699,6 +727,7 @@ impl<'a> LayoutCtx<'a> {
             clip: None,
             transform,
             fixed: self.fixed_depth > 0,
+            layer: self.positioned_layer,
         });
     }
 
@@ -739,6 +768,7 @@ impl<'a> LayoutCtx<'a> {
                 clip: None,
                 transform,
                 fixed: self.fixed_depth > 0,
+                layer: self.positioned_layer,
             });
         }
         self.display.push(DisplayItem {
@@ -759,6 +789,7 @@ impl<'a> LayoutCtx<'a> {
             clip: None,
             transform,
             fixed: self.fixed_depth > 0,
+            layer: self.positioned_layer,
         });
     }
 
@@ -1018,6 +1049,14 @@ impl<'a> LayoutCtx<'a> {
         if depth > 60 {
             return;
         }
+        // 绘制层(CSS 2.1 附录 E 第 8 步):定位元素(position != static)连同其
+        // 子树绘制在常规流内容之上。此前只按 (z, seq) 排序,定位元素若在 DOM
+        // 顺序上靠前会被后面的常规流图片/背景整块盖住(实测猎聘登录框被 hero
+        // 背景图覆盖 → 表单完全看不见)。
+        let prev_layer = self.positioned_layer;
+        if current.pos.position != "static" {
+            self.positioned_layer = 1;
+        }
         // 阶段三:脱离流的定位元素延后到兄弟节点布置完再处理。
         let mut deferred: Vec<(NodeRef, ComputedStyle)> = Vec::new();
         // 阶段七:本容器内的浮动台账(浮动不跨块容器)。
@@ -1099,6 +1138,7 @@ impl<'a> LayoutCtx<'a> {
                     w: iw,
                     h: ih,
                     background: style.background,
+                    background_alpha: style.background_alpha,
                     visible,
                     z_index: style.pos.z_index,
                     out_of_flow: false,
@@ -1306,6 +1346,7 @@ impl<'a> LayoutCtx<'a> {
                     w: bw,
                     h: box_h,
                     background: style.background,
+                    background_alpha: style.background_alpha,
                     visible: style_visible(&style),
                     z_index: style.pos.z_index,
                     out_of_flow: false,
@@ -1381,6 +1422,8 @@ impl<'a> LayoutCtx<'a> {
             position::layout_deferred(self, deferred, cb, depth);
             self.pending_margin_bottom = saved_pending;
         }
+        // 还原绘制层(定位元素子树的绘制层只在其子树内有效)。
+        self.positioned_layer = prev_layer;
     }
 
     /// 行内级元素是否需要生成近似矩形(供 inspect/坐标点击/截图裁剪寻址)。
@@ -1629,6 +1672,7 @@ impl<'a> LayoutCtx<'a> {
                     w: iw,
                     h: ih,
                     background: child_style.background,
+                    background_alpha: child_style.background_alpha,
                     visible,
                     z_index: child_style.pos.z_index,
                     out_of_flow: false,
@@ -1708,6 +1752,7 @@ impl<'a> LayoutCtx<'a> {
             w,
             h,
             background: style.background,
+                    background_alpha: style.background_alpha,
             visible: style_visible(style),
             z_index: style.pos.z_index,
             out_of_flow: false,

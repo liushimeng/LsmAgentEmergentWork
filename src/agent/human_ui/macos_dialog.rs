@@ -558,7 +558,10 @@ extern "C" fn on_focus_once(_self: Id, _cmd: Sel, _sender: Id) {
 }
 
 extern "C" fn on_window_will_close(_self: Id, _cmd: Sel, _sender: Id) {
-    finish("cancel", -1);
+    // 窗口消失 ≠ 人工明确取消:无头/自动化环境下窗口可能被系统回收,
+    // 报「取消」会让编排器把整个任务判死(实测猎聘任务 52s 后被误取消)。
+    // 真实取消只由「取消任务」按钮(on_cancel)产生。
+    finish("closed", -1);
 }
 
 /// 注册控制器类(进程内一次)。
@@ -842,6 +845,8 @@ fn finish(kind: &str, tag: i64) {
             ("timeout".to_string(), String::new())
         } else if kind == "cancel" {
             ("cancel".to_string(), String::new())
+        } else if kind == "closed" {
+            ("closed".to_string(), String::new())
         } else {
             let typed = unsafe { read_input(st.views.input) };
             if !typed.is_empty() {
@@ -1276,13 +1281,16 @@ unsafe fn build_and_run(p: &DialogPayload) -> (String, String) {
 
     send_void(send_id(cls(b"NSApplication\0"), sel(b"sharedApplication\0")), sel(b"run\0"));
 
-    // run 返回:取结果(意外返回兜底 cancel,对齐旧脚本)
+    // run 返回:取结果。**意外返回不得报「人工取消」** —— AppKit 的 run 循环
+    // 在无头/自动化环境可能提前返回,报 cancel 会让编排器把整个任务判死
+    // (实测猎聘任务 request_human 52s 后返 4002 人工取消,实际无人操作)。
+    // 兜底为 closed(未收到应答),由上层按「通道不可用」诚实收口。
     let result = {
         let mut guard = state();
         guard
             .as_mut()
             .and_then(|st| st.result.take())
-            .unwrap_or_else(|| ("cancel".to_string(), String::new()))
+            .unwrap_or_else(|| ("closed".to_string(), String::new()))
     };
     *state() = None;
     result

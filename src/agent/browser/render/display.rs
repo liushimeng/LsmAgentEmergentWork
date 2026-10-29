@@ -16,7 +16,9 @@ pub type ClipRect = (f64, f64, f64, f64);
 /// 背景填充:纯色或渐变。
 #[derive(Debug, Clone)]
 pub enum BgFill {
-    Solid([u8; 3]),
+    /// 纯色填充(rgb + alpha)。alpha<255 时在绘制期与已绘制的底层背景合成,
+    /// 不在计算样式阶段压平(见 `style::values::ComputedStyle::background_alpha`)。
+    Solid([u8; 3], u8),
     Gradient(Arc<GradientSpec>),
 }
 
@@ -81,6 +83,13 @@ pub struct DisplayItem {
     /// `position.rs` 对 fixed 取包含块 (0,0,vw,vh)),而普通项以页面为原点。
     /// 光栅化时滚动量 `scroll_y` 只对后者生效 —— 否则固定控件会随页面滚动平移。
     pub fixed: bool,
+    /// 绘制层:0 = 常规流内容,1 = 定位元素(position != static)及其子树。
+    ///
+    /// CSS 2.1 附录 E 第 8 步:定位元素(z-index:auto/0)连同其子树在常规流
+    /// 内容(块背景、浮动、行内内容、图片)**之上**绘制。此前只按 (z, seq)
+    /// 排序,定位元素若在 DOM 顺序上靠前,会被后面的常规流图片/背景整块盖住
+    /// (实测猎聘登录框被 hero 背景图覆盖 → 登录表单完全看不见)。
+    pub layer: u8,
 }
 
 impl DisplayItem {
@@ -151,7 +160,7 @@ impl DisplayItem {
 /// 显示列表终排:先 z 分层(沿用 z-index 语义),同 z 恢复 DFS 先序(seq),
 /// 同元素的同类通道序由 rank 收尾。稳定排序保证同键保持发射序。
 pub fn sort_items(items: &mut [DisplayItem]) {
-    items.sort_by(|a, b| (a.z, a.seq, a.rank()).cmp(&(b.z, b.seq, b.rank())));
+    items.sort_by(|a, b| (a.z, a.layer, a.seq, a.rank()).cmp(&(b.z, b.layer, b.seq, b.rank())));
 }
 
 // ============ 旧管线回退合成器 ============
@@ -177,7 +186,7 @@ pub fn build_legacy(layout: &Layout) -> Vec<DisplayItem> {
         if let Some(bg) = b.background {
             out.push(DisplayItem {
                 kind: DisplayKind::Background {
-                    fill: BgFill::Solid(bg),
+                    fill: BgFill::Solid(bg, b.background_alpha),
                 },
                 x: b.x,
                 y: b.y,
@@ -190,6 +199,7 @@ pub fn build_legacy(layout: &Layout) -> Vec<DisplayItem> {
                 clip: None,
                 transform: None,
                 fixed: false,
+                layer: 0,
             });
         }
     }
@@ -218,6 +228,7 @@ pub fn build_legacy(layout: &Layout) -> Vec<DisplayItem> {
             clip: None,
             transform: None,
             fixed: false,
+            layer: 0,
         });
     }
     for p in &layout.paints {
@@ -267,6 +278,7 @@ fn shadow_item(s: &ShadowDraw, seq: u64) -> DisplayItem {
         clip: None,
         transform: None,
         fixed: false,
+        layer: 0,
     }
 }
 
@@ -287,6 +299,7 @@ fn border_item(b: &BorderDraw, seq: u64) -> DisplayItem {
         clip: None,
         transform: None,
         fixed: false,
+        layer: 0,
     }
 }
 
@@ -309,6 +322,7 @@ fn image_item(p: &PaintBox, seq: u64) -> DisplayItem {
         clip: None,
         transform: None,
         fixed: false,
+        layer: 0,
     }
 }
 
@@ -331,5 +345,6 @@ fn text_item(l: &TextLine, seq: u64) -> DisplayItem {
         clip: None,
         transform: None,
         fixed: false,
+        layer: 0,
     }
 }

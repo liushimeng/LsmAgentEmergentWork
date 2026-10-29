@@ -51,6 +51,13 @@ pub struct ComputedStyle {
     pub box_sizing_content: bool,
     pub color: Rgb,
     pub background: Option<Rgb>,
+    /// `background-color` 的 alpha 通道(0..=255,默认 255)。
+    ///
+    /// 半透明背景**不能**在计算样式阶段按白底合成(旧实现如此):真实浏览器里
+    /// `rgba(33,35,41,.05)` 是盖在父层已绘制的背景之上的半透明暗色,而按白底
+    /// 合成会得到不透明的浅灰 `#f4f4f4`,把深色 banner 整条盖住,白字页头
+    /// 直接看不见(实测猎聘首页页头空白)。alpha 必须一路带到绘制期合成。
+    pub background_alpha: u8,
     pub font_size: f64,
     pub font_weight: u16,
     pub font_family: String,
@@ -406,6 +413,7 @@ impl Default for ComputedStyle {
             box_sizing_content: false,
             color: [32, 32, 32],
             background: None,
+            background_alpha: 255,
             font_size: 16.0,
             font_weight: 400,
             font_family: String::new(),
@@ -499,9 +507,10 @@ impl ComputedStyle {
         out.insert("color".into(), rgb_text(self.color));
         out.insert(
             "background-color".into(),
-            self.background
-                .map(rgb_text)
-                .unwrap_or_else(|| "rgba(0, 0, 0, 0)".into()),
+            match self.background {
+                Some(c) => rgba_text(c, self.background_alpha),
+                None => "rgba(0, 0, 0, 0)".into(),
+            },
         );
         out.insert("font-size".into(), format!("{}px", num(self.font_size)));
         out.insert("font-weight".into(), self.font_weight.to_string());
@@ -692,6 +701,21 @@ fn track_list_text(tracks: &[TrackSize]) -> String {
 
 fn rgb_text(c: Rgb) -> String {
     format!("rgb({}, {}, {})", c[0], c[1], c[2])
+}
+
+/// 带 alpha 的颜色文本(alpha=255 时退化为 `rgb(...)`,与浏览器一致)。
+fn rgba_text(c: Rgb, a: u8) -> String {
+    if a == 255 {
+        rgb_text(c)
+    } else {
+        format!(
+            "rgba({}, {}, {}, {})",
+            c[0],
+            c[1],
+            c[2],
+            (a as f64 / 255.0 * 100.0).round() / 100.0
+        )
+    }
 }
 
 /// 上下文:百分比/`rem`/视口相关解析。
@@ -896,15 +920,17 @@ pub fn apply_declaration(
             st.visibility = value.to_ascii_lowercase();
         }
         "color" => {
-            if let Some(c) = resolve_color(value, st.color) {
+            if let Some(c) = resolve_text_color(value, st.color) {
                 st.color = c;
             }
         }
         "background-color" => {
             if value.eq_ignore_ascii_case("transparent") {
                 st.background = None;
-            } else if let Some(c) = resolve_color(value, st.color) {
-                st.background = Some(c);
+                st.background_alpha = 255;
+            } else if let Some((rgb, a)) = resolve_color(value, st.color) {
+                st.background = Some(rgb);
+                st.background_alpha = a;
             }
         }
         "background" => {
@@ -960,10 +986,13 @@ pub fn apply_declaration(
             } else {
                 parse_background_position(&pos_tokens.join(" "))
             };
-            st.background = match color_token {
-                Some(c) => parse_color(&c).and_then(|v| v).map(|(rgb, alpha)| blend_on_white(rgb, alpha)),
-                None => None,
-            };
+            // 简写里的颜色同样带 alpha:`background:rgba(0,0,0,.05)` 必须保持
+            // 半透明(否则按白底合成会把卡片背景画成不透明浅灰)。
+            let shorthand_color = color_token
+                .as_ref()
+                .and_then(|c| parse_color(c).and_then(|v| v));
+            st.background = shorthand_color.map(|(rgb, _alpha)| rgb);
+            st.background_alpha = shorthand_color.map(|(_rgb, alpha)| alpha).unwrap_or(255);
         }
         "background-position" => {
             st.background_position = parse_background_position(value);
@@ -2677,13 +2706,16 @@ pub fn parse_color(value: &str) -> Option<Option<([u8; 3], u8)>> {
     None
 }
 
-fn resolve_color(value: &str, current: [u8; 3]) -> Option<[u8; 3]> {
+fn resolve_color(value: &str, current: [u8; 3]) -> Option<([u8; 3], u8)> {
     if value.trim().eq_ignore_ascii_case("currentcolor") {
-        return Some(current);
+        return Some((current, 255));
     }
-    parse_color(value)
-        .and_then(|c| c)
-        .map(|(rgb, a)| blend_on_white(rgb, a))
+    parse_color(value).and_then(|c| c)
+}
+
+/// 文字色:半透明仍按白底合成(文字 alpha 通道未建模,见方案边界)。
+fn resolve_text_color(value: &str, current: [u8; 3]) -> Option<[u8; 3]> {
+    resolve_color(value, current).map(|(rgb, a)| blend_on_white(rgb, a))
 }
 
 fn blend_on_white(c: [u8; 3], alpha: u8) -> [u8; 3] {
