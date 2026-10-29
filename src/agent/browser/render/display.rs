@@ -61,6 +61,21 @@ pub enum DisplayKind {
     /// canvas 区域占位说明块(尚无像素,或使用的 2D 路径/WebGL 能力未实现)。
     /// `pale`:元素自身无背景时先铺淡底(与旧渲染一致)。
     CanvasNote { pale: bool },
+    /// 原生控件几何图元:勾/圆点/箭头/列表圆点。用几何光栅而非字体字形,
+    /// 避免跨平台字体缺字导致豆腐块。
+    WidgetGlyph {
+        glyph: WidgetGlyphKind,
+        open: bool,
+    },
+}
+
+/// 控件图元类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WidgetGlyphKind {
+    CheckMark,
+    RadioDot,
+    Caret,
+    Bullet,
 }
 
 /// 绘制项。`x/y/w/h` 为**局部**(页坐标)border box;`opacity` 已含祖先组透明度乘积;
@@ -101,9 +116,10 @@ impl DisplayItem {
             DisplayKind::Background { .. } => 1,
             DisplayKind::Border { .. } => 2,
             DisplayKind::CanvasNote { .. } => 3,
-            DisplayKind::Image { .. } => 4,
-            DisplayKind::TextShadow { .. } => 5,
-            DisplayKind::Text { .. } => 6,
+            DisplayKind::WidgetGlyph { .. } => 4,
+            DisplayKind::Image { .. } => 5,
+            DisplayKind::TextShadow { .. } => 6,
+            DisplayKind::Text { .. } => 7,
         }
     }
 

@@ -11,8 +11,13 @@ mod inline;
 mod measure;
 mod grid;
 mod position;
+mod table;
 #[cfg(test)]
 mod position_tests;
+#[cfg(test)]
+mod form_widget_tests;
+#[cfg(test)]
+mod table_tests;
 #[cfg(test)]
 mod tests;
 
@@ -25,7 +30,7 @@ use kuchikiki::NodeRef;
 
 use super::document::{self, Document};
 use super::images::ImageSizes;
-use super::render::display::{self, BgFill, DisplayItem, DisplayKind};
+use super::render::display::{self, BgFill, DisplayItem, DisplayKind, WidgetGlyphKind};
 use super::render::FontSet;
 use super::style::{Affine, BgLayer, BorderColor, ComputedStyle, MediaCtx, StyleEngine, TextShadow};
 use super::urlutil;
@@ -373,8 +378,17 @@ pub(crate) fn is_replaced_tag(node: &NodeRef) -> bool {
         document::tag_name(node).to_ascii_lowercase().as_str(),
         // iframe(第 174 轮):按替换元素参与布局 —— 无 CSS/属性尺寸时取
         // 浏览器建议缺省 300×150,而非塌缩 0×0(猎聘页脚 iframe 实测 0×0,
-        // 坐标点击与 inspect 全部失真)。
-        "img" | "svg" | "iframe"
+        // 坐标点击与 inspect 全部失真)。canvas 同理:HTML width/height 是
+        // 位图缓冲固有尺寸,缺省 300×150。
+        "img" | "svg" | "iframe" | "canvas"
+    )
+}
+
+/// 表单控件标签(即使 CSS `display:block` 也保留替换式固有尺寸)。
+pub(crate) fn is_form_control_tag(node: &NodeRef) -> bool {
+    matches!(
+        document::tag_name(node).to_ascii_lowercase().as_str(),
+        "input" | "select" | "textarea" | "button" | "progress" | "meter"
     )
 }
 
@@ -445,6 +459,29 @@ pub(crate) fn svg_natural_size(node: &NodeRef) -> (f64, f64) {
 
 pub(crate) fn style_visible(style: &ComputedStyle) -> bool {
     style.visibility != "hidden" && style.visibility != "collapse" && style.opacity > 0.0
+}
+
+/// select 控件显示文本:运行时 `selected` option 的 label，否则首个 option。
+fn select_display_text(node: &NodeRef) -> String {
+    let Ok(options) = node.select("option") else {
+        return String::new();
+    };
+    let mut first = String::new();
+    for opt in options {
+        let opt = opt.as_node().clone();
+        let label = document::collapse_ws(&opt.text_contents());
+        if first.is_empty() {
+            first = label.clone();
+        }
+        if document::attr(&opt, "selected").is_some() {
+            return label;
+        }
+    }
+    first
+}
+
+fn parse_f64_attr(node: &NodeRef, key: &str) -> Option<f64> {
+    document::attr(node, key)?.trim().parse::<f64>().ok()
 }
 
 /// CSS 高度钳序:先 max-height,再 min-height(冲突时 min 胜出)。
@@ -943,6 +980,17 @@ impl<'a> LayoutCtx<'a> {
             } else if tag.eq_ignore_ascii_case("iframe") {
                 // CSS 替换元素建议缺省尺寸(真实浏览器对无尺寸 iframe 一致)。
                 Some((300.0, 150.0))
+            } else if tag.eq_ignore_ascii_case("canvas") {
+                // canvas 的 HTML width/height 是位图缓冲固有尺寸,缺省 300×150。
+                let aw = document::attr(node, "width")
+                    .and_then(|v| v.trim().parse::<f64>().ok())
+                    .filter(|v| *v > 0.0)
+                    .unwrap_or(300.0);
+                let ah = document::attr(node, "height")
+                    .and_then(|v| v.trim().parse::<f64>().ok())
+                    .filter(|v| *v > 0.0)
+                    .unwrap_or(150.0);
+                Some((aw, ah))
             } else {
                 None
             }
@@ -1102,12 +1150,52 @@ impl<'a> LayoutCtx<'a> {
                 flex::layout_container(self, &child, x, width, depth, &style, cb);
                 continue;
             }
+            // 基础表格格式化上下文:tr/td/th 走行列网格,不再退化为普通块/行内。
+            if style.display == "table" {
+                self.y += self.pending_margin_bottom;
+                self.pending_margin_bottom = 0.0;
+                self.flush_inline(buf, width);
+                table::layout_container(self, &child, x, width, depth, &style, cb);
+                continue;
+            }
             // 阶段三第二步:Grid 格式化上下文。
             if style.display == "grid" {
                 self.y += self.pending_margin_bottom;
                 self.pending_margin_bottom = 0.0;
                 self.flush_inline(buf, width);
                 grid::layout_container(self, &child, x, width, depth, &style, cb);
+                continue;
+            }
+            // 表单控件即使 CSS `display:block` 也保留替换式固有尺寸,
+            // 否则无内容 input 会被普通块级路径量成 0 高全宽盒。
+            if style.display == "block" && is_form_control_tag(&child) {
+                self.flush_inline(buf, width);
+                let (iw, ih) = self.inline_box_size(&child, &style, width);
+                let bx = x + style.margin_left;
+                let gap = collapse_margin(self.pending_margin_bottom, style.margin_top);
+                self.pending_margin_bottom = 0.0;
+                let by = self.y + gap;
+                let seq = self.next_seq();
+                self.boxes.push(ElementBox {
+                    selector: Document::stable_selector(&child),
+                    tag: document::tag_name(&child),
+                    x: bx,
+                    y: by,
+                    w: iw,
+                    h: ih,
+                    background: style.background,
+                    background_alpha: style.background_alpha,
+                    visible: style_visible(&style),
+                    z_index: style.pos.z_index,
+                    out_of_flow: false,
+                });
+                push_border_and_shadow(self, &style, bx, by, iw, ih);
+                let tag = document::tag_name(&child);
+                self.emit_element(seq, &style, &tag, bx, by, iw, ih);
+                self.emit_form_control_text(&child, &style, &tag, bx, by, iw, ih, None);
+                self.y = by + ih;
+                self.pending_margin_bottom =
+                    collapse_margin(self.pending_margin_bottom, style.margin_bottom);
                 continue;
             }
             // 阶段三第三步:替换元素(<img>/<svg>)独占一行,避免与文本重叠。
@@ -1143,7 +1231,9 @@ impl<'a> LayoutCtx<'a> {
                     z_index: style.pos.z_index,
                     out_of_flow: false,
                 });
-                self.emit_element(seq, &style, "img", bx + dx, by + dy, iw, ih);
+                let replaced_tag = document::tag_name(&child);
+                self.emit_element(seq, &style, &replaced_tag, bx + dx, by + dy, iw, ih);
+                self.emit_canvas_pixels(&child, &style, seq, bx + dx, by + dy, iw, ih);
                 if let Some(src) = isrc.filter(|s| self.image_loaded(s)) {
                     let paint = PaintBox {
                         src,
@@ -1386,6 +1476,7 @@ impl<'a> LayoutCtx<'a> {
                 let tag = document::tag_name(&child);
                 self.emit_element(seq, &style, &tag, bx + rdx, start_y + rdy, bw, box_h);
                 self.emit_canvas_pixels(&child, &style, seq, bx + rdx, start_y + rdy, bw, box_h);
+                self.emit_list_marker(&child, &style, bx + rdx, start_y + rdy, box_h);
                 // 阶段七:浮动盒登记并恢复流式游标(非浮动为 no-op)。
                 float::finish(self, placement, &mut floats, &mut inline_row);
                 if style.float != "none" {
@@ -1435,7 +1526,7 @@ impl<'a> LayoutCtx<'a> {
         let tag = document::tag_name(node);
         if matches!(
             tag.as_str(),
-            "a" | "button" | "input" | "select" | "textarea" | "label"
+            "a" | "button" | "input" | "select" | "textarea" | "label" | "progress" | "meter"
         ) {
             return true;
         }
@@ -1465,17 +1556,29 @@ impl<'a> LayoutCtx<'a> {
         let self_replaced = matches!(
             document::tag_name(node).to_ascii_lowercase().as_str(),
             "input" | "select" | "textarea" | "button" | "img" | "svg" | "iframe" | "canvas"
-                | "object" | "embed" | "video" | "audio" | "hr"
+                | "object" | "embed" | "video" | "audio" | "hr" | "progress" | "meter"
         );
         if !self_replaced && !explicit_dim && !has_structural_inline_content(node, 0) {
             return (0.0, 0.0);
         }
-        let text = node.text_contents();
+        let tag = document::tag_name(node).to_ascii_lowercase();
+        // select 的 option 子树不参与布局;固有宽只看当前显示项 + 箭头位,
+        // 否则 hidden option 的累计文本会把盒撑到页面外。
+        let text = if tag == "select" {
+            select_display_text(node)
+        } else {
+            node.text_contents()
+        };
         let text_w = self.font.text_width(&text, style.font_size);
+        let intrinsic_floor = if tag == "select" {
+            text_w + 22.0
+        } else {
+            text_w.max(40.0)
+        };
         let w = if let Some(p) = style.width_percent {
             (p / 100.0 * avail_w).max(1.0)
         } else {
-            style.width.unwrap_or_else(|| text_w.max(40.0)).max(1.0)
+            style.width.unwrap_or(intrinsic_floor).max(1.0)
         };
         let h = style
             .height
@@ -1484,10 +1587,11 @@ impl<'a> LayoutCtx<'a> {
         (w, h)
     }
 
-    /// 在行内表单控件盒内绘制 value/placeholder 文本。
+    /// 在行内表单控件盒内绘制原生控件内容。
     ///
-    /// 只发射文本显示项,不推进游标、不改变既有盒几何;占位符用 UA 灰
-    /// (#757575),密码按 `•` 掩码,超宽按盒内可用宽截断(与真实输入框裁剪一致)。
+    /// 文本类画 value/placeholder;checkbox/radio 画几何勾/点;select 只画当前
+    /// option 与箭头;textarea 多行换行;progress/meter 用轨道+比例填充表达。
+    /// 只发射显示项,不推进游标、不改变既有盒几何。
     #[allow(clippy::too_many_arguments)]
     fn emit_form_control_text(
         &mut self,
@@ -1500,40 +1604,131 @@ impl<'a> LayoutCtx<'a> {
         h: f64,
         tf: Option<Affine>,
     ) {
-        if tag != "input" && tag != "textarea" {
-            return;
-        }
-        let ty = document::attr(node, "type")
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let text_like = matches!(
-            ty.as_str(),
-            "" | "text" | "search" | "url" | "tel" | "email" | "password" | "number"
-        );
-        let button_like = matches!(ty.as_str(), "submit" | "button" | "reset");
-        if tag == "input" && !text_like && !button_like {
-            return;
-        }
-        let value = document::attr(node, "value").unwrap_or_default();
-        let (mut text, color) = if !value.trim().is_empty() {
-            (value, style.color)
-        } else if tag == "textarea" {
-            let t = node.text_contents();
-            if t.trim().is_empty() {
-                (document::attr(node, "placeholder").unwrap_or_default(), [117, 117, 117])
-            } else {
-                (t, style.color)
+        match tag {
+            "input" => {
+                let ty = document::attr(node, "type")
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                match ty.as_str() {
+                    "checkbox" | "radio" => {
+                        let checked = document::attr(node, "checked").is_some();
+                        if checked {
+                            let glyph = if ty == "checkbox" {
+                                WidgetGlyphKind::CheckMark
+                            } else {
+                                WidgetGlyphKind::RadioDot
+                            };
+                            let side = w.min(h).min(18.0);
+                            self.emit_widget_glyph(
+                                glyph,
+                                false,
+                                bx + (w - side) / 2.0,
+                                by + (h - side) / 2.0,
+                                side,
+                                side,
+                                style,
+                                tf,
+                            );
+                        }
+                    }
+                    "" | "text" | "search" | "url" | "tel" | "email" | "password" | "number"
+                    | "submit" | "button" | "reset" => {
+                        let (mut text, color) = self.input_display_text(node, style, &ty);
+                        if ty == "password" {
+                            text = "•".repeat(text.chars().count());
+                        }
+                        self.emit_singleline_text(&text, color, style, bx, by, w, h, tf);
+                    }
+                    _ => {}
+                }
             }
-        } else if text_like {
-            (document::attr(node, "placeholder").unwrap_or_default(), [117, 117, 117])
-        } else {
-            return;
-        };
+            "button" => {
+                let text = document::collapse_ws(&node.text_contents());
+                let text = if text.is_empty() {
+                    document::attr(node, "value").unwrap_or_default()
+                } else {
+                    text
+                };
+                self.emit_singleline_text(&text, style.color, style, bx, by, w, h, tf);
+            }
+            "select" => {
+                let text = select_display_text(node);
+                let caret_w = 14.0_f64.min(w * 0.25);
+                self.emit_singleline_text(
+                    &text,
+                    style.color,
+                    style,
+                    bx,
+                    by,
+                    (w - caret_w).max(1.0),
+                    h,
+                    tf,
+                );
+                let side = caret_w.min(h * 0.5).max(6.0);
+                self.emit_widget_glyph(
+                    WidgetGlyphKind::Caret,
+                    true,
+                    bx + w - caret_w + (caret_w - side) / 2.0,
+                    by + (h - side) / 2.0,
+                    side,
+                    side,
+                    style,
+                    tf,
+                );
+            }
+            "textarea" => {
+                let text = if document::attr(node, "value").is_some() {
+                    document::attr(node, "value").unwrap_or_default()
+                } else {
+                    node.text_contents()
+                };
+                let (text, color) = if text.trim().is_empty() {
+                    (document::attr(node, "placeholder").unwrap_or_default(), [117, 117, 117])
+                } else {
+                    (text, style.color)
+                };
+                self.emit_multiline_text(&text, color, style, bx, by, w, h, tf);
+            }
+            "progress" => self.emit_meter_like(node, style, bx, by, w, h, tf, false),
+            "meter" => self.emit_meter_like(node, style, bx, by, w, h, tf, true),
+            _ => {}
+        }
+    }
+
+    fn input_display_text(
+        &self,
+        node: &NodeRef,
+        style: &ComputedStyle,
+        ty: &str,
+    ) -> (String, [u8; 3]) {
+        let value = document::attr(node, "value").unwrap_or_default();
+        if !value.trim().is_empty() {
+            return (value, style.color);
+        }
+        if matches!(ty, "submit" | "button" | "reset") {
+            let fallback = match ty {
+                "submit" => "Submit",
+                "reset" => "Reset",
+                _ => "Button",
+            };
+            return (fallback.to_string(), style.color);
+        }
+        (document::attr(node, "placeholder").unwrap_or_default(), [117, 117, 117])
+    }
+
+    fn emit_singleline_text(
+        &mut self,
+        text: &str,
+        color: [u8; 3],
+        style: &ComputedStyle,
+        bx: f64,
+        by: f64,
+        w: f64,
+        h: f64,
+        tf: Option<Affine>,
+    ) {
         if text.trim().is_empty() {
             return;
-        }
-        if ty == "password" {
-            text = "•".repeat(text.chars().count());
         }
         let size = style.font_size.max(8.0);
         let max_w = (w - 6.0).max(0.0);
@@ -1565,6 +1760,218 @@ impl<'a> LayoutCtx<'a> {
         };
         self.emit_text(&line, tf, &[]);
         self.lines.push(line);
+    }
+
+    fn emit_multiline_text(
+        &mut self,
+        text: &str,
+        color: [u8; 3],
+        style: &ComputedStyle,
+        bx: f64,
+        by: f64,
+        w: f64,
+        h: f64,
+        tf: Option<Affine>,
+    ) {
+        let size = style.font_size.max(8.0);
+        let line_height = size * 1.35;
+        let max_w = (w - 6.0).max(1.0);
+        let max_rows = (((h - 4.0) / line_height).floor() as usize).max(1);
+        let mut rows: Vec<String> = Vec::new();
+        for raw in text.replace("\r\n", "\n").lines() {
+            let mut cur = String::new();
+            let mut used = 0.0;
+            for ch in raw.chars() {
+                let cw = self.font.char_width(ch, size);
+                if !cur.is_empty() && used + cw > max_w {
+                    rows.push(std::mem::take(&mut cur));
+                    used = 0.0;
+                    if rows.len() >= max_rows {
+                        break;
+                    }
+                }
+                cur.push(ch);
+                used += cw;
+            }
+            if rows.len() >= max_rows {
+                break;
+            }
+            rows.push(cur);
+            if rows.len() >= max_rows {
+                break;
+            }
+        }
+        for (i, row) in rows.into_iter().take(max_rows).enumerate() {
+            let line = TextLine {
+                text: row,
+                x: bx + 3.0,
+                y: by + 2.0 + i as f64 * line_height,
+                size,
+                color,
+                bold: style.font_weight >= 600,
+                visible: style_visible(style),
+            };
+            self.emit_text(&line, tf, &[]);
+            self.lines.push(line);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_meter_like(
+        &mut self,
+        node: &NodeRef,
+        style: &ComputedStyle,
+        bx: f64,
+        by: f64,
+        w: f64,
+        h: f64,
+        tf: Option<Affine>,
+        is_meter: bool,
+    ) {
+        let min = if is_meter {
+            parse_f64_attr(node, "min").unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        let max = parse_f64_attr(node, "max").unwrap_or(1.0).max(min + f64::EPSILON);
+        let value = parse_f64_attr(node, "value").unwrap_or(min);
+        let ratio = ((value - min) / (max - min)).clamp(0.0, 1.0);
+        let track_y = by + (h * 0.30).max(1.0);
+        let track_h = (h * 0.40).max(2.0);
+        let track_x = bx + 2.0;
+        let track_w = (w - 4.0).max(1.0);
+        self.push_widget_fill(style, [225, 225, 225], 255, track_x, track_y, track_w, track_h, tf);
+        self.push_widget_fill(
+            style,
+            if is_meter { [80, 160, 90] } else { [70, 130, 210] },
+            255,
+            track_x,
+            track_y,
+            track_w * ratio,
+            track_h,
+            tf,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_widget_fill(
+        &mut self,
+        style: &ComputedStyle,
+        color: [u8; 3],
+        alpha: u8,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        tf: Option<Affine>,
+    ) {
+        let seq = self.next_seq();
+        self.display.push(DisplayItem {
+            kind: DisplayKind::Background {
+                fill: BgFill::Solid(color, alpha),
+            },
+            x,
+            y,
+            w,
+            h,
+            radius: style.border_radius,
+            z: style.pos.z_index.max(self.z_floor),
+            seq,
+            opacity: style.opacity,
+            clip: None,
+            transform: tf,
+            fixed: self.fixed_depth > 0,
+            layer: self.layer_for(style),
+        });
+    }
+
+    fn emit_widget_glyph(
+        &mut self,
+        glyph: WidgetGlyphKind,
+        open: bool,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        style: &ComputedStyle,
+        tf: Option<Affine>,
+    ) {
+        let seq = self.next_seq();
+        self.display.push(DisplayItem {
+            kind: DisplayKind::WidgetGlyph { glyph, open },
+            x,
+            y,
+            w,
+            h,
+            radius: style.border_radius,
+            z: style.pos.z_index.max(self.z_floor),
+            seq,
+            opacity: style.opacity,
+            clip: None,
+            transform: tf,
+            fixed: self.fixed_depth > 0,
+            layer: self.layer_for(style),
+        });
+    }
+
+    /// 列表项 marker(本轮子集):ul disc、ol decimal、`list-style-type:none` 不画。
+    fn emit_list_marker(
+        &mut self,
+        node: &NodeRef,
+        style: &ComputedStyle,
+        x: f64,
+        y: f64,
+        h: f64,
+    ) {
+        if document::tag_name(node) != "li" {
+            return;
+        }
+        let Some(parent) = node.parent() else {
+            return;
+        };
+        let parent_tag = document::tag_name(&parent);
+        let list_type = style
+            .extra
+            .get("list-style-type")
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+        if list_type == "none" {
+            return;
+        }
+        let tf = self.own_transform(style, x, y, 20.0, h);
+        match parent_tag.as_str() {
+            "ul" => {
+                self.emit_widget_glyph(WidgetGlyphKind::Bullet, false, x - 18.0, y + 2.0, 10.0, 10.0, style, tf);
+            }
+            "ol" => {
+                let mut idx = 1usize;
+                for sib in parent.children() {
+                    if &sib == node {
+                        break;
+                    }
+                    if document::tag_name(&sib) == "li" {
+                        idx += 1;
+                    }
+                }
+                if let Some(start) = document::attr(&parent, "start").and_then(|v| v.trim().parse::<usize>().ok()) {
+                    idx = start + idx - 1;
+                }
+                let text = format!("{idx}.");
+                let size = style.font_size.max(8.0);
+                let line = TextLine {
+                    text,
+                    x: x - 22.0,
+                    y: y + 1.0,
+                    size,
+                    color: style.color,
+                    bold: false,
+                    visible: style_visible(style),
+                };
+                self.emit_text(&line, tf, &[]);
+                self.lines.push(line);
+            }
+            _ => {}
+        }
     }
 
     fn collect_inline(

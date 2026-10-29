@@ -135,6 +135,11 @@ pub struct ComputedStyle {
     pub extra: BTreeMap<String, String>,
     /// 自定义属性表(继承用,不进入 `to_map`)。
     pub custom: BTreeMap<String, String>,
+    /// details 关闭时的子树抑制标志(首个 summary 例外)。仅用于父子传播,
+    /// 不进入 `getComputedStyle`。
+    pub(crate) suppress_children: bool,
+    /// 已处于关闭 details 的非 summary 子树中,后代继续隐藏。
+    pub(crate) in_details_closed: bool,
 }
 
 /// 边框颜色计算值。
@@ -459,6 +464,8 @@ impl Default for ComputedStyle {
             overflow_clip: false,
             extra: BTreeMap::new(),
             custom: BTreeMap::new(),
+            suppress_children: false,
+            in_details_closed: false,
         }
     }
 }
@@ -476,7 +483,8 @@ impl ComputedStyle {
     pub fn is_block(&self) -> bool {
         matches!(
             self.display.as_str(),
-            "block" | "flex" | "grid" | "table" | "table-row" | "list-item"
+            "block" | "flex" | "grid" | "table" | "table-row" | "table-row-group"
+                | "table-header-group" | "table-footer-group" | "table-cell" | "list-item"
         )
     }
 
@@ -781,6 +789,8 @@ const BLOCK_TAGS: &[&str] = &[
 
 const HIDDEN_TAGS: &[&str] = &[
     "head", "title", "meta", "link", "style", "script", "noscript", "template", "base",
+    // option/optgroup/datalist 属控件内部浮层/数据源,不参与普通流布局。
+    "option", "optgroup", "datalist",
 ];
 
 /// 标签的 UA 默认样式。可继承属性从父级复制,其余属性重置。
@@ -835,7 +845,32 @@ pub fn ua_default(tag: &str, parent: &ComputedStyle) -> ComputedStyle {
             st.font_size = parent.font_size * 0.67;
             st.font_weight = 700;
         }
-        "strong" | "b" | "th" => st.font_weight = 700,
+        "table" => {
+            st.display = "table".to_string();
+        }
+        "thead" => {
+            st.display = "table-header-group".to_string();
+        }
+        "tbody" | "tfoot" => {
+            st.display = "table-row-group".to_string();
+        }
+        "tr" => {
+            st.display = "table-row".to_string();
+        }
+        "td" | "th" => {
+            st.display = "table-cell".to_string();
+            if tag == "th" {
+                st.font_weight = 700;
+            }
+            st.border_widths = [1.0; 4];
+            st.border_drawn = [true; 4];
+            st.border_colors = [BorderColor::Rgba([160, 160, 160], 255); 4];
+            st.padding_top = 4.0;
+            st.padding_right = 6.0;
+            st.padding_bottom = 4.0;
+            st.padding_left = 6.0;
+        }
+        "strong" | "b" => st.font_weight = 700,
         "small" => st.font_size = (parent.font_size * 0.85).max(8.0),
         "code" | "kbd" | "samp" => {
             st.font_family = "monospace".to_string();
@@ -1905,6 +1940,7 @@ fn normalize_display(value: &str) -> String {
         "grid" | "inline-grid" => "grid".into(),
         "table" | "inline-table" => "table".into(),
         "table-row" => "table-row".into(),
+        "table-row-group" | "table-header-group" | "table-footer-group" => value.trim().to_ascii_lowercase(),
         "table-cell" => "table-cell".into(),
         "list-item" => "list-item".into(),
         "contents" => "contents".into(),

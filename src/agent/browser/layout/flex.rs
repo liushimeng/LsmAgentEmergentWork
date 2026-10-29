@@ -169,13 +169,35 @@ pub(crate) fn layout_container(
     let content_h =
         layout_content(ctx, node, content_x, inner_w, style, depth + 1, cb);
     let box_h = (ctx.cursor_y() - start_y + content_h).max(1.0);
+    // 容器自身确定高:显式 height,或包含块高已知时的百分比高度。
+    // 此前 flex 容器盒高恒按内容回填 —— `height:100%` 的 flex 容器
+    // (猎聘行业卡 `.seo-jobcard2-common{height:100%;display:flex;
+    // flex-direction:column}`)被内容撑破定高父盒,公司行 + logo 溢出
+    // `overflow:hidden` 被整行裁掉(全站 logo 不可见的直接根因)。
+    let explicit_box_h = style
+        .height
+        .map(|h| {
+            let h = h.max(0.0);
+            if style.box_sizing_content {
+                h + style.padding_top + style.padding_bottom
+            } else {
+                h
+            }
+        })
+        .or_else(|| {
+            style
+                .height_percent
+                .filter(|_| cb.3 != super::UNKNOWN_CB_H)
+                .map(|p| (p / 100.0 * cb.3).max(0.0))
+        });
     // min/max-height:flex 容器同样按 CSS 钳序生效。
-    let box_h = constrain_height(style, box_h);
+    let box_h = constrain_height(style, explicit_box_h.unwrap_or(box_h));
     ctx.set_box_height(box_idx, box_h);
     // 阶段六:组效果回补 + 自身视觉发射(含多层背景图,修复 flex 容器边框/阴影缺口)。
     let tag = document::tag_name(node);
     ctx.finish_container(seq, dmark, node, style, &tag, bx, start_y, bw, box_h);
-    ctx.advance_y(content_h + style.padding_bottom + style.margin_bottom.max(2.0));
+    // 游标推进以**盒高**为准(显式高时内容可能短于盒高,盒子仍占满声明高)。
+    ctx.advance_y((box_h - style.padding_top) + style.padding_bottom + style.margin_bottom.max(2.0));
 }
 
 /// Flex 内容区布局:布置全部条目并注入几何,返回内容高度。
@@ -226,8 +248,16 @@ pub(crate) fn layout_content(
         // 不参与:column flex 的 justify-content:center 在「min-height 撑起容器」的
         // 场景(实测 zhipin `.page-verify{min-height:100vh;justify-content:center}`)
         // free 恒 0,垂直居中永不发生。
-        let h = style
-            .height
+        // 百分比高度(包含块高已知时)同样参与:猎聘行业卡
+        // `.seo-jobcard2-common{height:100%;flex-direction:column}` 的条目
+        // 需在父盒确定高内分布(公司行 margin-top:auto 锚底)。
+        let explicit_h = style.height.map(|h| h.max(0.0)).or_else(|| {
+            style
+                .height_percent
+                .filter(|_| _cb.3 != super::UNKNOWN_CB_H)
+                .map(|p| (p / 100.0 * _cb.3).max(0.0))
+        });
+        let h = explicit_h
             .map(|h| (h - style.padding_top - style.padding_bottom).max(0.0))
             .unwrap_or(0.0);
         let mh = style
@@ -236,7 +266,10 @@ pub(crate) fn layout_content(
             .unwrap_or(0.0);
         h.max(mh)
     };
-    let definite_main = !row && (style.height.is_some() || style.min_height.is_some());
+    let definite_main = !row
+        && (style.height.is_some()
+            || style.min_height.is_some()
+            || (style.height_percent.is_some() && _cb.3 != super::UNKNOWN_CB_H));
     let definite_cross: Option<f64> = if row {
         style
             .height
@@ -267,18 +300,28 @@ pub(crate) fn layout_content(
             } else if row {
                 // 行方向:按最终主尺寸重排内容,交叉 = 显式 height 或内容高。
                 let inner = (item.final_main - item.pads_main(row).0 - item.pads_main(row).1).max(1.0);
-                let mut frag =
-                    ctx.measure_content(item.node.as_ref().unwrap(), inner, &item.style, depth);
                 // 交叉尺寸:显式 height 优先;百分比高相对容器确定交叉;否则内容高。
                 let pct_h = item
                     .style
                     .height_percent
                     .zip(definite_cross)
                     .map(|(p, ch)| (p / 100.0 * ch).max(1.0));
-                item.final_cross = item
-                    .style
-                    .height
-                    .or(pct_h)
+                let definite_item_h = item.style.height.or(pct_h);
+                // 条目高度确定时,子代百分比高度相对条目**内容高**求解
+                // (CSS 语义;旧实现测量语境恒 UNKNOWN,`height:100%` 退化成
+                // 内容高,实测猎聘卡片 `.seo-jobcard2-common{height:100%}` 被
+                // 撑破定高卡片,公司行+logo 被裁掉)。
+                let cb_h = definite_item_h.map(|h| {
+                    (h - item.pads_cross(row).0 - item.pads_cross(row).1).max(1.0)
+                });
+                let mut frag = ctx.measure_content_with_cb_h(
+                    item.node.as_ref().unwrap(),
+                    inner,
+                    &item.style,
+                    depth,
+                    cb_h,
+                );
+                item.final_cross = definite_item_h
                     .unwrap_or(frag.height + item.pads_cross(row).0 + item.pads_cross(row).1);
                 item.final_cross = constrain_height(&item.style, item.final_cross);
                 item.frag = Some(std::mem::take(&mut frag));

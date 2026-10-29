@@ -127,9 +127,79 @@ impl<'a> LayoutCtx<'a> {
                 depth,
                 (0.0, 0.0, content_width.max(1.0), UNKNOWN_CB_H),
             )
+        } else if style.display == "table" {
+            table::layout_content(
+                self,
+                node,
+                0.0,
+                content_width.max(1.0),
+                style,
+                depth,
+                (0.0, 0.0, content_width.max(1.0), UNKNOWN_CB_H),
+            )
         } else {
             let mut buf = InlineBuf::default();
             let cb = (0.0, 0.0, content_width.max(1.0), UNKNOWN_CB_H);
+            self.layout_children(node, 0.0, content_width, &mut buf, depth, style, cb);
+            self.flush_inline(&mut buf, content_width);
+            self.y
+        };
+        let lines = self.lines.split_off(lines0);
+        let boxes = self.boxes.split_off(boxes0);
+        let paints = self.paints.split_off(paints0);
+        let borders = self.borders.split_off(borders0);
+        let shadows = self.shadows.split_off(shadows0);
+        let display_items = self.display.split_off(display0);
+        self.y = y0;
+        self.intrinsic = prev_intrinsic;
+        Fragment {
+            height,
+            lines,
+            boxes,
+            paints,
+            borders,
+            shadows,
+            display: display_items,
+        }
+    }
+
+    /// `measure_content` 的带确定高变体:测量根的包含块高度已知时
+    /// (flex 条目有显式 height 等),子代 `height:100%` 应相对该高度求解
+    /// 而不是退化成内容高。实测猎聘行业卡片:`.home-industry-content-item`
+    /// (height:192px) 在 flex 行里,其子 `.seo-jobcard2-common{height:100%}`
+    /// 在旧实现下按 auto 走内容高,叠加内容行高虚胀后溢出 overflow:hidden,
+    /// 公司行 + logo 整行被裁掉(全站 logo 不可见的直接根因)。
+    pub(crate) fn measure_content_with_cb_h(
+        &mut self,
+        node: &NodeRef,
+        content_width: f64,
+        style: &ComputedStyle,
+        depth: usize,
+        cb_h: Option<f64>,
+    ) -> Fragment {
+        let Some(known_h) = cb_h else {
+            return self.measure_content(node, content_width, style, depth);
+        };
+        if is_replaced_tag(node) {
+            return self.measure_content(node, content_width, style, depth);
+        }
+        let y0 = self.y;
+        let prev_intrinsic = self.intrinsic;
+        self.intrinsic = prev_intrinsic || content_width >= super::MAX_CONTENT_WIDTH;
+        let lines0 = self.lines.len();
+        let boxes0 = self.boxes.len();
+        let paints0 = self.paints.len();
+        let borders0 = self.borders.len();
+        let shadows0 = self.shadows.len();
+        let display0 = self.display.len();
+        self.y = 0.0;
+        // 块级子代路径才透传确定高;嵌套 flex/grid 容器的高度仍内容驱动
+        // (容器自身 height:100% 由布局主流程按包含块求解,不经测量语境)。
+        let height = if style.display == "flex" || style.display == "grid" || style.display == "table" {
+            self.measure_content(node, content_width, style, depth).height
+        } else {
+            let mut buf = InlineBuf::default();
+            let cb = (0.0, 0.0, content_width.max(1.0), known_h.max(1.0));
             self.layout_children(node, 0.0, content_width, &mut buf, depth, style, cb);
             self.flush_inline(&mut buf, content_width);
             self.y

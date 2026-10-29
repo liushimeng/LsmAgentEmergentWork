@@ -38,12 +38,22 @@ pub async fn inspect(
     if page_id.is_empty() {
         return Err(EngineError::param("inspect 需要 page_id"));
     }
-    let inner = mgr.inner.lock().await;
+    let mut inner = mgr.inner.lock().await;
+    // 「快照×布局」一致性守卫:html 在上次布局后被脚本改写时先重排,
+    // 保证 rect_for/page_health 等读数与当前 DOM 一致。
+    // 需要 &mut,放独立作用域,之后降级为不可变借用(arms 里还会读 inner 的
+    // http_cache/local_storage 等兄弟字段)。
+    {
+        let Some(tab) = inner.tabs.get_mut(page_id) else {
+            return Err(EngineError::page_not_found(page_id));
+        };
+        mgr.ensure_layout_locked(tab);
+    }
     let tab = inner
         .tabs
         .get(page_id)
         .ok_or_else(|| EngineError::page_not_found(page_id))?;
-    let doc = Document::parse(&tab.html, &tab.url);
+    let doc = tab.document_with_state();
 
     match info {
         "console" => {

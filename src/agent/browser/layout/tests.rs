@@ -1798,3 +1798,69 @@ fn 绝对定位元素背景画在自身子树之下() {
         text_seq
     );
 }
+
+// ===================== 猎聘行业卡片几何(真实 CSS) =====================
+// 复现「AI时代新机会」卡片:384x192 定高 + overflow:hidden 的内层,
+// 公司行+logo 此前被零高裁剪窗整行裁掉(2026-10-29 真机实测)。
+
+#[test]
+fn 猎聘卡片_height100链与显式行高不被内容撑破() {
+    let html = r#"<html><head><style>
+.home-industry-content-item { background:#fff; box-sizing:border-box; height:192px; width:384px; }
+.seo-jobcard2-common { border-radius:6px; box-sizing:border-box; height:100%; overflow:hidden; padding:24px; width:100%; }
+.seo-jobcard2-common .jobcard2-detail-box { display:block; padding-bottom:16px; }
+.seo-jobcard2-common .jobcard2-detail-box .jobcard2-detail-top { display:flex; align-items:center; justify-content:flex-start; }
+.seo-jobcard2-common .jobcard2-detail-top .jobcard2-title { color:#000; font-size:18px; font-weight:500; line-height:25px; margin-right:10px; }
+.seo-jobcard2-common .jobcard2-detail-top .jobcard2-salary { color:#ff6400; flex-shrink:0; font-size:18px; font-weight:500; line-height:25px; margin-left:auto; }
+.seo-jobcard2-common .jobcard2-detail-box .jobcard2-detail-labels { font-size:0; height:22px; margin-top:10px; overflow:hidden; }
+.seo-jobcard2-common .jobcard2-detail-labels span { background:#f8f9fb; border-radius:6px; box-sizing:border-box; color:#999; display:inline-block; font-size:12px; height:100%; line-height:16px; margin-right:8px; padding:3px 8px; }
+.seo-jobcard2-common .jobcard2-company-box { border-top:1px solid #f0f3f7; display:flex; padding-top:16px; }
+.seo-jobcard2-common .jobcard2-company-box .jobcard2-company-info { box-sizing:border-box; display:flex; padding-left:16px; width:calc(100% - 50px); flex-direction:column; justify-content:center; }
+.seo-jobcard2-common .jobcard2-company-info .jobcard2-company-title { color:#666; font-size:14px; font-weight:500; height:20px; line-height:20px; overflow:hidden; }
+.seo-jobcard2-common .jobcard2-company-info .jobcard2-company-labels { color:#999; font-size:0; height:17px; line-height:17px; margin-top:6px; overflow:hidden; }
+.seo-jobcard2-common .jobcard2-company-info .jobcard2-company-labels span { display:inline-block; font-size:12px; margin-right:6px; }
+.home-industry-container .seo-jobcard2-common .jobcard2-company-logo { flex-shrink:0; border-radius:4px; height:24px; overflow:hidden; width:24px; }
+.home-industry-container .seo-jobcard2-common .jobcard2-company-logo img { display:block; height:100%; object-fit:cover; width:100%; }
+.home-industry-container .home-industry-content-container .home-industry-content-list { display:flex; }
+.home-industry-content-item { margin:0; }
+</style></head><body>
+<section class="home-industry-container"><div class="home-industry-box"><div class="home-industry-content-container"><div class="home-industry-content-list">
+<div class="home-industry-content-item">
+  <div class="seo-jobcard2-common">
+    <a class="jobcard2-detail-box" href="/job/1.shtml">
+      <div class="jobcard2-detail-top">
+        <div class="jobcard2-title-group">
+          <span class="jobcard2-title">重庆城市销售经理</span>
+          <span class="jobcard2-location">重庆-大坪</span>
+        </div>
+        <span class="jobcard2-salary">20-30k·14薪</span>
+      </div>
+      <div class="jobcard2-detail-labels"><span>5-10年</span><span>大专</span></div>
+    </a>
+    <a class="jobcard2-company-box" href="/company/1/">
+      <div class="jobcard2-company-logo"><img src="https://img.example/logo.png" alt=""/></div>
+      <div class="jobcard2-company-info">
+        <div class="jobcard2-company-title">瑞幸咖啡(中国)有限公司</div>
+        <div class="jobcard2-company-labels"><span>互联网</span><span>10000人以上</span></div>
+      </div>
+    </a>
+  </div>
+</div></div></div></section>
+</body></html>"#;
+    let doc = Document::parse(html, "https://a.test/");
+    let layout = compute(&doc, 1200.0, &font());
+    let g = |sel: &str| layout.rect_for(sel).unwrap_or_else(|| panic!("缺盒子:{sel}"));
+    let card = g("html > body > section > div > div > div > div");
+    assert!((card.2 - 384.0).abs() < 0.5, "卡片宽 {card:?}");
+    assert!((card.3 - 192.0).abs() < 0.5, "卡片高 {card:?}");
+    let seo = g("html > body > section > div > div > div > div > div");
+    assert!((seo.3 - 192.0).abs() < 0.5, "seo-jobcard2-common height:100% 应为 192(border-box),实际 {seo:?}");
+    let labels = g("html > body > section > div > div > div > div > div > a > div:nth-of-type(2)");
+    assert!((labels.3 - 22.0).abs() < 0.5, "labels 显式 height:22px 应钳制行盒,实际 {labels:?}");
+    let company = g("html > body > section > div > div > div > div > div > a:nth-of-type(2)");
+    let card_content_bottom = card.1 + card.3 - 24.0;
+    assert!(
+        company.1 + company.3 <= card_content_bottom + 0.5,
+        "公司行应整行落在卡片裁剪窗内:company={company:?} 窗底={card_content_bottom}"
+    );
+}

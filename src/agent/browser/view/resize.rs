@@ -17,7 +17,7 @@
 
 use serde_json::Value;
 
-use super::super::{document, images, layout, style, LsmBrowserManager, TabState};
+use super::super::{images, layout, style, LsmBrowserManager, TabState};
 
 /// 查看器上报尺寸的合法范围(下界 1:极端窄窗口也允许;上界与宿主视口同量级)。
 pub const MIN_VIEW_W: u32 = 1;
@@ -73,7 +73,7 @@ pub fn resize_cmd_json(w: u32, h: u32) -> String {
 impl LsmBrowserManager {
     /// 按 tab 当前视口重新布局(抽出自 `set_viewport`,视口自适应复用同一路径)。
     pub(in crate::agent::browser) fn relayout_tab(&self, tab: &mut TabState) {
-        let doc = document::Document::parse(&tab.html, &tab.url);
+        let doc = tab.document_with_state();
         let media = style::MediaCtx::new(tab.viewport.width as f64, tab.viewport.height as f64);
         let sizes = images::ImageSizes::from_store(&tab.images);
         tab.layout = layout::compute_full(

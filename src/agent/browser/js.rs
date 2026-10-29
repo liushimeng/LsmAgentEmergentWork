@@ -237,6 +237,17 @@ const PRELUDE_BODY: &str = r##"
   var __timer_budget = 64;
 
   function __push(a) { __lsm_actions.push(a); }
+  // 快照 rect → 几何属性组(阶段一回退桥与 getBoundingClientRect 同源)。
+  function __geo1(n) {
+    var r = n && n.rect;
+    if (r && typeof r.length === "number" && r.length >= 4) {
+      return {
+        x: Math.round(Number(r[0]) || 0), y: Math.round(Number(r[1]) || 0),
+        w: Math.max(0, Math.round(Number(r[2]) || 0)), h: Math.max(0, Math.round(Number(r[3]) || 0)),
+      };
+    }
+    return { x: 0, y: 0, w: 0, h: 0 };
+  }
   function __mk(n) {
     var attrs = n.attrs || {};
     var el = {
@@ -279,6 +290,17 @@ const PRELUDE_BODY: &str = r##"
       addEventListener: function () {},
       removeEventListener: function () {},
       getBoundingClientRect: function () {
+        // 阶段一回退桥的几何真值:快照 rect [x,y,w,h](宿主布局产出)。
+        // 此前是硬编码全零桩 —— eval 超时回退到这里时,页面脚本与 Agent
+        // 的测量全部拿到 0(clientWidth 等属性干脆缺失),二维码 canvas
+        // 定尺寸、地图容器测量等链路当场断掉(实测猎聘首页全元素 0×0)。
+        var r = n && n.rect;
+        if (r && typeof r.length === "number" && r.length >= 4) {
+          var x = Number(r[0]) || 0, y = Number(r[1]) || 0;
+          var w = Math.max(0, Math.round(Number(r[2]) || 0));
+          var h = Math.max(0, Math.round(Number(r[3]) || 0));
+          return { x: x, y: y, top: y, left: x, right: x + w, bottom: y + h, width: w, height: h };
+        }
         return { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 };
       },
       scrollIntoView: function () { __push({ type: "scroll_to", selector: n.sel }); },
@@ -305,7 +327,18 @@ const PRELUDE_BODY: &str = r##"
       removeChild: function (c) { return c; },
       insertBefore: function (c) { return c; },
       remove: function () {},
-      cloneNode: function () { return el; }
+      cloneNode: function () { return el; },
+      // 几何属性族(与 getBoundingClientRect 同源,读快照 rect)。
+      // 此前整族缺失 —— jQuery `$(el).width()`、组件初始化读 clientWidth
+      // 全是 undefined,NaN 在测量链里向下传播。
+      clientWidth: __geo1(n).w,
+      clientHeight: __geo1(n).h,
+      offsetWidth: __geo1(n).w,
+      offsetHeight: __geo1(n).h,
+      scrollWidth: __geo1(n).w,
+      scrollHeight: __geo1(n).h,
+      offsetLeft: __geo1(n).x,
+      offsetTop: __geo1(n).y,
     };
     function define(name, getter, setter) {
       try { Object.defineProperty(el, name, { get: getter, set: setter, configurable: true, enumerable: true }); } catch (e) {}

@@ -180,6 +180,29 @@ impl JsHandle {
             .map_err(|_| "JS 执行超时(线程预算耗尽)".to_string())
     }
 
+    /// 带宽限续等的请求:常规 `wait_ms` 超时后**不放弃**,在同一回复
+    /// channel 上再等 `grace_ms`。线程单轮慢(Boa 解释执行重站脚本)不等于
+    /// 死了 —— 放弃的那轮动作会被 `tx.send` 静默丢弃,模块挂载整轮作废
+    /// (实测猎聘 hero 搜索条/广告位模块即断在此)。仍超时才报错,
+    /// 残留动作由线程回复邮箱(见 `runtime::merge_pending_into`)兜底回收。
+    pub fn request_with_grace(
+        &self,
+        make: impl FnOnce(std::sync::mpsc::Sender<JsReply>) -> JsRequest,
+        wait_ms: u64,
+        grace_ms: u64,
+    ) -> Result<JsReply, String> {
+        let (tx_reply, rx) = std::sync::mpsc::channel::<JsReply>();
+        self.tx
+            .send(make(tx_reply))
+            .map_err(|_| "JS 线程已退出".to_string())?;
+        match rx.recv_timeout(Duration::from_millis(wait_ms + 2_000)) {
+            Ok(r) => Ok(r),
+            Err(_) => rx
+                .recv_timeout(Duration::from_millis(grace_ms))
+                .map_err(|_| "JS 执行超时(线程预算耗尽,含宽限)".to_string()),
+        }
+    }
+
     /// 对给定源码做语句级定位(需在 `spawn_blocking` 中调用)。
     /// 诊断是离线分析,前缀重放次数远高于常规请求,故单独放宽墙钟。
     pub fn diag(&self, source: String, origin: String) -> Result<Vec<String>, String> {
@@ -232,6 +255,28 @@ pub fn budget_ms() -> u64 {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|v| *v >= 500)
         .unwrap_or(10_000)
+}
+
+/// 管线轮**宽限续等**预算(毫秒):常规等待超时后,在同一回复 channel 上
+/// 继续等待的时长。重站点(百度地图/猎聘)单轮脚本在 Boa 下可达分钟级,
+/// 线程还在正常执行时按超时放弃 = 整轮 DOM 动作作废(模块挂载丢回复);
+/// 宽限期内跑完照常消费。仍超时才走中断路径(残留动作由线程回复邮箱兜底)。
+pub fn grace_ms() -> u64 {
+    std::env::var("LAEW_WEB_SCRIPT_GRACE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v >= 1_000)
+        .unwrap_or(60_000)
+}
+
+/// eval_js 的宽限续等预算(毫秒):常规 10s 预算超时后继续等的时间窗。
+/// 重页面事件循环单轮可达数十秒,宽限内回来就正常返回,不再逼调用方重试。
+pub fn eval_grace_ms() -> u64 {
+    std::env::var("LAEW_WEB_EVAL_GRACE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v >= 500)
+        .unwrap_or(30_000)
 }
 
 /// 脚本管线产物:回写宿主前的中间结果。
@@ -572,7 +617,7 @@ pub(crate) async fn run_pipeline(
             .as_millis()
             .max(2_000) as u64;
         let reply: Result<JsReply, String> = match tokio::task::spawn_blocking(move || {
-            h.request_with_budget(
+            h.request_with_grace(
                 |tx| JsRequest::RunScripts {
                     scripts,
                     env,
@@ -581,12 +626,13 @@ pub(crate) async fn run_pipeline(
                     budget_ms: wait_ms,
                 },
                 wait_ms,
+                grace_ms(),
             )
         })
         .await
         {
             Ok(Ok(r)) => Ok(r),
-            _ => Err("脚本执行超时或线程不可用".to_string()),
+            _ => Err("脚本执行超时或线程不可用(含宽限)".to_string()),
         };
         let reply = match reply {
             Ok(r) => r,

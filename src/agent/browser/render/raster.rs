@@ -12,7 +12,7 @@ use tiny_skia::{Pixmap, PremultipliedColorU8};
 use super::super::images::{DecodedImage, ImageStore};
 use super::super::style::{Affine, CornerRadius, GradientKind, GradientSpec};
 use super::blur::{blur_mask, half_width_for, MAX_MASK_PIXELS};
-use super::display::{BgFill, DisplayItem, DisplayKind};
+use super::display::{BgFill, DisplayItem, DisplayKind, WidgetGlyphKind};
 use super::FontSet;
 
 /// 像素裁剪窗口(半开区间 `[x0,x1) × [y0,y1)`,画布坐标)。
@@ -300,8 +300,93 @@ pub(crate) fn rasterize(
             DisplayKind::CanvasNote { pale } => {
                 draw_canvas_note(font, pixmap, &sc, &mapper, item, *pale);
             }
+            DisplayKind::WidgetGlyph { glyph, open } => {
+                draw_widget_glyph(pixmap, &sc, &mapper, item, *glyph, *open);
+            }
         }
     }
+}
+
+/// 控件几何图元:全部以盒内归一化坐标判定,天然支持 transform 与 scissor。
+fn draw_widget_glyph(
+    pixmap: &mut Pixmap,
+    sc: &Scissor,
+    mapper: &Mapper,
+    item: &DisplayItem,
+    glyph: WidgetGlyphKind,
+    open: bool,
+) {
+    let rect = mapper.scissor_of(sc, item.x, item.y, item.w, item.h);
+    if rect.empty() {
+        return;
+    }
+    let w = pixmap.width() as i64;
+    let pixels = pixmap.pixels_mut();
+    let a = (item.opacity * 255.0).round().clamp(0.0, 255.0) as u8;
+    for py in rect.y0..rect.y1 {
+        for px in rect.x0..rect.x1 {
+            let (lx, ly) = mapper.local(px, py);
+            if glyph_contains(glyph, open, lx, ly, item.x, item.y, item.w, item.h) {
+                blend_pixel(pixels, w, px, py, 45, 45, 45, a);
+            }
+        }
+    }
+}
+
+fn glyph_contains(
+    glyph: WidgetGlyphKind,
+    open: bool,
+    lx: f64,
+    ly: f64,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+) -> bool {
+    let nx = ((lx - x) / w.max(1.0)).clamp(0.0, 1.0);
+    let ny = ((ly - y) / h.max(1.0)).clamp(0.0, 1.0);
+    match glyph {
+        WidgetGlyphKind::CheckMark => {
+            // 两段折线构成勾:粗细按短边比例,端点均在盒内留白。
+            let t = 0.11;
+            let p0 = (0.18, 0.52);
+            let p1 = (0.42, 0.75);
+            let p2 = (0.82, 0.25);
+            dist_segment(nx, ny, p0.0, p0.1, p1.0, p1.1) <= t
+                || dist_segment(nx, ny, p1.0, p1.1, p2.0, p2.1) <= t
+        }
+        WidgetGlyphKind::RadioDot => {
+            let r = 0.24;
+            (nx - 0.5).powi(2) + (ny - 0.5).powi(2) <= r * r
+        }
+        WidgetGlyphKind::Bullet => {
+            let r = 0.12;
+            (nx - 0.5).powi(2) + (ny - 0.5).powi(2) <= r * r
+        }
+        WidgetGlyphKind::Caret => {
+            if open {
+                // 向下三角:上宽下尖。
+                ny >= 0.34 && ny <= 0.68 && (ny - 0.34) / 0.34 >= (nx - 0.5).abs() / 0.22
+            } else {
+                // 向右三角:左尖右宽。
+                nx >= 0.34 && nx <= 0.68 && (nx - 0.34) / 0.34 >= (ny - 0.5).abs() / 0.22
+            }
+        }
+    }
+}
+
+fn dist_segment(px: f64, py: f64, x0: f64, y0: f64, x1: f64, y1: f64) -> f64 {
+    let dx = x1 - x0;
+    let dy = y1 - y0;
+    let len2 = dx * dx + dy * dy;
+    let t = if len2 <= f64::EPSILON {
+        0.0
+    } else {
+        (((px - x0) * dx + (py - y0) * dy) / len2).clamp(0.0, 1.0)
+    };
+    let qx = x0 + t * dx;
+    let qy = y0 + t * dy;
+    ((px - qx).powi(2) + (py - qy).powi(2)).sqrt()
 }
 
 /// 背景填充:纯色圆角矩形或渐变(渐变按像素求值,支持圆角、裁剪与 transform)。

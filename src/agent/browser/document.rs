@@ -51,6 +51,95 @@ impl Document {
         &self.root
     }
 
+    /// 把表单运行时值/details-dialog 开合覆盖落到解析树，供样式、布局与快照
+    /// 共享同一份状态。只修改临时 `Document`，不回写 `tab.html`。
+    ///
+    /// 覆盖规则：`form_values` 的 stable selector 值优先于 HTML 属性；空值表示
+    /// 清空（input/textarea 退回 placeholder）。`widget_open` 显式 `false` 可关闭
+    /// 源 HTML 中带 `open` 的 details/dialog。
+    pub fn apply_widget_state(
+        &mut self,
+        form_values: &HashMap<String, String>,
+        widget_open: &HashMap<String, bool>,
+    ) {
+        for node in self.select("*").unwrap_or_default() {
+            let tag = tag_name(&node);
+            let stable = Document::stable_selector(&node);
+            if let Some(open) = widget_open.get(&stable) {
+                if matches!(tag.as_str(), "details" | "dialog") {
+                    if *open {
+                        node.as_element()
+                            .unwrap()
+                            .attributes
+                            .borrow_mut()
+                            .insert("open", String::new());
+                    } else {
+                        node.as_element()
+                            .unwrap()
+                            .attributes
+                            .borrow_mut()
+                            .remove("open");
+                    }
+                }
+            }
+            let Some(value) = form_values.get(&stable) else {
+                continue;
+            };
+            match tag.as_str() {
+                "input" => {
+                    let typ = attr(&node, "type").unwrap_or_default().to_ascii_lowercase();
+                    if matches!(typ.as_str(), "checkbox" | "radio") {
+                        let mut attrs = node.as_element().unwrap().attributes.borrow_mut();
+                        if value == "true" {
+                            attrs.insert("checked", String::new());
+                        } else {
+                            attrs.remove("checked");
+                        }
+                    } else {
+                        let mut attrs = node.as_element().unwrap().attributes.borrow_mut();
+                        if value.is_empty() {
+                            attrs.remove("value");
+                        } else {
+                            attrs.insert("value", value.clone());
+                        }
+                    }
+                }
+                "textarea" => {
+                    let mut attrs = node.as_element().unwrap().attributes.borrow_mut();
+                    if value.is_empty() {
+                        attrs.remove("value");
+                    } else {
+                        attrs.insert("value", value.clone());
+                    }
+                    drop(attrs);
+                    for child in node.children().collect::<Vec<_>>() {
+                        child.detach();
+                    }
+                    if !value.is_empty() {
+                        node.append(NodeRef::new_text(value));
+                    }
+                }
+                "select" => {
+                    let Ok(options) = node.select("option") else {
+                        continue;
+                    };
+                    for opt in options {
+                        let opt = opt.as_node().clone();
+                        let opt_value = attr(&opt, "value")
+                            .unwrap_or_else(|| collapse_ws(&opt.text_contents()));
+                        let mut attrs = opt.as_element().unwrap().attributes.borrow_mut();
+                        if opt_value == *value {
+                            attrs.insert("selected", String::new());
+                        } else {
+                            attrs.remove("selected");
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     pub fn title(&self) -> String {
         self.root
             .select_first("title")
@@ -593,6 +682,11 @@ pub fn common_attrs(node: &NodeRef) -> HashMap<String, String> {
         "aria-hidden", "data-testid", "data-id", "for", "action", "method", "rel", "target",
         // 替换元素固有尺寸:静态 Canvas/图片的 JS 包装同样需要真实 width/height。
         "width", "height",
+        // 语义控件状态与表格跨距:快照/序列化必须保真,否则 JS 回写后
+        // details/dialog/响应式图片/表格会在下一次重排时静默丢失关键属性。
+        "open", "rowspan", "colspan", "srcset", "poster", "controls", "multiple", "size",
+        "min", "max", "step", "list", "pattern", "required", "accept", "download",
+        "datetime", "cite", "label", "contenteditable", "tabindex",
     ];
     for n in names {
         if let Some(v) = attr(node, n) {
@@ -1019,8 +1113,23 @@ mod tests {
     }
 
     #[test]
-    fn 隐藏元素不可见() {
-        let d = Document::parse(
+    fn 语义属性经快照序列化保真() {
+        let html = r#"<body><details open><summary>标题</summary><p>正文</p></details>
+        <table><tr><td colspan="2" rowspan="3">跨格</td></tr></table>
+        <img src="/a.png" srcset="/a.png 1x, /b.png 2x" poster="/p.jpg">
+        <video controls></video><input type="range" min="1" max="9" step="2" required></body>"#;
+        let d = Document::parse(html, "https://a.test/");
+        let out = d.serialize_full();
+        for key in [
+            "open", "colspan", "rowspan", "srcset", "poster", "controls", "min", "max",
+            "step", "required",
+        ] {
+            assert!(out.contains(key), "序列化不应丢失语义属性 - {key}: {out}");
+        }
+    }
+
+    #[test]
+    fn 隐藏元素不可见() {        let d = Document::parse(
             "<body><div style='display:none'><a href='/x'>x</a></div><a href='/y'>y</a></body>",
             "https://a.test/",
         );

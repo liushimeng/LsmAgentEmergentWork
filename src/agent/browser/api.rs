@@ -52,6 +52,33 @@ fn timeout_ms(params: &Value, top: &Value, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// 解析当前 HTML 并落入运行时控件覆盖，保证 inspect/布局/截图共用一份状态。
+fn tab_document(tab: &super::TabState) -> Document {
+    tab.document_with_state()
+}
+
+/// 运行时控件状态变化后重算布局并推帧。
+async fn relayout_and_push(mgr: &LsmBrowserManager, pid: &str) {
+    let mut inner = mgr.inner.lock().await;
+    let Some(tab) = inner.tabs.get_mut(pid) else {
+        return;
+    };
+    let doc = tab.document_with_state();
+    let media = super::style::MediaCtx::new(tab.viewport.width as f64, tab.viewport.height as f64);
+    let sizes = super::images::ImageSizes::from_store(&tab.images);
+    tab.layout = super::layout::compute_full(
+        &doc,
+        tab.viewport.width as f64,
+        mgr.font(),
+        &media,
+        &sizes,
+    );
+    tab.layout_rev = tab.html_rev;
+    if tab.mode.is_headed() {
+        mgr.push_frame(tab);
+    }
+}
+
 // ============ 阶段二:页面 JS 线程交互 ============
 
 /// 若页面有 JS 线程,把事件分发到页面 listener。无线程/失败返回 None(并清理失效句柄)。
@@ -62,11 +89,18 @@ async fn js_dispatch(
     event: &str,
 ) -> Option<script::JsReply> {
     let (handle, env, nodes) = {
-        let inner = mgr.inner.lock().await;
-        let tab = inner.tabs.get(pid)?;
+        let mut inner = mgr.inner.lock().await;
+        // 「快照×布局」一致性守卫(与 js_eval_thread 同因):需要 &mut,放独立作用域。
+        if let Some(tab) = inner.tabs.get_mut(pid) {
+            mgr.ensure_layout_locked(tab);
+        }
+        let inner = &*inner;
+        let Some(tab) = inner.tabs.get(pid) else {
+            return None;
+        };
         let handle = tab.js.clone()?;
         let mut env = script::build_env(
-            &inner,
+            inner,
             &tab.url,
             &tab.title,
             &tab.user_agent,
@@ -78,7 +112,7 @@ async fn js_dispatch(
         env.scroll_y = tab.scroll_y;
         // 资源时序注入(第 174 轮):取最近 120 条,足够探测「脚本是否加载」。
         env.resources = tab.network.iter().rev().take(120).rev().cloned().collect();
-        let doc = Document::parse(&tab.html, &tab.url);
+        let doc = tab_document(tab);
         let rects = tab.layout.rect_map();
         let nodes = doc.snapshot_nodes_with_rects((tab.viewport.width, tab.viewport.height), &rects);
         (handle, env, nodes)
@@ -107,6 +141,21 @@ async fn js_dispatch(
         }
         _ => None,
     }
+}
+
+/// JS 事件分发(带上限):线程忙/无响应时返回 None，保底让原生默认动作继续。
+async fn js_dispatch_bounded(
+    mgr: &LsmBrowserManager,
+    pid: &str,
+    selector: &str,
+    event: &str,
+) -> Option<script::JsReply> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        js_dispatch(mgr, pid, selector, event),
+    )
+    .await
+    .unwrap_or(None)
 }
 
 /// 应用 JS 回复:DOM 动作落到 `tab.html` 并重算布局;存储/Cookie/标题/滚动/台账合并。
@@ -162,10 +211,11 @@ async fn apply_js_reply(
     if summary.storage_session_clear {
         t.session_storage.clear();
     }
-    t.html = final_html.clone();
+    t.set_html(final_html.clone());
     if let Some(title) = &summary.title {
         t.title = title.clone();
     }
+    let state_changed = !summary.form_values.is_empty();
     for (k, v) in summary.form_values {
         t.form_values.insert(k, v);
     }
@@ -220,7 +270,7 @@ async fn apply_js_reply(
     // eval 因此从 25-35s 降到亚秒级。脚本补齐(run_pending_scripts)仍照常,
     // 由它自己的「无待执行脚本」预检兜底。
     let dom_changed = final_html != tab_html;
-    if !dom_changed {
+    if !dom_changed && !state_changed {
         drop(inner);
         run_pending_scripts(mgr, pid, interaction_budget_ms()).await;
         return reply
@@ -254,7 +304,7 @@ async fn apply_js_reply(
     .await;
     if let Some(tab) = inner.tabs.get_mut(pid) {
         tab.images = images_out.store;
-        let dom = Document::parse(&tab.html, &tab.url);
+        let dom = tab_document(tab);
         let media = super::style::MediaCtx::new(tab.viewport.width as f64, tab.viewport.height as f64);
         let sizes = super::images::ImageSizes::from_store(&tab.images);
         tab.layout = super::layout::compute_full(
@@ -343,7 +393,7 @@ async fn run_pending_scripts(mgr: &LsmBrowserManager, pid: &str, budget_ms: u64)
         // 都空跑一遍「解析+收集+排空」,重页(猎聘 372KB DOM)单条 eval
         // 25-35s 的大头就是它;页面无变化时这里直接归零。
         let mut probe = tab.executed_scripts.clone();
-        let doc = Document::parse(&tab.html, &tab.url);
+        let doc = tab_document(tab);
         let mut collected = script::dom_ops::collect_scripts(&doc, &tab.url, &mut probe);
         let deferred_left = std::mem::take(&mut collected.deferred);
         let has_pending = !collected.items.is_empty() || !deferred_left.is_empty();
@@ -384,7 +434,7 @@ async fn run_pending_scripts(mgr: &LsmBrowserManager, pid: &str, budget_ms: u64)
     };
     let changed = pipeline.html != html;
     if changed {
-        tab.html = pipeline.html;
+        tab.set_html(pipeline.html);
     }
     // 截断观测字段(第 174 轮):管线收敛则清零,截断则带出剩余数。
     tab.script_budget_cut = pipeline.budget_cut;
@@ -425,7 +475,7 @@ async fn run_pending_scripts(mgr: &LsmBrowserManager, pid: &str, budget_ms: u64)
         });
     }
     if changed {
-        let dom = Document::parse(&tab.html, &tab.url);
+        let dom = tab_document(tab);
         let media = super::style::MediaCtx::new(tab.viewport.width as f64, tab.viewport.height as f64);
         let sizes = super::images::ImageSizes::from_store(&tab.images);
         tab.layout = super::layout::compute_full(
@@ -435,6 +485,7 @@ async fn run_pending_scripts(mgr: &LsmBrowserManager, pid: &str, budget_ms: u64)
             &media,
             &sizes,
         );
+        tab.layout_rev = tab.html_rev;
         if tab.mode.is_headed() {
             mgr.push_frame(tab);
         }
@@ -456,14 +507,27 @@ fn apply_dom_actions(
     (final_html, summary)
 }
 
-/// eval_js 走页面 JS 线程(持久全局)。线程不可用时返回 None,由调用方回退快照桥。
+/// eval_js 走页面 JS 线程的三种结局。
+enum ThreadEval {
+    /// 线程正常回复。
+    Reply(script::JsReply),
+    /// 无 JS 线程可用(`LAEW_WEB_SCRIPT=off` / 线程真退出):调用方可回退快照桥。
+    NoThread,
+    /// 线程在位但本轮预算内没回(事件循环在排定时器/微任务):**不要静默回退**。
+    /// 阶段一桥是另一套语义环境(独立 Context、独立 document),静默回退会让
+    /// 调用方拿到「同一段脚本在另一个世界跑出来的结果」——几何/全局状态全部
+    /// 失真(实测猎聘:eval 超时回退后 `getBoundingClientRect` 全 0)。
+    Busy,
+}
+
+/// eval_js 走页面 JS 线程(持久全局)。线程不可用时返回 NoThread,由调用方回退快照桥。
 async fn js_eval_thread(
     mgr: &LsmBrowserManager,
     pid: &str,
     script_text: &str,
-) -> Option<script::JsReply> {
+) -> ThreadEval {
     if !script::scripts_enabled() {
-        return None;
+        return ThreadEval::NoThread;
     }
     {
         // 懒启动:页面无脚本时首次 eval_js 建线程,获得持久会话。
@@ -475,11 +539,22 @@ async fn js_eval_thread(
         }
     }
     let (handle, env, nodes) = {
-        let inner = mgr.inner.lock().await;
-        let tab = inner.tabs.get(pid)?;
-        let handle = tab.js.clone()?;
+        let mut inner = mgr.inner.lock().await;
+        // 「快照×布局」一致性守卫:html 在上次布局后被脚本改写时先重排,
+        // 否则 rect_map(旧布局)× 快照(新 html)的位置键错位,几何全 0。
+        // 需要 &mut,放独立作用域,之后降级为不可变借用。
+        if let Some(tab) = inner.tabs.get_mut(pid) {
+            mgr.ensure_layout_locked(tab);
+        }
+        let inner = &*inner;
+        let Some(tab) = inner.tabs.get(pid) else {
+            return ThreadEval::NoThread;
+        };
+        let Some(handle) = tab.js.clone() else {
+            return ThreadEval::NoThread;
+        };
         let mut env = script::build_env(
-            &inner,
+            inner,
             &tab.url,
             &tab.title,
             &tab.user_agent,
@@ -491,29 +566,37 @@ async fn js_eval_thread(
         env.scroll_y = tab.scroll_y;
         // 资源时序注入(第 174 轮):取最近 120 条,足够探测「脚本是否加载」。
         env.resources = tab.network.iter().rev().take(120).rev().cloned().collect();
-        let doc = Document::parse(&tab.html, &tab.url);
+        let doc = tab_document(tab);
         let rects = tab.layout.rect_map();
         let nodes = doc.snapshot_nodes_with_rects((tab.viewport.width, tab.viewport.height), &rects);
         (handle, env, nodes)
     };
     let script_text = script_text.to_string();
     let result = tokio::task::spawn_blocking(move || {
-        handle.request(|tx| script::JsRequest::Eval {
-            script: script_text,
-            env,
-            nodes,
-            reply: tx,
-        })
+        // eval 也走宽限续等:重页面(猎聘/百度地图)事件循环排定时器单轮可到
+        // 数十秒,常规 10s 预算内回不来就报「忙碌」,调用方还得再烧一轮迭代
+        // 重试。宽限 30s(与管线宽限同机制),仍超时才判忙碌(2002)。
+        handle.request_with_grace(
+            |tx| script::JsRequest::Eval {
+                script: script_text,
+                env,
+                nodes,
+                reply: tx,
+            },
+            script::budget_ms(),
+            script::eval_grace_ms(),
+        )
     })
     .await;
     match result {
-        Ok(Ok(reply)) => Some(reply),
+        Ok(Ok(reply)) => ThreadEval::Reply(reply),
         // 同 js_dispatch_thread:忙碌超时保留句柄,只有线程真退出才清。
         Ok(Err(e)) if e.contains("已退出") => {
             mgr.clear_js(pid).await;
-            None
+            ThreadEval::NoThread
         }
-        _ => None,
+        Ok(Err(_)) => ThreadEval::Busy,
+        Err(_) => ThreadEval::Busy,
     }
 }
 
@@ -527,11 +610,13 @@ pub(crate) async fn sync_page(mgr: &LsmBrowserManager, pid: &str) -> bool {
     if !has_js {
         return false;
     }
-    let Some(reply) = js_eval_thread(mgr, pid, "undefined").await else {
-        return false;
-    };
-    apply_js_reply(mgr, pid, &reply).await;
-    true
+    match js_eval_thread(mgr, pid, "undefined").await {
+        ThreadEval::Reply(reply) => {
+            apply_js_reply(mgr, pid, &reply).await;
+            true
+        }
+        _ => false,
+    }
 }
 
 /// 执行一个 control_action。
@@ -698,7 +783,7 @@ pub async fn control(
             if let Some(h) = p_u64(params, "height") {
                 tab.viewport.height = (h as u32).clamp(240, 4320);
             }
-            let doc = Document::parse(&tab.html, &tab.url);
+            let doc = tab_document(tab);
             // 阶段三第三步:视口变化复用已解码图片的固有尺寸重排。
             let media = super::style::MediaCtx::new(tab.viewport.width as f64, tab.viewport.height as f64);
             let sizes = super::images::ImageSizes::from_store(&tab.images);
@@ -860,13 +945,13 @@ async fn click_inner(
     let selector = require_selector(params)?;
     let idx = nth(params);
     let timeout = timeout_ms(params, params, 60_000);
-    let (plan, rect, stable, toggled, laid_out) = {
+    let (plan, rect, stable, toggled, laid_out, radio_scope, summary_details) = {
         let inner = mgr.inner.lock().await;
         let tab = inner
             .tabs
             .get(pid)
             .ok_or_else(|| EngineError::page_not_found(pid))?;
-        let doc = Document::parse(&tab.html, &tab.url);
+        let doc = tab_document(tab);
         let nodes = doc
             .select(selector)
             .map_err(EngineError::action_failed)?;
@@ -881,6 +966,18 @@ async fn click_inner(
             .unwrap_or_default()
             .to_ascii_lowercase();
         let mut toggled = None;
+        let mut radio_scope = None;
+        let mut summary_details = None;
+        if tag == "summary" {
+            let mut cur = node.parent();
+            while let Some(p) = cur {
+                if document::tag_name(&p) == "details" {
+                    summary_details = Some(Document::stable_selector(&p));
+                    break;
+                }
+                cur = p.parent();
+            }
+        }
         if tag == "input" && matches!(typ.as_str(), "checkbox" | "radio") {
             let cur = tab
                 .form_values
@@ -888,6 +985,20 @@ async fn click_inner(
                 .map(|v| v == "true")
                 .unwrap_or_else(|| document::attr(node, "checked").is_some());
             toggled = Some((stable.clone(), (!cur).to_string()));
+            if typ == "radio" {
+                if let Some(name) = document::attr(node, "name").filter(|n| !n.trim().is_empty()) {
+                    let mut form_key = String::new();
+                    let mut cur = node.parent();
+                    while let Some(p) = cur {
+                        if document::tag_name(&p) == "form" {
+                            form_key = Document::stable_selector(&p);
+                            break;
+                        }
+                        cur = p.parent();
+                    }
+                    radio_scope = Some((form_key, name));
+                }
+            }
         }
         let mut plan = None;
         if toggled.is_none() && !matches!(kind, "right" | "double") {
@@ -920,19 +1031,8 @@ async fn click_inner(
                 }
             }
         }
-        (plan, rect, stable, toggled, rect_opt.is_some())
+        (plan, rect, stable, toggled, rect_opt.is_some(), radio_scope, summary_details)
     };
-
-    if let Some((sel, value)) = toggled {
-        let mut inner = mgr.inner.lock().await;
-        if let Some(tab) = inner.tabs.get_mut(pid) {
-            tab.form_values.insert(sel, value);
-        }
-        return Ok(json!({
-            "clicked": true, "x": rect.0, "y": rect.1, "mode": kind,
-            "selector": stable, "toggled": true, "laid_out": laid_out,
-        }));
-    }
 
     let mut out = json!({
         "clicked": true,
@@ -945,7 +1045,14 @@ async fn click_inner(
     // 阶段二:页面 listener 分发。preventDefault 或 JS 产生导航动作时优先按 JS 语义执行;
     // listener 未拦截时继续默认行为(handler 与默认导航并存,贴近真实浏览器)。
     if !matches!(kind, "right" | "double" | "js") {
-        if let Some(reply) = js_dispatch(mgr, pid, &stable, "click").await {
+        // JS 先行但不能无限等:页面线程忙/无响应时按未拦截处理,保底推进默认动作。
+        let dispatch = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            js_dispatch(mgr, pid, &stable, "click"),
+        )
+        .await
+        .unwrap_or(None);
+        if let Some(reply) = dispatch {
             let pending = apply_js_reply(mgr, pid, &reply).await;
             if reply.handled {
                 out["js_handled"] = json!(true);
@@ -979,6 +1086,72 @@ async fn click_inner(
             }
         }
     }
+    // summary 是 details 的原生展开开关:JS 未拦截时切换开合覆盖并重排。
+    if let Some(details_sel) = summary_details {
+        let next_open = {
+            let mut inner = mgr.inner.lock().await;
+            let Some(tab) = inner.tabs.get_mut(pid) else {
+                return Ok(out);
+            };
+            let current = tab.widget_open.get(&details_sel).copied().unwrap_or_else(|| {
+                tab_document(tab)
+                    .select(&details_sel)
+                    .ok()
+                    .and_then(|mut v| v.pop())
+                    .map(|n| document::attr(&n, "open").is_some())
+                    .unwrap_or(false)
+            });
+            tab.widget_open.insert(details_sel.clone(), !current);
+            !current
+        };
+        out["toggled_open"] = json!(next_open);
+        out["details"] = json!(details_sel);
+        relayout_and_push(mgr, pid).await;
+        return Ok(out);
+    }
+
+    // checkbox/radio 默认切换:JS 先行且未 preventDefault 时才改运行时状态,
+    // 与真实浏览器的 click 事件语义一致;radio 同 form 同 name 互斥。
+    if let Some((sel, value)) = toggled {
+        let mut inner = mgr.inner.lock().await;
+        if let Some(tab) = inner.tabs.get_mut(pid) {
+            if value == "true" {
+                if let Some((form_key, name)) = &radio_scope {
+                    let doc = tab_document(tab);
+                    if let Ok(radios) = doc.select("input[type=\"radio\"]") {
+                        for radio in radios {
+                            if document::attr(&radio, "name").as_deref() != Some(name.as_str()) {
+                                continue;
+                            }
+                            let mut same_form = form_key.is_empty();
+                            if !same_form {
+                                let mut cur = radio.parent();
+                                while let Some(p) = cur {
+                                    if document::tag_name(&p) == "form" {
+                                        same_form = Document::stable_selector(&p) == *form_key;
+                                        break;
+                                    }
+                                    cur = p.parent();
+                                }
+                            }
+                            if same_form {
+                                let rs = Document::stable_selector(&radio);
+                                if rs != sel {
+                                    tab.form_values.insert(rs, "false".to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            tab.form_values.insert(sel, value);
+        }
+        drop(inner);
+        out["toggled"] = json!(true);
+        relayout_and_push(mgr, pid).await;
+        return Ok(out);
+    }
+
     match plan {
         Some(NavPlan::NewTab { url }) => {
             let spawned = mgr.new_tab(pid, &url, timeout).await?;
@@ -1004,7 +1177,7 @@ async fn act_hover(mgr: &LsmBrowserManager, pid: &str, params: &Value) -> Engine
         .tabs
         .get(pid)
         .ok_or_else(|| EngineError::page_not_found(pid))?;
-    let doc = Document::parse(&tab.html, &tab.url);
+    let doc = tab_document(tab);
     let nodes = doc.select(selector).map_err(EngineError::action_failed)?;
     let node = nodes.get(nth(params)).ok_or_else(|| EngineError::action_failed("选择器未命中"))?;
     let stable = Document::stable_selector(node);
@@ -1025,7 +1198,7 @@ async fn act_mouse_move(mgr: &LsmBrowserManager, pid: &str, params: &Value) -> E
         .get_mut(pid)
         .ok_or_else(|| EngineError::page_not_found(pid))?;
     let (x, y) = if let Some(sel) = p_str(params, "selector") {
-        let doc = Document::parse(&tab.html, &tab.url);
+        let doc = tab_document(tab);
         let nodes = doc.select(sel).map_err(EngineError::action_failed)?;
         let node = nodes.get(nth(params)).ok_or_else(|| EngineError::action_failed("选择器未命中"))?;
         let stable = Document::stable_selector(node);
@@ -1048,7 +1221,7 @@ async fn act_input(mgr: &LsmBrowserManager, pid: &str, params: &Value) -> Engine
             .tabs
             .get_mut(pid)
             .ok_or_else(|| EngineError::page_not_found(pid))?;
-        let doc = Document::parse(&tab.html, &tab.url);
+        let doc = tab_document(tab);
         let nodes = doc.select(selector).map_err(EngineError::action_failed)?;
         let node = nodes.get(nth(params)).ok_or_else(|| {
             EngineError::action_failed(format!("输入目标未命中:{selector}"))
@@ -1063,11 +1236,12 @@ async fn act_input(mgr: &LsmBrowserManager, pid: &str, params: &Value) -> Engine
     // 阶段二:input + change 事件分发到页面 listener(锁外执行)。
     let mut js_events = false;
     for evt in ["input", "change"] {
-        if let Some(reply) = js_dispatch(mgr, pid, &stable, evt).await {
+        if let Some(reply) = js_dispatch_bounded(mgr, pid, &stable, evt).await {
             apply_js_reply(mgr, pid, &reply).await;
             js_events = js_events || reply.handled;
         }
     }
+    relayout_and_push(mgr, pid).await;
     Ok(json!({
         "selector": stable,
         "text": text,
@@ -1082,16 +1256,20 @@ async fn act_input(mgr: &LsmBrowserManager, pid: &str, params: &Value) -> Engine
 async fn act_clear(mgr: &LsmBrowserManager, pid: &str, params: &Value) -> EngineResult<Value> {
     require_page(pid)?;
     let selector = require_selector(params)?;
-    let mut inner = mgr.inner.lock().await;
-    let tab = inner
-        .tabs
-        .get_mut(pid)
-        .ok_or_else(|| EngineError::page_not_found(pid))?;
-    let doc = Document::parse(&tab.html, &tab.url);
-    let nodes = doc.select(selector).map_err(EngineError::action_failed)?;
-    let node = nodes.get(nth(params)).ok_or_else(|| EngineError::action_failed("清空目标未命中"))?;
-    let stable = Document::stable_selector(node);
-    tab.form_values.insert(stable.clone(), String::new());
+    let stable = {
+        let mut inner = mgr.inner.lock().await;
+        let tab = inner
+            .tabs
+            .get_mut(pid)
+            .ok_or_else(|| EngineError::page_not_found(pid))?;
+        let doc = tab_document(tab);
+        let nodes = doc.select(selector).map_err(EngineError::action_failed)?;
+        let node = nodes.get(nth(params)).ok_or_else(|| EngineError::action_failed("清空目标未命中"))?;
+        let stable = Document::stable_selector(node);
+        tab.form_values.insert(stable.clone(), String::new());
+        stable
+    };
+    relayout_and_push(mgr, pid).await;
     Ok(json!({"cleared": true, "selector": stable, "len_after": 0}))
 }
 
@@ -1105,7 +1283,7 @@ async fn act_select_option(mgr: &LsmBrowserManager, pid: &str, params: &Value) -
             .tabs
             .get_mut(pid)
             .ok_or_else(|| EngineError::page_not_found(pid))?;
-        let doc = Document::parse(&tab.html, &tab.url);
+        let doc = tab_document(tab);
         let nodes = doc.select(selector).map_err(EngineError::action_failed)?;
         let node = nodes.get(nth(params)).ok_or_else(|| EngineError::action_failed("select 未命中"))?;
         let select = if document::tag_name(node) == "select" {
@@ -1168,10 +1346,11 @@ async fn act_select_option(mgr: &LsmBrowserManager, pid: &str, params: &Value) -
     };
     // 阶段二:change 事件分发到页面 listener。
     let mut js_events = false;
-    if let Some(reply) = js_dispatch(mgr, pid, &select_selector, "change").await {
+    if let Some(reply) = js_dispatch_bounded(mgr, pid, &select_selector, "change").await {
         apply_js_reply(mgr, pid, &reply).await;
         js_events = reply.handled;
     }
+    relayout_and_push(mgr, pid).await;
     Ok(json!({
         "selected": true,
         "selector": select_selector,
@@ -1188,41 +1367,53 @@ async fn act_select_dropdown(mgr: &LsmBrowserManager, pid: &str, params: &Value)
     let option_text = p_str(params, "option_text")
         .ok_or_else(|| EngineError::param("select_dropdown 需要 option_text"))?;
     let selector = p_str(params, "selector");
-    let mut inner = mgr.inner.lock().await;
-    let tab = inner
-        .tabs
-        .get_mut(pid)
-        .ok_or_else(|| EngineError::page_not_found(pid))?;
-    let doc = Document::parse(&tab.html, &tab.url);
-    let selects = if let Some(sel) = selector {
-        doc.select(sel).map_err(EngineError::action_failed)?
-    } else {
-        doc.select("select").map_err(EngineError::action_failed)?
-    };
-    for sel_node in selects {
-        let options = sel_node
-            .select("option")
-            .map_err(|_| EngineError::action_failed("非法选择器"))?;
-        for opt in options {
-            let label = document::collapse_ws(&opt.text_contents());
-            if label == option_text || label.contains(option_text) {
-                let value = document::attr(opt.as_node(), "value").unwrap_or_else(|| label.clone());
-                let select_selector = Document::stable_selector(&sel_node);
-                tab.form_values.insert(select_selector.clone(), value.clone());
-                return Ok(json!({
-                    "selected": true,
-                    "option_text": option_text,
-                    "value_after": value,
-                    "selector": select_selector,
-                    "mode": "custom_dropdown",
-                    "note": "原生 select 已直接选中;非原生下拉在阶段二接入页面脚本后可展开",
-                }));
+    let hit = {
+        let mut inner = mgr.inner.lock().await;
+        let tab = inner
+            .tabs
+            .get_mut(pid)
+            .ok_or_else(|| EngineError::page_not_found(pid))?;
+        let doc = tab_document(tab);
+        let selects = if let Some(sel) = selector {
+            doc.select(sel).map_err(EngineError::action_failed)?
+        } else {
+            doc.select("select").map_err(EngineError::action_failed)?
+        };
+        let mut hit = None;
+        for sel_node in selects {
+            let options = sel_node
+                .select("option")
+                .map_err(|_| EngineError::action_failed("非法选择器"))?;
+            for opt in options {
+                let label = document::collapse_ws(&opt.text_contents());
+                if label == option_text || label.contains(option_text) {
+                    let value = document::attr(opt.as_node(), "value").unwrap_or_else(|| label.clone());
+                    let select_selector = Document::stable_selector(&sel_node);
+                    tab.form_values.insert(select_selector.clone(), value.clone());
+                    hit = Some((select_selector, value));
+                    break;
+                }
+            }
+            if hit.is_some() {
+                break;
             }
         }
-    }
-    Err(EngineError::action_failed(format!(
-        "未找到包含「{option_text}」的下拉选项"
-    )))
+        hit
+    };
+    let Some((select_selector, value)) = hit else {
+        return Err(EngineError::action_failed(format!(
+            "未找到包含「{option_text}」的下拉选项"
+        )));
+    };
+    relayout_and_push(mgr, pid).await;
+    Ok(json!({
+        "selected": true,
+        "option_text": option_text,
+        "value_after": value,
+        "selector": select_selector,
+        "mode": "custom_dropdown",
+        "note": "原生 select 已直接选中;非原生下拉在阶段二接入页面脚本后可展开",
+    }))
 }
 
 async fn act_key_press(
@@ -1310,7 +1501,7 @@ async fn resolve_submit(
         .tabs
         .get(pid)
         .ok_or_else(|| EngineError::page_not_found(pid))?;
-    let doc = Document::parse(&tab.html, &tab.url);
+    let doc = tab_document(tab);
     let target = if let Some(sel) = selector {
         doc.select(sel)
             .map_err(EngineError::action_failed)?
@@ -1341,7 +1532,7 @@ async fn act_scroll(mgr: &LsmBrowserManager, pid: &str, params: &Value) -> Engin
         .get_mut(pid)
         .ok_or_else(|| EngineError::page_not_found(pid))?;
     if let Some(sel) = p_str(params, "selector") {
-        let doc = Document::parse(&tab.html, &tab.url);
+        let doc = tab_document(tab);
         let nodes = doc.select(sel).map_err(EngineError::action_failed)?;
         let node = nodes.get(nth(params)).ok_or_else(|| EngineError::action_failed("滚动目标未命中"))?;
         let stable = Document::stable_selector(node);
@@ -1374,7 +1565,7 @@ async fn act_scroll_to(mgr: &LsmBrowserManager, pid: &str, params: &Value) -> En
         .tabs
         .get_mut(pid)
         .ok_or_else(|| EngineError::page_not_found(pid))?;
-    let doc = Document::parse(&tab.html, &tab.url);
+    let doc = tab_document(tab);
     let nodes = doc.select(selector).map_err(EngineError::action_failed)?;
     let node = nodes.get(nth(params)).ok_or_else(|| EngineError::action_failed("滚动目标未命中"))?;
     let stable = Document::stable_selector(node);
@@ -1396,7 +1587,7 @@ async fn act_scroll_to_text(mgr: &LsmBrowserManager, pid: &str, params: &Value) 
         .tabs
         .get_mut(pid)
         .ok_or_else(|| EngineError::page_not_found(pid))?;
-    let doc = Document::parse(&tab.html, &tab.url);
+    let doc = tab_document(tab);
     let node = doc
         .find_by_text(text)
         .ok_or_else(|| EngineError::action_failed(format!("页面文本未找到:{text}")))?;
@@ -1420,7 +1611,7 @@ async fn act_focus(mgr: &LsmBrowserManager, pid: &str, params: &Value, mode: &st
         .tabs
         .get_mut(pid)
         .ok_or_else(|| EngineError::page_not_found(pid))?;
-    let doc = Document::parse(&tab.html, &tab.url);
+    let doc = tab_document(tab);
     let nodes = doc.select(selector).map_err(EngineError::action_failed)?;
     let node = nodes.get(nth(params)).ok_or_else(|| EngineError::action_failed("目标未命中"))?;
     let stable = Document::stable_selector(node);
@@ -1501,7 +1692,7 @@ async fn act_upload(mgr: &LsmBrowserManager, pid: &str, params: &Value) -> Engin
         .tabs
         .get_mut(pid)
         .ok_or_else(|| EngineError::page_not_found(pid))?;
-    let doc = Document::parse(&tab.html, &tab.url);
+    let doc = tab_document(tab);
     let nodes = doc.select(selector).map_err(EngineError::action_failed)?;
     let node = nodes.get(nth(params)).ok_or_else(|| EngineError::action_failed("上传控件未命中"))?;
     let stable = Document::stable_selector(node);
@@ -1516,7 +1707,7 @@ async fn act_drag(mgr: &LsmBrowserManager, pid: &str, params: &Value) -> EngineR
         .tabs
         .get(pid)
         .ok_or_else(|| EngineError::page_not_found(pid))?;
-    let doc = Document::parse(&tab.html, &tab.url);
+    let doc = tab_document(tab);
     let point = |sel_key: &str, x_key: &str, y_key: &str| -> Option<(f64, f64)> {
         if let Some(sel) = p_str(params, sel_key) {
             let nodes = doc.select(sel).ok()?;
@@ -1721,14 +1912,18 @@ async fn check_element_state(
 /// (`LAEW_WEB_SCRIPT=off` / 超时)回退阶段一快照桥。
 async fn js_condition(mgr: &LsmBrowserManager, pid: &str, expr: &str) -> bool {
     let script = format!("!!({expr})");
-    if let Some(reply) = js_eval_thread(mgr, pid, &script).await {
-        return reply.outcome.value.trim() == "true";
+    match js_eval_thread(mgr, pid, &script).await {
+        ThreadEval::Reply(reply) => return reply.outcome.value.trim() == "true",
+        // 忙碌超时:条件判定宁可判「未就绪」(调用方会继续等/超时收口),
+        // 也不要落到阶段一桥上拿另一套语义环境的结果。
+        ThreadEval::Busy => return false,
+        ThreadEval::NoThread => {}
     }
     let inner = mgr.inner.lock().await;
     let Some(tab) = inner.tabs.get(pid) else {
         return false;
     };
-    let doc = Document::parse(&tab.html, &tab.url);
+    let doc = tab_document(tab);
     let nodes = doc.snapshot_nodes();
     let empty = empty_map();
     let meta = JsPageMeta {
@@ -1791,10 +1986,23 @@ async fn act_eval(
     let _ = timeout_ms(params, top, 30_000);
 
     // 阶段二:优先走页面 JS 线程(持久全局,DOM 修改落回文档);
-    // 线程不可用(LAEW_WEB_SCRIPT=off / 超时)回退阶段一快照桥。
-    if let Some(reply) = js_eval_thread(mgr, pid, &script).await {
-        let pending = apply_js_reply(mgr, pid, &reply).await;
-        return finish_eval(mgr, pid, reply.outcome, pending, await_promise).await;
+    // 线程不可用(LAEW_WEB_SCRIPT=off / 线程退出)回退阶段一快照桥。
+    // **线程忙碌超时不再静默回退** —— 阶段一桥是另一套语义环境,静默回退
+    // 会让调用方拿到失真结果(几何全 0 / 全局状态另一份);显式报忙,
+    // 调用方 wait 后重试即可(句柄保留,页面全局状态无损)。
+    match js_eval_thread(mgr, pid, &script).await {
+        ThreadEval::Reply(reply) => {
+            let pending = apply_js_reply(mgr, pid, &reply).await;
+            return finish_eval(mgr, pid, reply.outcome, pending, await_promise).await;
+        }
+        ThreadEval::Busy => {
+            return Err(EngineError::new(
+                2002,
+                "页面 JS 线程忙碌(事件循环仍在排定时器/微任务),本次 eval 未执行;\
+                 请 control(wait) 1-3 秒后重试;线程与页面全局状态保持无损",
+            ));
+        }
+        ThreadEval::NoThread => {}
     }
 
     let (outcome, pending) = {
@@ -1803,7 +2011,7 @@ async fn act_eval(
         let Some(mut tab) = some_tab else {
             return Err(EngineError::page_not_found(pid));
         };
-        let doc = Document::parse(&tab.html, &tab.url);
+        let doc = tab_document(&tab);
         let rects = tab.layout.rect_map();
         let nodes = doc.snapshot_nodes_with_rects((tab.viewport.width, tab.viewport.height), &rects);
         let cookie_header = inner.cookies.header_for(&tab.url).unwrap_or_default();

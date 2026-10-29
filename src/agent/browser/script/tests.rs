@@ -2316,3 +2316,44 @@ fn 快照节点补齐style对象() {
     assert!(v.contains("\"setOk\":\"red\""), "style 赋值应可读回: {v}");
     handle.shutdown();
 }
+
+#[test]
+fn 回复邮箱_旧轮动作合并进新回复且时序在前() {
+    use crate::agent::browser::js::{JsAction, JsLog, JsOutcome};
+    use super::NetRecordLite;
+    // 宿主已放弃的旧轮(pending)与当前轮(cur)合并:旧动作在前、日志/网络拼接、
+    // 标量取当前值 —— 保证「线程跑完但宿主超时」的那轮 DOM 动作不丢。
+    let mut old = JsReply {
+        outcome: JsOutcome { ok: true, ..Default::default() },
+        network: Vec::new(),
+        handled: false,
+        default_prevented: false,
+    };
+    old.outcome.actions.push(JsAction { kind: "set_attr".into(), selector: "#a".into(), ..Default::default() });
+    old.outcome.logs.push(JsLog { level: "log".into(), text: "old".into() });
+    old.network.push(NetRecordLite {
+        url: "https://a.test/old".into(),
+        method: "GET".into(),
+        status: 200,
+        content_type: "text/plain".into(),
+        bytes: 1,
+        elapsed_ms: 1,
+        redirect: false,
+    });
+    let mut cur = JsReply {
+        outcome: JsOutcome { ok: true, ..Default::default() },
+        network: Vec::new(),
+        handled: false,
+        default_prevented: false,
+    };
+    cur.outcome.value = "42".into();
+    cur.outcome.actions.push(JsAction { kind: "set_value".into(), selector: "#b".into(), ..Default::default() });
+    let merged = super::runtime::merge_pending_into(cur, vec![old]);
+    assert_eq!(merged.outcome.actions.len(), 2);
+    assert_eq!(merged.outcome.actions[0].selector, "#a", "旧轮动作必须在前(时序)");
+    assert_eq!(merged.outcome.actions[1].selector, "#b");
+    assert_eq!(merged.outcome.logs.len(), 1);
+    assert_eq!(merged.outcome.value, "42", "标量取当前值");
+    assert_eq!(merged.network.len(), 1);
+    assert_eq!(merged.network[0].url, "https://a.test/old");
+}

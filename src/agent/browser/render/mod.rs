@@ -16,6 +16,8 @@ mod blur;
 mod raster;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod widget_tests;
 
 pub use display::{BgFill, ClipRect, DisplayItem, DisplayKind};
 
@@ -293,6 +295,9 @@ impl FontSet {
                     ),
                     DisplayKind::TextShadow { .. } => "textshadow".to_string(),
                     DisplayKind::CanvasNote { .. } => "canvasnote".to_string(),
+                    DisplayKind::WidgetGlyph { glyph, open } => {
+                        format!("widget({glyph:?},open={open})")
+                    }
                 };
                 buf.push_str(&format!(
                     "#{i} {} x={:.0} y={:.0} w={:.0} h={:.0} op={:.2} fixed={} z={:?} clip={:?}\n",

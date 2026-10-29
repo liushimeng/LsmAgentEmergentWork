@@ -10,6 +10,8 @@ pub mod transform;
 pub mod values;
 
 #[cfg(test)]
+mod state_tests;
+#[cfg(test)]
 mod tests;
 
 use std::collections::BTreeMap;
@@ -474,6 +476,32 @@ impl StyleEngine {
                 .unwrap_or(false)
         {
             st.display = "none".to_string();
+        }
+        // details/dialog 的显隐语义:`open` 属性由解析树承载(含运行时覆盖)。
+        // 关闭 details 只隐藏非 summary 子树,标志由父样式 O(1) 下传。
+        st.suppress_children = false;
+        st.in_details_closed = parent.in_details_closed;
+        if parent.in_details_closed {
+            st.display = "none".to_string();
+            st.in_details_closed = true;
+        } else if parent.suppress_children {
+            if tag == "summary" {
+                st.in_details_closed = false;
+            } else {
+                st.display = "none".to_string();
+                st.in_details_closed = true;
+            }
+        }
+        match tag.as_str() {
+            "details" => {
+                st.suppress_children = document::attr(node, "open").is_none() && !st.in_details_closed;
+            }
+            "dialog" => {
+                if document::attr(node, "open").is_none() {
+                    st.display = "none".to_string();
+                }
+            }
+            _ => {}
         }
         st
     }

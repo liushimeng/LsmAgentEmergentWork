@@ -100,7 +100,15 @@ pub(super) fn thread_main(rx: std::sync::mpsc::Receiver<JsRequest>) {
         match result {
             Ok(reply) => {
                 if let (Some(tx), Some(out)) = (reply_tx, reply) {
-                    let _ = tx.send(out);
+                    // 先把邮箱里「宿主已放弃但线程后来跑完」的旧轮合并进本回复,
+                    // 再发回宿主;发送仍失败(宿主又超时了)则回到邮箱等下下一轮。
+                    let merged = merge_pending_into(out, std::mem::take(&mut rt.pending_replies));
+                    if tx.send(merged.clone()).is_err() {
+                        if rt.pending_replies.len() > 8 {
+                            rt.pending_replies.remove(0);
+                        }
+                        rt.pending_replies.push(merged);
+                    }
                 }
             }
             Err(_) => {
@@ -146,6 +154,30 @@ struct ThreadRuntime {
     queue: Rc<BudgetedJobQueue>,
     /// 最近一次事件循环结束后仍未触发的定时器个数(0 = 页面已静默)。
     last_pending_timers: usize,
+    /// **回复邮箱**:宿主侧超时放弃后,线程才跑完的那轮回复压在这里,
+    /// 合并进下一个请求的回复带回宿主。此前 `tx.send` 失败即静默丢弃,
+    /// 该轮全部 DOM 动作永久丢失 —— 模块在线程里挂载完成、宿主 HTML
+    /// 永远没有(实测猎聘:hero 搜索条/广告位模块挂载动作整轮丢掉,
+    /// 页面停在「只剩登录卡」的半成品态)。上限 8 条,防病态站点撑爆。
+    pending_replies: Vec<JsReply>,
+}
+
+/// 把邮箱里的旧回复合并进当前回复:旧动作/日志/网络**先于**当前请求发生,
+/// 拼在前面(宿主按接收顺序应用,时序正确);标量字段一律取当前值。
+pub(super) fn merge_pending_into(mut cur: JsReply, pending: Vec<JsReply>) -> JsReply {
+    for old in pending {
+        let mut actions = old.outcome.actions;
+        actions.extend(std::mem::take(&mut cur.outcome.actions));
+        cur.outcome.actions = actions;
+        let mut logs = old.outcome.logs;
+        logs.extend(std::mem::take(&mut cur.outcome.logs));
+        cur.outcome.logs = logs;
+        let mut net = old.network;
+        net.extend(std::mem::take(&mut cur.network));
+        cur.network = net;
+        cur.outcome.webgl_asked = cur.outcome.webgl_asked.max(old.outcome.webgl_asked);
+    }
+    cur
 }
 
 impl ThreadRuntime {
@@ -228,6 +260,7 @@ impl ThreadRuntime {
             ctx,
             queue,
             last_pending_timers: 0,
+            pending_replies: Vec::new(),
         })
     }
 

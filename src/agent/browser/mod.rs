@@ -202,9 +202,22 @@ pub struct TabState {
     pub network: Vec<NetworkRecord>,
     pub console: Vec<ConsoleRecord>,
     pub form_values: HashMap<String, String>,
+    /// details/dialog 的运行时开合覆盖：key = stable selector，value = 是否 open。
+    /// 仅作为 `tab.html` 属性之上的覆盖层，布局/样式计算前落到解析树。
+    pub widget_open: HashMap<String, bool>,
     pub focused: Option<String>,
     pub mouse: Option<(f64, f64)>,
     pub layout: layout::Layout,
+    /// HTML 修订号:每次 `tab.html` 写入自增(经 `set_html`)。
+    /// 与 `layout_rev` 配对做「快照×布局」一致性守卫:
+    /// eval/dispatch/screenshot/inspect 入口发现两者不一致即重算布局,
+    /// 根治「HTML 已被脚本改写、rect_map 仍是旧布局」导致的位置键
+    /// (`:nth-of-type`)整体漂移 → JS 桥几何全 0 的问题
+    /// (实测猎聘:`run_pending_scripts` 改 html 不重排,页面脚本
+    /// `getBoundingClientRect/clientWidth` 全 0,二维码/地图测量链全断)。
+    pub html_rev: u64,
+    /// 布局修订号:最后一次 `tab.layout` 计算对应的 `html_rev`。
+    pub layout_rev: u64,
     pub created_at_ms: u128,
     pub last_active_ms: u128,
     pub foreground: bool,
@@ -231,6 +244,23 @@ pub struct TabState {
     /// Agent 可据此 wait/重试,不再对「组件差一口气装不上」盲探测)。
     pub script_budget_cut: bool,
     pub script_pending: usize,
+}
+
+impl TabState {
+    /// 写入新 HTML 并自增修订号。**所有 `tab.html` 的运行期变更必须走这里**
+    /// (open/navigate 构造期除外,它们随后同步写 `layout_rev`),
+    /// 否则 `ensure_layout_locked` 的「快照×布局」一致性守卫会漏判。
+    pub fn set_html(&mut self, html: String) {
+        self.html = html;
+        self.html_rev = self.html_rev.wrapping_add(1);
+    }
+
+    /// 解析当前 HTML 并落入运行时控件覆盖，供样式/布局/快照共享同一状态。
+    pub fn document_with_state(&self) -> document::Document {
+        let mut doc = document::Document::parse(&self.html, &self.url);
+        doc.apply_widget_state(&self.form_values, &self.widget_open);
+        doc
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -398,6 +428,32 @@ impl LsmBrowserManager {
         let me = Arc::new(Self::new());
         *me.self_weak.lock().unwrap() = Arc::downgrade(&me);
         me
+    }
+
+    /// 「快照×布局」一致性守卫:`tab.html` 在上次布局之后被改写
+    /// (脚本动作/管线补齐)时重算布局。
+    ///
+    /// 布局盒与快照节点都以 `stable_selector`(路径含 `:nth-of-type`)为键,
+    /// HTML 一变位置键整体漂移;旧 `rect_map` × 新快照 = 键全错位,
+    /// JS 桥 `getBoundingClientRect/clientWidth` 全 0(实测猎聘首页:
+    /// `run_pending_scripts` 改 html 不重排,宿主 rect_for 正常、
+    /// 页面脚本测量全 0,二维码 canvas/地图容器测量链全断)。
+    /// eval/dispatch/screenshot/inspect 入口都必须先过这道守卫。
+    pub fn ensure_layout_locked(&self, tab: &mut TabState) {
+        if tab.layout_rev == tab.html_rev {
+            return;
+        }
+        let doc = tab.document_with_state();
+        let media = style::MediaCtx::new(tab.viewport.width as f64, tab.viewport.height as f64);
+        let sizes = images::ImageSizes::from_store(&tab.images);
+        tab.layout = layout::compute_full(
+            &doc,
+            tab.viewport.width as f64,
+            &self.font,
+            &media,
+            &sizes,
+        );
+        tab.layout_rev = tab.html_rev;
     }
 
     /// 有头查看器 ↔ 引擎的桥接方法(查看器生命周期 / 帧推送 / 命令处理)
@@ -681,7 +737,8 @@ impl LsmBrowserManager {
             &images::ImageStore::new(),
         )
         .await;
-        let doc = document::Document::parse(&html, &resp.final_url);
+        let mut doc = document::Document::parse(&html, &resp.final_url);
+        doc.apply_widget_state(&pipeline.form_values, &HashMap::new());
         let title = pipeline.title.clone().unwrap_or_else(|| doc.title());
         let media = style::MediaCtx::new(viewport.width as f64, viewport.height as f64);
         let layout = layout::compute_full(
@@ -766,9 +823,13 @@ impl LsmBrowserManager {
                 logs
             },
             form_values: pipeline.form_values.clone(),
+            widget_open: HashMap::new(),
             focused: None,
             mouse: None,
             layout,
+            // open():布局与 html 同源计算,两者修订号对齐(守卫见 `ensure_layout_locked`)。
+            html_rev: 1,
+            layout_rev: 1,
             created_at_ms: now_ms(),
             last_active_ms: now_ms(),
             foreground: true,
@@ -986,7 +1047,8 @@ impl LsmBrowserManager {
             &images::ImageStore::new(),
         )
         .await;
-        let doc = document::Document::parse(&html, &resp.final_url);
+        let mut doc = document::Document::parse(&html, &resp.final_url);
+        doc.apply_widget_state(&pipeline.form_values, &HashMap::new());
         let title = pipeline.title.clone().unwrap_or_else(|| doc.title());
         let media = style::MediaCtx::new(viewport_w as f64, viewport_h as f64);
         let layout = layout::compute_full(&doc, viewport_w as f64, &self.font, &media, &images_out.sizes);
@@ -997,13 +1059,15 @@ impl LsmBrowserManager {
         tab.title = title.clone();
         tab.status = resp.status;
         tab.content_type = content_type.clone();
-        tab.html = html;
+        tab.set_html(html);
         tab.redirect_chain = resp.redirect_chain.clone();
         tab.source_bytes = resp.bytes.len();
         tab.layout = layout;
+        tab.layout_rev = tab.html_rev;
         tab.scroll_x = 0.0;
         tab.scroll_y = 0.0;
         tab.form_values = pipeline.form_values.clone();
+        tab.widget_open.clear();
         tab.focused = None;
         tab.last_active_ms = now_ms();
         // 阶段四第二步：CSP 策略与页面源写入安全上下文（供 fetch/XHR connect-src 门禁）。
@@ -1436,11 +1500,13 @@ impl LsmBrowserManager {
     pub async fn screenshot(&self, page_id: &str, params: &Value) -> EngineResult<Value> {
         // 先让持久 JS 线程把定时器/微任务与 Canvas 像素回写到宿主,再取布局帧。
         api::sync_page(self, page_id).await;
-        let inner = self.inner.lock().await;
+        let mut inner = self.inner.lock().await;
         let tab = inner
             .tabs
-            .get(page_id)
+            .get_mut(page_id)
             .ok_or_else(|| EngineError::page_not_found(page_id))?;
+        // 「快照×布局」一致性守卫:sync_page 应用动作后 html 可能已变,先重排再出帧。
+        self.ensure_layout_locked(tab);
         self.screenshot_locked(tab, params)
     }
 
