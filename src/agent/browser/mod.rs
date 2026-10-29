@@ -205,6 +205,10 @@ pub struct TabState {
     /// details/dialog 的运行时开合覆盖：key = stable selector，value = 是否 open。
     /// 仅作为 `tab.html` 属性之上的覆盖层，布局/样式计算前落到解析树。
     pub widget_open: HashMap<String, bool>,
+    /// 第 41 轮:运行时伪类状态（hover/focus/focus-visible/active）。
+    /// key = stable selector，value = 状态位。落到临时解析树的 `data-lsm-*`
+    /// 属性后由样式引擎的 `:hover`/`:focus`/`:focus-visible`/`:active` 命中。
+    pub pseudo_states: HashMap<String, document::PseudoFlags>,
     pub focused: Option<String>,
     pub mouse: Option<(f64, f64)>,
     pub layout: layout::Layout,
@@ -258,7 +262,7 @@ impl TabState {
     /// 解析当前 HTML 并落入运行时控件覆盖，供样式/布局/快照共享同一状态。
     pub fn document_with_state(&self) -> document::Document {
         let mut doc = document::Document::parse(&self.html, &self.url);
-        doc.apply_widget_state(&self.form_values, &self.widget_open);
+        doc.apply_widget_state(&self.form_values, &self.widget_open, &self.pseudo_states);
         doc
     }
 }
@@ -738,7 +742,7 @@ impl LsmBrowserManager {
         )
         .await;
         let mut doc = document::Document::parse(&html, &resp.final_url);
-        doc.apply_widget_state(&pipeline.form_values, &HashMap::new());
+        doc.apply_widget_state(&pipeline.form_values, &HashMap::new(), &HashMap::new());
         let title = pipeline.title.clone().unwrap_or_else(|| doc.title());
         let media = style::MediaCtx::new(viewport.width as f64, viewport.height as f64);
         let layout = layout::compute_full(
@@ -824,6 +828,7 @@ impl LsmBrowserManager {
             },
             form_values: pipeline.form_values.clone(),
             widget_open: HashMap::new(),
+            pseudo_states: HashMap::new(),
             focused: None,
             mouse: None,
             layout,
@@ -1048,7 +1053,7 @@ impl LsmBrowserManager {
         )
         .await;
         let mut doc = document::Document::parse(&html, &resp.final_url);
-        doc.apply_widget_state(&pipeline.form_values, &HashMap::new());
+        doc.apply_widget_state(&pipeline.form_values, &HashMap::new(), &HashMap::new());
         let title = pipeline.title.clone().unwrap_or_else(|| doc.title());
         let media = style::MediaCtx::new(viewport_w as f64, viewport_h as f64);
         let layout = layout::compute_full(&doc, viewport_w as f64, &self.font, &media, &images_out.sizes);
@@ -1068,6 +1073,8 @@ impl LsmBrowserManager {
         tab.scroll_y = 0.0;
         tab.form_values = pipeline.form_values.clone();
         tab.widget_open.clear();
+        // 第 41 轮:交互态随导航复位(新页面无悬停/焦点)。
+        tab.pseudo_states.clear();
         tab.focused = None;
         tab.last_active_ms = now_ms();
         // 阶段四第二步：CSP 策略与页面源写入安全上下文（供 fetch/XHR connect-src 门禁）。

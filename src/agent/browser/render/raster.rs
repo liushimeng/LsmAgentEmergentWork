@@ -363,6 +363,48 @@ fn glyph_contains(
             let r = 0.12;
             (nx - 0.5).powi(2) + (ny - 0.5).powi(2) <= r * r
         }
+        WidgetGlyphKind::BulletRing => {
+            // 未选中 radio:圆环轮廓(内外半径之间)。
+            let d = ((nx - 0.5).powi(2) + (ny - 0.5).powi(2)).sqrt();
+            d <= 0.40 && d >= 0.27
+        }
+        WidgetGlyphKind::BulletSquare => {
+            // `list-style-type: square`:实心方块。
+            (nx - 0.5).abs() <= 0.15 && (ny - 0.5).abs() <= 0.15
+        }
+        WidgetGlyphKind::Indeterminate => {
+            // checkbox 半选:居中横杠。
+            ny >= 0.43 && ny <= 0.57 && nx >= 0.18 && nx <= 0.82
+        }
+        WidgetGlyphKind::SliderThumb => {
+            // 滑块拇指:竖向圆角条(盒高由布局给定,此处只判横向占比)。
+            (nx - 0.5).abs() <= 0.26 && ny >= 0.06 && ny <= 0.94
+        }
+        WidgetGlyphKind::CalendarIcon => {
+            // 日历:外框 + 顶栏 + 上下两条装订短线。
+            let frame = nx >= 0.12 && nx <= 0.88 && ny >= 0.16 && ny <= 0.86;
+            let stroke = frame
+                && (nx <= 0.24
+                    || nx >= 0.76
+                    || ny <= 0.36
+                    || ny >= 0.74);
+            let header = nx >= 0.12 && nx <= 0.88 && ny >= 0.16 && ny <= 0.34;
+            let hangers = (nx - 0.32).abs() <= 0.07 && ny >= 0.04 && ny <= 0.26;
+            let hangers2 = (nx - 0.68).abs() <= 0.07 && ny >= 0.04 && ny <= 0.26;
+            stroke || header || hangers || hangers2
+        }
+        WidgetGlyphKind::ClockIcon => {
+            // 时钟:圆环 + 时针(竖)与分针(横)。
+            let d = ((nx - 0.5).powi(2) + (ny - 0.5).powi(2)).sqrt();
+            let ring = d <= 0.44 && d >= 0.32;
+            let hour = (nx - 0.5).abs() <= 0.07 && ny >= 0.26 && ny <= 0.54;
+            let minute = (ny - 0.54).abs() <= 0.07 && nx >= 0.46 && nx <= 0.70;
+            ring || hour || minute
+        }
+        WidgetGlyphKind::CaretUp => {
+            // 向上三角:下宽上尖。
+            ny >= 0.32 && ny <= 0.66 && (0.66 - ny) / 0.34 >= (nx - 0.5).abs() / 0.22
+        }
         WidgetGlyphKind::Caret => {
             if open {
                 // 向下三角:上宽下尖。

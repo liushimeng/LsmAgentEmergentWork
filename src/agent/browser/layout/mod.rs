@@ -8,16 +8,27 @@
 mod flex;
 mod float;
 mod inline;
+mod list_marker;
 mod measure;
 mod grid;
 mod position;
 mod table;
+mod top_layer;
+mod widgets;
 #[cfg(test)]
 mod position_tests;
 #[cfg(test)]
 mod form_widget_tests;
 #[cfg(test)]
+mod list_marker_tests;
+#[cfg(test)]
+mod pseudo_state_tests;
+#[cfg(test)]
 mod table_tests;
+#[cfg(test)]
+mod top_layer_tests;
+#[cfg(test)]
+mod widget_ui_tests;
 #[cfg(test)]
 mod tests;
 
@@ -462,7 +473,7 @@ pub(crate) fn style_visible(style: &ComputedStyle) -> bool {
 }
 
 /// select 控件显示文本:运行时 `selected` option 的 label，否则首个 option。
-fn select_display_text(node: &NodeRef) -> String {
+pub(crate) fn select_display_text(node: &NodeRef) -> String {
     let Ok(options) = node.select("option") else {
         return String::new();
     };
@@ -480,7 +491,7 @@ fn select_display_text(node: &NodeRef) -> String {
     first
 }
 
-fn parse_f64_attr(node: &NodeRef, key: &str) -> Option<f64> {
+pub(crate) fn parse_f64_attr(node: &NodeRef, key: &str) -> Option<f64> {
     document::attr(node, key)?.trim().parse::<f64>().ok()
 }
 
@@ -863,6 +874,12 @@ impl<'a> LayoutCtx<'a> {
                 (h - style.padding_top - style.padding_bottom).max(0.0),
             );
             for it in &mut self.display[mark..] {
+                // 第 41 轮:裁剪逃逸 —— `position:fixed` 子树与顶层浮层
+                // (dialog/select 面板,layer=2)不受祖先 overflow 裁剪
+                // (CSS 定位/顶层元素脱离常规裁剪链)。
+                if it.fixed || it.layer >= top_layer::TOP_LAYER {
+                    continue;
+                }
                 it.intersect_clip(rect);
             }
         }
@@ -1140,6 +1157,11 @@ impl<'a> LayoutCtx<'a> {
                 deferred.push((child.clone(), style));
                 continue;
             }
+            // 第 41 轮:模态对话框走顶层语义(视口居中 + ::backdrop),
+            // 不参与常规块级流,也不被祖先 overflow 裁剪。
+            if top_layer::layout_dialog(self, &child, &style, depth) {
+                continue;
+            }
             // 阶段三:Flex 格式化上下文。
             if style.display == "flex" {
                 // flex/grid 容器边距不参与兄弟折叠(近似:收编前置 pending,
@@ -1192,7 +1214,7 @@ impl<'a> LayoutCtx<'a> {
                 push_border_and_shadow(self, &style, bx, by, iw, ih);
                 let tag = document::tag_name(&child);
                 self.emit_element(seq, &style, &tag, bx, by, iw, ih);
-                self.emit_form_control_text(&child, &style, &tag, bx, by, iw, ih, None);
+                widgets::emit_form_control_text(self, &child, &style, &tag, bx, by, iw, ih, None);
                 self.y = by + ih;
                 self.pending_margin_bottom =
                     collapse_margin(self.pending_margin_bottom, style.margin_bottom);
@@ -1324,7 +1346,11 @@ impl<'a> LayoutCtx<'a> {
                 if explicit_content_w {
                     bw += style.padding_left + style.padding_right;
                 }
-                let content_w = (bw - style.padding_left - style.padding_right).max(1.0);
+                // 第 41 轮:`list-style-position: inside` 的 marker 占用行首,
+                // li 内容整体右移「marker 宽 + 间隙」(近似:CSS 只让首行让位)。
+                let marker_inset = list_marker::inside_inset(self, &child, &style);
+                let content_w =
+                    (bw - style.padding_left - style.padding_right - marker_inset).max(1.0);
                 let start_y = self.y;
                 self.y += style.padding_top;
                 // 盒高先于子代布局求出:显式/百分比高度不依赖子代内容;
@@ -1364,14 +1390,14 @@ impl<'a> LayoutCtx<'a> {
                     UNKNOWN_CB_H
                 };
                 let child_cb = (
-                    bx + style.padding_left,
+                    bx + style.padding_left + marker_inset,
                     start_y + style.padding_top,
-                    (bw - style.padding_left - style.padding_right).max(0.0),
+                    (bw - style.padding_left - style.padding_right - marker_inset).max(0.0),
                     cb_h,
                 );
                 self.layout_children(
                     &child,
-                    bx + style.padding_left,
+                    bx + style.padding_left + marker_inset,
                     content_w,
                     buf,
                     depth + 1,
@@ -1476,7 +1502,13 @@ impl<'a> LayoutCtx<'a> {
                 let tag = document::tag_name(&child);
                 self.emit_element(seq, &style, &tag, bx + rdx, start_y + rdy, bw, box_h);
                 self.emit_canvas_pixels(&child, &style, seq, bx + rdx, start_y + rdy, bw, box_h);
-                self.emit_list_marker(&child, &style, bx + rdx, start_y + rdy, box_h);
+                self.emit_list_marker(
+                    &child,
+                    &style,
+                    bx + rdx + style.padding_left,
+                    start_y + rdy,
+                    box_h,
+                );
                 // 阶段七:浮动盒登记并恢复流式游标(非浮动为 no-op)。
                 float::finish(self, placement, &mut floats, &mut inline_row);
                 if style.float != "none" {
@@ -1515,689 +1547,6 @@ impl<'a> LayoutCtx<'a> {
         }
         // 还原绘制层(定位元素子树的绘制层只在其子树内有效)。
         self.positioned_layer = prev_layer;
-    }
-
-    /// 行内级元素是否需要生成近似矩形(供 inspect/坐标点击/截图裁剪寻址)。
-    ///
-    /// 行内元素在 CSS 中生成行内盒而非块级盒,但 Agent 需要几何来定位与点击,
-    /// 故对"可寻址"的行内元素各生成一个近似矩形:交互元素、`inline-block`、
-    /// 以及带显式尺寸的行内元素。
-    fn inline_box_worthy(&self, node: &NodeRef, style: &ComputedStyle) -> bool {
-        let tag = document::tag_name(node);
-        if matches!(
-            tag.as_str(),
-            "a" | "button" | "input" | "select" | "textarea" | "label" | "progress" | "meter"
-        ) {
-            return true;
-        }
-        style.display == "inline-block"
-            || style.display == "inline-flex"
-            || style.width.is_some()
-            || style.height.is_some()
-            || style.width_percent.is_some()
-            // 第 174 轮:带 id 的行内元素一律可寻址 —— id 是 Agent 侧最常用的
-            // 选择器锚点,猎聘登录入口 span#header-quick-menu-login 是纯
-            // display:inline 无显式尺寸,不在此列时快照矩形恒 0×0、点击坐标
-            // 落在 (1,1) 死区(近似矩形不影响流,只服务几何寻址)。
-            || document::attr(node, "id").map(|v| !v.trim().is_empty()).unwrap_or(false)
-    }
-
-    /// 行内盒的近似尺寸:显式 CSS 尺寸优先,其次按文本量估算。
-    ///
-    /// 百分比宽度按包含块宽度(`avail_w`)求解;百分比高度在父高未知时按 `auto`
-    /// 处理(CSS 中行内元素的百分比高度同样不生效)。
-    fn inline_box_size(&self, node: &NodeRef, style: &ComputedStyle, avail_w: f64) -> (f64, f64) {
-        // 第 175 轮:空行内元素(无文本、无显式尺寸、无可渲染子元素)量成 0×0 ——
-        // 不产生行盒(Chrome 语义);盒照常发射,保住第 174 轮的几何寻址诉求
-        // (Chrome 空行内元素 rect 亦为 0×0)。表单控件/替换类标签自身即有
-        // 固有尺寸(void 元素无子节点,不能按「无子内容」判空)。
-        let explicit_dim =
-            style.width.is_some() || style.height.is_some() || style.width_percent.is_some();
-        let self_replaced = matches!(
-            document::tag_name(node).to_ascii_lowercase().as_str(),
-            "input" | "select" | "textarea" | "button" | "img" | "svg" | "iframe" | "canvas"
-                | "object" | "embed" | "video" | "audio" | "hr" | "progress" | "meter"
-        );
-        if !self_replaced && !explicit_dim && !has_structural_inline_content(node, 0) {
-            return (0.0, 0.0);
-        }
-        let tag = document::tag_name(node).to_ascii_lowercase();
-        // select 的 option 子树不参与布局;固有宽只看当前显示项 + 箭头位,
-        // 否则 hidden option 的累计文本会把盒撑到页面外。
-        let text = if tag == "select" {
-            select_display_text(node)
-        } else {
-            node.text_contents()
-        };
-        let text_w = self.font.text_width(&text, style.font_size);
-        let intrinsic_floor = if tag == "select" {
-            text_w + 22.0
-        } else {
-            text_w.max(40.0)
-        };
-        let w = if let Some(p) = style.width_percent {
-            (p / 100.0 * avail_w).max(1.0)
-        } else {
-            style.width.unwrap_or(intrinsic_floor).max(1.0)
-        };
-        let h = style
-            .height
-            .unwrap_or_else(|| (style.font_size * 1.45).max(16.0))
-            .max(1.0);
-        (w, h)
-    }
-
-    /// 在行内表单控件盒内绘制原生控件内容。
-    ///
-    /// 文本类画 value/placeholder;checkbox/radio 画几何勾/点;select 只画当前
-    /// option 与箭头;textarea 多行换行;progress/meter 用轨道+比例填充表达。
-    /// 只发射显示项,不推进游标、不改变既有盒几何。
-    #[allow(clippy::too_many_arguments)]
-    fn emit_form_control_text(
-        &mut self,
-        node: &NodeRef,
-        style: &ComputedStyle,
-        tag: &str,
-        bx: f64,
-        by: f64,
-        w: f64,
-        h: f64,
-        tf: Option<Affine>,
-    ) {
-        match tag {
-            "input" => {
-                let ty = document::attr(node, "type")
-                    .unwrap_or_default()
-                    .to_ascii_lowercase();
-                match ty.as_str() {
-                    "checkbox" | "radio" => {
-                        let checked = document::attr(node, "checked").is_some();
-                        if checked {
-                            let glyph = if ty == "checkbox" {
-                                WidgetGlyphKind::CheckMark
-                            } else {
-                                WidgetGlyphKind::RadioDot
-                            };
-                            let side = w.min(h).min(18.0);
-                            self.emit_widget_glyph(
-                                glyph,
-                                false,
-                                bx + (w - side) / 2.0,
-                                by + (h - side) / 2.0,
-                                side,
-                                side,
-                                style,
-                                tf,
-                            );
-                        }
-                    }
-                    "" | "text" | "search" | "url" | "tel" | "email" | "password" | "number"
-                    | "submit" | "button" | "reset" => {
-                        let (mut text, color) = self.input_display_text(node, style, &ty);
-                        if ty == "password" {
-                            text = "•".repeat(text.chars().count());
-                        }
-                        self.emit_singleline_text(&text, color, style, bx, by, w, h, tf);
-                    }
-                    _ => {}
-                }
-            }
-            "button" => {
-                let text = document::collapse_ws(&node.text_contents());
-                let text = if text.is_empty() {
-                    document::attr(node, "value").unwrap_or_default()
-                } else {
-                    text
-                };
-                self.emit_singleline_text(&text, style.color, style, bx, by, w, h, tf);
-            }
-            "select" => {
-                let text = select_display_text(node);
-                let caret_w = 14.0_f64.min(w * 0.25);
-                self.emit_singleline_text(
-                    &text,
-                    style.color,
-                    style,
-                    bx,
-                    by,
-                    (w - caret_w).max(1.0),
-                    h,
-                    tf,
-                );
-                let side = caret_w.min(h * 0.5).max(6.0);
-                self.emit_widget_glyph(
-                    WidgetGlyphKind::Caret,
-                    true,
-                    bx + w - caret_w + (caret_w - side) / 2.0,
-                    by + (h - side) / 2.0,
-                    side,
-                    side,
-                    style,
-                    tf,
-                );
-            }
-            "textarea" => {
-                let text = if document::attr(node, "value").is_some() {
-                    document::attr(node, "value").unwrap_or_default()
-                } else {
-                    node.text_contents()
-                };
-                let (text, color) = if text.trim().is_empty() {
-                    (document::attr(node, "placeholder").unwrap_or_default(), [117, 117, 117])
-                } else {
-                    (text, style.color)
-                };
-                self.emit_multiline_text(&text, color, style, bx, by, w, h, tf);
-            }
-            "progress" => self.emit_meter_like(node, style, bx, by, w, h, tf, false),
-            "meter" => self.emit_meter_like(node, style, bx, by, w, h, tf, true),
-            _ => {}
-        }
-    }
-
-    fn input_display_text(
-        &self,
-        node: &NodeRef,
-        style: &ComputedStyle,
-        ty: &str,
-    ) -> (String, [u8; 3]) {
-        let value = document::attr(node, "value").unwrap_or_default();
-        if !value.trim().is_empty() {
-            return (value, style.color);
-        }
-        if matches!(ty, "submit" | "button" | "reset") {
-            let fallback = match ty {
-                "submit" => "Submit",
-                "reset" => "Reset",
-                _ => "Button",
-            };
-            return (fallback.to_string(), style.color);
-        }
-        (document::attr(node, "placeholder").unwrap_or_default(), [117, 117, 117])
-    }
-
-    fn emit_singleline_text(
-        &mut self,
-        text: &str,
-        color: [u8; 3],
-        style: &ComputedStyle,
-        bx: f64,
-        by: f64,
-        w: f64,
-        h: f64,
-        tf: Option<Affine>,
-    ) {
-        if text.trim().is_empty() {
-            return;
-        }
-        let size = style.font_size.max(8.0);
-        let max_w = (w - 6.0).max(0.0);
-        if max_w < size {
-            return;
-        }
-        let mut clipped = String::new();
-        let mut used = 0.0;
-        for ch in text.chars() {
-            let cw = self.font.char_width(ch, size);
-            if used + cw > max_w {
-                break;
-            }
-            used += cw;
-            clipped.push(ch);
-        }
-        if clipped.is_empty() {
-            return;
-        }
-        let line_height = size * 1.35;
-        let line = TextLine {
-            text: clipped,
-            x: bx + 3.0,
-            y: by + ((h - line_height) / 2.0).max(1.0),
-            size,
-            color,
-            bold: style.font_weight >= 600,
-            visible: style_visible(style),
-        };
-        self.emit_text(&line, tf, &[]);
-        self.lines.push(line);
-    }
-
-    fn emit_multiline_text(
-        &mut self,
-        text: &str,
-        color: [u8; 3],
-        style: &ComputedStyle,
-        bx: f64,
-        by: f64,
-        w: f64,
-        h: f64,
-        tf: Option<Affine>,
-    ) {
-        let size = style.font_size.max(8.0);
-        let line_height = size * 1.35;
-        let max_w = (w - 6.0).max(1.0);
-        let max_rows = (((h - 4.0) / line_height).floor() as usize).max(1);
-        let mut rows: Vec<String> = Vec::new();
-        for raw in text.replace("\r\n", "\n").lines() {
-            let mut cur = String::new();
-            let mut used = 0.0;
-            for ch in raw.chars() {
-                let cw = self.font.char_width(ch, size);
-                if !cur.is_empty() && used + cw > max_w {
-                    rows.push(std::mem::take(&mut cur));
-                    used = 0.0;
-                    if rows.len() >= max_rows {
-                        break;
-                    }
-                }
-                cur.push(ch);
-                used += cw;
-            }
-            if rows.len() >= max_rows {
-                break;
-            }
-            rows.push(cur);
-            if rows.len() >= max_rows {
-                break;
-            }
-        }
-        for (i, row) in rows.into_iter().take(max_rows).enumerate() {
-            let line = TextLine {
-                text: row,
-                x: bx + 3.0,
-                y: by + 2.0 + i as f64 * line_height,
-                size,
-                color,
-                bold: style.font_weight >= 600,
-                visible: style_visible(style),
-            };
-            self.emit_text(&line, tf, &[]);
-            self.lines.push(line);
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn emit_meter_like(
-        &mut self,
-        node: &NodeRef,
-        style: &ComputedStyle,
-        bx: f64,
-        by: f64,
-        w: f64,
-        h: f64,
-        tf: Option<Affine>,
-        is_meter: bool,
-    ) {
-        let min = if is_meter {
-            parse_f64_attr(node, "min").unwrap_or(0.0)
-        } else {
-            0.0
-        };
-        let max = parse_f64_attr(node, "max").unwrap_or(1.0).max(min + f64::EPSILON);
-        let value = parse_f64_attr(node, "value").unwrap_or(min);
-        let ratio = ((value - min) / (max - min)).clamp(0.0, 1.0);
-        let track_y = by + (h * 0.30).max(1.0);
-        let track_h = (h * 0.40).max(2.0);
-        let track_x = bx + 2.0;
-        let track_w = (w - 4.0).max(1.0);
-        self.push_widget_fill(style, [225, 225, 225], 255, track_x, track_y, track_w, track_h, tf);
-        self.push_widget_fill(
-            style,
-            if is_meter { [80, 160, 90] } else { [70, 130, 210] },
-            255,
-            track_x,
-            track_y,
-            track_w * ratio,
-            track_h,
-            tf,
-        );
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn push_widget_fill(
-        &mut self,
-        style: &ComputedStyle,
-        color: [u8; 3],
-        alpha: u8,
-        x: f64,
-        y: f64,
-        w: f64,
-        h: f64,
-        tf: Option<Affine>,
-    ) {
-        let seq = self.next_seq();
-        self.display.push(DisplayItem {
-            kind: DisplayKind::Background {
-                fill: BgFill::Solid(color, alpha),
-            },
-            x,
-            y,
-            w,
-            h,
-            radius: style.border_radius,
-            z: style.pos.z_index.max(self.z_floor),
-            seq,
-            opacity: style.opacity,
-            clip: None,
-            transform: tf,
-            fixed: self.fixed_depth > 0,
-            layer: self.layer_for(style),
-        });
-    }
-
-    fn emit_widget_glyph(
-        &mut self,
-        glyph: WidgetGlyphKind,
-        open: bool,
-        x: f64,
-        y: f64,
-        w: f64,
-        h: f64,
-        style: &ComputedStyle,
-        tf: Option<Affine>,
-    ) {
-        let seq = self.next_seq();
-        self.display.push(DisplayItem {
-            kind: DisplayKind::WidgetGlyph { glyph, open },
-            x,
-            y,
-            w,
-            h,
-            radius: style.border_radius,
-            z: style.pos.z_index.max(self.z_floor),
-            seq,
-            opacity: style.opacity,
-            clip: None,
-            transform: tf,
-            fixed: self.fixed_depth > 0,
-            layer: self.layer_for(style),
-        });
-    }
-
-    /// 列表项 marker(本轮子集):ul disc、ol decimal、`list-style-type:none` 不画。
-    fn emit_list_marker(
-        &mut self,
-        node: &NodeRef,
-        style: &ComputedStyle,
-        x: f64,
-        y: f64,
-        h: f64,
-    ) {
-        if document::tag_name(node) != "li" {
-            return;
-        }
-        let Some(parent) = node.parent() else {
-            return;
-        };
-        let parent_tag = document::tag_name(&parent);
-        let list_type = style
-            .extra
-            .get("list-style-type")
-            .map(|s| s.to_ascii_lowercase())
-            .unwrap_or_default();
-        if list_type == "none" {
-            return;
-        }
-        let tf = self.own_transform(style, x, y, 20.0, h);
-        match parent_tag.as_str() {
-            "ul" => {
-                self.emit_widget_glyph(WidgetGlyphKind::Bullet, false, x - 18.0, y + 2.0, 10.0, 10.0, style, tf);
-            }
-            "ol" => {
-                let mut idx = 1usize;
-                for sib in parent.children() {
-                    if &sib == node {
-                        break;
-                    }
-                    if document::tag_name(&sib) == "li" {
-                        idx += 1;
-                    }
-                }
-                if let Some(start) = document::attr(&parent, "start").and_then(|v| v.trim().parse::<usize>().ok()) {
-                    idx = start + idx - 1;
-                }
-                let text = format!("{idx}.");
-                let size = style.font_size.max(8.0);
-                let line = TextLine {
-                    text,
-                    x: x - 22.0,
-                    y: y + 1.0,
-                    size,
-                    color: style.color,
-                    bold: false,
-                    visible: style_visible(style),
-                };
-                self.emit_text(&line, tf, &[]);
-                self.lines.push(line);
-            }
-            _ => {}
-        }
-    }
-
-    fn collect_inline(
-        &mut self,
-        node: &NodeRef,
-        style: &ComputedStyle,
-        buf: &mut InlineBuf,
-        depth: usize,
-        line_x: f64,
-        avail_w: f64,
-        inherited_tf: Option<Affine>,
-        row: &mut float::InlineRow,
-    ) {
-        if depth > 40 || buf.chars > 200_000 {
-            return;
-        }
-        // 行内元素自身变换(与祖先链合成):行内文本在父级 flush,变换栈里没有它,
-        // 故把变换随 run 带到 flush 时应用(块级文本由 apply_group 回补)。
-        let mut tf = inherited_tf;
-        // 行内元素自身建盒。此前只有"块级盒的直接行内子节点"才拿到盒子,
-        // 导致 `<div><input></div>` 这类结构完全取不到几何(inspect 的 rect 恒 0×0)。
-        let own_box = self.inline_box_worthy(node, style);
-        let mut box_x = line_x;
-        let mut box_w = avail_w;
-        // 子代 x 基准 = 本元素 **margin-box x**(text/img/嵌套各自由此加
-        // 自身 margin+padding 得内容起点);own_box 盒需回退自身偏移。
-        let mut inner_x = line_x;
-        if own_box {
-            let (w, h) = self.inline_box_size(node, style, avail_w);
-            let (dx, dy) = relative_offset(style, avail_w, self.viewport_h);
-            let bx = line_x + style.margin_left + style.padding_left + dx;
-            let by = self.y + dy;
-            tf = self.emit_inline_box(node, style, bx, by, w, h, tf);
-            // 阶段七:登记当前行占用,后续行内浮动可排在它的右侧剩余带。
-            // 第 175 轮:空行内元素 0×0 不占流(Chrome 语义)—— 只发射寻址盒,
-            // 不登记行占用、不推进游标,消灭 `<a name=x></a>` 类幽灵行高。
-            if w > 0.0 && h > 0.0 {
-                row.register(bx, by, w, h, line_x + avail_w);
-            }
-            box_x = bx;
-            box_w = w;
-            inner_x = bx - style.margin_left - style.padding_left;
-        }
-        // 行内块/控件盒为子代建立独立行内上下文(浮动不越出该盒),子代几何
-        // 也相对自身盒求解(此前一律沿用祖先 line_x/avail_w)。
-        let mut inner_row = float::InlineRow::default();
-        let child_row: &mut float::InlineRow = if own_box { &mut inner_row } else { row };
-        self.collect_inline_children(node, style, buf, depth, inner_x, box_w, child_row, tf);
-        if own_box {
-            let bottom = inner_row.content_bottom();
-            if bottom > self.y {
-                self.y = bottom;
-            }
-        }
-    }
-
-    /// `collect_inline` 的子代遍历(行内浮动入口复用同一套收集逻辑)。
-    #[allow(clippy::too_many_arguments)]
-    fn collect_inline_children(
-        &mut self,
-        node: &NodeRef,
-        style: &ComputedStyle,
-        buf: &mut InlineBuf,
-        depth: usize,
-        line_x: f64,
-        avail_w: f64,
-        row: &mut float::InlineRow,
-        tf: Option<Affine>,
-    ) {
-        for child in node.children() {
-            if let Some(text) = child.as_text() {
-                let raw = text.borrow();
-                if !raw.trim().is_empty() {
-                    // line_x = 本元素 margin-box x;push_styled 再加自身
-                    // margin+padding 得文本内容起点。
-                    buf.push_styled(&raw, style, line_x, tf, style.text_shadow.clone());
-                }
-                continue;
-            }
-            if child.as_element().is_none() {
-                continue;
-            }
-            let child_style = self.engine.computed(&child, style);
-            if child_style.display == "none" {
-                continue;
-            }
-            let tag = document::tag_name(&child);
-            if tag == "br" {
-                buf.force_break();
-                continue;
-            }
-            // 阶段三第三步:行内替换元素(<img>/<svg>):记录矩形并预留行高。
-            if tag.eq_ignore_ascii_case("img") || tag.eq_ignore_ascii_case("svg") {
-                let (iw, ih, isrc) = self.replaced_size(&child, &child_style, avail_w, None);
-                let ix = line_x + child_style.margin_left + child_style.padding_left;
-                let iy = self.y;
-                let visible = style_visible(&child_style);
-                // 阶段六:显示项发射(元素视觉 + 内容图)。
-                let seq = self.next_seq();
-                self.boxes.push(ElementBox {
-                    selector: Document::stable_selector(&child),
-                    tag: "img".to_string(),
-                    x: ix,
-                    y: iy,
-                    w: iw,
-                    h: ih,
-                    background: child_style.background,
-                    background_alpha: child_style.background_alpha,
-                    visible,
-                    z_index: child_style.pos.z_index,
-                    out_of_flow: false,
-                });
-                self.emit_element(seq, &child_style, "img", ix, iy, iw, ih);
-                if let Some(src) = isrc.filter(|s| self.image_loaded(s)) {
-                    let paint = PaintBox {
-                        src,
-                        x: ix,
-                        y: iy,
-                        w: (iw - child_style.padding_left - child_style.padding_right).max(0.0),
-                        h: (ih - child_style.padding_top - child_style.padding_bottom).max(0.0),
-                        fit: child_style.object_fit.clone(),
-                        kind: PaintKind::Content,
-                        visible,
-                        z_index: child_style.pos.z_index,
-                        off_x: 0.0,
-                        off_y: 0.0,
-                    };
-                    let img_tf = match (self.own_transform(&child_style, ix, iy, iw, ih), tf) {
-                        (Some(m), Some(anc)) => Some(m.compose(&anc)),
-                        (Some(m), None) => Some(m),
-                        (None, anc) => anc,
-                    };
-                    self.emit_image(&paint, child_style.opacity, img_tf);
-                    self.paints.push(paint);
-                }
-                buf.reserve_height(ih);
-                continue;
-            }
-            // 阶段七:行内浮动排在当前行剩余带(输入框+按钮/图标+文字经典浮动行)。
-            // 子级 margin-box 起点 = 本元素内容盒 x(margin-box + 自身 margin+padding)。
-            let child_x = line_x + style.margin_left + style.padding_left;
-            if child_style.float != "none" {
-                self.layout_inline_float(&child, &child_style, buf, depth, child_x, avail_w, row, tf);
-                continue;
-            }
-            // 非浮动行内内容:当前行已有浮动时下沉到浮动之下(不做文字环绕)。
-            if row.has_floats() {
-                let y = row.float_bottom();
-                if y > self.y {
-                    self.y = y;
-                }
-                row.deactivate();
-            }
-            // 交互类行内元素的矩形由 `collect_inline` 入口统一建盒(元素自身),
-            // 此处只负责继续收集其子树文本。
-            self.collect_inline(&child, &child_style, buf, depth + 1, child_x, avail_w, tf, row);
-        }
-    }
-
-    /// 行内盒统一发射(自身视觉 + 边框/阴影 + 表单控件文本),返回合成后的变换。
-    fn emit_inline_box(
-        &mut self,
-        node: &NodeRef,
-        style: &ComputedStyle,
-        bx: f64,
-        by: f64,
-        w: f64,
-        h: f64,
-        inherited_tf: Option<Affine>,
-    ) -> Option<Affine> {
-        let mut tf = inherited_tf;
-        if let Some(m) = self.own_transform(style, bx, by, w, h) {
-            tf = Some(match tf {
-                Some(anc) => m.compose(&anc),
-                None => m,
-            });
-        }
-        // 阶段六:显示项发射(行内元素视觉,边框/阴影/背景/渐变全量)。
-        let seq = self.next_seq();
-        self.boxes.push(ElementBox {
-            selector: Document::stable_selector(node),
-            tag: document::tag_name(node),
-            x: bx,
-            y: by,
-            w,
-            h,
-            background: style.background,
-                    background_alpha: style.background_alpha,
-            visible: style_visible(style),
-            z_index: style.pos.z_index,
-            out_of_flow: false,
-        });
-        // 输入框/按钮等交互元素的边框与外阴影(绘制不占几何)。
-        push_border_and_shadow(self, style, bx, by, w, h);
-        let tag = document::tag_name(node);
-        self.emit_element(seq, style, &tag, bx, by, w, h);
-        self.emit_canvas_pixels(node, style, seq, bx, by, w, h);
-        // 阶段七:表单控件的 value/placeholder 文本(此前只画背景+边框,
-        // 输入框在截图里是没有任何提示文字的灰盒)。
-        self.emit_form_control_text(node, style, &tag, bx, by, w, h, tf);
-        tf
-    }
-
-    /// 行内浮动:排在当前行已占用内容的剩余带,带宽不足换行;
-    /// 子代在浮动盒内按独立行内上下文排布。
-    #[allow(clippy::too_many_arguments)]
-    fn layout_inline_float(
-        &mut self,
-        node: &NodeRef,
-        style: &ComputedStyle,
-        buf: &mut InlineBuf,
-        depth: usize,
-        line_x: f64,
-        avail_w: f64,
-        row: &mut float::InlineRow,
-        tf: Option<Affine>,
-    ) {
-        let (w, h) = self.inline_box_size(node, style, avail_w);
-        let (bx, by) = row.place_float(style, line_x, line_x + avail_w, self.y, w, h);
-        self.y = by;
-        let tf = self.emit_inline_box(node, style, bx, by, w, h, tf);
-        let mut inner = float::InlineRow::default();
-        self.collect_inline_children(node, style, buf, depth + 1, bx, w, &mut inner, tf);
-        row.note_bottom(inner.content_bottom());
-        // 游标留在本行,后续浮动继续排在同一行剩余带。
-        self.y = by;
     }
 
 }

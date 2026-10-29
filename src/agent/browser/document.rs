@@ -30,6 +30,41 @@ const SNAPSHOT_EXCLUDE_TAGS: &[&str] = &[
 /// 进快照但子树不展开、文本置空的标签。
 const SNAPSHOT_LEAF_TAGS: &[&str] = &["script", "style", "svg"];
 
+// ========== 第 41 轮:运行时伪类状态 ==========
+
+/// 运行时伪类状态标记属性名(内核私有,只写临时解析树,不回写源 HTML)。
+///
+/// 状态经 `apply_widget_state` 落到临时解析树,样式引擎的
+/// `:hover`/`:focus`/`:focus-visible`/`:active` 再按属性查表命中 ——
+/// 与 `:checked`/`:disabled` 的「运行时覆盖 → 属性 → 样式」通路完全同构。
+pub const ATTR_PSEUDO_HOVER: &str = "data-lsm-hover";
+pub const ATTR_PSEUDO_FOCUS: &str = "data-lsm-focus";
+pub const ATTR_PSEUDO_FOCUS_VISIBLE: &str = "data-lsm-focus-visible";
+pub const ATTR_PSEUDO_ACTIVE: &str = "data-lsm-active";
+
+/// `select` 展开态标记(内核私有):布局层据此铺出浮层 option 面板。
+pub const ATTR_SELECT_OPEN: &str = "data-lsm-select-open";
+
+/// 运行时伪类状态位(按元素聚合)。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PseudoFlags {
+    /// 指针悬停。
+    pub hover: bool,
+    /// 获得焦点。
+    pub focus: bool,
+    /// 键盘可见焦点(本轮与 `focus` 同步置位,内核暂无键盘导航)。
+    pub focus_visible: bool,
+    /// 按下(点击)瞬间。
+    pub active: bool,
+}
+
+impl PseudoFlags {
+    /// 是否带任何状态位。
+    pub fn any(&self) -> bool {
+        self.hover || self.focus || self.focus_visible || self.active
+    }
+}
+
 /// 解析后的文档(局部值,不跨 await 保存)。
 pub struct Document {
     root: NodeRef,
@@ -51,20 +86,30 @@ impl Document {
         &self.root
     }
 
-    /// 把表单运行时值/details-dialog 开合覆盖落到解析树，供样式、布局与快照
+    /// 把表单运行时值/details-dialog 开合/交互态覆盖落到解析树，供样式、布局与快照
     /// 共享同一份状态。只修改临时 `Document`，不回写 `tab.html`。
     ///
     /// 覆盖规则：`form_values` 的 stable selector 值优先于 HTML 属性；空值表示
     /// 清空（input/textarea 退回 placeholder）。`widget_open` 显式 `false` 可关闭
-    /// 源 HTML 中带 `open` 的 details/dialog。
+    /// 源 HTML 中带 `open` 的 details/dialog。`pseudo_states` 写入 `data-lsm-*`
+    /// 状态属性，供 `:hover`/`:focus`/`:focus-visible`/`:active` 匹配。
     pub fn apply_widget_state(
         &mut self,
         form_values: &HashMap<String, String>,
         widget_open: &HashMap<String, bool>,
+        pseudo_states: &HashMap<String, PseudoFlags>,
     ) {
         for node in self.select("*").unwrap_or_default() {
             let tag = tag_name(&node);
             let stable = Document::stable_selector(&node);
+            // 第 41 轮:交互态状态位 → `data-lsm-*` 属性(有则置、无则撤)。
+            if let Some(flags) = pseudo_states.get(&stable) {
+                let mut attrs = node.as_element().unwrap().attributes.borrow_mut();
+                set_state_attr(&mut attrs, ATTR_PSEUDO_HOVER, flags.hover);
+                set_state_attr(&mut attrs, ATTR_PSEUDO_FOCUS, flags.focus);
+                set_state_attr(&mut attrs, ATTR_PSEUDO_FOCUS_VISIBLE, flags.focus_visible);
+                set_state_attr(&mut attrs, ATTR_PSEUDO_ACTIVE, flags.active);
+            }
             if let Some(open) = widget_open.get(&stable) {
                 if matches!(tag.as_str(), "details" | "dialog") {
                     if *open {
@@ -80,6 +125,11 @@ impl Document {
                             .borrow_mut()
                             .remove("open");
                     }
+                } else if tag == "select" {
+                    // 第 41 轮:select 展开态用内核私有标记承载(布局层据此
+                    // 铺出浮层 option 面板);`widget_open` 语义在此复用为开合。
+                    let mut attrs = node.as_element().unwrap().attributes.borrow_mut();
+                    set_state_attr(&mut attrs, ATTR_SELECT_OPEN, *open);
                 }
             }
             let Some(value) = form_values.get(&stable) else {
@@ -663,6 +713,15 @@ impl FormRequest {
 
 // ===================== 辅助 =====================
 
+/// 置/撤运行时伪类状态标记属性。
+fn set_state_attr(attrs: &mut kuchikiki::Attributes, name: &str, on: bool) {
+    if on {
+        attrs.insert(name.to_string(), String::new());
+    } else {
+        attrs.remove(name);
+    }
+}
+
 pub fn tag_name(node: &NodeRef) -> String {
     node.as_element()
         .map(|e| e.name.local.to_string())
@@ -686,7 +745,7 @@ pub fn common_attrs(node: &NodeRef) -> HashMap<String, String> {
         // details/dialog/响应式图片/表格会在下一次重排时静默丢失关键属性。
         "open", "rowspan", "colspan", "srcset", "poster", "controls", "multiple", "size",
         "min", "max", "step", "list", "pattern", "required", "accept", "download",
-        "datetime", "cite", "label", "contenteditable", "tabindex",
+        "datetime", "cite", "label", "contenteditable", "tabindex", "indeterminate",
     ];
     for n in names {
         if let Some(v) = attr(node, n) {

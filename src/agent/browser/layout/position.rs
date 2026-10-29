@@ -123,6 +123,13 @@ fn layout_abs(
     // 内容片段按最终宽度重排并平移注入。
     let mut frag = ctx.measure_content(node, content_w, style, depth);
     translate(&mut frag, bx + pad_l, by + pad_t);
+    // 片段在测量期生成(此时 `fixed_depth` 尚未自增),固定定位子树的内容
+    // 需补打 `fixed` 标记 —— 否则会随页面滚动平移,也会被祖先 overflow 裁剪。
+    if fixed {
+        for it in &mut frag.display {
+            it.fixed = true;
+        }
+    }
     // fixed 子树整体标记:其盒坐标以视口为原点(上方包含块取 (0,0,vw,vh)),
     // 与普通项的页面原点不同系,光栅化侧据此跳过滚动偏移。
     if fixed {

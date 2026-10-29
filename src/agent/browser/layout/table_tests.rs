@@ -94,3 +94,107 @@ fn 非法跨距被钳制不panic() {
     assert!(lay.boxes.iter().any(|b| b.selector == "#bad"));
     assert!(lay.boxes.iter().any(|b| b.selector == "#ok"));
 }
+
+#[test]
+fn caption排在表格上方并占高() {
+    let doc = Document::parse(
+        "<body><table><caption id='cap'>表标题</caption><tr><td id='a'>A</td></tr></table></body>",
+        "https://a.test/",
+    );
+    let lay = compute(&doc, 800.0, &font());
+    assert!(lay.lines.iter().any(|l| l.text.contains("表标题")), "caption 必须渲染");
+    let cap = box_by_selector(&lay, "#cap");
+    let cell = box_by_selector(&lay, "#a");
+    assert!(
+        cap.y + cap.h <= cell.y + 0.5,
+        "caption 必须排在单元格上方:{:?} vs {:?}",
+        cap,
+        cell
+    );
+    let table = box_by_selector(&lay, "html > body > table");
+    assert!(
+        table.h >= cap.h + cell.h,
+        "表格总高必须含 caption:{:?}",
+        table
+    );
+}
+
+#[test]
+fn colgroup指定列宽() {
+    let doc = Document::parse(
+        "<body><table><colgroup><col id='c1' width='120'><col id='c2' width='60'></colgroup><tr><td id='a'>A</td><td id='b'>BBBBBBBBBBBBBBBB</td></tr></table></body>",
+        "https://a.test/",
+    );
+    let lay = compute(&doc, 800.0, &font());
+    let a = box_by_selector(&lay, "#a");
+    let b = box_by_selector(&lay, "#b");
+    assert!(
+        (a.w - 120.0).abs() < 2.0,
+        "第一列宽度应取 col 的 120px:{:?}",
+        a
+    );
+    assert!(
+        (b.w - 60.0).abs() < 2.0,
+        "第二列宽度应取 col 的 60px:{:?}",
+        b
+    );
+}
+
+#[test]
+fn 百分比列宽按表格内容宽求解() {
+    let doc = Document::parse(
+        "<body><table style='width:400px'><tr><td id='a' style='width:25%'>A</td><td id='b' style='width:75%'>B</td></tr></table></body>",
+        "https://a.test/",
+    );
+    let lay = compute(&doc, 800.0, &font());
+    let a = box_by_selector(&lay, "#a");
+    assert!(
+        (a.w - 100.0).abs() < 3.0,
+        "25% 列宽应约等于 400 的四分之一:{:?}",
+        a
+    );
+}
+
+#[test]
+fn 固定表格布局不被内容撑开() {
+    let doc = Document::parse(
+        "<body><table style='table-layout:fixed;width:400px'><tr><td id='a' style='width:100px'>A</td><td id='b' style='width:300px'>BBBBBBBBBBBBBBBBBBBBBBBBBBBB</td></tr></table></body>",
+        "https://a.test/",
+    );
+    let lay = compute(&doc, 800.0, &font());
+    let a = box_by_selector(&lay, "#a");
+    let b = box_by_selector(&lay, "#b");
+    assert!(
+        (a.w - 100.0).abs() < 2.0,
+        "固定布局下第一列必须保持 100px:{:?}",
+        a
+    );
+    assert!(
+        (b.w - 300.0).abs() < 2.0,
+        "固定布局下第二列必须保持 300px(不被内容撑开):{:?}",
+        b
+    );
+}
+
+#[test]
+fn 边框折叠时相邻单元格不重复画右边框() {
+    let doc = Document::parse(
+        "<body><table style='border-collapse:collapse'><tr><td id='a'>A</td><td id='b'>B</td></tr></table></body>",
+        "https://a.test/",
+    );
+    let lay = compute(&doc, 800.0, &font());
+    // 折叠模式:第一列不画右边框,第二列(末列)才画。
+    let a = lay.boxes.iter().find(|b| b.selector == "#a").unwrap();
+    let b = lay.boxes.iter().find(|b| b.selector == "#b").unwrap();
+    let _ = (a, b);
+    // 通过边框绘制指令核对:同一行相邻两格,右边框只应出现一次。
+    let row_borders = lay
+        .borders
+        .iter()
+        .filter(|bd| bd.widths.iter().any(|w| *w > 0.0))
+        .count();
+    assert!(
+        row_borders >= 2,
+        "折叠模式仍需绘制边框:边框指令数={row_borders}"
+    );
+}

@@ -102,10 +102,18 @@ function __lsmPseudo(idx, name, arg) {
   if (name === "disabled") return !!(n.attrs && n.attrs.disabled);
   if (name === "enabled") return !(n.attrs && n.attrs.disabled);
   if (name === "required") return !!(n.attrs && n.attrs.required);
-  // 状态类伪类:内核无交互状态 → 不匹配(绝不匹配全部)。
-  if (name === "hover" || name === "active" || name === "focus" || name === "focus-visible" ||
-      name === "focus-within" || name === "visited" || name === "target" ||
-      name === "indeterminate" || name === "read-only" || name === "read-write") return false;
+  // 第 41 轮:交互态伪类按运行时状态属性命中(内核私有 `data-lsm-*` 标记,
+  // 由 `Document::apply_widget_state` 写入临时解析树)。
+  var attrs = n.attrs || {};
+  function __lsmHas(a) { return Object.prototype.hasOwnProperty.call(attrs, a); }
+  if (name === "hover") return __lsmHas("data-lsm-hover");
+  if (name === "focus") return __lsmHas("data-lsm-focus");
+  if (name === "focus-visible") return __lsmHas("data-lsm-focus-visible");
+  if (name === "active") return __lsmHas("data-lsm-active");
+  if (name === "indeterminate") return __lsmHas("indeterminate");
+  // 其余状态类伪类:内核无对应状态 → 不匹配(绝不匹配全部)。
+  if (name === "focus-within" || name === "visited" || name === "target" ||
+      name === "read-only" || name === "read-write") return false;
   // 未知伪类:不匹配。
   return false;
 }

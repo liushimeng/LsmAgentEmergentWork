@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use kuchikiki::NodeRef;
 
 pub use gradient::{GradientKind, GradientSpec, GradientStop};
+pub use selector::selector_specificity;
 pub use transform::{Affine, Length, Transform2D, TransformOrigin};
 pub use values::BgLayer;
 pub use values::BorderColor;

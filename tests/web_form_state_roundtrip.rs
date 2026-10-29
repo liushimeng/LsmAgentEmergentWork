@@ -144,3 +144,172 @@ async fn 表单状态详情开合与表格几何端到端一致() {
 
     exec(&tool, json!({"action":"close","page_id":page_id})).await;
 }
+
+/// 第 41 轮:交互态伪类与浮层展开的端到端回归(mock 站点,无外网)。
+async fn start_interaction_site() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                loop {
+                    let Ok(n) = socket.read(&mut tmp).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let body = r##"<!doctype html><html><head><style>
+                html,body{margin:0;background:#fff}
+                #btn{width:120px;height:40px;background:#dddddd}
+                #btn:hover{background:#ff0000}
+                #btn:focus{background:#00ff00}
+                select{width:160px;height:32px}
+                </style></head><body>
+                <button id="btn">按钮</button>
+                <select id="s"><option value="a">AAAA</option><option value="b">BBBB</option></select>
+                </body></html>"##;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    format!("http://{}", addr)
+}
+
+/// 采样截图指定矩形区域,统计接近目标色的像素数。
+fn count_color(img: &image::RgbaImage, rect: (f64, f64, f64, f64), target: [u8; 3]) -> usize {
+    let (x, y, w, h) = rect;
+    let x0 = x.max(0.0) as u32;
+    let y0 = y.max(0.0) as u32;
+    let x1 = ((x + w).max(0.0) as u32).min(img.width());
+    let y1 = ((y + h).max(0.0) as u32).min(img.height());
+    let mut n = 0;
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let p = img.get_pixel(px, py).0;
+            if (p[0] as i32 - target[0] as i32).abs() < 24
+                && (p[1] as i32 - target[1] as i32).abs() < 24
+                && (p[2] as i32 - target[2] as i32).abs() < 24
+            {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// 截图并解码,返回图像与按钮矩形。
+async fn shot_button(
+    tool: &McpWebLsmBrowserUseTool,
+    page_id: &str,
+    dir: &tempfile::TempDir,
+    name: &str,
+) -> (image::RgbaImage, (f64, f64, f64, f64)) {
+    let path = dir.path().join(name);
+    let shot = exec(
+        tool,
+        json!({"action":"control","page_id":page_id,"control_action":"screenshot","params":{"save_path":path.to_string_lossy(),"full_page":false}}),
+    )
+    .await;
+    assert_eq!(shot["code"], 0, "{shot}");
+    let bytes = std::fs::read(&path).expect("截图应落盘");
+    let img = image::load_from_memory(&bytes).expect("截图 PNG 应可解码").to_rgba8();
+    let btn = element(tool, page_id, "#btn").await;
+    let rect = (
+        btn["rect"]["x"].as_f64().unwrap(),
+        btn["rect"]["y"].as_f64().unwrap(),
+        btn["rect"]["width"].as_f64().unwrap(),
+        btn["rect"]["height"].as_f64().unwrap(),
+    );
+    (img, rect)
+}
+
+#[tokio::test]
+async fn 交互态伪类与下拉浮层端到端一致() {
+    std::env::set_var("LAEW_ALLOW_PRIVATE_ENDPOINT", "1");
+    let base = start_interaction_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+    let open = exec(
+        &tool,
+        json!({"action":"open","url":base,"mode":"hidden","reuse":false,"viewport":{"width":1280,"height":720}}),
+    )
+    .await;
+    assert_eq!(open["code"], 0, "{open}");
+    let page_id = open["data"]["page_id"].as_str().unwrap().to_string();
+    let dir = tempfile::tempdir().unwrap();
+
+    // hover:置运行时伪类状态 → `:hover` 样式命中(背景转红)。
+    let hovered = exec(
+        &tool,
+        json!({"action":"control","page_id":page_id,"control_action":"hover","params":{"selector":"#btn"}}),
+    )
+    .await;
+    assert_eq!(hovered["code"], 0, "{hovered}");
+    assert_eq!(hovered["data"]["hovered"], true, "{hovered}");
+    let btn = element(&tool, &page_id, "#btn").await;
+    assert_eq!(
+        btn["attributes"]["data-lsm-hover"], "",
+        "hover 状态必须落到运行时状态属性:{btn}"
+    );
+    let (img, rect) = shot_button(&tool, &page_id, &dir, "hover.png").await;
+    let red = count_color(&img, rect, [255, 0, 0]);
+    assert!(red > 100, ":hover 样式必须真实进像素,红色像素数={red}");
+
+    // focus:焦点样式(绿)覆盖 hover(红)。
+    let focused = exec(
+        &tool,
+        json!({"action":"control","page_id":page_id,"control_action":"focus","params":{"selector":"#btn"}}),
+    )
+    .await;
+    assert_eq!(focused["code"], 0, "{focused}");
+    let (img, rect) = shot_button(&tool, &page_id, &dir, "focus.png").await;
+    let green = count_color(&img, rect, [0, 255, 0]);
+    assert!(green > 100, ":focus 样式必须真实进像素,绿色像素数={green}");
+
+    // blur:焦点态撤销,回到 hover 态。
+    let blurred = exec(
+        &tool,
+        json!({"action":"control","page_id":page_id,"control_action":"blur","params":{"selector":"#btn"}}),
+    )
+    .await;
+    assert_eq!(blurred["code"], 0, "{blurred}");
+    let (img, rect) = shot_button(&tool, &page_id, &dir, "blur.png").await;
+    let red = count_color(&img, rect, [255, 0, 0]);
+    assert!(red > 100, "blur 后应回到 hover 态,红色像素数={red}");
+
+    // 下拉浮层:展开后全部 option 进入绘制文本。
+    let opened = exec(
+        &tool,
+        json!({"action":"control","page_id":page_id,"control_action":"open_dropdown","params":{"selector":"#s"}}),
+    )
+    .await;
+    assert_eq!(opened["code"], 0, "{opened}");
+    assert_eq!(opened["data"]["open"], true, "{opened}");
+    let text = exec(
+        &tool,
+        json!({"action":"inspect","page_id":page_id,"info":"text"}),
+    )
+    .await;
+    let body_text = text["data"]["text"].as_str().unwrap_or_default();
+    assert!(
+        body_text.contains("AAAA") && body_text.contains("BBBB"),
+        "展开的 select 面板应列出全部 option:{body_text}"
+    );
+
+    exec(&tool, json!({"action":"close","page_id":page_id})).await;
+}

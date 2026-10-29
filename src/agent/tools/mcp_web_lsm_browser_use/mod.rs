@@ -260,6 +260,7 @@ control_action=set_control_state,params.state=\"user\"(交人工)或 \"agent\"(�
                         "click", "human_click", "right_click", "double_click", "hover",
                         "scroll", "scroll_to", "scroll_to_text", "key_press", "press_sequence",
                         "input_text", "human_input", "clear_input", "select_option", "select_dropdown",
+                        "open_dropdown", "close_dropdown",
                         "upload_file", "download", "new_tab", "new_window", "close_tab", "bring_to_front",
                         "navigate", "back", "forward", "reload", "wait", "eval_js",
                         "set_cookie", "delete_cookie", "set_storage", "clear_storage",

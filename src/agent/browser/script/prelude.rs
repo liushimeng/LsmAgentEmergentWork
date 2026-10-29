@@ -1383,6 +1383,24 @@ function __mk(n) {
     __lsmRec("attributes", el, { attributeName: "checked", attributeOldValue: n.checked ? "true" : "false" });
     __push({ type: "set_checked", selector: n.sel, value: v ? "true" : "false" });
   });
+  // 第 41 轮:半选态(indeterminate)。内核以同名属性承载,布局层据此画横杠,
+  // 样式引擎的 `:indeterminate` 也按该属性命中。
+  define("indeterminate", function () {
+    return !!(n.attrs && Object.prototype.hasOwnProperty.call(n.attrs, "indeterminate"));
+  }, function (v) {
+    if (v) __push({ type: "set_attr", selector: n.sel, key: "indeterminate", value: "" });
+    else __push({ type: "remove_attr", selector: n.sel, key: "indeterminate" });
+  });
+  // 第 41 轮:模态对话框。浏览器语义:只有 `showModal()` 打开的对话框才是
+  // 模态的(进顶层 + 有 `::backdrop` 遮罩);`open` 属性的对话框无模态遮罩。
+  define("showModal", function () { return undefined; }, function () {
+    __push({ type: "set_attr", selector: n.sel, key: "open", value: "" });
+    __push({ type: "set_attr", selector: n.sel, key: "data-lsm-modal", value: "" });
+  });
+  define("close", function () { return undefined; }, function () {
+    __push({ type: "remove_attr", selector: n.sel, key: "open" });
+    __push({ type: "remove_attr", selector: n.sel, key: "data-lsm-modal" });
+  });
   // 真实的父子关系:站点脚本常走 `el.parentNode.insertBefore(...)` 这类路径,
   // 此前 parentNode 恒为 null、children 恒为空,脚本当场抛异常。
   define("parentNode", function () {

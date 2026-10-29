@@ -76,6 +76,20 @@ pub enum WidgetGlyphKind {
     RadioDot,
     Caret,
     Bullet,
+    /// 第 41 轮新增:未选中 radio 的圆环轮廓。
+    BulletRing,
+    /// 第 41 轮新增:`square` 列表 marker(实心方块)。
+    BulletSquare,
+    /// 第 41 轮新增:checkbox 的 indeterminate 横杠。
+    Indeterminate,
+    /// 第 41 轮新增:滑块(range)拇指,竖条。
+    SliderThumb,
+    /// 第 41 轮新增:日历图标(date/datetime-local/month/week)。
+    CalendarIcon,
+    /// 第 41 轮新增:时钟图标(time)。
+    ClockIcon,
+    /// 第 41 轮新增:向上三角(number 微调按钮上箭头)。
+    CaretUp,
 }
 
 /// 绘制项。`x/y/w/h` 为**局部**(页坐标)border box;`opacity` 已含祖先组透明度乘积;
@@ -98,12 +112,16 @@ pub struct DisplayItem {
     /// `position.rs` 对 fixed 取包含块 (0,0,vw,vh)),而普通项以页面为原点。
     /// 光栅化时滚动量 `scroll_y` 只对后者生效 —— 否则固定控件会随页面滚动平移。
     pub fixed: bool,
-    /// 绘制层:0 = 常规流内容,1 = 定位元素(position != static)及其子树。
+    /// 绘制层:0 = 常规流内容,1 = 定位元素(position != static)及其子树,
+    /// 2 = **顶层**(top layer:`dialog[open]`、`select` 展开面板)。
     ///
     /// CSS 2.1 附录 E 第 8 步:定位元素(z-index:auto/0)连同其子树在常规流
     /// 内容(块背景、浮动、行内内容、图片)**之上**绘制。此前只按 (z, seq)
     /// 排序,定位元素若在 DOM 顺序上靠前,会被后面的常规流图片/背景整块盖住
     /// (实测猎聘登录框被 hero 背景图覆盖 → 登录表单完全看不见)。
+    ///
+    /// 第 41 轮新增第 2 档:顶层 UI 脱离常规层叠上下文,永远画在定位层之上,
+    /// 且**不参与祖先 `overflow:hidden` 的裁剪交集**(见 `layout/top_layer.rs`)。
     pub layer: u8,
 }
 

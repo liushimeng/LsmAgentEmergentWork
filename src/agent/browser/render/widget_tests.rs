@@ -13,7 +13,7 @@ fn render_state(html: &str, values: &[(&str, &str)]) -> (image::RgbaImage, layou
         .iter()
         .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
         .collect();
-    doc.apply_widget_state(&values, &HashMap::new());
+    doc.apply_widget_state(&values, &HashMap::new(), &HashMap::new());
     let font = FontSet::fallback();
     let lay = layout::compute(&doc, 640.0, &font);
     let pm = font
@@ -81,4 +81,76 @@ fn select箭头图元进入真实像素() {
         "布局显示列表应含箭头图元"
     );
     assert!(dark_count(&img, &lay, "#s") > 8, "select 箭头/文本应产生深色像素");
+}
+
+/// 第 41 轮:新增控件图元必须落到真实像素。
+#[test]
+fn 滑块拇指图元进入真实像素() {
+    let (img, lay) = render_state(
+        "<body><input id='r' type='range' min='0' max='100' value='50' style='width:160px;height:30px'></body>",
+        &[],
+    );
+    assert!(
+        lay.display.iter().any(|it| matches!(
+            it.kind,
+            DisplayKind::WidgetGlyph {
+                glyph: WidgetGlyphKind::SliderThumb,
+                ..
+            }
+        )),
+        "布局显示列表应含滑块拇指图元"
+    );
+    assert!(dark_count(&img, &lay, "#r") > 8, "滑块拇指应产生深色像素");
+}
+
+#[test]
+fn 日历图标图元进入真实像素() {
+    let (img, lay) = render_state(
+        "<body><input id='d' type='date' value='2026-10-29' style='width:160px;height:30px'></body>",
+        &[],
+    );
+    assert!(
+        lay.display.iter().any(|it| matches!(
+            it.kind,
+            DisplayKind::WidgetGlyph {
+                glyph: WidgetGlyphKind::CalendarIcon,
+                ..
+            }
+        )),
+        "布局显示列表应含日历图标图元"
+    );
+    assert!(dark_count(&img, &lay, "#d") > 8, "日历图标应产生深色像素");
+}
+
+#[test]
+fn 数字微调箭头图元进入真实像素() {
+    let (img, lay) = render_state(
+        "<body><input id='n' type='number' value='7' style='width:120px;height:30px'></body>",
+        &[],
+    );
+    assert!(
+        lay.display.iter().any(|it| matches!(
+            it.kind,
+            DisplayKind::WidgetGlyph {
+                glyph: WidgetGlyphKind::CaretUp,
+                ..
+            }
+        )),
+        "布局显示列表应含上箭头图元"
+    );
+    assert!(dark_count(&img, &lay, "#n") > 8, "微调箭头应产生深色像素");
+}
+
+#[test]
+fn 颜色色块进入真实像素() {
+    let (img, lay) = render_state(
+        "<body><input id='c' type='color' value='#0000ff' style='width:60px;height:30px'></body>",
+        &[],
+    );
+    let blue = img
+        .pixels()
+        .filter(|p| p[2] > 200 && p[0] < 80 && p[1] < 80)
+        .count();
+    assert!(blue > 20, "颜色选择器色块应产生蓝色像素,实际:{blue}");
+    let _ = lay;
 }

@@ -18,3 +18,4 @@
 | [35-渲染引擎块级堆叠语义与跨平台字体回退链.md](35-渲染引擎块级堆叠语义与跨平台字体回退链.md) | 相邻兄弟外边距折叠/空块零高/行内共享行盒；FontSet 跨平台回退链与字形栅格缓存 |
 | [36-验证页布局弹层与Canvas截图保真修复.md](36-验证页布局弹层与Canvas截图保真修复.md) | Flex column 主轴高度/inset 百分比包含块；Canvas 2D 真实 RGBA 与 PNG 截图回写 |
 | [40-Web控件全量能力盘点与增量实施方案.md](40-Web控件全量能力盘点与增量实施方案.md) | Web 控件全量能力矩阵；表单状态→布局→像素闭环、details/dialog、Canvas 尺寸、列表 marker、基础表格 |
+| [41-控件内置UI运行时状态与表格格式化上下文方案.md](41-控件内置UI运行时状态与表格格式化上下文方案.md) | 控件内置 UI（滑块/色块/日历/微调箭头）、运行时伪类状态（`:hover`/`:focus`）、顶层浮层（dialog + backdrop、裁剪逃逸）、表格 caption/colgroup/border-collapse、列表全类型 marker |

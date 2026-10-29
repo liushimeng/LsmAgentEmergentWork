@@ -11,6 +11,60 @@ use super::script;
 use super::{EngineError, EngineResult, LsmBrowserManager};
 use crate::agent::browser::urlutil;
 
+// ========== 第 41 轮:运行时伪类状态(hover/focus/active) ==========
+
+/// 伪类状态维度。同一时刻**只有一个**元素持有某个维度的状态位
+/// (浏览器语义:一个指针、一个焦点)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PseudoDim {
+    Hover,
+    Focus,
+    Active,
+}
+
+/// 置/清某元素的运行时伪类状态位。
+///
+/// 状态落进 `TabState.pseudo_states`,布局/样式阶段由
+/// `Document::apply_widget_state` 写成 `data-lsm-*` 属性,样式引擎的
+/// `:hover`/`:focus`/`:focus-visible`/`:active` 据此命中。
+///
+/// **状态只影响绘制,不影响占位**:控件固有尺寸不读任何状态标记,
+/// 状态切换不会让相邻元素抖动。
+fn set_pseudo_state(
+    tab: &mut super::TabState,
+    stable: &str,
+    dim: PseudoDim,
+    on: bool,
+) {
+    for flags in tab.pseudo_states.values_mut() {
+        match dim {
+            // 指针移动 → 旧的 hover 失效;同时「按键松开」,active 一并失效
+            // (内核无 mousedown/mouseup,移动指针即视为松开)。
+            PseudoDim::Hover => {
+                flags.hover = false;
+                flags.active = false;
+            }
+            PseudoDim::Focus => {
+                flags.focus = false;
+                flags.focus_visible = false;
+            }
+            PseudoDim::Active => flags.active = false,
+        }
+    }
+    if on {
+        let entry = tab.pseudo_states.entry(stable.to_string()).or_default();
+        match dim {
+            PseudoDim::Hover => entry.hover = true,
+            PseudoDim::Focus => {
+                entry.focus = true;
+                entry.focus_visible = true;
+            }
+            PseudoDim::Active => entry.active = true,
+        }
+    }
+    tab.pseudo_states.retain(|_, f| f.any());
+}
+
 fn p_str<'a>(params: &'a Value, key: &str) -> Option<&'a str> {
     params.get(key).and_then(Value::as_str).filter(|s| !s.is_empty())
 }
@@ -657,6 +711,9 @@ pub async fn control(
         "clear_input" => act_clear(mgr, pid, params).await,
         "select_option" => act_select_option(mgr, pid, params).await,
         "select_dropdown" => act_select_dropdown(mgr, pid, params).await,
+        // 第 41 轮:select 展开/收起浮层面板。
+        "open_dropdown" => act_toggle_dropdown(mgr, pid, params, true).await,
+        "close_dropdown" => act_toggle_dropdown(mgr, pid, params, false).await,
         "key_press" => act_key_press(mgr, pid, params, top).await,
         "press_sequence" => act_press_sequence(mgr, pid, params, top).await,
         "scroll" => act_scroll(mgr, pid, params).await,
@@ -1034,6 +1091,16 @@ async fn click_inner(
         (plan, rect, stable, toggled, rect_opt.is_some(), radio_scope, summary_details)
     };
 
+    // 第 41 轮:点击语义 —— 目标进入 hover + active 状态(指针悬停 + 按下),
+    // 使 `:hover`/`:active` 样式命中。状态只影响绘制,不改控件占位。
+    {
+        let mut inner = mgr.inner.lock().await;
+        if let Some(tab) = inner.tabs.get_mut(pid) {
+            set_pseudo_state(tab, &stable, PseudoDim::Hover, true);
+            set_pseudo_state(tab, &stable, PseudoDim::Active, true);
+        }
+    }
+
     let mut out = json!({
         "clicked": true,
         "x": rect.0,
@@ -1152,6 +1219,7 @@ async fn click_inner(
         return Ok(out);
     }
 
+    let navigated = plan.is_some();
     match plan {
         Some(NavPlan::NewTab { url }) => {
             let spawned = mgr.new_tab(pid, &url, timeout).await?;
@@ -1166,23 +1234,38 @@ async fn click_inner(
         }
         None => {}
     }
+    // 第 41 轮:无导航时按新状态重排重绘(导航分支由导航自身重建布局)。
+    if !navigated {
+        relayout_and_push(mgr, pid).await;
+    }
     Ok(out)
 }
 
 async fn act_hover(mgr: &LsmBrowserManager, pid: &str, params: &Value) -> EngineResult<Value> {
     require_page(pid)?;
     let selector = require_selector(params)?;
-    let inner = mgr.inner.lock().await;
-    let tab = inner
-        .tabs
-        .get(pid)
-        .ok_or_else(|| EngineError::page_not_found(pid))?;
-    let doc = tab_document(tab);
-    let nodes = doc.select(selector).map_err(EngineError::action_failed)?;
-    let node = nodes.get(nth(params)).ok_or_else(|| EngineError::action_failed("选择器未命中"))?;
-    let stable = Document::stable_selector(node);
-    let laid_out = tab.layout.rect_for(&stable).is_some();
-    let rect = tab.layout.rect_for(&stable).unwrap_or((0.0, 0.0, 0.0, 0.0));
+    let (stable, laid_out, rect) = {
+        let inner = mgr.inner.lock().await;
+        let tab = inner
+            .tabs
+            .get(pid)
+            .ok_or_else(|| EngineError::page_not_found(pid))?;
+        let doc = tab_document(tab);
+        let nodes = doc.select(selector).map_err(EngineError::action_failed)?;
+        let node = nodes.get(nth(params)).ok_or_else(|| EngineError::action_failed("选择器未命中"))?;
+        let stable = Document::stable_selector(node);
+        let laid_out = tab.layout.rect_for(&stable).is_some();
+        let rect = tab.layout.rect_for(&stable).unwrap_or((0.0, 0.0, 0.0, 0.0));
+        (stable, laid_out, rect)
+    };
+    // 第 41 轮:hover 进入运行时伪类状态 → `:hover` 样式命中 → 重排重绘。
+    {
+        let mut inner = mgr.inner.lock().await;
+        if let Some(tab) = inner.tabs.get_mut(pid) {
+            set_pseudo_state(tab, &stable, PseudoDim::Hover, true);
+        }
+    }
+    relayout_and_push(mgr, pid).await;
     Ok(json!({
         "hovered": true, "selector": stable, "x": rect.0, "y": rect.1,
         "laid_out": laid_out,
@@ -1197,17 +1280,27 @@ async fn act_mouse_move(mgr: &LsmBrowserManager, pid: &str, params: &Value) -> E
         .tabs
         .get_mut(pid)
         .ok_or_else(|| EngineError::page_not_found(pid))?;
+    let mut hovered: Option<String> = None;
     let (x, y) = if let Some(sel) = p_str(params, "selector") {
         let doc = tab_document(tab);
         let nodes = doc.select(sel).map_err(EngineError::action_failed)?;
         let node = nodes.get(nth(params)).ok_or_else(|| EngineError::action_failed("选择器未命中"))?;
         let stable = Document::stable_selector(node);
         let r = tab.layout.rect_for(&stable).unwrap_or((0.0, 0.0, 0.0, 0.0));
+        hovered = Some(stable);
         (r.0 + r.2 / 2.0, r.1 + r.3 / 2.0)
     } else {
         (p_f64(params, "x").unwrap_or(0.0), p_f64(params, "y").unwrap_or(0.0))
     };
     tab.mouse = Some((x, y));
+    // 第 41 轮:按选择器移动指针等价于悬停该元素 → `:hover` 样式命中。
+    if let Some(stable) = hovered.as_deref() {
+        set_pseudo_state(tab, stable, PseudoDim::Hover, true);
+    }
+    drop(inner);
+    if hovered.is_some() {
+        relayout_and_push(mgr, pid).await;
+    }
     Ok(json!({"x": x, "y": y, "note": "指针坐标为布局近似值(非真实设备像素)" }))
 }
 
@@ -1416,6 +1509,46 @@ async fn act_select_dropdown(mgr: &LsmBrowserManager, pid: &str, params: &Value)
     }))
 }
 
+/// 第 41 轮:展开/收起 `select` 的浮层 option 面板。
+///
+/// 展开态写入 `TabState.widget_open`,布局层据此铺出顶层浮层面板
+/// (不受祖先 overflow 裁剪,画在定位层之上)。
+async fn act_toggle_dropdown(
+    mgr: &LsmBrowserManager,
+    pid: &str,
+    params: &Value,
+    open: bool,
+) -> EngineResult<Value> {
+    require_page(pid)?;
+    let selector = require_selector(params)?;
+    let stable = {
+        let inner = mgr.inner.lock().await;
+        let tab = inner
+            .tabs
+            .get(pid)
+            .ok_or_else(|| EngineError::page_not_found(pid))?;
+        let doc = tab_document(tab);
+        let nodes = doc.select(selector).map_err(EngineError::action_failed)?;
+        let node = nodes
+            .get(nth(params))
+            .ok_or_else(|| EngineError::action_failed("下拉目标未命中"))?;
+        if document::tag_name(node).to_ascii_lowercase() != "select" {
+            return Err(EngineError::action_failed("下拉目标不是 <select>"));
+        }
+        Document::stable_selector(node)
+    };
+    {
+        let mut inner = mgr.inner.lock().await;
+        let tab = inner
+            .tabs
+            .get_mut(pid)
+            .ok_or_else(|| EngineError::page_not_found(pid))?;
+        tab.widget_open.insert(stable.clone(), open);
+    }
+    relayout_and_push(mgr, pid).await;
+    Ok(json!({"selector": stable, "open": open}))
+}
+
 async fn act_key_press(
     mgr: &LsmBrowserManager,
     pid: &str,
@@ -1606,20 +1739,33 @@ async fn act_scroll_to_text(mgr: &LsmBrowserManager, pid: &str, params: &Value) 
 async fn act_focus(mgr: &LsmBrowserManager, pid: &str, params: &Value, mode: &str) -> EngineResult<Value> {
     require_page(pid)?;
     let selector = require_selector(params)?;
-    let mut inner = mgr.inner.lock().await;
-    let tab = inner
-        .tabs
-        .get_mut(pid)
-        .ok_or_else(|| EngineError::page_not_found(pid))?;
-    let doc = tab_document(tab);
-    let nodes = doc.select(selector).map_err(EngineError::action_failed)?;
-    let node = nodes.get(nth(params)).ok_or_else(|| EngineError::action_failed("目标未命中"))?;
-    let stable = Document::stable_selector(node);
-    if mode == "focus" {
-        tab.focused = Some(stable.clone());
-    } else {
-        tab.focused = None;
+    let stable = {
+        let inner = mgr.inner.lock().await;
+        let tab = inner
+            .tabs
+            .get(pid)
+            .ok_or_else(|| EngineError::page_not_found(pid))?;
+        let doc = tab_document(tab);
+        let nodes = doc.select(selector).map_err(EngineError::action_failed)?;
+        let node = nodes.get(nth(params)).ok_or_else(|| EngineError::action_failed("目标未命中"))?;
+        Document::stable_selector(node)
+    };
+    {
+        let mut inner = mgr.inner.lock().await;
+        let tab = inner
+            .tabs
+            .get_mut(pid)
+            .ok_or_else(|| EngineError::page_not_found(pid))?;
+        if mode == "focus" {
+            tab.focused = Some(stable.clone());
+            // 第 41 轮:焦点进入运行时伪类状态 → `:focus`/`:focus-visible` 命中。
+            set_pseudo_state(tab, &stable, PseudoDim::Focus, true);
+        } else {
+            tab.focused = None;
+            set_pseudo_state(tab, &stable, PseudoDim::Focus, false);
+        }
     }
+    relayout_and_push(mgr, pid).await;
     Ok(json!({"selector": stable, "mode": mode, "active": mode == "focus"}))
 }
 

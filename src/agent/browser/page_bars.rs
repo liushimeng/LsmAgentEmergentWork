@@ -712,6 +712,7 @@ mod tests {
             console: vec![],
             form_values: Default::default(),
             widget_open: Default::default(),
+            pseudo_states: Default::default(),
             focused: None,
             mouse: None,
             layout: Default::default(),

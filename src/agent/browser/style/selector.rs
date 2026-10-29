@@ -2,9 +2,15 @@
 //!
 //! 支持后代 / 子代 `>` / 相邻兄弟 `+` / 一般兄弟 `~` 四种组合符,
 //! 复合选择器(标签、`*`、`#id`、`.class`、属性、伪类)。
-//! 伪元素规则由上层跳过;动态伪类(`:hover/:focus/:active`)恒不匹配。
+//! 伪元素规则由上层跳过;未知伪类恒不匹配。
+//!
+//! 第 41 轮:`:hover`/`:focus`/`:focus-visible`/`:active` 由**运行时伪类状态**
+//! 驱动 —— 状态经 `Document::apply_widget_state` 以 `data-lsm-*` 属性写入
+//! 临时解析树,匹配时按属性查表(与 `:checked`/`:disabled` 同构)。
 
 use kuchikiki::NodeRef;
+
+use super::super::document;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Combinator {
@@ -51,6 +57,11 @@ pub enum Pseudo {
     Disabled,
     Enabled,
     Link,
+    /// 第 41 轮:运行时交互态伪类(由 `data-lsm-*` 属性标记驱动)。
+    Hover,
+    Focus,
+    FocusVisible,
+    Active,
     /// 动态伪类/未知伪类:恒不匹配。
     Never,
 }
@@ -430,6 +441,10 @@ fn parse_pseudo(name: &str, arg: Option<&str>) -> Option<Pseudo> {
         "disabled" => Pseudo::Disabled,
         "enabled" => Pseudo::Enabled,
         "link" | "any-link" => Pseudo::Link,
+        "hover" => Pseudo::Hover,
+        "focus" => Pseudo::Focus,
+        "focus-visible" => Pseudo::FocusVisible,
+        "active" => Pseudo::Active,
         _ => Pseudo::Never,
     })
 }
@@ -459,6 +474,13 @@ pub fn parse_nth(arg: &str) -> Option<(i32, i32)> {
         _ => b_part.trim_start_matches('+').parse::<i32>().ok()?,
     };
     Some((a, b))
+}
+
+/// 选择器的特异性 `(id, class/attr/伪类, 类型)`。
+///
+/// 供测试与诊断使用(第 41 轮:伪类必须计入伪类列)。
+pub fn selector_specificity(input: &str) -> (u16, u16, u16) {
+    parse_selector(input).map(|s| s.specificity).unwrap_or((0, 0, 0))
 }
 
 fn compound_specificity(c: &Compound) -> (u16, u16, u16) {
@@ -599,8 +621,22 @@ fn pseudo_matches(node: &NodeRef, tag: &str, pseudo: &Pseudo) -> bool {
                     .map(|e| e.attributes.borrow().contains("href"))
                     .unwrap_or(false)
         }
+        // 第 41 轮:运行时交互态。状态经 `Document::apply_widget_state` 以
+        // `data-lsm-*` 属性写入临时解析树,匹配时按属性查表 —— 与
+        // `:checked`/`:disabled` 同一套「运行时覆盖 → 属性 → 样式」通路。
+        Pseudo::Hover => has_state_attr(node, document::ATTR_PSEUDO_HOVER),
+        Pseudo::Focus => has_state_attr(node, document::ATTR_PSEUDO_FOCUS),
+        Pseudo::FocusVisible => has_state_attr(node, document::ATTR_PSEUDO_FOCUS_VISIBLE),
+        Pseudo::Active => has_state_attr(node, document::ATTR_PSEUDO_ACTIVE),
         Pseudo::Never => false,
     }
+}
+
+/// 运行时伪类状态标记属性是否存在。
+fn has_state_attr(node: &NodeRef, name: &str) -> bool {
+    node.as_element()
+        .map(|e| e.attributes.borrow().contains(name))
+        .unwrap_or(false)
 }
 
 fn nth_matches(index: i32, a: i32, b: i32) -> bool {

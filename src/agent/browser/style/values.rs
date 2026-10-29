@@ -891,6 +891,13 @@ pub fn ua_default(tag: &str, parent: &ComputedStyle) -> ComputedStyle {
         }
         _ => {}
     }
+    // `list-style*` 是继承属性:从父级拷贝,否则 `ul` 上的声明传不到 `li`
+    // (第 41 轮:`list-style-type`/`list-style-position` 全类型支持的前提)。
+    for key in ["list-style", "list-style-type", "list-style-position"] {
+        if let Some(v) = parent.extra.get(key) {
+            st.extra.insert(key.to_string(), v.clone());
+        }
+    }
     let margin = match tag.as_str() {
         "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "ul" | "ol" | "pre" | "blockquote"
         | "dl" | "figure" => 8.0,
@@ -1522,6 +1529,7 @@ fn is_inherited_property(key: &str) -> bool {
             | "word-spacing"
             | "list-style"
             | "list-style-type"
+            | "list-style-position"
     )
 }
 

@@ -21,7 +21,7 @@ fn state_doc(html: &str, values: &[(&str, &str)], open: &[(&str, bool)]) -> Docu
         .iter()
         .map(|(k, v)| ((*k).to_string(), *v))
         .collect();
-    doc.apply_widget_state(&values, &open);
+    doc.apply_widget_state(&values, &open, &HashMap::new());
     doc
 }
 
