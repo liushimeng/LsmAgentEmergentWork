@@ -821,6 +821,24 @@ async fn run_control(args: Value) -> Result<String> {
         };
         let image_path = str_arg(p, "image_path").unwrap_or("");
 
+        // 人工可见性守卫:hidden 模式(非 TTY 自动判定/显式 hidden)没有可见窗口,
+        // 人工无法在页面上操作。如实把系统提示拼进展示消息、结果回 page_visible:false,
+        // 避免「请在浏览器窗口点击验证」这类不可能指令发给人工(实测 -f 后台管道任务)。
+        let page_visible = McpChromeUseTool::mgr().mode().is_headed();
+        let message = match (message, page_visible) {
+            (Some(m), true) => Some(m),
+            (Some(m), false) => Some(format!(
+                "{m}\n[系统提示] 当前浏览器为隐藏模式(无可见窗口),人工无法直接操作页面;\
+                 可在弹窗选项中应答,或让 Agent 以有头模式(headed)重新打开页面后再发起人工介入。"
+            )),
+            (None, false) => Some(
+                "[系统提示] 当前浏览器为隐藏模式(无可见窗口),人工无法直接操作页面;\
+                 可在弹窗选项中应答,或让 Agent 以有头模式(headed)重新打开页面后再发起人工介入。"
+                    .to_string(),
+            ),
+            (None, true) => None,
+        };
+
         // **控制权移交**:提问期间控制权必须交还人工 —— 撤蒙层、放行输入闸,
         // 否则人工扫码/输码/登录点不动页面,弹窗就成了摆设。
         // 收口(应答/超时/取消)后按进入前的状态恢复,回到防交叉操作基线。
@@ -871,6 +889,15 @@ async fn run_control(args: Value) -> Result<String> {
                     web_control::state_of(Engine::Chrome, &page_id).as_str()
                 }),
             );
+            // 人工可见性回传:隐藏模式下人工没有窗口可操作,模型据此决定
+            // 改有头模式重开页面,而不是反复发不可能完成的人工介入。
+            obj.insert("page_visible".into(), json!(page_visible));
+            if !page_visible {
+                obj.insert(
+                    "visibility_hint".into(),
+                    json!("页面无可见窗口(隐藏模式):如需人工在页面上操作,先用 open(mode=headed) 重开页面,再 request_human;仅在弹窗选项应答的场合可维持隐藏。"),
+                );
+            }
         }
         return envelope(code, &message, data);
     }

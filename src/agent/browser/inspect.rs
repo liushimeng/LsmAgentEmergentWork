@@ -277,6 +277,37 @@ pub async fn inspect(
             // 第 174 轮:脚本管线截断也是一等健康信号 —— 截断意味着懒加载组件
             // (登录弹层/搜索面板)可能还没挂载,先补齐脚本再判断页面状态。
             let script_cut = tab.script_budget_cut && tab.script_pending > 0;
+            // 同路径请求循环探测:验证码组件反复重置 / 轮询打转会在网络台账留下
+            // 「同 method+路径(忽略 query)大量重复」的形态(实测 zhipin 安全验证页
+            // GeeTest reset.php 连打 19 次直到脚本预算截断,页面只显示「配置错误」)。
+            // 这是一等健康信号:让 Agent 直接看到「组件在自愈循环」,而不是对着
+            // 「配置错误」文本反复刷新。仅诊断,不改行为(正常长轮询站点也会命中,
+            // 文案用「疑似」,让模型结合 console/network 自行判断)。
+            let mut loop_counts: std::collections::HashMap<(String, String), usize> =
+                std::collections::HashMap::new();
+            for ev in tab.network.iter().rev().take(500) {
+                // 归一键:去 scheme 与 query,保留 host+path(不同域同路径不混淆;
+                // 相对 URL 原样保留路径)。
+                let host_path = ev
+                    .url
+                    .split_once("://")
+                    .map(|(_, rest)| rest)
+                    .unwrap_or(ev.url.as_str());
+                let host_path = host_path
+                    .split_once('?')
+                    .map(|(p, _)| p)
+                    .unwrap_or(host_path);
+                *loop_counts
+                    .entry((ev.method.clone(), host_path.to_string()))
+                    .or_insert(0) += 1;
+            }
+            let request_loop = loop_counts
+                .into_iter()
+                .filter(|(_, n)| *n >= 8)
+                .max_by_key(|(k, n)| (*n, k.1.clone()))
+                .map(|((method, path), n)| {
+                    json!({"method": method, "path": path, "count": n})
+                });
             let (diagnosis, hint) = if script_cut {
                 (
                     "页面脚本管线被墙钟预算截断,仍有模块未装载,动态组件可能尚未挂载",
@@ -329,6 +360,12 @@ pub async fn inspect(
                 },
                 "script_budget_cut": tab.script_budget_cut,
                 "script_pending": tab.script_pending,
+                "request_loop": request_loop,
+                "request_loop_note": if request_loop.is_some() {
+                    "同路径请求大量重复(疑似验证码组件反复重置/轮询循环):结合 inspect(console) 的异常看组件是否在自愈循环;刷新通常无济于事,必要时改用 MCP_Web_Chrome_Use 或 request_human"
+                } else {
+                    ""
+                },
                 "diagnosis": diagnosis,
                 "hint": hint,
             }))

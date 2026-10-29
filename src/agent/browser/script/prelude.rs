@@ -173,6 +173,52 @@ function __clog(level, text) {
 }
 function __cerror(text) { __clog("error", text); }
 
+// ---------- LAEW_JS_CB_TRACE=1:第三方 SDK 初始化入口的回调异常透传陷阱 ----------
+// 验证码/统计类 SDK(极验 initGeetest 等)内部 try/catch 会把用户回调抛出的原始异常
+// 吞成一句「配置错误请点击重试」,真实堆栈在页面侧拿不到。本陷阱在 window 代理
+// 读取入口函数时包一层:函数参数(用户回调)与返回对象的方法被换成
+// 「记录异常原文后原样重抛」的包装,语义不变,异常进 console 台账。默认关闭。
+var __lsmCbTrace = false;
+var __lsmCbTraceNames = { "initGeetest": true };
+function __lsmCbWrapErr(scope, e) {
+  try {
+    __cerror("[cbtrap] " + scope + " 异常: " + String((e && e.message) || e) +
+      " | " + String((e && e.stack) || "").slice(0, 800));
+  } catch (e2) {}
+}
+function __lsmCbWrapFn(scope, fn) {
+  if (typeof fn !== "function" || fn.__lsmCbWrapped) return fn;
+  var w = function () {
+    var args = Array.prototype.slice.call(arguments);
+    for (var i = 0; i < args.length; i++) {
+      if (typeof args[i] === "function") args[i] = __lsmCbWrapFn(scope + "/arg" + i, args[i]);
+    }
+    try { return fn.apply(this, args); }
+    catch (e) { __lsmCbWrapErr(scope, e); throw e; }
+  };
+  try { Object.defineProperty(w, "__lsmCbWrapped", { value: true }); } catch (e3) {}
+  return w;
+}
+function __lsmCbWrapEntry(name, fn) {
+  var w = function () {
+    var args = Array.prototype.slice.call(arguments);
+    for (var i = 0; i < args.length; i++) {
+      if (typeof args[i] === "function") args[i] = __lsmCbWrapFn(name + "/cb", args[i]);
+    }
+    var r = fn.apply(this, args);
+    if (r && typeof r === "object") {
+      for (var k in r) {
+        if (typeof r[k] === "function") {
+          try { r[k] = __lsmCbWrapFn(name + "/obj." + k, r[k]); } catch (e4) {}
+        }
+      }
+    }
+    return r;
+  };
+  try { Object.defineProperty(w, "__lsmCbWrapped", { value: true }); } catch (e5) {}
+  return w;
+}
+
 // ---------- Annex B 兼容:String.prototype.substr ----------
 // Boa 0.20 默认关闭 annex-b,`substr` 缺失;站点会自带补丁,但实测百度地图里
 // 落到一个 native 形态的实现上,`"array".substr(1)` 直接抛
@@ -2784,9 +2830,15 @@ var window = __lsmWin;
 if (typeof Proxy === "function") {
   window = new Proxy(__lsmWin, {
     get: function (t, k) {
-      if (k in t) return t[k];
-      if (typeof globalThis !== "undefined" && k in globalThis) return globalThis[k];
-      return undefined;
+      var v;
+      if (k in t) v = t[k];
+      else if (typeof globalThis !== "undefined" && k in globalThis) v = globalThis[k];
+      // cb 陷阱:入口函数在读侧懒包装(赋值侧有裸全局/window 两路,读侧单点收口)
+      if (__lsmCbTrace && typeof k === "string" && __lsmCbTraceNames[k] &&
+          typeof v === "function" && !v.__lsmCbWrapped) {
+        try { v = __lsmCbWrapEntry(k, v); } catch (e0) {}
+      }
+      return v;
     },
     // has 陷阱:`"onsubmit" in window` 在真实浏览器恒为 true(window 有一整族
     // on* 事件处理器占位属性),站点库拿它做特性检测。缺此陷阱时默认转发到

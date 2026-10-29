@@ -100,6 +100,8 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 | `LAEW_WEB_PREFERS_DARK` | `1`/`true`/`yes`/`on` | `prefers-color-scheme: dark` 求值为真(样式引擎与 `matchMedia` 共用) |
 | `LAEW_WEB_ACCEPT_LANGUAGE` | 任意 `Accept-Language` 值 | 覆盖浏览器请求头合成层的 `Accept-Language`(默认 `zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7`)。见 `src/agent/browser/reqctx.rs` |
 | `LAEW_DOM_TRACE` | `1` | 打印 JS→DOM 动作账本(kind/selector/样本),诊断「页面空白 / JS 建好的 UI 没回写」。见 `src/agent/browser/script/dom_ops.rs` |
+| `LAEW_JS_CHAIN_TRACE` | `1`/`true`/`yes`/`on` | 动态脚本装载链逐环打点(register/load-entry/style/fire),定位「SDK 已装载但 onload→Promise 链不推进」类静默断链。见 `src/agent/browser/script/runtime.rs` |
+| `LAEW_JS_CB_TRACE` | `1`/`true`/`yes`/`on` | 第三方 SDK 初始化入口(initGeetest 等)的用户回调异常透传陷阱:SDK 内部 catch 吞掉的原始异常/堆栈以 `[cbtrap]` 进 console 台账。默认关闭。见 `src/agent/browser/script/prelude.rs`、`docs/MCP_Web_LsmAgentBrowser_Use/37-GeeTest自愈循环可观测与HITL可见性守卫.md` |
 | `LAEW_BROWSER_VIEW_ACTIVATE` | `off`/`0`/`false`/`no` | 关闭有头浏览器启动时前台激活(默认激活并把窗口带到前台,避免被 Chrome/终端遮住;关闭后只 orderFront 不抢焦点)。见 `src/agent/browser/view/macos.rs` |
 | `LAEW_BROWSER_VIEWER_BIN` | 任意可执行文件路径 | 覆盖有头查看器子进程的可执行文件(默认当前进程)。供库进程/自检拉起真正的 `laew __browser-view` 用。见 `src/agent/browser/view/mod.rs` |
 | `LAEW_PAGE_BARS` | `off`/`0`/`false`/`no` | 关闭**屏蔽页面状态栏/进度栏**(两浏览器工具同参;Chrome 注入 JS + Lsm 查看器帧合成)。见 `src/agent/chrome_browser/status.rs`、`src/agent/browser/page_bars.rs`、`docs/双浏览器工具架构/02-屏蔽页面状态栏与进度栏.md` |

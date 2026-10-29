@@ -221,6 +221,20 @@ async fn request_human(args: &Value, params: &Value) -> Result<String> {
     };
     let image_path = str_arg(params, "image_path").unwrap_or("");
 
+    // 人工可见性守卫:隐藏模式(或查看器已退出)时人工没有可见窗口可操作。
+    // 如实把系统提示拼进展示消息、并在结果里回 page_visible:false,避免
+    // 「请在浏览器窗口完成滑块」这类不可能指令发给人工(实测 -f 后台管道
+    // 任务默认 hidden,人工侧只看得到 HITL 弹窗)。
+    let page_visible = mgr.viewer_alive();
+    let message = if page_visible {
+        message
+    } else {
+        format!(
+            "{message}\n[系统提示] 当前浏览器为隐藏模式(无可见窗口),人工无法直接操作页面;\
+             可在弹窗选项中应答,或让 Agent 以有头模式(headed)重新打开页面后再发起人工介入。"
+        )
+    };
+
     // **控制权移交**:提问期间控制权交还人工 —— 撤蒙层;收口后按进入前的状态恢复。
     let hitl_note = format!("人工介入中({reason});完成后由 Agent 取回控制权");
     let prev_state = if page_id.is_empty() {
@@ -269,6 +283,7 @@ async fn request_human(args: &Value, params: &Value) -> Result<String> {
                     "human_response": text,
                     "assist_channel": via.as_str(),
                     "origin": "llm",
+                    "page_visible": page_visible,
                     "next_hint": next_hint,
                 }),
             )
@@ -280,7 +295,12 @@ async fn request_human(args: &Value, params: &Value) -> Result<String> {
                 "reason": reason,
                 "kind_label": crate::agent::human_assist::kind_label(&reason),
                 "assist_channel": via.as_str(),
-                "hint": "可重试 request_human,或如实告知用户改在交互模式重试;严禁伪造结果。",
+                "page_visible": page_visible,
+                "hint": if page_visible {
+                    "可重试 request_human,或如实告知用户改在交互模式重试;严禁伪造结果。"
+                } else {
+                    "页面无可见窗口(隐藏模式),重试 request_human 前先以有头模式打开页面,否则人工永远无法在页面上操作;严禁伪造结果。"
+                },
             }),
         ),
         HumanAssistOutcome::Cancelled { via } => {
@@ -292,6 +312,7 @@ async fn request_human(args: &Value, params: &Value) -> Result<String> {
                     "reason": reason,
                     "human_cancelled": true,
                     "assist_channel": via.as_str(),
+                    "page_visible": page_visible,
                     "next_hint": "立即停止本任务,不要重试或改用其它通道。",
                 }),
             )

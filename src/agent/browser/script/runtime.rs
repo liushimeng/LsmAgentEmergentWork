@@ -205,6 +205,15 @@ impl ThreadRuntime {
         let _ = ctx.eval(Source::from_bytes(
             format!("globalThis.__lsmChainTrace = {chain_trace};").as_bytes(),
         ));
+        // LAEW_JS_CB_TRACE=1:第三方 SDK 初始化入口(initGeetest 等)的用户回调
+        // 异常透传陷阱——SDK 内部 catch 会把原始异常吞成「配置错误」,这里把
+        // 异常原文 + 堆栈透传进 console 台账,供 inspect(console) 取证。
+        let cb_trace = std::env::var("LAEW_JS_CB_TRACE")
+            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+        let _ = ctx.eval(Source::from_bytes(
+            format!("globalThis.__lsmCbTrace = {cb_trace};").as_bytes(),
+        ));
         // LAEW_JS_DIAG=1 时装 define 陷阱:站点装载器安装全局 define 时被包裹,
         // 原始首次执行(站点装载器调用约定)即被记录——重放不复现的根因是
         // 装载器注册表跳过重复 define,只有首跑能观测。

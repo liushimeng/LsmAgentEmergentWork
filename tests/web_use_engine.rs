@@ -143,6 +143,38 @@ fn route(path: &str, with_headers: bool) -> (&'static str, String, Vec<(String, 
                 .to_string(),
             vec![],
         )
+    } else if path.starts_with("/poll-endpoint") {
+        // 请求循环探测测试:同路径被 fetch 多次(query 变化),page_health 应聚出循环形态。
+        ("200 OK", "{\"ok\":true}".to_string(), vec![])
+    } else if path == "/loop-page" {
+        (
+            "200 OK",
+            "<html><head><title>轮询页</title></head><body><div id=\"app\">polling</div>\
+             <script>(async function(){\
+               for (var i = 0; i < 9; i++) { try { await fetch('/poll-endpoint?i=' + i); } catch (e) {} }\
+               window.__pollDone = true;\
+             })();</script>\
+             </body></html>"
+                .to_string(),
+            vec![],
+        )
+    } else if path == "/cbtrap-page" {
+        // cb 陷阱测试:模拟第三方验证码 SDK「入口全局函数 + 用户回调」模式,
+        // 回调同步抛错(SDK 内部 catch 会吞掉原始异常,只有陷阱能透传)。
+        (
+            "200 OK",
+            "<html><head><title>cb陷阱页</title></head><body><div id=\"row\"></div>\
+             <script>\
+             window.initGeetest = function (cfg, cb) {\
+               var fake = { onReady: function () { return this; } };\
+               try { cb(fake); } catch (e) { /* SDK 吞掉原始异常 */ }\
+             };\
+             window.initGeetest({}, function (n) { n.onReady(); throw new Error('boom-cbtrap'); });\
+             </script>\
+             </body></html>"
+                .to_string(),
+            vec![],
+        )
     } else if path == "/jsonp-call.js" {
         // JSONP 模拟:调用页面先注册的全局回调(gt.js 模式)。
         (
@@ -1391,6 +1423,92 @@ async fn dispatch_event_兼容事件对象与type参数() {
     )
     .await;
     assert_eq!(text["code"], 0, "字符串形状应继续可用:{text}");
+
+    exec(&tool, json!({"action": "close", "page_id": page_id})).await;
+}
+
+#[tokio::test]
+async fn page_health_同路径请求循环探测() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+
+    let open = exec(
+        &tool,
+        json!({"action": "open", "url": format!("{base}/loop-page"), "mode": "hidden"}),
+    )
+    .await;
+    assert_eq!(open["code"], 0, "{open}");
+    let page_id = open["data"]["page_id"].as_str().unwrap().to_string();
+
+    // 等轮询脚本跑完(9 次同路径 fetch)
+    for _ in 0..20 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let done = exec(
+            &tool,
+            json!({"action": "control", "page_id": page_id, "control_action": "eval_js",
+                    "params": {"expression": "String(window.__pollDone === true)"}}),
+        )
+        .await;
+        if done["data"]["result"].as_str() == Some("true") {
+            break;
+        }
+    }
+
+    let ph = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": page_id, "info": "page_health"}),
+    )
+    .await;
+    let rl = &ph["data"]["request_loop"];
+    assert!(
+        rl.is_object(),
+        "9 次同路径 fetch 后 request_loop 应聚出形态:{ph}"
+    );
+    assert_eq!(rl["method"], "GET", "{rl}");
+    assert!(
+        rl["path"].as_str().unwrap_or("").contains("/poll-endpoint"),
+        "循环路径应为 /poll-endpoint:{rl}"
+    );
+    assert!(
+        rl["count"].as_u64().unwrap_or(0) >= 8,
+        "同路径计数应 >=8:{rl}"
+    );
+
+    exec(&tool, json!({"action": "close", "page_id": page_id})).await;
+}
+
+#[tokio::test]
+async fn cb陷阱_用户回调异常透传console() {
+    allow_loopback();
+    std::env::set_var("LAEW_JS_CB_TRACE", "1");
+    let base = start_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+
+    let open = exec(
+        &tool,
+        json!({"action": "open", "url": format!("{base}/cbtrap-page"), "mode": "hidden"}),
+    )
+    .await;
+    assert_eq!(open["code"], 0, "{open}");
+    let page_id = open["data"]["page_id"].as_str().unwrap().to_string();
+
+    let con = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": page_id, "info": "console",
+                "params": {"limit": 100}}),
+    )
+    .await;
+    let events = con["data"]["events"].as_array().cloned().unwrap_or_default();
+    let trap_text: Vec<String> = events
+        .iter()
+        .map(|e| e["text"].as_str().unwrap_or("").to_string())
+        .filter(|t| t.contains("[cbtrap]"))
+        .collect();
+    assert!(
+        trap_text.iter().any(|t| t.contains("initGeetest/cb") && t.contains("boom-cbtrap")),
+        "SDK 吞掉的回调原始异常应被 cb 陷阱透传进 console:{trap_text:?}"
+    );
 
     exec(&tool, json!({"action": "close", "page_id": page_id})).await;
 }

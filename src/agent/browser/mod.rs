@@ -407,6 +407,16 @@ impl LsmBrowserManager {
         GLOBAL.clone()
     }
 
+    /// 有头查看器是否在位(headed 但查看器已退出、hidden 从未启动都返回 false)。
+    /// `request_human` 用它判断「人工有没有可见窗口可操作」——隐藏模式下弹窗
+    /// 提示人工「请在浏览器窗口完成验证」是不可能指令,必须提前告知模型。
+    pub fn viewer_alive(&self) -> bool {
+        self.view
+            .lock()
+            .map(|v| v.as_ref().map(|s| s.is_alive()).unwrap_or(false))
+            .unwrap_or(false)
+    }
+
     pub fn user_agent(&self) -> &str {
         self.http.user_agent()
     }
