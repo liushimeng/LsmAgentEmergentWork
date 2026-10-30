@@ -673,3 +673,21 @@ fn getComputedStyle_背景色输出rgba() {
     let bg = m.get("background-color").cloned().unwrap_or_default();
     assert!(bg.starts_with("rgba("), "半透明背景应输出 rgba(...):{bg}");
 }
+
+#[test]
+fn 百分比top对未知包含块高按auto处理() {
+    // 猎聘 ant-spin-dot 根因:`top:50%` 对 UNKNOWN_CB_H(f64::MAX/2)求解
+    // 得 ~4.49e307,直通显示列表污染整页高度。包含块高不定时百分比偏移
+    // 应按 auto(None)处理。
+    let mut pos = super::values::PositionStyle::default();
+    pos.top_percent = Some(50.0);
+    let sentinel = crate::agent::browser::layout::UNKNOWN_CB_H;
+    assert!(pos.resolved_top(sentinel).is_none(), "哨兵高不应解出天文坐标");
+    assert!(pos.resolved_bottom(sentinel).is_none(), "bottom 同理");
+    // 正常包含块高照常求解。
+    let v = pos.resolved_top(600.0).unwrap();
+    assert!((v - 300.0).abs() < 0.01, "600 高的 50% 应为 300:{v}");
+    // 显式长度不受哨兵守卫影响。
+    pos.top = Some(12.0);
+    assert_eq!(pos.resolved_top(sentinel), Some(12.0));
+}

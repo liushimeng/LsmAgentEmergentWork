@@ -334,6 +334,9 @@ pub struct OpenOutcome {
     /// 页面内 iframe 数量(第 174 轮:内核不渲染 iframe 内容,如实计数告知,
     /// 免得 Agent 对 iframe 里的登录/验证码区域反复重试)。
     pub iframe_count: usize,
+    /// 页面内 `<video>` 数量:内核不渲染视频画面(hero 背景视频区域会留
+    /// 纯色/空白)。如实计数告知,与 webgl/iframe 同款边界上报。
+    pub video_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -624,6 +627,11 @@ impl LsmBrowserManager {
                             .get(&existing)
                             .and_then(|t| document::Document::parse(&t.html, &t.url).select("iframe").ok().map(|v| v.len()))
                             .unwrap_or(0);
+                        let video_count = inner
+                            .tabs
+                            .get(&existing)
+                            .and_then(|t| document::Document::parse(&t.html, &t.url).select("video").ok().map(|v| v.len()))
+                            .unwrap_or(0);
                         return Ok(OpenOutcome {
                             page_id: pid,
                             title: nav.title,
@@ -641,6 +649,7 @@ impl LsmBrowserManager {
                             viewport_height: vh,
                             webgl_asked: webgl_asked,
                             iframe_count,
+                            video_count,
                         });
                     }
                     Err(err) => {
@@ -902,6 +911,7 @@ impl LsmBrowserManager {
             viewport_height: viewport.height,
             webgl_asked: pipeline.webgl_asked,
             iframe_count: doc.select("iframe").map(|v| v.len()).unwrap_or(0),
+            video_count: doc.select("video").map(|v| v.len()).unwrap_or(0),
         })
     }
 

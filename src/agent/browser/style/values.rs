@@ -73,6 +73,11 @@ pub struct ComputedStyle {
     pub margin_right: f64,
     pub margin_bottom: f64,
     pub margin_left: f64,
+    /// `margin-left/right: auto` 标记(块级定宽居中的 CSS 2.1 §10.3.3 语义)。
+    /// 长度解析对 "auto" 返回 None,不保留标记的话 auto 被丢成 0,
+    /// `width:1192px;margin:0 auto` 的页头恒贴左(实测猎聘页头)。
+    pub margin_left_auto: bool,
+    pub margin_right_auto: bool,
     pub padding_top: f64,
     pub padding_right: f64,
     pub padding_bottom: f64,
@@ -224,11 +229,21 @@ impl PositionStyle {
         self.right.or(self.right_percent.map(|p| p / 100.0 * containing_width))
     }
 
+    /// 百分比 top/bottom 对「包含块高度未知」(UNKNOWN_CB_H 哨兵,f64::MAX/2)
+    /// 求解会得到 ~4.49e307 一类的天文坐标(实测猎聘 ant-spin-dot 的
+    /// `top:50%`,整页高度/渲染预算被连带污染)。CSS 语义:包含块高不定
+    /// (依赖内容)时百分比偏移按 auto(0)处理 —— 这里直接返回 None。
     pub fn resolved_top(&self, containing_height: f64) -> Option<f64> {
+        if self.top.is_none() && containing_height >= 1e15 {
+            return None;
+        }
         self.top.or(self.top_percent.map(|p| p / 100.0 * containing_height))
     }
 
     pub fn resolved_bottom(&self, containing_height: f64) -> Option<f64> {
+        if self.bottom.is_none() && containing_height >= 1e15 {
+            return None;
+        }
         self.bottom.or(self.bottom_percent.map(|p| p / 100.0 * containing_height))
     }
 
@@ -439,6 +454,8 @@ impl Default for ComputedStyle {
             margin_right: 0.0,
             margin_bottom: 0.0,
             margin_left: 0.0,
+            margin_left_auto: false,
+            margin_right_auto: false,
             padding_top: 0.0,
             padding_right: 0.0,
             padding_bottom: 0.0,
@@ -1098,14 +1115,47 @@ pub fn apply_declaration(
                 st.margin_bottom = b;
                 st.margin_left = l;
             }
+            // auto 槽位识别(CSS 简写 1/2/3/4 值展开:auto 只在 left/right
+            // 有布局语义——块级定宽居中,§10.3.3)。parse_length 对 auto
+            // 返回 None,长度按 0 处理,标记交给布局层解剩余空间。
+            let tokens: Vec<&str> = value.split_whitespace().collect();
+            let (l_auto, r_auto) = match tokens.len() {
+                1 => (tokens[0].eq_ignore_ascii_case("auto"), tokens[0].eq_ignore_ascii_case("auto")),
+                2 => (tokens[1].eq_ignore_ascii_case("auto"), tokens[1].eq_ignore_ascii_case("auto")),
+                3 => (tokens[2].eq_ignore_ascii_case("auto"), tokens[1].eq_ignore_ascii_case("auto")),
+                4 => (tokens[3].eq_ignore_ascii_case("auto"), tokens[1].eq_ignore_ascii_case("auto")),
+                _ => (false, false),
+            };
+            st.margin_left_auto = l_auto;
+            st.margin_right_auto = r_auto;
         }
         "margin-top" | "margin-right" | "margin-bottom" | "margin-left" => {
-            if let Some(v) = parse_length(value, st.font_size, ctx) {
+            if value.eq_ignore_ascii_case("auto") {
                 match key.as_str() {
-                    "margin-top" => st.margin_top = v,
-                    "margin-right" => st.margin_right = v,
-                    "margin-bottom" => st.margin_bottom = v,
-                    _ => st.margin_left = v,
+                    "margin-right" => {
+                        st.margin_right = 0.0;
+                        st.margin_right_auto = true;
+                    }
+                    "margin-left" => {
+                        st.margin_left = 0.0;
+                        st.margin_left_auto = true;
+                    }
+                    _ => {}
+                }
+            } else {
+                if let Some(v) = parse_length(value, st.font_size, ctx) {
+                    match key.as_str() {
+                        "margin-top" => st.margin_top = v,
+                        "margin-right" => {
+                            st.margin_right = v;
+                            st.margin_right_auto = false;
+                        }
+                        "margin-bottom" => st.margin_bottom = v,
+                        _ => {
+                            st.margin_left = v;
+                            st.margin_left_auto = false;
+                        }
+                    }
                 }
             }
         }

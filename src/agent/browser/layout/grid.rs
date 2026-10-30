@@ -91,7 +91,6 @@ pub(crate) fn layout_container(
     cb: (f64, f64, f64, f64),
 ) {
     ctx.advance_y(style.margin_top);
-    let bx = x + style.margin_left;
     let mut bw = (width
         - style.margin_left
         - style.margin_right
@@ -104,6 +103,18 @@ pub(crate) fn layout_container(
     if let Some(mw) = style.max_width {
         bw = bw.min(mw.max(1.0));
     }
+    // 第 178 轮:auto 左右边距在显式宽度下按剩余空间求解(CSS §10.3.3,
+    // 与块级/flex 分支同款语义)。
+    let bx = if (style.margin_left_auto || style.margin_right_auto) && style.width.is_some() {
+        let free = (width - style.margin_left - style.margin_right - bw).max(0.0);
+        match (style.margin_left_auto, style.margin_right_auto) {
+            (true, true) => x + free / 2.0,
+            (true, false) => x + free,
+            _ => x + style.margin_left,
+        }
+    } else {
+        x + style.margin_left
+    };
     // 显式 content-box:width 即内容盒宽,padding 加回边框盒(见 mod.rs 同名注释)。
     if style.box_sizing_content && style.width.is_some() {
         bw += style.padding_left + style.padding_right;

@@ -782,13 +782,24 @@ impl<'a> LayoutCtx<'a> {
         row: &mut float::InlineRow,
         tf: Option<Affine>,
     ) {
+        // 行内游标(第 178 轮补,第 44 轮行内原子盒之上保留):行内**原子盒**
+        // (替换元素/表单控件)由行提交期的 flow_x 定位,但非原子的行内盒
+        // (inline-block span 等)仍在收集期即时发射、不经行内缓冲 —— 所有
+        // 兄弟共用同一 line_x 时,两个 inline-block 药丸标签(font-size:0
+        // 容器内)同坐标叠印(实测猎聘行业卡「5-7年/统招本科」)。pen 按
+        // margin-box 宽推进,让后续兄弟/文本落在新起点;文本段定位取
+        // `flow_x.max(run.x)`,与行内流的先后关系天然协调。
+        let mut pen = line_x;
         for child in node.children() {
             if let Some(text) = child.as_text() {
                 let raw = text.borrow();
                 if !raw.trim().is_empty() {
-                    // line_x = 本元素 margin-box x;push_styled 再加自身
+                    // pen = 本元素当前游标;push_styled 再加自身
                     // margin+padding 得文本内容起点。
-                    buf.push_styled(&raw, style, line_x, tf, style.text_shadow.clone());
+                    buf.push_styled(&raw, style, pen, tf, style.text_shadow.clone());
+                    // 文本推进游标但不越出可用右缘(同块级分支)。
+                    let tw = self.font.text_width(&raw, style.font_size);
+                    pen += tw.min((line_x + avail_w - pen).max(0.0));
                 }
                 continue;
             }
@@ -818,15 +829,23 @@ impl<'a> LayoutCtx<'a> {
                     AtomicKind::Replaced,
                     iw,
                     ih,
-                    line_x,
+                    pen,
                     tf,
                 );
                 buf.push_atomic(atomic);
+                // 原子盒自身经 flow_x 定位,但**后续非原子兄弟**仍读 pen,
+                // 按其 margin-box 宽推进。
+                pen = pen
+                    + child_style.margin_left
+                    + child_style.padding_left
+                    + iw
+                    + child_style.padding_right
+                    + child_style.margin_right;
                 continue;
             }
             // 阶段七:行内浮动排在当前行剩余带(输入框+按钮/图标+文字经典浮动行)。
             // 子级 margin-box 起点 = 本元素内容盒 x(margin-box + 自身 margin+padding)。
-            let child_x = line_x + style.margin_left + style.padding_left;
+            let child_x = pen + style.margin_left + style.padding_left;
             if child_style.float != "none" {
                 self.layout_inline_float(&child, &child_style, buf, depth, child_x, avail_w, row, tf);
                 continue;
@@ -840,8 +859,25 @@ impl<'a> LayoutCtx<'a> {
                 row.deactivate();
             }
             // 交互类行内元素的矩形由 `collect_inline` 入口统一建盒(元素自身),
-            // 此处只负责继续收集其子树文本。
+            // 此处只负责继续收集其子树文本。inline-box 子级(含表单控件原子盒)
+            // 按 margin-box 宽推进游标;纯 inline 子级按子树文本宽近似推进
+            // (文本自身经 buf 流动,推进只为让**后续盒**落在文本之后;
+            // 空/隐身元素推进 0,与 font-size:0 去缝容器语义一致)。
+            let is_box_child = self.inline_box_worthy(&child, &child_style);
             self.collect_inline(&child, &child_style, buf, depth + 1, child_x, avail_w, tf, row);
+            if is_box_child {
+                let (w, _h) = self.inline_box_size(&child, &child_style, avail_w);
+                pen = child_x
+                    + child_style.margin_left
+                    + child_style.padding_left
+                    + w
+                    + child_style.padding_right
+                    + child_style.margin_right;
+            } else {
+                let text = child.text_contents();
+                let tw = self.font.text_width(&text, child_style.font_size);
+                pen = child_x + tw.min((line_x + avail_w - child_x).max(0.0));
+            }
         }
     }
 

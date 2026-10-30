@@ -1950,3 +1950,58 @@ fn body渐变背景传播画布() {
         other => panic!("应为渐变填充,实际 {other:?}"),
     }
 }
+
+// ===================== 第 178 轮:margin auto 居中 / 行内游标推进 =====================
+
+#[test]
+fn 定宽块margin_auto在视口内居中() {
+    // 猎聘页头根因:`#framework-pc-header-container .header-content-box`
+    // 是 `width:1192px;margin:0 auto`,此前 auto 被样式层丢成 0,
+    // 1920 视口下恒贴左(x=0,应 x=364)。
+    let doc = Document::parse(
+        "<head><style>#hdr .box{width:200px;margin:0 auto;height:40px}</style></head>\
+         <body><div id='hdr'><div class='box'>X</div></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let g = |sel: &str| layout.rect_for(sel).unwrap_or_else(|| panic!("缺盒子:{sel}"));
+    let (x, _y, w, _h) = g("html > body > div > div");
+    assert!((w - 200.0).abs() < 0.5, "定宽块宽 {w}");
+    assert!((x - 300.0).abs() < 0.5, "双侧 auto 应居中:x={x}(期望 300)");
+}
+
+#[test]
+fn 单侧auto边距吃满剩余空间() {
+    let doc = Document::parse(
+        "<head><style>body{margin:0}.l{width:200px;margin-left:auto;height:20px}.r{width:200px;margin-right:auto;height:20px}</style></head>\
+         <body><div class='l'>A</div><div class='r'>B</div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let g = |sel: &str| layout.rect_for(sel).unwrap_or_else(|| panic!("缺盒子:{sel}"));
+    let (lx, _y, w, _h) = g("html > body > div");
+    assert!((lx - 600.0).abs() < 0.5, "margin-left:auto 应右贴:x={lx}(期望 600)");
+    let (rx, _y2, _w2, _h2) = g("html > body > div:nth-of-type(2)");
+    assert!(rx.abs() < 0.5, "margin-right:auto 不影响起点:x={rx}(期望 0)");
+}
+
+#[test]
+fn 零字号容器内inline_block兄弟水平排开() {
+    // 猎聘行业卡标签根因:`.jobcard2-detail-labels{font-size:0}` 内两个
+    // inline-block span(去缝手法)曾同坐标叠印 —— 行内游标不推进。
+    let doc = Document::parse(
+        "<head><style>.labels{font-size:0;height:22px}\
+         .labels span{display:inline-block;font-size:12px;padding:3px 8px;background:#f8f9fb}</style></head>\
+         <body><div class='labels'><span>5-7年</span><span>统招本科</span></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let g = |sel: &str| layout.rect_for(sel).unwrap_or_else(|| panic!("缺盒子:{sel}"));
+    let (x1, _y1, w1, _h1) = g("html > body > div > span");
+    let (x2, _y2, _w2, _h2) = g("html > body > div > span:nth-of-type(2)");
+    assert!(
+        x2 >= x1 + w1 - 0.5,
+        "第二个 inline-block 应排在第一个之后:x1={x1} w1={w1} x2={x2}"
+    );
+    assert!((x2 - x1) < 200.0, "两枚药丸不应天各一方:x1={x1} x2={x2}");
+}

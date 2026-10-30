@@ -88,17 +88,34 @@ impl CspPolicy {
                 }
                 "*" => return true, // 通配符（不带引号）
                 _ => {
-                    // host 来源匹配（简化：前缀匹配）
+                    // host 来源匹配（简化：前缀匹配,带 scheme 的源走这条）
                     if url.starts_with(src) {
                         return true;
                     }
+                    let host_of_url = url::Url::parse(url).ok().and_then(|u| {
+                        u.host_str().map(|h| h.to_ascii_lowercase())
+                    });
+                    // 裸主机源(无 scheme,CSP 语义 = 任意 scheme 的该主机):
+                    // `url.starts_with(src)` 对 `https://` 前缀 URL 恒 false,
+                    // 站点 CSP 里的 `www.googletagmanager.com` 等裸主机全部
+                    // 误判为被阻止(实测猎聘 googletagmanager 脚本假告警)。
+                    if let Some(host) = &host_of_url {
+                        let src_lower = src.to_ascii_lowercase();
+                        let src_bare = src_lower
+                            .strip_prefix("https://")
+                            .or_else(|| src_lower.strip_prefix("http://"))
+                            .unwrap_or(&src_lower);
+                        let src_host = src_bare.split('/').next().unwrap_or(src_bare);
+                        if host == src_host {
+                            return true;
+                        }
+                    }
                     // 通配符 *.example.com（匹配 host 后缀，防止 example.com.evil.com 误匹配）
                     if let Some(domain) = src.strip_prefix("*.") {
-                        if let Ok(u) = url::Url::parse(url) {
-                            if let Some(host) = u.host_str() {
-                                if host == domain || host.ends_with(&format!(".{domain}")) {
-                                    return true;
-                                }
+                        if let Some(host) = &host_of_url {
+                            let domain = domain.to_ascii_lowercase();
+                            if host == &domain || host.ends_with(&format!(".{domain}")) {
+                                return true;
                             }
                         }
                     }
@@ -192,4 +209,23 @@ mod tests {
         assert!(policy.is_script_allowed("https://cdn.example.com/app.js", false));
         assert!(!policy.is_script_allowed("https://example.com.evil.com/app.js", false));
     }
+}
+
+#[test]
+fn csp_裸主机源跨scheme匹配() {
+    // 猎聘实测:CSP script-src 含裸主机 `www.googletagmanager.com`,
+    // 旧实现 url.starts_with(src) 对 https:// 前缀 URL 恒 false → 假告警。
+    let policy = CspPolicy::parse("script-src 'self' www.googletagmanager.com *.baidu.com");
+    assert!(
+        policy.is_script_allowed("https://www.googletagmanager.com/gtag/js?id=X", false),
+        "裸主机源应匹配该主机的 https URL"
+    );
+    assert!(
+        policy.is_script_allowed("https://hm.baidu.com/hm.js?a=1", false),
+        "*.baidu.com 应匹配 hm.baidu.com"
+    );
+    assert!(
+        !policy.is_script_allowed("https://evil.com/x.js", false),
+        "未列出的主机仍应被阻止"
+    );
 }

@@ -317,6 +317,11 @@ pub fn compute_full(
     // 阶段六:显示列表终排(z 分层 → DFS 先序 → 同元素通道序)。
     let mut display_items = std::mem::take(&mut ctx.display);
     display::sort_items(&mut display_items);
+    // 页高钳制(第 178 轮):布局几何的任何非有限/超界值在收尾归零标不可见,
+    // 防止哨兵级包含块高(UNKNOWN_CB_H)泄漏成 4.49e307 天文坐标污染整页
+    // 高度与渲染预算(实测猎聘 `.ant-spin-dot` 的 `top:50%`)。钳制放在
+    // 画布背景发射前,保证 canvas_h 也取到有界值。
+    let height = height.min(PAGE_H_SANITY_MAX);
     // 根画布背景传播(CSS 2.1 §14.2 / CSS Backgrounds 3 §2.2):根元素(html)
     // 的背景覆盖整个画布;根背景为空时 **body 的背景上传播为画布背景**。
     // 本布局器不给 html/body 建盒(初始包含块直接从 body 子元素起排),
@@ -375,6 +380,7 @@ pub fn compute_full(
             }
         }
     }
+    sanitize_layout_geometry(&mut ctx.boxes, &mut ctx.lines, &mut display_items);
     Layout {
         lines: ctx.lines,
         boxes: ctx.boxes,
@@ -384,6 +390,48 @@ pub fn compute_full(
         display: display_items,
         width: ctx.width,
         height,
+    }
+}
+
+/// 页高/坐标健全性上限:真实页面不可能超过 ~1e5 逻辑像素;超出即视为
+/// 计算事故(如哨兵值泄漏、百分比链爆炸),整页钳到该值防内存/渲染预算被打爆。
+pub(crate) const PAGE_H_SANITY_MAX: f64 = 1_000_000.0;
+
+/// 几何防御性钳制:任何非有限或超界(>1e6)的坐标/尺寸归零并标记不可见。
+/// 这是哨兵泄漏(UNKNOWN_CB_H)与数值爆炸的**最后防线** —— 布局正确性
+/// 修复在源头(见 resolved_top 的哨兵守卫),这里只保证渲染层与 inspect
+/// 拿到的永远是有界值(实测猎聘 ant-spin-dot y=4.49e307 曾直通显示列表)。
+fn sanitize_layout_geometry(
+    boxes: &mut [ElementBox],
+    lines: &mut [TextLine],
+    display: &mut [DisplayItem],
+) {
+    fn sane(v: f64) -> bool {
+        v.is_finite() && v.abs() <= PAGE_H_SANITY_MAX
+    }
+    for b in boxes.iter_mut() {
+        if !sane(b.x) || !sane(b.y) || !sane(b.w) || !sane(b.h) {
+            b.x = 0.0;
+            b.y = 0.0;
+            b.w = 0.0;
+            b.h = 0.0;
+            b.visible = false;
+        }
+    }
+    for l in lines.iter_mut() {
+        if !sane(l.x) || !sane(l.y) {
+            l.x = 0.0;
+            l.y = 0.0;
+            l.visible = false;
+        }
+    }
+    for it in display.iter_mut() {
+        if !sane(it.x) || !sane(it.y) || !sane(it.w) || !sane(it.h) {
+            it.x = 0.0;
+            it.y = 0.0;
+            it.w = 0.0;
+            it.h = 0.0;
+        }
     }
 }
 
@@ -1190,6 +1238,11 @@ impl<'a> LayoutCtx<'a> {
         let mut floats = float::FloatState::default();
         // 阶段七:本容器内联上下文共享的行占用(行内浮动跨兄弟元素排同一行)。
         let mut inline_row = float::InlineRow::default();
+        // 行内游标(第 178 轮):inline-box/文本兄弟水平推进。此前块容器的
+        // 行内子级共用同一 x —— 两个 inline-block 药丸(font-size:0 容器内)
+        // 同坐标叠印(实测猎聘行业卡标签)。文本经 buf 的 line_w 累计流动,
+        // 游标服务于「盒先行、后续内容随后」的混排。
+        let mut pen = x;
         for child in parent.children() {
             if let Some(text) = child.as_text() {
                 let raw = text.borrow();
@@ -1197,13 +1250,18 @@ impl<'a> LayoutCtx<'a> {
                     // 块级文本:变换由本块 `apply_group` 回补,run 不带变换;
                     // text-shadow 随 run 带到 flush(块级文本无行内样式承载)。
                     // x 基准 = 本容器 margin-box x(文本起点 = 容器内容盒 x)。
+                    let base = pen - current.margin_left - current.padding_left;
                     buf.push_styled(
                         &raw,
                         current,
-                        x - current.margin_left - current.padding_left,
+                        base,
                         None,
                         current.text_shadow.clone(),
                     );
+                    // 文本推进游标,但不越出容器内容右缘(长文本换行后,
+                    // 后续行内盒最多落在右缘内,而不是被总字宽推到天边)。
+                    let tw = self.font.text_width(&raw, current.font_size);
+                    pen += tw.min((x + width - pen).max(0.0));
                 }
                 continue;
             }
@@ -1381,7 +1439,6 @@ impl<'a> LayoutCtx<'a> {
                 let gap = collapse_margin(self.pending_margin_bottom, style.margin_top);
                 self.pending_margin_bottom = 0.0;
                 self.y += gap;
-                let bx = x + style.margin_left;
                 // 盒宽(border box,不含 margin):auto 时撑满父内容宽减 margin;
                 // 百分比按父内容宽求解;显式长度直接采用。
                 // 默认按 border-box(CSS width 即边框盒宽,padding 从中扣减——
@@ -1407,6 +1464,27 @@ impl<'a> LayoutCtx<'a> {
                 if let Some(mw) = style.min_width {
                     bw = bw.max(mw);
                 }
+                // CSS 2.1 §10.3.3:auto 左右边距在**显式宽度**下按剩余空间求解
+                // (双侧 auto = 居中;单侧 auto = 吃满剩余)。宽度 auto(默认撑满)
+                // 时剩余恒 0,退化与旧行为一致。此前 auto 在样式层被丢成 0,
+                // `width:1192px;margin:0 auto` 的页头恒贴左(实测猎聘页头 x=0)。
+                let ml = if (style.margin_left_auto || style.margin_right_auto)
+                    && (style.width.is_some() || style.width_percent.is_some())
+                {
+                    let free =
+                        (width - bw - style.margin_left - style.margin_right).max(0.0);
+                    match (style.margin_left_auto, style.margin_right_auto) {
+                        (true, true) => free / 2.0,
+                        // 仅左侧 auto:左侧吃满剩余(右侧保持原值)。
+                        (true, false) => free,
+                        // 仅右侧 auto:定位仍由左侧决定,右侧吸收剩余。
+                        (false, true) => style.margin_left,
+                        _ => style.margin_left,
+                    }
+                } else {
+                    style.margin_left
+                };
+                let bx = x + ml;
                 if explicit_content_w {
                     bw += style.padding_left + style.padding_right;
                 }
@@ -1585,7 +1663,7 @@ impl<'a> LayoutCtx<'a> {
             float::sink_inline_below_floats(self, &floats);
             if style.float != "none" {
                 // 阶段七:块容器的直接行内子级带浮动时,同样走行内浮动带。
-                self.layout_inline_float(&child, &style, buf, depth, x, width, &mut inline_row, None);
+                self.layout_inline_float(&child, &style, buf, depth, pen, width, &mut inline_row, None);
             } else {
                 if inline_row.has_floats() {
                     let y = inline_row.float_bottom();
@@ -1594,7 +1672,25 @@ impl<'a> LayoutCtx<'a> {
                     }
                     inline_row.deactivate();
                 }
-                self.collect_inline(&child, &style, buf, depth + 1, x, width, None, &mut inline_row);
+                // 行内游标:inline-box 子级(inline-block/控件/显式尺寸/带 id)
+                // 按 margin-box 宽推进,后续兄弟落在其后;纯 inline 子级按
+                // 子树文本宽近似推进(文本自身仍经 buf 流动,推进只为让
+                // 后续盒/文本不与其叠印)。inline_box_size 对空元素返回 0,
+                // 幽灵元素不推进(与第 175 轮语义一致)。
+                let is_box_child = self.inline_box_worthy(&child, &style);
+                self.collect_inline(&child, &style, buf, depth + 1, pen, width, None, &mut inline_row);
+                if is_box_child {
+                    let (w, _h) = self.inline_box_size(&child, &style, width);
+                    pen += style.margin_left
+                        + style.padding_left
+                        + w
+                        + style.padding_right
+                        + style.margin_right;
+                } else {
+                    let text = child.text_contents();
+                    let tw = self.font.text_width(&text, style.font_size);
+                    pen += tw.min((x + width - pen).max(0.0));
+                }
             }
         }
         // 阶段七:容器内容底收编浮动(clearfix 友好近似,auto 高不再塌缩)。

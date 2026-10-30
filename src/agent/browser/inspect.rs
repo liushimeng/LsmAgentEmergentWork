@@ -813,7 +813,11 @@ fn inspect_page_state(doc: &Document, params: &Value) -> EngineResult<Value> {
 fn inspect_blockers(tab: &super::TabState, doc: &Document) -> Value {
     let text = doc.text().to_ascii_lowercase();
     let checks: &[(&str, &[&str])] = &[
-        ("captcha", &["验证码", "滑块", "人机验证", "captcha", "安全验证"]),
+        // captcha 词必须带**验证动作语义**:未登录站点的登录面板普遍含
+        // 「获取验证码」按钮文案(实测猎聘首页/搜索页每次都命中裸词),
+        // 裸「验证码」会把正常页面误判为 captcha 阻断并误导 Agent
+        // 立即 request_human。改为要求完整短语。
+        ("captcha", &["请输入验证码", "请完成验证", "滑动验证", "拖动滑块", "人机验证", "安全验证", "captcha", "点击按钮进行验证"]),
         ("login", &["请登录", "登录后查看", "sign in to continue"]),
         ("rate_limit", &["访问频繁", "访问过于频繁", "too many requests", "rate limit"]),
         // 阻断词必须带访问/拦截语义:招聘、安全资讯等正常页面会出现

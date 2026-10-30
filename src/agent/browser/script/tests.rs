@@ -2357,3 +2357,126 @@ fn 回复邮箱_旧轮动作合并进新回复且时序在前() {
     assert_eq!(merged.network.len(), 1);
     assert_eq!(merged.network[0].url, "https://a.test/old");
 }
+
+#[test]
+fn replaceChildren清空宿主静态子树() {
+    // 猎聘页头双副本根因:快照元素 replaceChildren 只清 JS 侧覆盖层,
+    // 宿主 DOM 静态 SSR 子树原样保留,React 重建副本追加 → 同容器两份
+    // 内容同坐标叠印。宿主必须收到 clear_children 动作并真实清空。
+    let handle = JsHandle::spawn();
+    let page = "<body><nav id='nav'><ul id='old'><li>旧菜单</li></ul></nav></body>";
+    let reply = eval_on(
+        &handle,
+        r#"
+        var nav = document.querySelector('#nav');
+        var ul = document.createElement('ul');
+        ul.id = 'new';
+        var li = document.createElement('li');
+        li.textContent = '新菜单';
+        ul.appendChild(li);
+        nav.replaceChildren(ul);
+        'ok'
+        "#,
+        page,
+        "https://a.test/",
+    );
+    assert!(reply.outcome.ok, "replaceChildren 不得抛错:{:?}", reply.outcome.error);
+    let cleared = reply
+        .outcome
+        .actions
+        .iter()
+        .any(|a| a.kind == "clear_children" && a.selector.contains("nav"));
+    assert!(cleared, "必须向宿主推送 clear_children 动作:{:?}", reply.outcome.actions.iter().map(|a| a.kind.clone()).collect::<Vec<_>>());
+    let doc = Document::parse(page, "https://a.test/");
+    let summary = dom_ops::apply(&doc, &reply.outcome.actions, "https://a.test/");
+    assert!(summary.applied > 0, "动作应全部应用:{summary:?}");
+    let html = doc.serialize_full();
+    assert!(!html.contains("旧菜单"), "静态旧子树应被清掉:{html}");
+    assert!(html.contains("新菜单"), "新子树应保留:{html}");
+    handle.shutdown();
+}
+
+#[test]
+fn 动态挂载同id时旧静态节点退役() {
+    // 猎聘页头双副本终结:水化失败静默回退后,React 新挂的菜单携带与
+    // SSR 骨架相同的 id(header-nav-menu-home 等)。id 唯一性守卫把旧
+    // 静态节点退役,宿主收敛到单副本(与 Chrome 水化成功/回退清旧的结果一致)。
+    let doc = Document::parse(
+        "<body><nav><ul><li><a id='m-home'>首页SSR</a></li></ul></nav></body>",
+        "https://a.test/",
+    );
+    let actions = vec![super::JsAction {
+        kind: "append_html".into(),
+        selector: "html > body > nav".into(),
+        key: String::new(),
+        value: "<ul data-lsm-id='d1'><li><a id='m-home'>首页NEW</a></li></ul>".into(),
+        url: String::new(),
+        event: String::new(),
+    }];
+    let summary = dom_ops::apply(&doc, &actions, "https://a.test/");
+    assert_eq!(summary.applied, 1);
+    assert!(summary.retired >= 1, "同 id 旧节点应退役:{summary:?}");
+    let html = doc.serialize_full();
+    assert!(!html.contains("首页SSR"), "旧静态菜单应消失:{html}");
+    assert!(html.contains("首页NEW"), "新动态菜单应在:{html}");
+    assert_eq!(html.matches("id=\"m-home\"").count(), 1, "id 必须唯一:{html}");
+    // 结构级退役:旧静态 ul 连同空壳 li 一起消失,不留幻影占位。
+    assert_eq!(html.matches("<li>").count(), 1, "旧 li 壳应整棵退役:{html}");
+}
+
+#[test]
+fn 同id挂载退役结构对应祖先整棵旧子树() {
+    // 猎聘 p5 复盘:只退役 a#header-nav-menu-* 载体,静态 ul 的 li 壳仍带
+    // padding/margin 占位,把 React 重建的导航右推 340px 与右锚定的
+    // quick-menu 叠印。锁步上溯到「同标签同类名 + 旧子树 id 全部被片段
+    // 重新声明」的最高祖先(此处 = ul.menu),整棵退役,连无 id 的纯壳
+    // 节点(死 SSR 标记)一并清掉。
+    let doc = Document::parse(
+        "<body><nav><ul class='menu'><li><a id='m1'>旧A</a></li>\
+         <li><a id='m2'>旧B</a></li><li>纯壳</li></ul></nav></body>",
+        "https://a.test/",
+    );
+    let actions = vec![super::JsAction {
+        kind: "append_html".into(),
+        selector: "html > body > nav".into(),
+        key: String::new(),
+        value: "<ul class='menu'><li><a id='m1'>新A</a></li><li><a id='m2'>新B</a></li></ul>".into(),
+        url: String::new(),
+        event: String::new(),
+    }];
+    let summary = dom_ops::apply(&doc, &actions, "https://a.test/");
+    assert_eq!(summary.applied, 1);
+    assert_eq!(summary.retired, 1, "应退役 1 棵结构对应子树:{summary:?}");
+    let html = doc.serialize_full();
+    assert!(!html.contains("旧A") && !html.contains("旧B"), "旧内容应消失:{html}");
+    assert!(!html.contains("纯壳"), "无 id 的死壳应随旧子树退役:{html}");
+    assert!(html.contains("新A") && html.contains("新B"), "新内容应在:{html}");
+    assert_eq!(html.matches("class=\"menu\"").count(), 1, "menu 应收敛单副本:{html}");
+}
+
+#[test]
+fn 旧子树含未重声明id时不整棵退役() {
+    // Containment 安全边界:旧 ul 里还有片段未重新声明的 id='keep'(仍被
+    // 引用的活内容),上溯在 ul 处阻断,退回只退役 id 载体所在的 li;
+    // keep 与其祖先 ul 原样保留。
+    let doc = Document::parse(
+        "<body><nav><ul class='menu'><li><a id='m1'>旧A</a></li>\
+         <li><a id='keep'>活着</a></li></ul></nav></body>",
+        "https://a.test/",
+    );
+    let actions = vec![super::JsAction {
+        kind: "append_html".into(),
+        selector: "html > body > nav".into(),
+        key: String::new(),
+        value: "<ul class='menu'><li><a id='m1'>新A</a></li></ul>".into(),
+        url: String::new(),
+        event: String::new(),
+    }];
+    let summary = dom_ops::apply(&doc, &actions, "https://a.test/");
+    assert_eq!(summary.applied, 1);
+    assert!(summary.retired >= 1, "载体退役:{summary:?}");
+    let html = doc.serialize_full();
+    assert!(html.contains("活着"), "未重新声明的 id 内容必须保留:{html}");
+    assert!(html.contains("新A"), "新内容应在:{html}");
+    assert_eq!(html.matches("id=\"m1\"").count(), 1, "id 必须唯一:{html}");
+}

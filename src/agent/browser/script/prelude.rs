@@ -1336,6 +1336,10 @@ function __mk(n) {
       htmlCleared = true;
       dynKids.length = 0;
       __lsmRec("childList", el, {});
+      // 宿主侧必须真实清空子树:此前只置 JS 侧 htmlCleared 标志,宿主 DOM
+      // 静态子树原样保留、新子女照常追加 → 同容器两份内容叠加渲染
+      // (实测猎聘页头:React 重建 nav 后静态 SSR 菜单 + 动态副本同坐标叠印)。
+      __push({ type: "clear_children", selector: n.sel });
       var kids = Array.prototype.slice.call(arguments);
       for (var i = 0; i < kids.length; i++) __lsmInsertChild(el, n.sel, kids[i], false);
     },

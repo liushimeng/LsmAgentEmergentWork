@@ -87,7 +87,15 @@ impl CorsHeaders {
     }
 }
 
-/// 校验简单跨域请求。
+/// 校验简单跨域请求(实际响应)。
+///
+/// 浏览器语义:对**实际响应**只校验 `Access-Control-Allow-Origin`
+/// (带 credentials 时再校验 Allow-Credentials);`Access-Control-Allow-Methods`
+/// **只在预检(OPTIONS)响应**里出现和校验,实际响应本就不带它。
+/// 此前这里同时校验 method,而 `allows_method` 在响应无该头时恒 false ——
+/// 所有跨源 API POST(实测猎聘 api-c/api-wanda 全家:200 + 响应体被内核丢弃
+/// → 台账 bytes=0 → 职位列表空)被自己判死。预检校验见
+/// `check_preflight_request`(那里保留完整三查)。
 pub fn check_simple_request(
     request_origin: &str,
     request_method: &str,
@@ -102,11 +110,8 @@ pub fn check_simple_request(
             "Access-Control-Allow-Origin 不允许来源 {request_origin}"
         ));
     }
-    if !cors.allows_method(request_method) {
-        return CorsResult::Denied(format!(
-            "Access-Control-Allow-Methods 不允许方法 {request_method}"
-        ));
-    }
+    // method 参数保留给预检路径共用签名;实际响应不查(见函数文档)。
+    let _ = request_method;
     CorsResult::Allowed
 }
 
@@ -215,6 +220,41 @@ mod tests {
         let cors = make_headers();
         let result = check_simple_request("https://other.com", "GET", &cors, false);
         assert!(matches!(result, CorsResult::Denied(_)));
+    }
+
+    #[test]
+    fn 实际响应无allow_methods也放行_post() {
+        // 真实站点的**实际响应**只带 ACAO、不带 Access-Control-Allow-Methods
+        // (猎聘 api-c 实测:ACAO 精确回显 Origin,无 Allow-Methods)。
+        // 实际响应按浏览器语义只查 origin —— 若在这里查 method,
+        // 所有跨源 API POST 会被内核误杀(响应体丢弃、台账 bytes=0)。
+        let cors = CorsHeaders {
+            allow_origin: Some("https://www.liepin.com".to_string()),
+            allow_methods: None,
+            ..Default::default()
+        };
+        let result = check_simple_request("https://www.liepin.com", "POST", &cors, false);
+        assert_eq!(result, CorsResult::Allowed, "实际响应不校验 Allow-Methods");
+    }
+
+    #[test]
+    fn 预检响应仍完整校验方法() {
+        let cors = CorsHeaders {
+            allow_origin: Some("https://www.liepin.com".to_string()),
+            allow_methods: None,
+            ..Default::default()
+        };
+        let result = check_preflight_request(
+            "https://www.liepin.com",
+            "POST",
+            &["content-type".to_string()],
+            &cors,
+            false,
+        );
+        assert!(
+            matches!(result, CorsResult::Denied(_)),
+            "预检无 Allow-Methods 应拒绝,实际 {result:?}"
+        );
     }
 
     #[test]

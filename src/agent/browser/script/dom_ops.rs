@@ -25,6 +25,8 @@ const MAX_EXTERNAL_SCRIPTS: usize = 512;
 pub struct ApplySummary {
     pub applied: usize,
     pub failed: usize,
+    /// id 唯一性守卫退役的旧节点数(诊断用)。
+    pub retired: usize,
     /// selector → value(set_value/set_checked 合并)。
     pub form_values: HashMap<String, String>,
     pub title: Option<String>,
@@ -109,6 +111,19 @@ pub fn apply(doc: &Document, actions: &[JsAction], base_url: &str) -> ApplySumma
                 node.append(NodeRef::new_text(&action.value));
                 summary.applied += 1;
             }
+            // replaceChildren() 的清空半程:移除目标节点全部子节点。
+            // 只清 JS 侧覆盖层不清宿主的话,静态 SSR 子树会与重建副本
+            // 叠加渲染(实测猎聘页头双副本根因)。
+            "clear_children" => {
+                let Some(node) = find(doc, &action.selector) else {
+                    summary.failed += 1;
+                    continue;
+                };
+                for child in node.children().collect::<Vec<_>>() {
+                    child.detach();
+                }
+                summary.applied += 1;
+            }
             // 追加文本节点(浏览器语义:appendChild(textNode) **不清空**既有子节点)。
             // set_text 会把子节点全换掉,用它做 appendChild 会误删元素原有内容。
             "append_text" => {
@@ -148,13 +163,28 @@ pub fn apply(doc: &Document, actions: &[JsAction], base_url: &str) -> ApplySumma
                 }
                 summary.applied += 1;
             }
-            "append_html" => {
+            "append_html" | "insert_html" => {
                 let Some(node) = find(doc, &action.selector) else {
                     summary.failed += 1;
                     continue;
                 };
-                for frag in parse_fragment_nodes(&action.value) {
-                    node.append(frag);
+                let fragments = parse_fragment_nodes(&action.value);
+                // id 唯一性守卫(结构级退役):动态挂载引入的 id 若宿主已存在,
+                // 先退役**结构对应**的旧子树再插入。依据:① 重复 id 本就是非法
+                // HTML;② 框架水化失败静默回退客户端渲染时,新挂载的子树才是
+                // 框架持有引用、绑事件、会继续操作的活树,旧 SSR 骨架是死标记
+                // —— 两者并存会把页头整块叠印(实测猎聘:静态 SSR 菜单 +
+                // React 重建副本同坐标,布局文本整段重复两遍;载体退役后残余
+                // li 壳的 padding/margin 还会把新导航右推 340px 与 quick-menu
+                // 叠印);③ 浏览器对水化失败的处理同样是「清旧挂新」,宿主侧
+                // 收敛到单副本与 Chrome 结果一致。
+                retire_superseded_subtrees(doc, &fragments, &node, &mut summary);
+                for frag in fragments {
+                    if action.kind == "append_html" {
+                        node.append(frag);
+                    } else {
+                        node.insert_before(frag);
+                    }
                 }
                 summary.applied += 1;
             }
@@ -186,16 +216,6 @@ pub fn apply(doc: &Document, actions: &[JsAction], base_url: &str) -> ApplySumma
                     } else {
                         dst.append(frag);
                     }
-                }
-                summary.applied += 1;
-            }
-            "insert_html" => {
-                let Some(node) = find(doc, &action.selector) else {
-                    summary.failed += 1;
-                    continue;
-                };
-                for frag in parse_fragment_nodes(&action.value) {
-                    node.insert_before(frag);
                 }
                 summary.applied += 1;
             }
@@ -332,6 +352,104 @@ fn parse_fragment_nodes(html: &str) -> Vec<NodeRef> {
         .select_first("body")
         .map(|b| b.as_node().children().collect::<Vec<_>>())
         .unwrap_or_default()
+}
+
+/// id 唯一性守卫(结构级退役):即将插入的片段若携带宿主已存在的 id,不只
+/// 退役 id 载体,而是沿「宿主祖先链 × 片段祖先链」**锁步上溯**找结构对应点
+/// ——同标签、同类名的最高祖先对,且旧祖先子树里的 id 全部被新片段重新声明
+/// (= 完全被取代),把旧祖先**整棵**退役。见 `append_html` 分支注释:水化失败
+/// 静默回退时框架新挂的子树是活树,旧 SSR 骨架是死标记,并存即叠印。
+///
+/// 只退役载体本身会留下空壳(实测猎聘 p5 复盘):静态 `ul.header-nav-menu` 的
+/// `a#header-nav-menu-*` 退役后,残余 li 壳仍带 padding/margin 占位,把 React
+/// 重建的导航整体右推 340px,与右锚定(`position:absolute;right:0`)的
+/// quick-menu 叠印成一团。整棵退役结构对应的旧子树,宿主才收敛到与 Chrome
+/// 水化成功一致的单一副本。
+///
+/// 安全边界:旧子树里存在未被新片段重新声明的 id 时,Containment 检查阻断
+/// 上溯,退回只退役 id 载体(不误删仍被引用的兄弟结构);body/html 永不退役。
+fn retire_superseded_subtrees(
+    doc: &Document,
+    fragments: &[NodeRef],
+    insertion_target: &NodeRef,
+    summary: &mut ApplySummary,
+) {
+    // 片段侧:全量 id 集合 + id → 携带节点(取其祖先链做锁步上溯)。
+    let mut frag_ids: Vec<String> = Vec::new();
+    let mut frag_carriers: Vec<(String, NodeRef)> = Vec::new();
+    for frag in fragments {
+        for node in frag.descendants() {
+            let Some(id) = document::attr(&node, "id") else { continue };
+            if id.is_empty() || id.len() > 128 || id.contains('"') {
+                continue;
+            }
+            if !frag_ids.contains(&id) {
+                frag_ids.push(id.clone());
+            }
+            frag_carriers.push((id, node));
+        }
+    }
+    if frag_ids.is_empty() {
+        return;
+    }
+    // 已退役的根去重:多个 id 命中同一结构对应祖先时只退役一次。
+    let mut retired_roots: Vec<NodeRef> = Vec::new();
+    for (id, carrier) in &frag_carriers {
+        let selector = format!("[id=\"{id}\"]");
+        let Ok(matches) = doc.select(&selector) else { continue };
+        for old in matches {
+            // 退役根:初始为 id 载体本身,锁步上溯通过全部检查可整棵扩大。
+            let mut root = old.clone();
+            let mut host_cur = old.clone();
+            let mut frag_cur = carrier.clone();
+            for _ in 0..8 {
+                let (Some(host_parent), Some(frag_parent)) = (host_cur.parent(), frag_cur.parent())
+                else {
+                    break;
+                };
+                // 到达插入容器即停:片段根节点对应的是容器的**子级层**,
+                // 上溯越过容器等于把插入目标自己退役掉。
+                if host_parent == *insertion_target {
+                    break;
+                }
+                let (Some(host_el), Some(frag_el)) = (host_parent.as_element(), frag_parent.as_element())
+                else {
+                    break;
+                };
+                if host_el.name.local != frag_el.name.local {
+                    break;
+                }
+                if document::attr(&host_parent, "class").unwrap_or_default().trim()
+                    != document::attr(&frag_parent, "class").unwrap_or_default().trim()
+                {
+                    break;
+                }
+                let tag = host_el.name.local.as_ref();
+                if tag == "body" || tag == "html" {
+                    break;
+                }
+                // Containment:旧祖先子树里的 id 必须全部被新片段重新声明;
+                // 有 id 不在片段里 → 旧结构还有活内容,上溯到此为止。
+                let fully_superseded = host_parent.descendants().all(|node| {
+                    document::attr(&node, "id")
+                        .map(|x| frag_ids.contains(&x))
+                        .unwrap_or(true)
+                });
+                if !fully_superseded {
+                    break;
+                }
+                root = host_parent.clone();
+                host_cur = host_parent;
+                frag_cur = frag_parent;
+            }
+            if retired_roots.contains(&root) {
+                continue;
+            }
+            retired_roots.push(root.clone());
+            root.detach();
+            summary.retired += 1;
+        }
+    }
 }
 
 /// 文档序脚本条目。内联脚本与外链 URL **必须保持 DOM 中的相对顺序**:

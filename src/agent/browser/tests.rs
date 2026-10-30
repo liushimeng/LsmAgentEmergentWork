@@ -659,7 +659,7 @@ fn csp_脚本门禁判定() {
 
 #[test]
 fn cors_跨域校验判定() {
-    use security::{check_simple_request, CorsHeaders, CorsResult};
+    use security::{check_preflight_request, check_simple_request, CorsHeaders, CorsResult};
     // 无 CORS 头 → 拒绝。
     let cors = CorsHeaders::default();
     assert!(matches!(
@@ -676,7 +676,10 @@ fn cors_跨域校验判定() {
         check_simple_request("https://a.com", "GET", &cors, false),
         CorsResult::Allowed
     ));
-    // 方法不在白名单 → 拒绝。
+    // 第 178 轮语义修正:**实际响应**只校验 origin —— 浏览器只在预检
+    // (OPTIONS)响应里查 Access-Control-Allow-Methods,实际响应本就不带
+    // 该头。此前这里同时查 method,所有跨源 API POST 被内核误杀
+    // (实测猎聘 api-c 全家 200+空体,职位列表因此全空)。
     let cors = CorsHeaders {
         allow_origin: Some("*".to_string()),
         allow_methods: Some(vec!["POST".to_string()]),
@@ -684,6 +687,11 @@ fn cors_跨域校验判定() {
     };
     assert!(matches!(
         check_simple_request("https://a.com", "GET", &cors, false),
+        CorsResult::Allowed
+    ));
+    // 方法白名单仍在**预检**里完整校验。
+    assert!(matches!(
+        check_preflight_request("https://a.com", "GET", &[], &cors, false),
         CorsResult::Denied(_)
     ));
     // 同源 → 跳过校验。

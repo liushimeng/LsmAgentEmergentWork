@@ -563,6 +563,16 @@ pub(super) async fn run_open(mut args: Value) -> Result<String> {
             "hint": "需要 iframe 内容时:若是登录/验证码,改为顶层 navigate 到该 iframe 的 src 页面(同引擎可渲染);或改用 MCP_Web_Chrome_Use。",
         }));
     }
+    // 视频画面渲染同样是内核边界(hero 背景视频区域留纯色/空白),
+    // 与 webgl/iframe 同款如实上报(实测猎聘首页 hero 背景即 <video>)。
+    if out.video_count > 0 {
+        gaps.push(json!({
+            "kind": "video",
+            "count": out.video_count,
+            "detail": "页面含 <video>,内核不渲染视频画面,对应区域会保持纯色/空白背景;DOM 文本与页面其余部分不受影响。",
+            "hint": "任务依赖视频画面时改用 MCP_Web_Chrome_Use;只需页面文本/DOM 数据时本工具不受影响。",
+        }));
+    }
     if !gaps.is_empty() {
         data["capability_gaps"] = json!(gaps);
     }
