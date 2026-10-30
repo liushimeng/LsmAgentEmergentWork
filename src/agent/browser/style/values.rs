@@ -144,6 +144,11 @@ pub struct ComputedStyle {
     pub border_radius: [CornerRadius; 4],
     /// `overflow:hidden|clip|scroll|auto` 归一为内容裁剪开关(非继承)。
     pub overflow_clip: bool,
+    /// `overflow:auto|scroll|overlay` 归一为**可滚动容器**(非继承)。
+    ///
+    /// 与 `overflow_clip` 分开:可滚动容器除裁剪外还带滚动偏移与滚动条
+    /// (第 46 轮);`hidden`/`clip` 只裁剪不滚动。
+    pub overflow_scroll: bool,
     /// 未建模属性的计算值文本(如 border-radius)。
     pub extra: BTreeMap<String, String>,
     /// 自定义属性表(继承用,不进入 `to_map`)。
@@ -489,6 +494,7 @@ impl Default for ComputedStyle {
             transform_origin: TransformOrigin::default(),
             border_radius: [CornerRadius::Px(0.0); 4],
             overflow_clip: false,
+            overflow_scroll: false,
             extra: BTreeMap::new(),
             custom: BTreeMap::new(),
             suppress_children: false,
@@ -1558,11 +1564,15 @@ pub fn apply_declaration(
         }
         "overflow" => {
             st.overflow_clip = parse_overflow(value);
+            st.overflow_scroll = parse_overflow_scrollable(value);
         }
         "overflow-x" | "overflow-y" => {
             // 任一轴裁剪即整体裁剪(视觉近似,滚动条不建模)。
             if parse_overflow(value) {
                 st.overflow_clip = true;
+            }
+            if parse_overflow_scrollable(value) {
+                st.overflow_scroll = true;
             }
         }
         "float" => {
@@ -1888,6 +1898,14 @@ pub fn parse_css_url(value: &str) -> Option<String> {
     } else {
         Some(raw.to_string())
     }
+}
+
+/// `overflow` 可滚动关键字归一:auto/scroll/overlay 为可滚动容器。
+fn parse_overflow_scrollable(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "auto" | "scroll" | "overlay"
+    )
 }
 
 /// `overflow` 关键字归一:hidden/clip/scroll/auto 均裁剪,visible 不裁。

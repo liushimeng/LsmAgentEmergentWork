@@ -422,6 +422,58 @@ async fn Esc关闭顶层dialog() {
 }
 
 #[tokio::test]
+async fn 元素内滚动按偏移移动内容() {
+    let mgr = LsmBrowserManager::new();
+    let url = html_doc(
+        "<div id='s' style='overflow:auto;height:60px;width:300px'><p id='p1'>第一段</p><p id='p2'>第二段</p><p id='p3'>第三段</p><p id='p4'>第四段</p></div>",
+    );
+    let out = mgr
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .await
+        .unwrap();
+    let before = inspect::inspect(
+        &mgr,
+        &out.page_id,
+        "elements",
+        &serde_json::json!({"selector": "#p1"}),
+    )
+    .await
+    .unwrap();
+    let y_before = before["rect"]["y"].as_f64().unwrap_or_default();
+
+    let scrolled = api::control(
+        &mgr,
+        Some(&out.page_id),
+        "scroll",
+        &serde_json::json!({"selector": "#s", "delta_y": 30}),
+        &serde_json::json!({}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(scrolled["mode"], "element_scroll", "{scrolled}");
+    assert_eq!(scrolled["scrollTop"], 30.0, "{scrolled}");
+    assert!(
+        scrolled["maxScroll"].as_f64().unwrap_or(0.0) > 0.0,
+        "可滚动容器应有最大滚动量:{scrolled}"
+    );
+
+    let after = inspect::inspect(
+        &mgr,
+        &out.page_id,
+        "elements",
+        &serde_json::json!({"selector": "#p1"}),
+    )
+    .await
+    .unwrap();
+    let y_after = after["rect"]["y"].as_f64().unwrap_or_default();
+    assert!(
+        (y_before - y_after - 30.0).abs() < 1.0,
+        "内容应按滚动偏移上移:before={y_before} after={y_after}"
+    );
+    mgr.shutdown().await;
+}
+
+#[tokio::test]
 async fn 点击后active释放且hover命中祖先链() {
     let mgr = LsmBrowserManager::new();
     let url = html_doc("<div id='parent'><button id='child'>按钮</button></div>");
