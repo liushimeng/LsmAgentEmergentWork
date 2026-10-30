@@ -334,7 +334,10 @@ fn collect_items(
 
 /// 一轴放置解析:返回 (0 基起点?, 跨度);`auto` 线参与自动放置。
 fn resolve_axis(start: GridLine, end: GridLine, explicit_len: usize) -> (Option<usize>, usize) {
-    let neg = |n: i64| -> usize { (explicit_len as i64 + n).max(0) as usize };
+    // CSS 网格线从 1 起算,负号从**末端线**反数:`-1` = 显式网格的最后一条线
+    // (0 基下标 = explicit_len),`-2` = explicit_len-1。旧实现漏了 +1,
+    // `grid-column:1/-1` 只跨 N-1 列(京东首页 `repeat(7,1fr)` 通栏块右缺一格)。
+    let neg = |n: i64| -> usize { (explicit_len as i64 + 1 + n).max(0) as usize };
     let start_pos: Option<usize> = match start {
         GridLine::Int(n) if n > 0 => Some((n - 1) as usize),
         GridLine::Int(n) => Some(neg(n)),

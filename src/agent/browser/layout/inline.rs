@@ -166,6 +166,19 @@ impl InlineBuf {
         let preserve = matches!(st.white_space.as_str(), "pre" | "pre-wrap" | "break-spaces");
         let wrap = !matches!(st.white_space.as_str(), "pre" | "nowrap");
         let order = self.next_order();
+        // `white-space: normal|nowrap` 的换行/制表/连续空格折叠成单个空格
+        // (CSS white-space 语义)。此前把文本节点里的源码换行当硬换行,
+        // 京东页脚每个 `<a>` 之间都被缩进换行切成独立行、页面被撑到 5777px。
+        let text = if preserve {
+            text.to_string()
+        } else {
+            collapse_ws(text)
+        };
+        let line_height = if st.line_height > 0.0 {
+            st.line_height
+        } else {
+            size * 1.45
+        };
         if let Some(last) = self.runs.last_mut() {
             if !last.sealed
                 && (last.size - size).abs() < 0.1
@@ -180,21 +193,17 @@ impl InlineBuf {
                 && last.text_shadow == text_shadow
                 && last.owner == owner
             {
-                last.text.push_str(text);
+                last.text.push_str(&text);
                 return;
             }
         }
         self.runs.push(InlineRun {
-            text: text.to_string(),
+            text,
             x,
             size,
             color: st.color,
             bold,
-            line_height: if st.line_height > 0.0 {
-                st.line_height
-            } else {
-                size * 1.45
-            },
+            line_height,
             visible,
             align: st.text_align.clone(),
             wrap,
@@ -250,6 +259,9 @@ impl InlineBuf {
     /// 预留行高(行内盒撑开所在行)。
     ///
     /// 无可用 run 时插入一个空文本占位 run,`flush_inline` 只按其高度推进游标。
+    /// `size=8` 让占位 run 的基线以上部分不压过同行的文本 run(行内块盒的
+    /// 基线按 CSS 取**最后一行文本的基线**,不是盒底);盒高全部记在
+    /// `line_height` 上由行盒下行段承担。
     pub(crate) fn reserve_height(&mut self, h: f64) {
         if h <= 0.0 {
             return;
@@ -312,6 +324,26 @@ fn inline_paints(style: &ComputedStyle) -> bool {
         || !style.box_shadow.is_empty()
 }
 
+/// `white-space: normal|nowrap` 的空白折叠:连续空白(空格/换行/制表)压成
+/// 单个空格。行内文本节点保留源码缩进换行,不折叠就会被当成硬换行。
+fn collapse_ws(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_ws = false;
+    for ch in text.chars() {
+        // CSS 可折叠空白只含 ASCII 空格/制表/换行/回车/换页;不折叠 NBSP。
+        if matches!(ch, ' ' | '\t' | '\n' | '\r' | '\u{000C}') {
+            if !in_ws {
+                out.push(' ');
+                in_ws = true;
+            }
+        } else {
+            out.push(ch);
+            in_ws = false;
+        }
+    }
+    out
+}
+
 impl<'a> LayoutCtx<'a> {
     /// 行内格式化上下文:把缓冲的样式 run 与原子盒排成**共享行盒**的段落流。
     ///
@@ -332,6 +364,20 @@ impl<'a> LayoutCtx<'a> {
     /// 「不低于 80px」老下限 —— 否则 60px 宽的药丸标签里的文字会按 80px
     /// 换行、溢出盒外(正是「盒宽包住文字」要消灭的那类显示不全)。
     pub(super) fn flush_inline_floor(&mut self, buf: &mut InlineBuf, max_w: f64, floor: f64) {
+        if std::env::var("LAEW_LINE_TRACE").is_ok() {
+            let first = buf
+                .runs
+                .first()
+                .map(|r| r.text.chars().take(10).collect::<String>())
+                .unwrap_or_default();
+            eprintln!(
+                "[flush] runs={} atomics={} max_w={:.1} first={}",
+                buf.runs.len(),
+                buf.atomics.len(),
+                max_w,
+                first
+            );
+        }
         let max_w = max_w.max(floor);
         let items: &InlineBuf = buf;
         let mut line = LineState::new();
@@ -526,6 +572,26 @@ impl<'a> LayoutCtx<'a> {
         // 在此完整落地,后块 margin_top 从行盒另起)。
         self.y += self.pending_margin_bottom;
         self.pending_margin_bottom = 0.0;
+        // 行盒诊断(LAEW_LINE_TRACE=1):定位「每个行内项各占一行 / 行高被
+        // 内部 line-height 撑爆」类问题(京东页脚实测)。
+        if std::env::var("LAEW_LINE_TRACE").is_ok() {
+            let first = line
+                .segs
+                .first()
+                .map(|s| s.text.chars().take(12).collect::<String>())
+                .unwrap_or_default();
+            eprintln!(
+                "[line] y={:.1} max_w={:.1} segs={} asc={:.1} desc={:.1} flow={:.1} origin={:.1} first={}",
+                self.y,
+                max_w,
+                line.segs.len(),
+                line.ascent,
+                line.descent,
+                line.flow_x,
+                line.origin_x,
+                first
+            );
+        }
         // 同行共基线:基线 = 行顶 + 基线以上高度(最大字号或更高的原子盒)。
         let baseline = self.y + line.ascent;
         let n = line.segs.len();
@@ -1022,6 +1088,10 @@ impl<'a> LayoutCtx<'a> {
             // 第 44 轮:列表形态 select 的固有高 = 行数 × 行高。
             let rows = super::widgets::select_list_rows(node).max(1) as f64;
             (rows * (style.font_size * 1.45).max(14.0) + 4.0).max(16.0)
+        } else if style.line_height > 0.0 {
+            // 普通行内元素的高度 = 行高(不是 1.45×字号):否则行盒会被
+            // 抬成「行高 + 字号」(京东页脚 li 高度 45px 的根因之一)。
+            style.line_height
         } else {
             (style.font_size * 1.45).max(16.0)
         };
@@ -1075,6 +1145,7 @@ impl<'a> LayoutCtx<'a> {
         // 导致 `<div><input></div>` 这类结构完全取不到几何(inspect 的 rect 恒 0×0)。
         let own_box = self.inline_box_worthy(node, style);
         let mut box_w = avail_w;
+        let mut box_h = 0.0;
         // 子代 x 基准 = 本元素 **margin-box x**(text/img/嵌套各自由此加
         // 自身 margin+padding 得内容起点);own_box 盒需回退自身偏移。
         let mut inner_x = line_x;
@@ -1147,9 +1218,15 @@ impl<'a> LayoutCtx<'a> {
                 // 空洞,实测 `<p>Hello <a>link</a> World</p>` 文字整体下沉 23px);
                 // 盒高改由行盒的 `reserve_height` 承担。
                 row.register_band(bx, by, w, h, line_x + avail_w);
-                buf.reserve_height(h);
+                // 只有 inline-block 有独立盒高;普通行内 `<a>/<span>` 的高度由
+                // 文本行高承担,再 reserve 一次会把行高抬成「盒高 + 字号」
+                // (京东页脚每个 `<li>` 45px 的直接原因)。
+                if style.display == "inline-block" {
+                    buf.reserve_height(h);
+                }
             }
             box_w = w;
+            box_h = h;
             inner_x = bx - style.margin_left - style.padding_left;
         }
         // 表单控件文本/内置 UI 已由 `emit_form_control_text` 全权绘制,子文本

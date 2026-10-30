@@ -313,8 +313,17 @@ impl FontSet {
                     }
                 };
                 buf.push_str(&format!(
-                    "#{i} {} x={:.0} y={:.0} w={:.0} h={:.0} op={:.2} fixed={} z={:?} clip={:?}\n",
-                    kind, it.x, it.y, it.w, it.h, it.opacity, it.fixed, it.z, it.clip
+                    "#{i} {} x={:.0} y={:.0} w={:.0} h={:.0} op={:.2} fixed={} z={:?} tf={:?} clip={:?}\n",
+                    kind,
+                    it.x,
+                    it.y,
+                    it.w,
+                    it.h,
+                    it.opacity,
+                    it.fixed,
+                    it.z,
+                    it.transform.map(|t| (t.a, t.b, t.c, t.d, t.e, t.f)),
+                    it.clip
                 ));
             }
             std::fs::write(&path, buf).ok();

@@ -235,7 +235,9 @@ fn 永久定时器_单请求快进次数有硬上限() {
         .iter()
         .filter(|a| a.kind == "set_attr" && a.key == "data-tick")
         .count();
-    assert_eq!(ticks, 64, "永久动画不能在一次请求里无界快进:{:?}", reply.outcome.actions);
+    // 首屏加载轮的定时器预算为 4(与脚本取回强交替,防动画帧一轮烧掉
+    // 整条管线预算);交互轮仍是 64。
+    assert_eq!(ticks, 4, "永久动画不能在一次请求里无界快进:{:?}", reply.outcome.actions);
     assert!(reply.outcome.ok, "{:?}", reply.outcome.error);
     handle.shutdown();
 }
@@ -2479,4 +2481,37 @@ fn 旧子树含未重声明id时不整棵退役() {
     assert!(html.contains("活着"), "未重新声明的 id 内容必须保留:{html}");
     assert!(html.contains("新A"), "新内容应在:{html}");
     assert_eq!(html.matches("id=\"m1\"").count(), 1, "id 必须唯一:{html}");
+}
+
+#[test]
+fn canvas_to_data_url_大画布走原始像素通道() {
+    // 京东 pc-tk 指纹画布 2000×200:旧实现逐字节 `String.fromCharCode` +
+    // btoa,单次 toDataURL >50s,首屏脚本管线被整条拖死。改为把
+    // Uint8Array 直接交给宿主编码 PNG 后应在毫秒级返回。
+    let handle = JsHandle::spawn();
+    let started = std::time::Instant::now();
+    let reply = eval_on(
+        &handle,
+        r##"(function(){
+            var c = document.createElement("canvas");
+            c.width = 2000; c.height = 200;
+            var n = c.getContext("2d");
+            n.fillStyle = "#f60"; n.fillRect(1, 1, 10, 10);
+            var d = c.toDataURL();
+            return d.slice(0, 22) + "|" + d.length;
+        })()"##,
+        PAGE,
+        "https://a.test/",
+    );
+    assert!(reply.outcome.ok, "{:?}", reply.outcome.error);
+    assert!(
+        reply.outcome.value.starts_with("data:image/png;base64,"),
+        "{}",
+        reply.outcome.value
+    );
+    assert!(
+        started.elapsed().as_secs() < 10,
+        "2000×200 toDataURL 耗时 {:?},疑似回退到逐字节 btoa 路径",
+        started.elapsed()
+    );
 }

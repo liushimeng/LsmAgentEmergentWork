@@ -77,13 +77,29 @@ fn tool_exec_budget(name: &str, args: &serde_json::Value) -> Option<std::time::D
     {
         return None;
     }
-    let secs = std::env::var("LAEW_TOOL_TIMEOUT_SECS")
+    let explicit = std::env::var("LAEW_TOOL_TIMEOUT_SECS")
         .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(Agent::DEFAULT_TOOL_TIMEOUT_SECS);
+        .and_then(|v| v.parse::<u64>().ok());
+    let secs = explicit.unwrap_or(Agent::DEFAULT_TOOL_TIMEOUT_SECS);
     if secs == 0 {
         return None;
     }
+    // 浏览器工具的 `open`/`sequence` 自带**脚本管线工作预算**(重站首屏实测
+    // 4~6 分钟:京东 pc-tk 单脚本 191s)。通用超时是「挂死保护」,不得短于
+    // 工具自身声明的工作预算 —— 否则页面还没跑完就被判超时,整轮结果作废
+    // (京东实测 open 268s,离 300s 只差 30s;触发预算顺延时必然越界)。
+    // 显式设置 `LAEW_TOOL_TIMEOUT_SECS` 时以用户配置为准(便于压测/演练)。
+    let secs = match explicit {
+        Some(_) => secs,
+        None if name == "MCP_Web_LsmAgentBrowser_Use" || name == "MCP_Web_Chrome_Use" => {
+            let pipeline = crate::agent::browser::script::pipeline_budget_ms();
+            let extensions = crate::agent::browser::script::PIPELINE_EXTENSION_MS
+                * u64::from(crate::agent::browser::script::PIPELINE_MAX_EXTENSIONS);
+            // 网络导航 + 布局 + 截图等非脚本开销按 60s 预留。
+            secs.max(pipeline.saturating_add(extensions) / 1000 + 60)
+        }
+        None => secs,
+    };
     Some(std::time::Duration::from_secs(secs))
 }
 
@@ -669,12 +685,38 @@ mod tests {
             ),
             None
         );
-        assert_eq!(
+        // 非 request_human 的浏览器调用仍有预算(不再要求与普通工具等值:
+        // 浏览器工具的下限会被脚本管线预算抬高,见下一个用例)。
+        assert!(
             tool_exec_budget(
                 "MCP_Web_LsmAgentBrowser_Use",
                 &json!({"action":"control","control_action":"click","selector":"#a"})
-            ),
-            tool_exec_budget("Read", &json!({"file_path":"x"}))
+            )
+            .is_some()
         );
+    }
+
+    /// 浏览器工具的总超时不得短于自身脚本管线预算(京东实测 open 268s,
+    /// 默认 300s 只差 30s;触发预算顺延后必然越界被判超时)。
+    #[test]
+    fn 浏览器工具超时不短于脚本管线预算() {
+        if std::env::var("LAEW_TOOL_TIMEOUT_SECS").is_ok() {
+            return; // 显式配置优先,跳过(并行测试下改 env 不安全)
+        }
+        let d = tool_exec_budget(
+            "MCP_Web_LsmAgentBrowser_Use",
+            &json!({"action":"open","url":"https://example.com"}),
+        )
+        .expect("浏览器工具应有预算");
+        let pipeline = crate::agent::browser::script::pipeline_budget_ms();
+        assert!(
+            d.as_millis() as u64 >= pipeline,
+            "超时预算 {:?} 不得短于管线预算 {}ms",
+            d,
+            pipeline
+        );
+        // 普通工具仍走默认值。
+        let read = tool_exec_budget("Read", &json!({"file_path":"x"})).expect("Read 应有预算");
+        assert_eq!(read.as_secs(), Agent::DEFAULT_TOOL_TIMEOUT_SECS);
     }
 }

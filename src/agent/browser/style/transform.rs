@@ -188,6 +188,41 @@ impl Transform2D {
             f: oy - (m.b * ox + m.d * oy) + m.f,
         }
     }
+
+    /// 序列化回 CSS 函数串(诊断/inspect 用;百分比保持原样)。
+    pub fn to_css(&self) -> String {
+        fn len(l: Length) -> String {
+            match l {
+                Length::Px(v) => format!("{}px", crate::agent::browser::style::values::num(v)),
+                Length::Pct(p) => format!("{}%", crate::agent::browser::style::values::num(p)),
+            }
+        }
+        let mut parts = Vec::with_capacity(self.ops.len());
+        for op in &self.ops {
+            parts.push(match op {
+                TransformOp::Translate(x, y) => format!("translate({}, {})", len(*x), len(*y)),
+                TransformOp::TranslateX(x) => format!("translateX({})", len(*x)),
+                TransformOp::TranslateY(y) => format!("translateY({})", len(*y)),
+                TransformOp::Rotate(d) => format!("rotate({}deg)", crate::agent::browser::style::values::num(*d)),
+                TransformOp::Scale(x, y) => format!("scale({}, {})", crate::agent::browser::style::values::num(*x), crate::agent::browser::style::values::num(*y)),
+                TransformOp::ScaleX(x) => format!("scaleX({})", crate::agent::browser::style::values::num(*x)),
+                TransformOp::ScaleY(y) => format!("scaleY({})", crate::agent::browser::style::values::num(*y)),
+                TransformOp::Skew(x, y) => format!("skew({}deg, {}deg)", crate::agent::browser::style::values::num(*x), crate::agent::browser::style::values::num(*y)),
+                TransformOp::SkewX(x) => format!("skewX({}deg)", crate::agent::browser::style::values::num(*x)),
+                TransformOp::SkewY(y) => format!("skewY({}deg)", crate::agent::browser::style::values::num(*y)),
+                TransformOp::Matrix(a, b, c, d, e, f) => format!(
+                    "matrix({}, {}, {}, {}, {}, {})",
+                    crate::agent::browser::style::values::num(*a),
+                    crate::agent::browser::style::values::num(*b),
+                    crate::agent::browser::style::values::num(*c),
+                    crate::agent::browser::style::values::num(*d),
+                    len(*e),
+                    len(*f)
+                ),
+            });
+        }
+        parts.join(" ")
+    }
 }
 
 /// `transform-origin` 计算值(默认 `50% 50%`)。

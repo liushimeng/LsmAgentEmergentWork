@@ -566,6 +566,13 @@ impl ComputedStyle {
             },
         );
         out.insert("line-height".into(), format!("{}px", num(self.line_height)));
+        out.insert(
+            "transform".into(),
+            match &self.transform {
+                Some(t) => t.to_css(),
+                None => "none".to_string(),
+            },
+        );
         out.insert("text-align".into(), self.text_align.clone());
         out.insert("white-space".into(), self.white_space.clone());
         for (name, v) in [
@@ -718,7 +725,7 @@ impl ComputedStyle {
     }
 }
 
-fn num(v: f64) -> String {
+pub(crate) fn num(v: f64) -> String {
     if (v - v.round()).abs() < 0.01 {
         format!("{}", v.round() as i64)
     } else {
@@ -1409,6 +1416,32 @@ pub fn apply_declaration(
             } else {
                 GridFlow::Row
             };
+        }
+        "place-items" => {
+            // 简写:第一个值 → align-items,第二个值 → justify-items(缺省同第一个)。
+            let parts: Vec<&str> = value.split_whitespace().collect();
+            let a = parts.first().copied().unwrap_or("stretch");
+            let j = parts.get(1).copied().unwrap_or(a);
+            if let Some(v) = normalize_cross_align(a) {
+                st.flex.align_items = v.clone();
+                st.grid.align_items = to_grid_align(&v);
+            }
+            if let Some(v) = normalize_grid_align(j) {
+                st.grid.justify_items = v;
+            }
+        }
+        "place-content" => {
+            let parts: Vec<&str> = value.split_whitespace().collect();
+            let a = parts.first().copied().unwrap_or("normal");
+            let j = parts.get(1).copied().unwrap_or(a);
+            if let Some(v) = normalize_flex_align(a) {
+                st.flex.align_content = v.clone();
+                st.grid.align_content = to_grid_align(&v);
+            }
+            if let Some(v) = normalize_flex_align(j) {
+                st.flex.justify = v.clone();
+                st.grid.justify_content = to_grid_align(&v);
+            }
         }
         "justify-items" => {
             if let Some(v) = normalize_grid_align(value) {

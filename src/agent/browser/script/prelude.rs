@@ -771,6 +771,12 @@ function __lsmLoadDynScript(el, url) {
     } else {
       var code = String(r.body == null ? "" : r.body);
       if (code.trim()) {
+        // 线程内同步执行(经典 `<script src>` 语义)。
+        // 已知副作用:JSONP 回调会在 `appendChild` 返回前触发,站点闭包里的
+        // `var el=appendScriptTagToHead(...)` 尚未赋值,回调末尾的
+        // `cleanup()` 读 `el.parentNode` 会抛 TypeError(京东登录/广告 JSONP
+        // 实测)。但数据回调在 cleanup **之前**已经执行,页面状态与渲染不受
+        // 影响;改为异步执行会打乱装载器时序、反而丢掉首屏楼层,故保留同步。
         try { (0, eval)(code); ok = true; }
         catch (e3) { __cerror("动态脚本执行失败 " + url + ": " + String((e3 && e3.stack) || e3)); ok = true; }
       } else { ok = true; }
@@ -2787,9 +2793,12 @@ function clearTimeout(id) {
 function clearInterval(id) { clearTimeout(id); }
 function requestAnimationFrame(fn) { return setTimeout(fn, 16); }
 function cancelAnimationFrame(id) { clearTimeout(id); }
+// 单次事件循环最多推进的定时器回调数(宿主按加载/交互轮设置)。
+var __lsmTimerBudget = 64;
 function __lsmTick() {
   var ran = 0;
-  while (ran < 64) {
+  var cap = __lsmTimerBudget > 0 ? __lsmTimerBudget : 64;
+  while (ran < cap) {
     var best = -1;
     for (var i = 0; i < __lsmTimers.length; i++) {
       if (best < 0 || __lsmTimers[i].next < __lsmTimers[best].next) best = i;
@@ -2798,8 +2807,11 @@ function __lsmTick() {
     var due = __lsmTimers[best].next;
     __lsmNow = Math.max(__lsmNow, due);
     var batch = [], rest = [];
+    // 同一到期时刻可能有上百个定时器(React 首屏 mount 常见):必须按
+    // 剩余预算截断批次,否则一次 tick 就把整批跑完,cap 形同虚设。
+    var room = cap - ran;
     for (var j = 0; j < __lsmTimers.length; j++) {
-      if (__lsmTimers[j].next <= due) batch.push(__lsmTimers[j]);
+      if (__lsmTimers[j].next <= due && batch.length < room) batch.push(__lsmTimers[j]);
       else rest.push(__lsmTimers[j]);
     }
     __lsmTimers = rest;
@@ -2812,7 +2824,7 @@ function __lsmTick() {
       __lsmTimerRan++;
       try { tm.fn.apply(null, tm.args || []); } catch (e) { __cerror("timer[" + String(tm.reg || "") + "]: " + String((e && e.stack) || e)); }
     }
-    if (ran >= 64) break;
+    if (ran >= cap) break;
   }
   // 定时器批次后派发观察者:rAF/定时器驱动的 SPA 靠 MutationObserver 推进状态。
   __lsmFlushObservers();

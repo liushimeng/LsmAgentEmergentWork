@@ -345,8 +345,12 @@ const MAX_DRAIN_ROUNDS: u32 = 6;
 // (2026-10-30 京东实测)。快站脚本跑完即收工,不受该上限影响。
 const PIPELINE_BUDGET_MS: u64 = 240_000;
 
+/// 预算顺延单次时长与次数上限(到点仍有待取回脚本时使用)。
+pub(crate) const PIPELINE_EXTENSION_MS: u64 = 60_000;
+pub(crate) const PIPELINE_MAX_EXTENSIONS: u32 = 2;
+
 /// 管线墙钟预算(环境变量覆盖,下限 2000ms)。
-fn pipeline_budget_ms() -> u64 {
+pub(crate) fn pipeline_budget_ms() -> u64 {
     std::env::var("LAEW_WEB_SCRIPT_PIPELINE_MS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -414,29 +418,49 @@ pub(crate) async fn run_pipeline(
     let grace = if seed.grace_ms > 0 { seed.grace_ms } else { grace_ms() };
     let max_rounds = if seed.max_rounds == 0 { MAX_ROUNDS } else { seed.max_rounds };
     let budget = if seed.budget_ms == 0 { pipeline_budget_ms() } else { seed.budget_ms };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget);
+    let mut deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget);
+    // 预算顺延次数:到点时若仍有**待取回脚本**(不是空转的定时器),说明
+    // 页面 UI chunk 还没装完,直接截断会让首页楼层整片缺失。每次顺延 60s,
+    // 最多两次(总上限 budget + 120s),只给「有脚本待办」的情况。
+    let mut budget_extensions: u32 = 0;
     let title_now = {
         let doc = super::document::Document::parse(raw_html, base_url);
         doc.title()
     };
     for round in 0..max_rounds {
         if std::time::Instant::now() >= deadline {
-            out.console.push(super::ConsoleRecord {
-                level: "warn".to_string(),
-                text: format!("脚本管线达到墙钟预算({}ms),已停止继续取回模块", budget),
-                at_ms: super::now_ms(),
-            });
-            out.budget_cut = true;
-            // 量化「还差多少」:截断时统计仍未执行的脚本数,调用方据此决定
-            // wait/重试还是换路径,不再只凭一条 console 文案猜。
-            {
+            // 量化「还差多少」:截断/顺延前统计仍未执行的脚本数。
+            let pending = {
                 let doc = super::document::Document::parse(&out.html, base_url);
                 let mut probe = executed.clone();
                 let mut left = dom_ops::collect_scripts(&doc, base_url, &mut probe);
                 let deferred_left = std::mem::take(&mut left.deferred);
-                out.pending_scripts = left.items.len() + deferred_left.len();
+                left.items.len() + deferred_left.len()
+            };
+            if pending > 0 && budget_extensions < PIPELINE_MAX_EXTENSIONS {
+                budget_extensions += 1;
+                deadline = std::time::Instant::now()
+                    + std::time::Duration::from_millis(PIPELINE_EXTENSION_MS);
+                out.console.push(super::ConsoleRecord {
+                    level: "warn".to_string(),
+                    text: format!(
+                        "脚本管线预算顺延 {}s(第 {} 次):仍有 {} 个脚本待取回",
+                        PIPELINE_EXTENSION_MS / 1000,
+                        budget_extensions,
+                        pending
+                    ),
+                    at_ms: super::now_ms(),
+                });
+            } else {
+                out.console.push(super::ConsoleRecord {
+                    level: "warn".to_string(),
+                    text: format!("脚本管线达到墙钟预算({}ms),已停止继续取回模块", budget),
+                    at_ms: super::now_ms(),
+                });
+                out.budget_cut = true;
+                out.pending_scripts = pending;
+                break;
             }
-            break;
         }
         let mut collected = {
             // Document(NodeRef)非 Send,收集完立即销毁,不跨 await 存活。

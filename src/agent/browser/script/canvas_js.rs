@@ -77,6 +77,15 @@ function __lsmCanvasDataUrl(canvas) {
   var ctx = canvas.__ctx2d;
   if (!ctx) return "data:image/png;base64,";
   var pixels = ctx.__pixels;
+  // 首选:直接把像素视图交给宿主编码 PNG。旧路径在 JS 侧逐字节
+  // `String.fromCharCode` 拼上百万字符再 btoa,京东 2000×200 指纹画布
+  // 实测 >50s 不返回(pc-tk 首屏因此卡死)。
+  try {
+    var view = new Uint8Array(pixels.buffer, pixels.byteOffset || 0, pixels.byteLength);
+    return __lsmCanvasPngRaw(canvas.width, canvas.height, view);
+  } catch (e) {
+    // typed array 视图不可用时回退旧路径(慢,但语义等价)。
+  }
   var binary = "";
   // 每字节对应一个 Latin-1 码元;btoa 的宿主实现同样按二进制语义编码。
   for (var i = 0; i < pixels.length; i++) binary += String.fromCharCode(pixels[i]);

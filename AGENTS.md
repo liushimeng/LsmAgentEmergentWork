@@ -68,7 +68,7 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 | `LAEW_DEAD_LOOP` | `off`/`0`/`false`/`no` | 关闭 LLM 交互级死循环守卫(裁决 + QC 根因裁决通道),**检测统计仍保留**。见 `src/agent/dead_loop/` |
 | `LAEW_DEAD_LOOP_LONG_WINDOW` | 正整数(默认 `12`) | 大循环「低新颖度」检测窗口长度(轮) |
 | `LAEW_MAINWORK_TIMEOUT` | 正整数(秒,默认 `300`) | Main-Work 拆解墙钟超时。见 `src/agent/orchestrator/pipeline.rs` |
-| `LAEW_TOOL_TIMEOUT_SECS` | 正整数(秒,默认 `300`) | 单条工具调用总执行超时。豁免:`Bash`与 `request_human`。见 `src/agent/tool_exec.rs` |
+| `LAEW_TOOL_TIMEOUT_SECS` | 正整数(秒,默认 `300`) | 单条工具调用总执行超时。豁免:`Bash`与 `request_human`;两浏览器工具**未显式设置时**下限自动抬到「脚本管线预算 + 顺延 + 60s」(重站首屏 open 实测 268s,默认 300s 会擦边超时)。显式设置则以配置为准。见 `src/agent/tool_exec.rs` |
 | `LAEW_WF_SERIAL_FALLBACK` | `off`/`0`/`false`/`no` | 关闭零依赖计划串行链兜底。见 `src/agent/main_work/topo.rs` |
 | `LAEW_REPLAN` | `off`/`0`/`false`/`no` | 关闭 Plan 再规划/更新规划。设计见 `docs/PlanAgent再规划与更新规划/01-设计与解决方案.md` |
 | `LAEW_DEBUG_SYNC` | `1`/`true`/`yes`/`on` | 恢复 `--debug` TUI 同步生成调试报告（默认后台化）。见 `src/tui/dispatch.rs::spawn_debug_report` |
@@ -103,6 +103,8 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 | `LAEW_DOM_TRACE` | `1` / `2`(`full`) | 打印 JS→DOM 动作账本(kind/selector/样本),诊断「页面空白 / JS 建好的 UI 没回写」。`1`=每批前 25 条采样;`2`/`full`=全量(定位个别动态节点的创建/样式写入链路)。见 `src/agent/browser/script/dom_ops.rs` |
 | `LAEW_JS_CHAIN_TRACE` | `1`/`true`/`yes`/`on` | 动态脚本装载链逐环打点(register/load-entry/style/fire),定位「SDK 已装载但 onload→Promise 链不推进」类静默断链。见 `src/agent/browser/script/runtime.rs` |
 | `LAEW_JS_CB_TRACE` | `1`/`true`/`yes`/`on` | 第三方 SDK 初始化入口(initGeetest 等)的用户回调异常透传陷阱:SDK 内部 catch 吞掉的原始异常/堆栈以 `[cbtrap]` 进 console 台账。默认关闭。见 `src/agent/browser/script/prelude.rs`、`docs/MCP_Web_LsmAgentBrowser_Use/05-窗口交互与页面观察/37-GeeTest自愈循环可观测与HITL可见性守卫.md` |
+| `LAEW_JS_TIMING` | `1`/`true`/`yes`/`on` | 逐脚本墙钟耗时台账(`[jstime] ms/字节/来源`),定位「管线预算被哪个脚本吃掉」。见 `src/agent/browser/script/runtime.rs` |
+| `LAEW_LINE_TRACE` | `1`/`true`/`yes`/`on` | 行盒诊断:每次 flush/commit 打印行宽、段数、基线上/下高度与首段文本,定位「每个行内项各占一行 / 行高被内部 line-height 撑爆」。见 `src/agent/browser/layout/inline.rs` |
 | `LAEW_BROWSER_VIEW_ACTIVATE` | `off`/`0`/`false`/`no` | 关闭有头浏览器启动时前台激活(默认激活并把窗口带到前台,避免被 Chrome/终端遮住;关闭后只 orderFront 不抢焦点)。见 `src/agent/browser/view/macos.rs` |
 | `LAEW_BROWSER_VIEWER_BIN` | 任意可执行文件路径 | 覆盖有头查看器子进程的可执行文件(默认当前进程)。供库进程/自检拉起真正的 `laew __browser-view` 用。见 `src/agent/browser/view/mod.rs` |
 | `LAEW_PAGE_BARS` | `off`/`0`/`false`/`no` | 关闭**屏蔽页面状态栏/进度栏**(两浏览器工具同参;Chrome 注入 JS + Lsm 查看器帧合成)。见 `src/agent/chrome_browser/status.rs`、`src/agent/browser/page_bars.rs`、`docs/双浏览器工具架构/02-屏蔽页面状态栏与进度栏.md` |
