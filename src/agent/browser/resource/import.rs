@@ -85,6 +85,27 @@ where
     Ok(result)
 }
 
+/// 提取 CSS 中全部 `@import` 的 `(URL, media 条件)`(文档顺序)。
+///
+/// 供主管线**预抓取**使用:先把所有被导入的样式表取回来,再用
+/// `resolve_imports` 做同步内联(避免异步递归借用冲突)。
+pub fn import_urls(css: &str) -> Vec<(String, String)> {
+    let Ok(import_re) = Regex::new(
+        r#"@import\s+(?:url\(\s*['"]?([^'")]+)['"]?\s*\)|['"]([^'"]+)['"])\s*([^;]*);?"#,
+    ) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, String)> = Vec::new();
+    for cap in import_re.captures_iter(css) {
+        let Some(url) = cap.get(1).or_else(|| cap.get(2)) else {
+            continue;
+        };
+        let media = cap.get(3).map(|m| m.as_str().trim().to_string()).unwrap_or_default();
+        out.push((url.as_str().to_string(), media));
+    }
+    out
+}
+
 /// 检查 CSS 是否包含 @import。
 pub fn has_import(css: &str) -> bool {
     css.contains("@import")

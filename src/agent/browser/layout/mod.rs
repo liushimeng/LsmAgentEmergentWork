@@ -1010,7 +1010,14 @@ impl<'a> LayoutCtx<'a> {
     // ============ 阶段三第三步:替换元素(图片)============
 
     /// 解析 `<img>` 的绝对地址(相对地址按页面 URL 解析)。
+    ///
+    /// 第 45 轮:`srcset`/`picture` 候选优先,`src` 兜底。
     pub(crate) fn image_src(&self, node: &NodeRef) -> Option<String> {
+        self.srcset_pick(node).or_else(|| self.src_attr_abs(node))
+    }
+
+    /// `<img src>` 的绝对地址。
+    fn src_attr_abs(&self, node: &NodeRef) -> Option<String> {
         let raw = document::attr(node, "src")?;
         let raw = raw.trim();
         if raw.is_empty() {
@@ -1019,10 +1026,59 @@ impl<'a> LayoutCtx<'a> {
         urlutil::resolve(&self.base_url, raw)
     }
 
+    /// `srcset`/`picture` 选中的候选地址(未命中则 `None`)。
+    ///
+    /// 选���口径:`<picture>` 内的 `<source srcset>` 优先(按 `media`/`type` 过滤),
+    /// 其次 `<img srcset>`;候选按视口宽与像素密度选择(见 `document::select_srcset`)。
+    pub(crate) fn srcset_pick(&self, node: &NodeRef) -> Option<String> {
+        let mut cands = document::picture_srcset(node, self.width);
+        if cands.is_none() {
+            if let Some(raw) = document::attr(node, "srcset") {
+                let parsed = document::parse_srcset(&raw);
+                if !parsed.is_empty() {
+                    cands = Some(parsed);
+                }
+            }
+        }
+        let cands = cands?;
+        let pick = document::select_srcset(&cands, self.width, 1.0)?;
+        let pick = pick.trim();
+        if pick.is_empty() {
+            return None;
+        }
+        urlutil::resolve(&self.base_url, pick)
+    }
+
+    /// 实际用于显示的图片地址:优先已加载的 `srcset` 候选,回落已加载的 `src`。
+    pub(crate) fn image_display_src(&self, node: &NodeRef) -> Option<String> {
+        let picked = self.srcset_pick(node);
+        if let Some(abs) = picked.as_ref() {
+            if self.image_loaded(abs) {
+                return Some(abs.clone());
+            }
+        }
+        if let Some(abs) = self.src_attr_abs(node) {
+            if self.image_loaded(&abs) {
+                return Some(abs);
+            }
+        }
+        picked.or_else(|| self.src_attr_abs(node))
+    }
+
     /// 图片固有尺寸(解码后的自然宽高);未加载返回 `None`。
+    ///
+    /// `srcset` 候选未加载成功时回落 `src` 的固有尺寸(盒高不至于塌成 0)。
     pub(crate) fn natural_size(&self, node: &NodeRef) -> Option<(f64, f64)> {
         let src = self.image_src(node)?;
-        self.images.natural(&src)
+        if let Some(sz) = self.images.natural(&src) {
+            return Some(sz);
+        }
+        if let Some(fallback) = self.src_attr_abs(node) {
+            if let Some(sz) = self.images.natural(&fallback) {
+                return Some(sz);
+            }
+        }
+        None
     }
 
     /// 图片是否已解码(未解码不产出绘制指令)。

@@ -1875,6 +1875,26 @@ function __newEl(tag) {
     el.width = 0;
     el.height = 0;
     el.crossOrigin = null;
+    // 第 45 轮:`currentSrc` —— 响应式图片实际选中的候选地址。
+    // 站点常用 `img.currentSrc` 判断当前用的是哪一档(2x 图 vs 1x 图)。
+    def("currentSrc", function () {
+      var ss = el.__attrs.srcset;
+      if (ss) {
+        var cands = String(ss).split(",").map(function (p) {
+          var t = String(p).trim().split(/\s+/);
+          return { u: t[0] || "", d: t[1] || "1x" };
+        }).filter(function (c) { return !!c.u; });
+        var best = null, fallback = null;
+        for (var i = 0; i < cands.length; i++) {
+          var x = parseFloat(cands[i].d) || 1;
+          if (!fallback || x > fallback.x) fallback = { u: cands[i].u, x: x };
+          if (x >= 1 && (!best || x < best.x)) best = { u: cands[i].u, x: x };
+        }
+        var pick = best || fallback;
+        if (pick) return pick.u;
+      }
+      return el.__attrs.src == null ? "" : String(el.__attrs.src);
+    });
     def("src",
       function () { return el.__attrs.src == null ? "" : String(el.__attrs.src); },
       function (v) {

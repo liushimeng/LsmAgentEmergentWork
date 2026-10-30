@@ -150,23 +150,45 @@ fn is_fetchable(url: &str) -> bool {
     url.starts_with("http://") || url.starts_with("https://") || url.starts_with("data:")
 }
 
-/// 收集文档中的 `<img src>` 绝对地址(文档顺序,去重)。
-pub fn collect_image_urls(html: &str, base_url: &str) -> Vec<String> {
+/// 收集文档中的 `<img src>` 与 **`srcset`/`picture` 选中候选**的绝对地址
+/// (文档顺序,去重)。
+///
+/// 第 45 轮:`srcset` 候选此前完全不参与预取 —— 只给 `srcset`、不给 `src`
+/// 的响应式图片在页面上就是一块空白。
+pub fn collect_image_urls(html: &str, base_url: &str, viewport_width: f64) -> Vec<String> {
     let doc = Document::parse(html, base_url);
     let mut out: Vec<String> = Vec::new();
-    for node in doc.select("img").unwrap_or_default() {
-        let Some(src) = document::attr(&node, "src") else {
-            continue;
-        };
-        let src = src.trim();
-        if src.is_empty() {
-            continue;
+    let mut push = |url: &str, out: &mut Vec<String>| {
+        let url = url.trim();
+        if url.is_empty() {
+            return;
         }
-        let Some(abs) = urlutil::resolve(base_url, src) else {
-            continue;
+        let Some(abs) = urlutil::resolve(base_url, url) else {
+            return;
         };
         if is_fetchable(&abs) && !out.contains(&abs) {
             out.push(abs);
+        }
+    };
+    for node in doc.select("img").unwrap_or_default() {
+        // `srcset` / `picture` 选中的候选(优先渲染的那张)。
+        let mut cands = document::picture_srcset(&node, viewport_width);
+        if cands.is_none() {
+            if let Some(raw) = document::attr(&node, "srcset") {
+                let parsed = document::parse_srcset(&raw);
+                if !parsed.is_empty() {
+                    cands = Some(parsed);
+                }
+            }
+        }
+        if let Some(cands) = cands {
+            if let Some(pick) = document::select_srcset(&cands, viewport_width, 1.0) {
+                push(&pick, &mut out);
+            }
+        }
+        // `src` 兜底(候选加载失败时可回退)。
+        if let Some(src) = document::attr(&node, "src") {
+            push(&src, &mut out);
         }
     }
     out
@@ -250,6 +272,7 @@ pub async fn load_images(
     ua: &str,
     timeout_ms: u64,
     existing: &ImageStore,
+    viewport_width: f64,
 ) -> ImageLoadOutcome {
     let mut out = ImageLoadOutcome {
         store: existing.clone(),
@@ -290,7 +313,7 @@ pub async fn load_images(
             out.store.insert(key, Arc::new(img));
         }
     }
-    let mut urls = collect_image_urls(html, base_url);
+    let mut urls = collect_image_urls(html, base_url, viewport_width);
     for u in collect_css_image_urls(html, base_url) {
         if !urls.contains(&u) {
             urls.push(u);
@@ -537,7 +560,7 @@ mod tests {
     #[test]
     fn 收集_img_绝对地址() {
         let html = r#"<body><img src="/a.png"><img src="b.jpg"><img><img src="https://c.test/c.gif"></body>"#;
-        let urls = collect_image_urls(html, "https://a.test/dir/page");
+        let urls = collect_image_urls(html, "https://a.test/dir/page", 1920.0);
         assert_eq!(
             urls,
             vec![

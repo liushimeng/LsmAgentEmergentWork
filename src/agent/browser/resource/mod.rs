@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub use font::{decode_font, is_font_content_type, FontResource, MAX_FONT_BYTES};
-pub use import::{has_import, resolve_imports, MAX_IMPORT_DEPTH};
+pub use import::{has_import, import_urls, resolve_imports, MAX_IMPORT_DEPTH};
 pub use scheduler::{ResourcePriority, ResourceScheduler};
 
 /// 已加载资源。

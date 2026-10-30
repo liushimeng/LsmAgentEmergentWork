@@ -468,11 +468,16 @@ async fn apply_js_reply(
             .cloned()
             .collect();
     }
-    let (page_url, user_agent, existing_images) = {
+    let (page_url, user_agent, existing_images, viewport_width) = {
         let Some(tab) = inner.tabs.get(pid) else {
             return Vec::new();
         };
-        (tab.url.clone(), tab.user_agent.clone(), tab.images.clone())
+        (
+            tab.url.clone(),
+            tab.user_agent.clone(),
+            tab.images.clone(),
+            tab.viewport.width as f64,
+        )
     };
     let images_out = super::images::load_images(
         &mut inner,
@@ -482,6 +487,7 @@ async fn apply_js_reply(
         &user_agent,
         15_000,
         &existing_images,
+        viewport_width,
     )
     .await;
     if let Some(tab) = inner.tabs.get_mut(pid) {

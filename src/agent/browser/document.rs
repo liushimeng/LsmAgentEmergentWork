@@ -1020,6 +1020,213 @@ pub fn node_text(node: &NodeRef) -> String {
     collapse_ws(&out)
 }
 
+/// `srcset` 候选的描述符。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SrcsetDescriptor {
+    /// `w` 描述符:候选的固有宽度(px)。
+    Width(f64),
+    /// `x` 描述符:像素密度倍率(无描述符按 1x)。
+    Density(f64),
+}
+
+/// 解析 `srcset` 属性:返回 `(URL, 描述符)` 候选列表(文档顺序)。
+///
+/// 语法:`url [描述符]` 列表,逗号分隔;描述符为 `w`(宽度)或 `x`(密度)。
+/// URL 本身可含逗号(此时按「逗号后有描述符」切分,近似浏览器口径)。
+pub fn parse_srcset(raw: &str) -> Vec<(String, SrcsetDescriptor)> {
+    let mut out: Vec<(String, SrcsetDescriptor)> = Vec::new();
+    for part in split_srcset(raw) {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let mut it = part.split_whitespace();
+        let Some(url) = it.next() else { continue };
+        let desc = it.next().unwrap_or("1x");
+        let d = if let Some(w) = desc.strip_suffix('w') {
+            match w.trim().parse::<f64>() {
+                Ok(v) if v > 0.0 => SrcsetDescriptor::Width(v),
+                _ => SrcsetDescriptor::Density(1.0),
+            }
+        } else if let Some(x) = desc.strip_suffix('x') {
+            match x.trim().parse::<f64>() {
+                Ok(v) if v > 0.0 => SrcsetDescriptor::Density(v),
+                _ => SrcsetDescriptor::Density(1.0),
+            }
+        } else {
+            SrcsetDescriptor::Density(1.0)
+        };
+        out.push((url.to_string(), d));
+    }
+    out
+}
+
+/// `srcset` 候选切分(HTML 标准口径:URL 取到空白为止,描述符取到逗号为止)。
+///
+/// URL 内的逗号(如 `data:` URL)不会被误切:URL 只在遇到空白时才停。
+fn split_srcset(raw: &str) -> Vec<String> {
+    let chars: Vec<char> = raw.chars().collect();
+    let n = chars.len();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < n {
+        // 跳过候选之间的空白与逗号。
+        while i < n && (chars[i].is_whitespace() || chars[i] == ',') {
+            i += 1;
+        }
+        if i >= n {
+            break;
+        }
+        // URL:取到空白为止。
+        let start = i;
+        while i < n && !chars[i].is_whitespace() {
+            i += 1;
+        }
+        let mut url: String = chars[start..i].iter().collect();
+        // URL 末尾的逗号 = 候选结束(无描述符,按 1x)。
+        if url.ends_with(',') {
+            url.pop();
+            if !url.trim().is_empty() {
+                out.push(url.trim().to_string());
+            }
+            continue;
+        }
+        // 描述符:取到逗号为止(可为空)。
+        let dstart = i;
+        while i < n && chars[i] != ',' {
+            i += 1;
+        }
+        let desc: String = chars[dstart..i].iter().collect();
+        if i < n {
+            i += 1;
+        }
+        let piece = format!("{url} {desc}");
+        let piece = piece.trim();
+        if !piece.is_empty() {
+            out.push(piece.to_string());
+        }
+    }
+    out
+}
+
+/// 按视口宽与像素密度选出 `srcset` 候选(HTML 标准的近似口径)。
+///
+/// - 含 `w` 描述符:取「不小于源尺寸(视口宽 × DPR)的最小宽度候选」,
+///   没有则取最大宽度候选;
+/// - 只含 `x` 描述符:取「不小于 DPR 的最小密度候选」,没有则取最大密度候选。
+pub fn select_srcset(
+    candidates: &[(String, SrcsetDescriptor)],
+    viewport_width: f64,
+    dpr: f64,
+) -> Option<String> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let target_w = (viewport_width.max(1.0) * dpr.max(0.1)).ceil();
+    let has_w = candidates
+        .iter()
+        .any(|(_, d)| matches!(d, SrcsetDescriptor::Width(_)));
+    if has_w {
+        let mut best: Option<(f64, String)> = None;
+        let mut fallback: Option<(f64, String)> = None;
+        for (url, d) in candidates {
+            let SrcsetDescriptor::Width(w) = d else { continue };
+            let w = *w;
+            if fallback.as_ref().map(|(fw, _)| w > *fw).unwrap_or(true) {
+                fallback = Some((w, url.clone()));
+            }
+            if w >= target_w {
+                if best.as_ref().map(|(bw, _)| w < *bw).unwrap_or(true) {
+                    best = Some((w, url.clone()));
+                }
+            }
+        }
+        return best.or(fallback).map(|(_, u)| u);
+    }
+    let mut best: Option<(f64, String)> = None;
+    let mut fallback: Option<(f64, String)> = None;
+    for (url, d) in candidates {
+        let SrcsetDescriptor::Density(x) = d else { continue };
+        let x = *x;
+        if fallback.as_ref().map(|(fx, _)| x > *fx).unwrap_or(true) {
+            fallback = Some((x, url.clone()));
+        }
+        if x >= dpr {
+            if best.as_ref().map(|(bx, _)| x < *bx).unwrap_or(true) {
+                best = Some((x, url.clone()));
+            }
+        }
+    }
+    best.or(fallback).map(|(_, u)| u)
+}
+
+/// `<picture>` 内命中的 `<source>` 的 `srcset` 候选(按文档顺序取第一个匹配)。
+///
+/// `media` 只支持 `min-width`/`max-width` 的 px 口径;`type` 只放行 `image/*`。
+pub fn picture_srcset(node: &NodeRef, viewport_width: f64) -> Option<Vec<(String, SrcsetDescriptor)>> {
+    let parent = node.parent()?;
+    if !tag_name(&parent).eq_ignore_ascii_case("picture") {
+        return None;
+    }
+    for child in parent.children() {
+        if child.as_element().is_none() || !tag_name(&child).eq_ignore_ascii_case("source") {
+            continue;
+        }
+        if let Some(media) = attr(&child, "media") {
+            if !media_matches(media.trim(), viewport_width) {
+                continue;
+            }
+        }
+        if let Some(t) = attr(&child, "type") {
+            let t = t.trim().to_ascii_lowercase();
+            if !t.is_empty() && !t.starts_with("image/") {
+                continue;
+            }
+        }
+        let raw = attr(&child, "srcset")?;
+        let cands = parse_srcset(&raw);
+        if !cands.is_empty() {
+            return Some(cands);
+        }
+    }
+    None
+}
+
+/// 极简 `media` 匹配:支持 `all`、`min-width`/`max-width`(px)与逗号分隔的「与」。
+fn media_matches(media: &str, viewport_width: f64) -> bool {
+    if media.is_empty() {
+        return true;
+    }
+    for cond in media.split(',') {
+        let cond = cond.trim().to_ascii_lowercase();
+        let cond = cond
+            .strip_prefix('(')
+            .and_then(|c| c.strip_suffix(')'))
+            .unwrap_or(&cond)
+            .trim();
+        if cond.is_empty() || cond == "all" {
+            continue;
+        }
+        if let Some(v) = cond.strip_prefix("min-width:") {
+            let px = v.trim().trim_end_matches("px").trim().parse::<f64>().unwrap_or(0.0);
+            if viewport_width + 0.5 < px {
+                return false;
+            }
+            continue;
+        }
+        if let Some(v) = cond.strip_prefix("max-width:") {
+            let px = v.trim().trim_end_matches("px").trim().parse::<f64>().unwrap_or(f64::MAX);
+            if viewport_width - 0.5 > px {
+                return false;
+            }
+            continue;
+        }
+        // 未支持的条件一律不匹配(保守:不因未知条件选中错误候选)。
+        return false;
+    }
+    true
+}
+
 pub fn collapse_ws(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut space = false;
@@ -1270,4 +1477,56 @@ mod tests {
         assert!(!is_visible(&links[0]));
         assert!(is_visible(&links[1]));
     }
+    #[test]
+    fn srcset_候选解析与选择() {
+        let cands = parse_srcset("/a.png 1x, /b.png 2x");
+        assert_eq!(cands.len(), 2);
+        assert_eq!(cands[0].0, "/a.png");
+        assert_eq!(cands[1].1, SrcsetDescriptor::Density(2.0));
+        // 1x 视口选 1x 候选;2x 视口选 2x 候选。
+        assert_eq!(
+            select_srcset(&cands, 800.0, 1.0).as_deref(),
+            Some("/a.png")
+        );
+        assert_eq!(
+            select_srcset(&cands, 800.0, 2.0).as_deref(),
+            Some("/b.png")
+        );
+    }
+
+    #[test]
+    fn srcset_宽度描述符按视口选候选() {
+        let cands = parse_srcset("/s.png 100w, /m.png 800w, /l.png 1920w");
+        // 视口 800 → 选不小于 800 的最小宽度候选。
+        assert_eq!(
+            select_srcset(&cands, 800.0, 1.0).as_deref(),
+            Some("/m.png")
+        );
+        // 视口 400 → 100w 不够,选 800w。
+        assert_eq!(
+            select_srcset(&cands, 400.0, 1.0).as_deref(),
+            Some("/m.png")
+        );
+        // 视口 2000 → 没有更大的,取最大宽度候选。
+        assert_eq!(
+            select_srcset(&cands, 2000.0, 1.0).as_deref(),
+            Some("/l.png")
+        );
+    }
+
+    #[test]
+    fn picture_取命中的source候选() {
+        let d = Document::parse(
+            "<body><picture><source media='(min-width: 1000px)' srcset='/wide.png'><source srcset='/narrow.png'><img id='i' src='/fallback.png'></picture></body>",
+            "https://a.test/",
+        );
+        let img = d.select("#i").unwrap().remove(0);
+        // 视口 500 → 宽屏 source 不匹配,取第二个。
+        let cands = picture_srcset(&img, 500.0).expect("应有 source 候选");
+        assert_eq!(cands[0].0, "/narrow.png");
+        // 视口 1200 → 命中宽屏 source。
+        let cands = picture_srcset(&img, 1200.0).expect("应有 source 候选");
+        assert_eq!(cands[0].0, "/wide.png");
+    }
+
 }
