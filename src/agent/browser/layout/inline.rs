@@ -7,9 +7,43 @@
 //!
 //! 第 44 轮:引入**行内原子盒**(替换元素与表单控件)—— 它们参与行宽、
 //! 断行与基线对齐,详见 `inline_atomic.rs` 的模块文档。
+//!
+//! 第 47 轮(行内排版第二层):
+//! - **行内块独立格式化上下文**:`display:inline-block`/`inline-flex` 的子代
+//!   进**独立** `InlineBuf`,按盒内容宽换行、在盒内发射,盒高由内容决定
+//!   (`layout_inline_block_ctx_at` + `flush_inline_floor`);
+//! - **行内片段盒**:普通行内元素(`a`/`span`/`label`/…)的背景/边框/阴影由
+//!   文本 run 携带的 `InlineOwner` 在**行提交期**按片段绘制
+//!   (`emit_inline_fragment`),不再画在收集期的行首;
+//! - **窄容器换行**:断行后清零待入段宽(`seg_w`)、词界回退断行。
 
 use super::inline_atomic::{AtomicKind, InlineAtomic, VAlign};
 use super::*;
+
+/// 行内**片段盒**属主(第 47 轮):文本 run 的最内层普通行内元素。
+///
+/// 普通行内元素(`a`/`span`/`b`/`label`/…)的背景/边框/阴影**按行盒片段**
+/// 逐段绘制(CSS 2.1 §10.6.1:行内非替换元素的背景覆盖其 inline box,
+/// 多行时每行一段;左右内边距只在**首末片段**上各出现一次,上下内边距
+/// 每段都有但不影响行高)。此前内核在**收集期**把盒画在行首,链接/标签的
+/// 背景整块盖到前一个词上,多行时高度只有一行。
+///
+/// 只存绘制必需的快照(选择器/标签/计算样式),不持 `NodeRef` —— run 会被
+/// 克隆进 `Seg`,持节点会让克隆变贵且与 `LayoutCtx` 的生命周期纠缠。
+#[derive(Clone)]
+pub(crate) struct InlineOwner {
+    selector: String,
+    tag: String,
+    style: ComputedStyle,
+}
+
+impl PartialEq for InlineOwner {
+    /// 合并判定只看**身份**:同一元素的相邻 run 合并后仍属同一片段盒属主,
+    /// 样式差异由 run 自身的样式段承载。
+    fn eq(&self, other: &Self) -> bool {
+        self.selector == other.selector && self.tag == other.tag
+    }
+}
 
 /// 行内格式化上下文中的一个样式段(同一视觉行可容纳多个段)。
 struct Seg {
@@ -103,6 +137,9 @@ struct InlineRun {
     /// 已「封口」:其后不允许再并入同风格文本(原子盒前后不得合并,
     /// 否则会丢掉原子盒在行内的先后位置)。
     sealed: bool,
+    /// 行内片段盒属主(第 47 轮):该 run 的文本所属最内层普通行内元素。
+    /// `None` = 块级文本或无属主(不画片段盒)。
+    owner: Option<InlineOwner>,
 }
 
 impl InlineBuf {
@@ -119,6 +156,7 @@ impl InlineBuf {
         x_base: f64,
         transform: Option<Affine>,
         text_shadow: Vec<TextShadow>,
+        owner: Option<InlineOwner>,
     ) {
         self.chars += text.chars().count();
         let size = st.font_size;
@@ -140,6 +178,7 @@ impl InlineBuf {
                 && last.preserve == preserve
                 && last.transform == transform
                 && last.text_shadow == text_shadow
+                && last.owner == owner
             {
                 last.text.push_str(text);
                 return;
@@ -164,6 +203,7 @@ impl InlineBuf {
             text_shadow,
             order,
             sealed: false,
+            owner,
         });
     }
 
@@ -183,7 +223,28 @@ impl InlineBuf {
     pub(super) fn force_break(&mut self) {
         if let Some(last) = self.runs.last_mut() {
             last.text.push('\n');
+            return;
         }
+        // 行首 `<br>`(此前无 run 可追加):插入一个只含换行的占位 run,
+        // 否则 `flush_run` 的换行分支拿不到任何东西,换行被静默吞掉。
+        let order = self.next_order();
+        self.runs.push(InlineRun {
+            text: "\n".to_string(),
+            x: 0.0,
+            size: 8.0,
+            color: [0, 0, 0],
+            bold: false,
+            line_height: 0.0,
+            visible: true,
+            align: "left".to_string(),
+            wrap: false,
+            preserve: false,
+            transform: None,
+            text_shadow: Vec::new(),
+            order,
+            sealed: false,
+            owner: None,
+        });
     }
 
     /// 预留行高(行内盒撑开所在行)。
@@ -213,8 +274,42 @@ impl InlineBuf {
             text_shadow: Vec::new(),
             order,
             sealed: false,
+            owner: None,
         });
     }
+}
+
+/// 行内**块容器**(第 47 轮):`display:inline-block` / `inline-flex`。
+///
+/// 这类元素是行内级盒,但**建立独立格式化上下文**(BFC):子代不得漏进父行,
+/// 盒高由内容决定。`inline-grid`/`inline-table` 在样式层被归一成
+/// `grid`/`table`(见 `style::values::normalize_display`),布局层无法识别,
+/// 仍走老的单盒近似 —— 列为已知边界。
+fn is_inline_block_container(style: &ComputedStyle) -> bool {
+    matches!(style.display.as_str(), "inline-block" | "inline-flex")
+}
+
+/// **普通行内元素**(第 47 轮):`display:inline` 且无显式尺寸。
+///
+/// 这类元素生成行内盒(不是块容器),其背景/边框必须**按行盒片段**绘制。
+/// `display:inline` 携带显式尺寸是无效 CSS 组合,仍按老的单盒近似处理。
+fn is_plain_inline(style: &ComputedStyle) -> bool {
+    style.display == "inline"
+        && style.width.is_none()
+        && style.height.is_none()
+        && style.width_percent.is_none()
+}
+
+/// 行内元素是否**绘制**了盒视觉(背景/背景层/边框/外阴影)。
+fn inline_paints(style: &ComputedStyle) -> bool {
+    style.background.is_some()
+        || !style.background_layers.is_empty()
+        || style
+            .border_widths
+            .iter()
+            .zip(style.border_drawn.iter())
+            .any(|(w, d)| *w > 0.0 && *d)
+        || !style.box_shadow.is_empty()
 }
 
 impl<'a> LayoutCtx<'a> {
@@ -228,7 +323,16 @@ impl<'a> LayoutCtx<'a> {
     /// 第 44 轮:文本 run 与原子盒按**收集顺序**合并成一条事件流,
     /// 原子盒占宽并触发断行,行提交时按基线定位。
     pub(super) fn flush_inline(&mut self, buf: &mut InlineBuf, max_w: f64) {
-        let max_w = max_w.max(80.0);
+        self.flush_inline_floor(buf, max_w, 80.0)
+    }
+
+    /// 带**换行下限**的行内 flush(第 47 轮)。
+    ///
+    /// 行内块容器的独立格式化上下文按**盒内容宽**换行,不能套用常规行内的
+    /// 「不低于 80px」老下限 —— 否则 60px 宽的药丸标签里的文字会按 80px
+    /// 换行、溢出盒外(正是「盒宽包住文字」要消灭的那类显示不全)。
+    pub(super) fn flush_inline_floor(&mut self, buf: &mut InlineBuf, max_w: f64, floor: f64) {
+        let max_w = max_w.max(floor);
         let items: &InlineBuf = buf;
         let mut line = LineState::new();
         let mut ri = 0usize;
@@ -272,7 +376,10 @@ impl<'a> LayoutCtx<'a> {
         let mut seg_text = String::new();
         let mut seg_w = 0.0f64;
         let mut seg_x = 0.0f64;
-        for ch in run.text.chars() {
+        // 第 47 轮:字符源改为**可回插的队列** —— 词界回退时需要把已消耗的
+        // 字符交还给循环(词后的字符移到下一行,而不是留在本行末尾)。
+        let mut pending: std::collections::VecDeque<char> = run.text.chars().collect();
+        while let Some(ch) = pending.pop_front() {
             if ch == '\n' {
                 if !seg_text.is_empty() {
                     self.push_seg(
@@ -287,6 +394,10 @@ impl<'a> LayoutCtx<'a> {
                 }
                 self.commit_line(line, max_w, items);
                 line.reset();
+                // 第 47 轮:换行后**必须**清零待入段宽,否则下一行的断行判定
+                // 会拿上一行的累计宽当基数 —— 窄容器(药丸标签、侧栏、代码块)
+                // 的文字从第二行起逐字断行,整段不可读。
+                seg_w = 0.0;
                 continue;
             }
             let w = self.font.char_width(ch, size);
@@ -297,6 +408,19 @@ impl<'a> LayoutCtx<'a> {
                 && line.flow_x - line.origin_x + seg_w + w > max_w
                 && (!line.segs.is_empty() || !seg_text.is_empty())
             {
+                // 第 47 轮:**词界回退**。浏览器在词界断行,不在词中截断 ——
+                // 回退到本段最后一个空白,把其后的字符交还队列(下一行重排)。
+                // `pre`/`nowrap` 不做回退(前者不换行,后者不断)。
+                let mut tail = String::new();
+                if !run.preserve {
+                    if let Some(k) = seg_text.rfind(char::is_whitespace) {
+                        if k > 0 {
+                            tail = seg_text[k..].trim_start().to_string();
+                            seg_text.truncate(k);
+                            seg_w = self.font.text_width(&seg_text, size);
+                        }
+                    }
+                }
                 if !seg_text.is_empty() {
                     self.push_seg(
                         line,
@@ -310,6 +434,16 @@ impl<'a> LayoutCtx<'a> {
                 }
                 self.commit_line(line, max_w, items);
                 line.reset();
+                // 第 47 轮:同上 —— 断行后清零待入段宽(见上处注释)。
+                seg_w = 0.0;
+                // 交还队列:触发断行的字符属于**下一行**,排在回退尾巴之后。
+                // `push_front` 逆序插入,故按「尾巴 + 本字符」的逆序压。
+                let mut carry: Vec<char> = tail.chars().collect();
+                carry.push(ch);
+                for c in carry.into_iter().rev() {
+                    pending.push_front(c);
+                }
+                continue;
             }
             if seg_text.is_empty() {
                 // 段落点:行首取 run.x(缩进语义),行中续流取 max(流点, run.x)
@@ -410,6 +544,8 @@ impl<'a> LayoutCtx<'a> {
                 continue;
             }
             emitted += 1;
+            // 片段盒宽按**裁剪后**的文本量折算(与实际绘制宽度一致)。
+            let frag_w = self.font.text_width(&content, seg.run.size);
             let offset = match seg.run.align.as_str() {
                 // 内在尺寸(max-content)测量语境:对齐偏移不参与宽度计算,
                 // 否则居中文字的行起点会落到 ~5 万处,被当成内容宽。
@@ -431,6 +567,26 @@ impl<'a> LayoutCtx<'a> {
             // 阶段六:文本显示项(flush 时取新 seq → 与前后块级兄弟正确分层)。
             self.emit_text(&text_line, seg.run.transform.clone(), &seg.run.text_shadow);
             self.lines.push(text_line);
+            // 行内片段盒(第 47 轮):普通行内元素的背景/边框/阴影按**本片段**
+            // 绘制 —— 位置与高度都是行提交后的最终值,不再画在收集期的行首。
+            if let Some(owner) = &seg.run.owner {
+                let first = !line.segs[..i]
+                    .iter()
+                    .any(|s| s.run.owner.as_ref() == Some(owner));
+                let last = !line.segs[i + 1..]
+                    .iter()
+                    .any(|s| s.run.owner.as_ref() == Some(owner));
+                self.emit_inline_fragment(
+                    owner,
+                    seg.x + offset,
+                    frag_w,
+                    baseline - seg.run.size,
+                    seg.run.line_height,
+                    first,
+                    last,
+                    seg.run.transform.clone(),
+                );
+            }
         }
         // 原子盒:按基线定位并发射(盒与显示项在此才产生,位置是最终位置)。
         for (idx, bx) in line.atomics.clone() {
@@ -454,6 +610,55 @@ impl<'a> LayoutCtx<'a> {
         line.atomics.clear();
         line.ascent = 0.0;
         line.descent = 0.0;
+    }
+
+    /// 发射一个**行内片段盒**(第 47 轮):普通行内元素的背景/边框/阴影。
+    ///
+    /// 几何口径(CSS 2.1 §10.6.1 的行内非替换元素):
+    /// - 左右内边距只在**首末片段**各出现一次(`first`/`last` 标志);
+    /// - 上下内边距**每段都有**,但**不影响行高**(行盒高度已由 run 的
+    ///   `line-height` 决定,垂直内边距只是让背景上下溢出);
+    /// - 多行时每行一段,每段画完整四边 —— 与浏览器「逐行片段续画边框」一致。
+    ///
+    /// 无绘制内容(无背景/边框/阴影)时只落**几何寻址盒**,不产显示项。
+    #[allow(clippy::too_many_arguments)]
+    fn emit_inline_fragment(
+        &mut self,
+        owner: &InlineOwner,
+        x: f64,
+        w: f64,
+        text_top: f64,
+        line_height: f64,
+        first: bool,
+        last: bool,
+        tf: Option<Affine>,
+    ) {
+        let st = &owner.style;
+        let pad_l = if first { st.padding_left } else { 0.0 };
+        let pad_r = if last { st.padding_right } else { 0.0 };
+        let box_x = x - pad_l;
+        let box_w = (w + pad_l + pad_r).max(0.0);
+        let box_h = (st.padding_top + line_height + st.padding_bottom).max(0.0);
+        let box_y = text_top - st.padding_top;
+        if box_w <= 0.0 || box_h <= 0.0 {
+            return;
+        }
+        let seq = self.next_seq();
+        self.boxes.push(ElementBox {
+            selector: owner.selector.clone(),
+            tag: owner.tag.clone(),
+            x: box_x,
+            y: box_y,
+            w: box_w,
+            h: box_h,
+            background: st.background,
+            background_alpha: st.background_alpha,
+            visible: style_visible(st),
+            z_index: st.pos.z_index,
+            out_of_flow: false,
+        });
+        push_border_and_shadow(self, st, box_x, box_y, box_w, box_h);
+        self.emit_element_tf(seq, st, &owner.tag, box_x, box_y, box_w, box_h, tf);
     }
 
     /// 发射一个行内原子盒(替换元素 / 表单控件)。
@@ -519,6 +724,161 @@ impl<'a> LayoutCtx<'a> {
                 widgets::emit_form_control_text(self, node, style, &tag, x, y, w, h, tf);
             }
         }
+    }
+
+    /// 普通行内元素的**片段盒属主**(第 47 轮)。
+    ///
+    /// 命中条件:`display:inline` 且无显式尺寸(**普通行内盒**,不是块容器),
+    /// 并且要么**绘制了盒视觉**(背景/背景层/边框/外阴影),要么**需要几何
+    /// 寻址**(`inline_box_worthy`:交互元素/带 id/显式尺寸)—— 后者即便不画
+    /// 任何像素,也要保住 `rect_for` 的寻址盒(空锚点 `<a name=x>` 是
+    /// 百度地图顶部条带根因的回归点)。
+    ///
+    /// 命中失败的普通行内元素(如纯文本 `<b>`/`<i>`)不携带属主:它们不画盒、
+    /// 也不需要逐元素寻址,背景缺失是样式层未建模的属性(斜体/下划线等),
+    /// 不在本轮范围。
+    fn inline_fragment_owner(&self, node: &NodeRef, style: &ComputedStyle) -> Option<InlineOwner> {
+        if !is_plain_inline(style) {
+            return None;
+        }
+        if !inline_paints(style) && !self.inline_box_worthy(node, style) {
+            return None;
+        }
+        Some(InlineOwner {
+            selector: Document::stable_selector(node),
+            tag: document::tag_name(node),
+            style: style.clone(),
+        })
+    }
+
+    /// 行内块容器子树的 **max-content 宽**估算(第 47 轮)。
+    ///
+    /// 沿 DOM 子树按「行内累加」:文本按字号折算,替换元素取固有宽,显式宽
+    /// 直接采用,控件取 `inline_box_size` 口径,其余递归。**不铺开布局、
+    /// 不发射任何几何**,供 shrink-to-fit 的 preferred 宽使用。
+    fn inline_container_max_content(&self, node: &NodeRef, style: &ComputedStyle) -> f64 {
+        self.inline_container_max_content_depth(node, style, 0)
+    }
+
+    /// `inline_container_max_content` 的递归体(`depth` 为防御性深度上限)。
+    fn inline_container_max_content_depth(
+        &self,
+        node: &NodeRef,
+        style: &ComputedStyle,
+        depth: usize,
+    ) -> f64 {
+        if depth > 24 {
+            return 0.0;
+        }
+        let mut acc = 0.0f64;
+        for child in node.children() {
+            if let Some(text) = child.as_text() {
+                let raw = text.borrow();
+                if !raw.trim().is_empty() {
+                    acc += self.font.text_width(&raw, style.font_size);
+                }
+                continue;
+            }
+            if child.as_element().is_none() {
+                continue;
+            }
+            let cs = self.engine.computed(&child, style);
+            if cs.display == "none" || cs.suppress_children {
+                continue;
+            }
+            let margins =
+                cs.margin_left + cs.margin_right + cs.padding_left + cs.padding_right;
+            let tag = document::tag_name(&child).to_ascii_lowercase();
+            // 替换元素:固有宽(百分比宽按 auto,与 `replaced_size` 口径一致)。
+            if matches!(tag.as_str(), "img" | "svg" | "canvas" | "iframe") {
+                let (w, _h, _src) = self.replaced_size(&child, &cs, 0.0, None);
+                acc += w + margins;
+                continue;
+            }
+            if let Some(w) = cs.width {
+                acc += w + margins;
+                continue;
+            }
+            if is_form_control_tag(&child) {
+                let (w, _h) = self.inline_box_size(&child, &cs, 0.0);
+                acc += w + margins;
+                continue;
+            }
+            if tag == "br" {
+                continue;
+            }
+            acc += self.inline_container_max_content_depth(&child, &cs, depth + 1) + margins;
+        }
+        acc
+    }
+
+    /// 在 `(bx, by)` 处以内容宽 `cw` 布局**行内块容器**的子代并发射盒自身
+    /// (第 47 轮)。返回 `(内容底, 盒高)`;全局游标复原(推进由调用方决定)。
+    ///
+    /// 子代进**独立行内缓冲**,按 `cw` 换行并在盒内发射 —— 不再漏进父行、
+    /// 也不再让多行内容溢出盒外。盒高由内容决定(`height` 缺省时),显式高优先。
+    ///
+    /// 盒视觉(背景/边框/阴影/圆角)与几何寻址盒在此发射;**seq 先于子代预留**,
+    /// 保证盒画在子代内容之下。
+    #[allow(clippy::too_many_arguments)]
+    fn layout_inline_block_ctx_at(
+        &mut self,
+        node: &NodeRef,
+        style: &ComputedStyle,
+        bx: f64,
+        by: f64,
+        cw: f64,
+        tf: Option<Affine>,
+        depth: usize,
+    ) -> (f64, f64) {
+        let box_seq = self.next_seq();
+        let mut child_buf = InlineBuf::default();
+        let mut inner_row = float::InlineRow::default();
+        let saved_y = self.y;
+        self.y = by;
+        let inner_x = bx - style.margin_left - style.padding_left;
+        self.collect_inline_children(
+            node,
+            style,
+            &mut child_buf,
+            depth,
+            inner_x,
+            cw,
+            &mut inner_row,
+            tf,
+        );
+        // 换行下限取 8px:行内块容器按**盒内容宽**换行,不能套用常规行内的
+        // 80px 下限(否则 60px 宽的药丸里的文字按 80px 换行、溢出盒外)。
+        self.flush_inline_floor(&mut child_buf, cw, 8.0);
+        let mut content_bottom = self.y;
+        let float_bottom = inner_row.content_bottom();
+        if float_bottom > content_bottom {
+            content_bottom = float_bottom;
+        }
+        self.y = saved_y;
+        let content_h = (content_bottom - by).max(0.0);
+        let h = constrain_height(
+            style,
+            style.height.map(|h| h.max(0.0)).unwrap_or(content_h),
+        )
+        .max(1.0);
+        self.boxes.push(ElementBox {
+            selector: Document::stable_selector(node),
+            tag: document::tag_name(node),
+            x: bx,
+            y: by,
+            w: cw,
+            h,
+            background: style.background,
+            background_alpha: style.background_alpha,
+            visible: style_visible(style),
+            z_index: style.pos.z_index,
+            out_of_flow: false,
+        });
+        push_border_and_shadow(self, style, bx, by, cw, h);
+        let tag = document::tag_name(node);
+        self.emit_element_tf(box_seq, style, &tag, bx, by, cw, h, tf);
+        (content_bottom, h)
     }
 
     /// 行内级元素是否需要生成近似矩形(供 inspect/坐标点击/截图裁剪寻址)。
@@ -597,10 +957,13 @@ impl<'a> LayoutCtx<'a> {
                 .unwrap_or(default)
                 .clamp(1.0, 100.0)
         };
-        // 第 41 轮:带内置 UI 的 input 类型给类型化固有宽(浏览器量级),
-        // 免得滑轨/色块/日历图标被挤进 40px 的窄盒里看不出是控件。
-        // 第 42 轮:文本类再并入 value/placeholder 与 `size` 列宽。
-        let intrinsic_floor = if tag == "select" {
+        // 第 47 轮:行内**块容器**的固有宽 = 子树按行内累加的 max-content
+        // (shrink-to-fit 的 preferred 值)。此前取 `text_contents()` 的文本宽,
+        // 漏掉图标/控件等兄弟盒 —— 猎聘行业 tab(图标 20 + 间距 8 + 文本)的
+        // 盒宽少 28px,子代在盒内换行溢出盒外。
+        let intrinsic_floor = if is_inline_block_container(style) {
+            self.inline_container_max_content(node, style).max(40.0)
+        } else if tag == "select" {
             if super::widgets::select_is_list(node) {
                 // 第 44 轮:列表形态 select 的固有宽 = 最长 option 文本 + 勾选位。
                 let mut max_text = 0.0f64;
@@ -687,6 +1050,13 @@ impl<'a> LayoutCtx<'a> {
         // 第 44 轮:行内替换元素(`img`/`svg`/`canvas`/`iframe`)是**行内原子盒**:
         // 占宽、参与断行、按基线对齐(替换元素的底边贴基线,CSS 2.1 §10.8.1)。
         let tag = document::tag_name(node).to_ascii_lowercase();
+        // 第 47 轮:`<br>` 作为**块容器的直接子级**也要换行 —— 此前只有
+        // `collect_inline_children`(嵌套进行内元素时)认 `<br>`,直接子级走
+        // 本入口时是静默 no-op(`<div>a<br>b</div>` 的 b 紧接 a 不换行)。
+        if tag == "br" {
+            buf.force_break();
+            return;
+        }
         if matches!(tag.as_str(), "img" | "svg" | "canvas" | "iframe") {
             let (iw, ih, _isrc) = self.replaced_size(node, style, avail_w, None);
             let atomic = InlineAtomic::new(
@@ -739,7 +1109,36 @@ impl<'a> LayoutCtx<'a> {
             }
             let bx = line_x + style.margin_left + style.padding_left + dx;
             let by = self.y + dy;
-            tf = self.emit_inline_box(node, style, bx, by, w, h, tf);
+            // 第 47 轮:行内**块容器**(`inline-block`/`inline-flex`)走独立格式化
+            // 上下文 —— 子代进独立行内缓冲、按盒内容宽换行并在盒内发射,盒高
+            // 由内容决定。此前子代文本漏进父行、多行内容溢出盒外,且盒高恒为
+            // 一行高(`inline_box_size` 的 `font-size × 1.45` 近似)。
+            if is_inline_block_container(style) {
+                // 全局游标**不**因盒高推进:盒高由 `reserve_height` 经行盒
+                // 的基线分解承担(与第 44 轮行内原子盒、第 175 轮行内盒同口径),
+                // 再推一次会让段首凭空下沉一个盒高(实测本例文字下沉 23px)。
+                let (_content_bottom, bh) =
+                    self.layout_inline_block_ctx_at(node, style, bx, by, w, tf, depth);
+                row.register_band(bx, by, w, bh, line_x + avail_w);
+                buf.reserve_height(bh);
+                return;
+            }
+            // 第 47 轮:普通行内元素(`a`/`span`/`b`/`label`/…)改走**片段盒** ——
+            // 收集期只把属主记在文本 run 上,盒在行提交期按片段绘制。
+            // 此前 `emit_inline_box` 把盒画在**行首**且恒一行高:段落中间的
+            // 链接背景整块盖到前一个词上,多行链接只有第一行有背景。
+            // 空行内元素(0×0,无文本可挂片段)退回单盒路径 —— 保住第 175 轮的
+            // 「空锚点仍发射寻址盒」语义,行盒仍不产生。
+            let fragment_box = is_plain_inline(style) && w > 0.0 && h > 0.0;
+            if !fragment_box {
+                tf = self.emit_inline_box(node, style, bx, by, w, h, tf);
+            } else if let Some(m) = self.own_transform(style, bx, by, w, h) {
+                // 片段盒在行提交期才发射,自身变换仍须在此合成进子代变换链。
+                tf = Some(match tf {
+                    Some(anc) => m.compose(&anc),
+                    None => m,
+                });
+            }
             // 阶段七:登记当前行占用,后续行内浮动可排在它的右侧剩余带。
             // 第 175 轮:空行内元素 0×0 不占流(Chrome 语义)—— 只发射寻址盒,
             // 不登记行占用、不推进游标,消灭 `<a name=x></a>` 类幽灵行高。
@@ -789,6 +1188,9 @@ impl<'a> LayoutCtx<'a> {
         // 容器内)同坐标叠印(实测猎聘行业卡「5-7年/统招本科」)。pen 按
         // margin-box 宽推进,让后续兄弟/文本落在新起点;文本段定位取
         // `flow_x.max(run.x)`,与行内流的先后关系天然协调。
+        // 第 47 轮:本容器是**普通行内元素**时,其直接文本的子 run 携带
+        // 片段盒属主 —— 行提交期按片段绘制背景/边框/阴影。
+        let owner = self.inline_fragment_owner(node, style);
         let mut pen = line_x;
         for child in node.children() {
             if let Some(text) = child.as_text() {
@@ -796,7 +1198,14 @@ impl<'a> LayoutCtx<'a> {
                 if !raw.trim().is_empty() {
                     // pen = 本元素当前游标;push_styled 再加自身
                     // margin+padding 得文本内容起点。
-                    buf.push_styled(&raw, style, pen, tf, style.text_shadow.clone());
+                    buf.push_styled(
+                        &raw,
+                        style,
+                        pen,
+                        tf,
+                        style.text_shadow.clone(),
+                        owner.clone(),
+                    );
                     // 文本推进游标但不越出可用右缘(同块级分支)。
                     let tw = self.font.text_width(&raw, style.font_size);
                     pen += tw.min((line_x + avail_w - pen).max(0.0));
@@ -942,6 +1351,14 @@ impl<'a> LayoutCtx<'a> {
         let (w, h) = self.inline_box_size(node, style, avail_w);
         let (bx, by) = row.place_float(style, line_x, line_x + avail_w, self.y, w, h);
         self.y = by;
+        // 第 47 轮:浮动的行内块容器同样走独立格式化上下文(盒高由内容决定)。
+        if is_inline_block_container(style) {
+            let (_content_bottom, bh) =
+                self.layout_inline_block_ctx_at(node, style, bx, by, w, tf, depth);
+            row.note_bottom(by + bh);
+            self.y = by;
+            return;
+        }
         let tf = self.emit_inline_box(node, style, bx, by, w, h, tf);
         if is_form_control_tag(node) {
             // 控件内容同样由 widgets 层唯一绘制,浮动路径不再收集子文本。
