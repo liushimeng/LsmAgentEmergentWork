@@ -73,7 +73,7 @@ fn normalize_inspect_params(args: &Value) -> Value {
         _ => serde_json::Map::new(),
     };
     for key in [
-        "selector", "nth", "limit", "include_text", "include_outer_html", "max_depth",
+        "selector", "nth", "list", "limit", "include_text", "include_outer_html", "max_depth",
         "node_count_limit", "prefix", "contains", "max", "max_links", "include_context",
         "context_length", "item_selector", "fields", "url_from", "scan_cap", "filter",
         "probe", "keys", "probe_window", "max_bytes", "max_array_items", "save_path",

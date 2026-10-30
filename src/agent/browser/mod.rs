@@ -41,8 +41,21 @@ use tokio::sync::Mutex;
 use crate::artifact_root;
 use storage::{CookieJar, Cookie};
 
-pub const DEFAULT_UA: &str =
-    "Mozilla/5.0 (compatible; LsmAgentBrowser/0.1; +https://localhost/laew)";
+/// 默认 User-Agent:按宿主 OS 合成的桌面 Chrome UA(反-反爬指纹基线)。
+/// 此前是 `Mozilla/5.0 (compatible; LsmAgentBrowser/0.1; +https://localhost/laew)`
+/// —— 自曝爬虫身份,且与 `navigator.userAgent` 同源透传,厂商指纹(GeeTest `w=`
+/// 等)按「非常见浏览器 UA」直接降权(实测 zhipin 安全验证页 reset 循环形态
+/// 之一)。需要机器人礼貌标识的场合,由调用方 `open(user_agent=...)` 显式覆盖。
+pub const DEFAULT_UA: &str = if cfg!(target_os = "windows") {
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) \
+     Chrome/128.0.0.0 Safari/537.36"
+} else if cfg!(target_os = "macos") {
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) \
+     Chrome/128.0.0.0 Safari/537.36"
+} else {
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
+     Chrome/128.0.0.0 Safari/537.36"
+};
 /// 默认视口尺寸(1920×1080):有头窗口初始内容区按此铺开,人工拖动后按真实
 /// 内容区尺寸自适应(见 `view::resize`)。
 pub const DEFAULT_VIEWPORT_W: u32 = 1920;

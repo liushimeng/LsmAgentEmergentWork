@@ -321,7 +321,7 @@ function __lsmRefresh(nodes, meta) {
   var ss = __lsmMeta.session || {};
   for (var k1 in ss) if (Object.prototype.hasOwnProperty.call(ss, k1)) __lsmSession[k1] = String(ss[k1]);
   __lsmCookie = String(__lsmMeta.cookies || "");
-  navigator.userAgent = String(__lsmMeta.ua || "");
+  __lsmApplyUaIdentity(__lsmMeta.ua);
   __lsmSetViewport(Number(__lsmMeta.width) || 1280, Number(__lsmMeta.height) || 720);
   window.__lsmPrefersDark = !!__lsmMeta.prefersDark;
   window.__lsmTraceToObj = !!__lsmMeta.traceToObj;
@@ -2512,16 +2512,111 @@ var sessionStorage = makeStorage(__lsmSession, "storage_session");
 var navigator = {
   userAgent: "",
   appName: "Netscape",
-  appVersion: "5.0 (LsmAgentBrowser)",
-  platform: "LsmAgentBrowser",
+  appCodeName: "Mozilla",
+  appVersion: "5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+  platform: "MacIntel",
+  vendor: "Google Inc.",
+  product: "Gecko",
+  productSub: "20030107",
   language: "zh-CN",
   languages: ["zh-CN", "zh", "en"],
   onLine: true,
   webdriver: false,
   cookieEnabled: true,
   hardwareConcurrency: 4,
+  deviceMemory: 8,
   maxTouchPoints: 0
 };
+// ---------- navigator 身份派生(UA 单一真源,反-反爬指纹保真) ----------
+// 指纹层三处曾暴露自研内核身份:platform/appVersion 恒为 "LsmAgentBrowser"、
+// plugins/mimeTypes 缺失 —— 厂商指纹(GeeTest `w=` 等)按「平台名非主流 +
+// 无插件数组」判为自动化环境。以下按 UA 派生平台标识(与 Chrome 语义一致):
+//   Windows UA → "Win32";Mac → "MacIntel";Linux → "Linux x86_64"
+//   appVersion = UA 去 "Mozilla/" 前缀;vendor 按 UA 品牌派生。
+function __lsmPlatformFromUa(ua) {
+  var s = String(ua || "");
+  if (/Windows/.test(s)) return "Win32";
+  if (/Macintosh|Mac OS X/.test(s)) return "MacIntel";
+  if (/Android/.test(s)) return "Linux armv8l";
+  if (/iPhone|iPad|iPod/.test(s)) return "iPhone";
+  if (/Linux|X11/.test(s)) return "Linux x86_64";
+  return "MacIntel";
+}
+function __lsmVendorFromUa(ua) {
+  var s = String(ua || "");
+  if (/Firefox\//.test(s)) return "";
+  if (/Safari\//.test(s) && !/Chrome\//.test(s) && !/Edg\//.test(s) && !/Chromium\//.test(s)) {
+    return "Apple Computer, Inc.";
+  }
+  return "Google Inc.";
+}
+function __lsmApplyUaIdentity(ua) {
+  var s = String(ua || "");
+  if (!s) return;
+  try {
+    navigator.userAgent = s;
+    navigator.platform = __lsmPlatformFromUa(s);
+    navigator.appVersion = s.indexOf("Mozilla/") === 0 ? s.slice(8) : s;
+    navigator.vendor = __lsmVendorFromUa(s);
+  } catch (e) {}
+}
+// Chrome 族 PDF 插件数组(真实形状):5 插件 × 2 MIME;厂商指纹常用
+// `navigator.plugins.length > 0` / 逐名遍历做环境真实性探测。
+function __lsmDefineTag(obj, tag) {
+  try { Object.defineProperty(obj, Symbol.toStringTag, { value: tag, configurable: true }); } catch (e) {}
+}
+function __lsmBuildPdfPlugins() {
+  function mkMime(t) {
+    var m = { type: t, suffixes: "pdf", description: "Portable Document Format", enabledPlugin: null };
+    __lsmDefineTag(m, "MimeType");
+    return m;
+  }
+  function mkPlugin(name) {
+    var mimes = [mkMime("application/pdf"), mkMime("text/pdf")];
+    var p = {
+      name: name,
+      filename: "internal-pdf-viewer",
+      description: "Portable Document Format",
+      length: mimes.length,
+      item: function (j) { return mimes[j] || null; },
+      namedItem: function (n) {
+        for (var k = 0; k < mimes.length; k++) if (mimes[k].type === n) return mimes[k];
+        return null;
+      }
+    };
+    for (var j = 0; j < mimes.length; j++) { mimes[j].enabledPlugin = p; p[String(j)] = mimes[j]; }
+    __lsmDefineTag(p, "Plugin");
+    return p;
+  }
+  var names = ["PDF Viewer", "Chrome PDF Viewer", "Chromium PDF Viewer",
+    "Microsoft Edge PDF Viewer", "WebKit built-in PDF"];
+  var plugins = [];
+  for (var i = 0; i < names.length; i++) plugins.push(mkPlugin(names[i]));
+  var arr = {
+    length: plugins.length,
+    item: function (idx) { return plugins[idx] || null; },
+    namedItem: function (n) {
+      for (var i2 = 0; i2 < plugins.length; i2++) if (plugins[i2] && plugins[i2].name === n) return plugins[i2];
+      return null;
+    },
+    refresh: function () {}
+  };
+  for (var i3 = 0; i3 < plugins.length; i3++) arr[String(i3)] = plugins[i3];
+  __lsmDefineTag(arr, "PluginArray");
+  var marr = {
+    length: 2,
+    item: function (idx) { return plugins[0] ? plugins[0].item(idx) : null; },
+    namedItem: function (n) { return plugins[0] ? plugins[0].namedItem(n) : null; }
+  };
+  if (plugins[0]) {
+    marr["application/pdf"] = plugins[0].item(0);
+    marr["text/pdf"] = plugins[0].item(1);
+  }
+  __lsmDefineTag(marr, "MimeTypeArray");
+  navigator.plugins = arr;
+  navigator.mimeTypes = marr;
+}
+__lsmBuildPdfPlugins();
 var screen = {
   width: 1280, height: 720, availWidth: 1280, availHeight: 720,
   colorDepth: 24, pixelDepth: 24,
@@ -4054,7 +4149,7 @@ function __lsmFlushWrites() {
   }
   __lsmWriteBuf = [];
 }
-function __lsmSetUa(ua) { navigator.userAgent = String(ua || ""); }
+function __lsmSetUa(ua) { __lsmApplyUaIdentity(String(ua || "")); }
 function __lsmSetViewport(w, h) {
   window.innerWidth = w; window.innerHeight = h;
   window.outerWidth = w; window.outerHeight = h;

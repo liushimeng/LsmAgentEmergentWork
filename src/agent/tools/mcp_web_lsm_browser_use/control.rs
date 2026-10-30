@@ -128,6 +128,7 @@ fn normalize_params(args: &mut Value) -> Value {
         "message", "reason", "options", "url", "timeout_ms", "force", "selector", "nth",
         "text", "key", "keys", "file_paths", "file_path", "name", "value", "kind", "items",
         "save_path", "output_path", "path", "full_page", "ocr", "clip", "region",
+        "expression", "script", "function", "js", "code", "await_promise",
         "return_base64", "format", "duration_ms", "ms", "state", "values", "index",
     ] {
         if let Some(v) = args.get(key) {

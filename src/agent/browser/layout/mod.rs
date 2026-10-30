@@ -41,9 +41,9 @@ use kuchikiki::NodeRef;
 
 use super::document::{self, Document};
 use super::images::ImageSizes;
-use super::render::display::{self, BgFill, DisplayItem, DisplayKind};
+use super::render::display::{self, BgFill, DisplayItem, DisplayKind, WidgetGlyphKind};
 use super::render::FontSet;
-use super::style::{Affine, BgLayer, BorderColor, ComputedStyle, MediaCtx, StyleEngine, TextShadow};
+use super::style::{Affine, BgLayer, CornerRadius, BorderColor, ComputedStyle, MediaCtx, StyleEngine, TextShadow};
 use super::urlutil;
 
 /// 测量宽度的"无穷大":超过任何真实换行阈值,用于 max-content 度量。
@@ -313,6 +313,64 @@ pub fn compute_full(
     // 阶段六:显示列表终排(z 分层 → DFS 先序 → 同元素通道序)。
     let mut display_items = std::mem::take(&mut ctx.display);
     display::sort_items(&mut display_items);
+    // 根画布背景传播(CSS 2.1 §14.2 / CSS Backgrounds 3 §2.2):根元素(html)
+    // 的背景覆盖整个画布;根背景为空时 **body 的背景上传播为画布背景**。
+    // 本布局器不给 html/body 建盒(初始包含块直接从 body 子元素起排),
+    // 两者的背景此前从不发射 → 凡是「背景写在 body/html 上」的站点
+    // (实测 zhipin 安全验证页 `body{background:var(--bg-page)}`)整页渲染
+    // 成纯白,与 Chrome 对照构成「整体白屏」观感。此处按规范补传播:
+    //   1. html 有背景色/渐变层 → 用 html 的;
+    //   2. 否则用 body 的;
+    //   3. 均无 → 不发射(维持渲染层白底基线)。
+    // 画布背景位于一切内容之下(含负 z-index 元素),以 z=i64::MIN 保证最先
+    // 绘制;高度取 max(页高, 视口高),整页截图(向下滚动区)同样铺满。
+    // 注:html 与 body 同时设置背景时,规范语义是 html 的传播、body 的画在
+    // 自身盒上;body 无盒故自身背景仍不发射(与本修复前一致,不劣化)。
+    {
+        let root_style = if html_style.background.is_some()
+            || !html_style.background_layers.is_empty()
+        {
+            Some(&html_style)
+        } else if body_style.background.is_some() || !body_style.background_layers.is_empty() {
+            Some(&body_style)
+        } else {
+            None
+        };
+        if let Some(style) = root_style {
+            let canvas_h = height.max(ctx.viewport_h);
+            let mut canvas_items: Vec<DisplayItem> = Vec::new();
+            let mut push_canvas = |fill: BgFill| {
+                canvas_items.push(DisplayItem {
+                    kind: DisplayKind::Background { fill },
+                    x: 0.0,
+                    y: 0.0,
+                    w: ctx.width,
+                    h: canvas_h,
+                    radius: [CornerRadius::Px(0.0); 4],
+                    z: i64::MIN,
+                    seq: 0,
+                    opacity: 1.0,
+                    clip: None,
+                    transform: None,
+                    fixed: false,
+                    layer: 0,
+                });
+            };
+            if let Some(bg) = style.background {
+                if style.background_alpha > 0 {
+                    push_canvas(BgFill::Solid(bg, style.background_alpha));
+                }
+            }
+            for layer in style.background_layers.iter().rev() {
+                if let BgLayer::Gradient(g) = layer {
+                    push_canvas(BgFill::Gradient(g.clone()));
+                }
+            }
+            if !canvas_items.is_empty() {
+                display_items.splice(0..0, canvas_items);
+            }
+        }
+    }
     Layout {
         lines: ctx.lines,
         boxes: ctx.boxes,

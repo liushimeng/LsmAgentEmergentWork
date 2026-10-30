@@ -910,11 +910,16 @@ fn control_node_is_selected_only_serializes_when_true() {
 }
 
 // ===================== 第 100 轮:Doom Loop 检测 =====================
+// 三场景合一个测试:doom_loop 状态是**进程级全局**,此前拆成三个 #[test]
+// 并行跑,reset/check 互相踩(2026-10-30 实测新增布局测试改变调度时序后
+// 必现竞态红)。合并为单函数内三段顺序场景,天然串行。
 
 #[test]
-fn doom_loop_triggers_on_three_identical_calls() {
+fn doom_loop_三场景_三次同参触发_异参不触发() {
     use crate::agent::tools::mcp_window_use::{doom_loop_check, doom_loop_reset};
     use serde_json::json;
+
+    // 场景 1:三次完全相同 → 第 3 次触发。
     doom_loop_reset();
     let a1 = json!({"action": "control", "window_id": "w", "path": "/0/2/1", "control_action": "click"});
     let a2 = json!({"action": "control", "window_id": "w", "path": "/0/2/1", "control_action": "click"});
@@ -928,33 +933,25 @@ fn doom_loop_triggers_on_three_identical_calls() {
     assert_eq!(sig.action, "control");
     assert!(sig.sig.contains("control"));
     assert!(sig.sig.contains("path=/0/2/1"));
-}
 
-#[test]
-fn doom_loop_does_not_trigger_for_different_paths() {
-    use crate::agent::tools::mcp_window_use::{doom_loop_check, doom_loop_reset};
-    use serde_json::json;
+    // 场景 2:不同 path 不应触发。
     doom_loop_reset();
-    let a1 = json!({"action": "control", "window_id": "w", "path": "/0/2/1", "control_action": "click"});
-    let a2 = json!({"action": "control", "window_id": "w", "path": "/0/2/2", "control_action": "click"});
-    let a3 = json!({"action": "control", "window_id": "w", "path": "/0/2/3", "control_action": "click"});
-    assert!(doom_loop_check("control", &a1).is_none());
-    assert!(doom_loop_check("control", &a2).is_none());
-    assert!(doom_loop_check("control", &a3).is_none(),
+    let b1 = json!({"action": "control", "window_id": "w", "path": "/0/2/1", "control_action": "click"});
+    let b2 = json!({"action": "control", "window_id": "w", "path": "/0/2/2", "control_action": "click"});
+    let b3 = json!({"action": "control", "window_id": "w", "path": "/0/2/3", "control_action": "click"});
+    assert!(doom_loop_check("control", &b1).is_none());
+    assert!(doom_loop_check("control", &b2).is_none());
+    assert!(doom_loop_check("control", &b3).is_none(),
         "不同 path 不应触发 Doom Loop");
-}
 
-#[test]
-fn doom_loop_does_not_trigger_for_different_actions() {
-    use crate::agent::tools::mcp_window_use::{doom_loop_check, doom_loop_reset};
-    use serde_json::json;
+    // 场景 3:不同 action 不应触发。
     doom_loop_reset();
-    let a1 = json!({"action": "control", "window_id": "w", "path": "/0", "control_action": "click"});
-    let a2 = json!({"action": "control", "window_id": "w", "path": "/0", "control_action": "click"});
-    let a3 = json!({"action": "inspect", "window_id": "w", "path": "/0", "control_action": ""});
-    assert!(doom_loop_check("control", &a1).is_none());
-    assert!(doom_loop_check("control", &a2).is_none());
-    assert!(doom_loop_check("inspect", &a3).is_none(),
+    let c1 = json!({"action": "control", "window_id": "w", "path": "/0", "control_action": "click"});
+    let c2 = json!({"action": "control", "window_id": "w", "path": "/0", "control_action": "click"});
+    let c3 = json!({"action": "inspect", "window_id": "w", "path": "/0", "control_action": ""});
+    assert!(doom_loop_check("control", &c1).is_none());
+    assert!(doom_loop_check("control", &c2).is_none());
+    assert!(doom_loop_check("inspect", &c3).is_none(),
         "不同 action 不应触发 Doom Loop");
 }
 

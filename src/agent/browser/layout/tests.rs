@@ -1864,3 +1864,89 @@ fn 猎聘卡片_height100链与显式行高不被内容撑破() {
         "公司行应整行落在卡片裁剪窗内:company={company:?} 窗底={card_content_bottom}"
     );
 }
+
+// ===================== 根画布背景传播(阶段六补,2026-10-30) =====================
+
+use super::super::render::display::BgFill;
+
+fn canvas_bg(layout: &super::Layout) -> Option<&BgFill> {
+    layout
+        .display
+        .first()
+        .filter(|it| it.z == i64::MIN)
+        .and_then(|it| match &it.kind {
+            DisplayKind::Background { fill } => Some(fill),
+            _ => None,
+        })
+}
+
+#[test]
+fn body背景上传播为画布背景() {
+    // zhipin verify 页形态:背景写在 body 上(var(--bg-page))。
+    let doc = Document::parse(
+        "<body style='background:#f5f7fa'><div>card</div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 1000.0, &font());
+    let fill = canvas_bg(&layout).expect("body 背景应传播为画布背景项");
+    match fill {
+        BgFill::Solid(rgb, a) => {
+            assert_eq!(*rgb, [245, 247, 250], "画布背景色应取 body 背景");
+            assert_eq!(*a, 255);
+        }
+        other => panic!("应为纯色填充,实际 {other:?}"),
+    }
+}
+
+#[test]
+fn 画布背景项铺满视口且位于一切之下() {
+    let doc = Document::parse(
+        "<body style='background:#eef1f5'><p>短内容</p></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 1000.0, &font());
+    let first = layout.display.first().expect("首项应为画布背景");
+    assert_eq!(first.z, i64::MIN, "画布背景应在一切内容之下");
+    assert_eq!(first.x, 0.0);
+    assert_eq!(first.y, 0.0);
+    assert!((first.w - 1000.0).abs() < 0.5, "画布宽应铺满视口");
+    assert!(first.h >= 720.0, "短页时画布高应覆盖视口(compute 缺省 720),实际 {}", first.h);
+}
+
+#[test]
+fn html背景优先于body传播() {
+    let doc = Document::parse(
+        "<html style='background:#112233'><body style='background:#445566'><p>x</p></body></html>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    match canvas_bg(&layout).expect("应有画布背景项") {
+        BgFill::Solid(rgb, _) => assert_eq!(*rgb, [0x11, 0x22, 0x33], "html 背景应优先传播"),
+        other => panic!("应为纯色填充,实际 {other:?}"),
+    }
+}
+
+#[test]
+fn 根均无背景时不发射画布项() {
+    let doc = Document::parse("<body><p>plain</p></body>", "https://a.test/");
+    let layout = compute(&doc, 800.0, &font());
+    assert!(
+        canvas_bg(&layout).is_none(),
+        "html/body 均无背景时不应有 z=i64::MIN 画布项"
+    );
+}
+
+#[test]
+fn body渐变背景传播画布() {
+    let doc = Document::parse(
+        "<body style='background:linear-gradient(180deg,#fafbfc 0,#eef1f5 100%)'><p>x</p></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 900.0, &font());
+    match canvas_bg(&layout).expect("渐变背景应传播为画布项") {
+        BgFill::Gradient(g) => {
+            assert!(g.raw.contains("linear-gradient"), "应保留渐变原文,实际 {}", g.raw);
+        }
+        other => panic!("应为渐变填充,实际 {other:?}"),
+    }
+}
