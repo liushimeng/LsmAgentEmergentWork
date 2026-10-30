@@ -21,3 +21,4 @@
 | [41-控件内置UI运行时状态与表格格式化上下文方案.md](41-控件内置UI运行时状态与表格格式化上下文方案.md) | 控件内置 UI（滑块/色块/日历/微调箭头）、运行时伪类状态（`:hover`/`:focus`）、顶层浮层（dialog + backdrop、裁剪逃逸）、表格 caption/colgroup/border-collapse、列表全类型 marker |
 | [42-控件交互语义与状态可见性修复方案.md](42-控件交互语义与状态可见性修复方案.md) | 顶层排序压过高 z、`showModal()` 可调用、`:indeterminate`、hover 祖先链 / active 释放、select 面板可选、控件固有尺寸、inspect `state` 状态总账 |
 | [44-行内原子盒基线对齐与控件视觉语义方案.md](44-行内原子盒基线对齐与控件视觉语义方案.md) | 行内原子盒(替换元素/表单控件)占宽参与断行与基线对齐、`vertical-align` 子集、段首不再下沉、控件视觉语义(disabled 灰化 / meter 分段 / progress 不确定态 / `accent-color`)、select 列表形态与 `optgroup`、`reset` 本地重置 / Esc 关 dialog / `close(returnValue)`、全量控件矩阵总账 |
+| [46-元素级滚动容器与滚动条方案.md](46-元素级滚动容器与滚动条方案.md) | `overflow:auto|scroll` 归一为可滚动容器:运行时滚动偏移(临时解析树 `data-lsm-scroll-top`)→ 内容上移 + 越界裁剪 + 滚动条 + `Layout::scroll_max`;`control(scroll, selector=…, delta_y=…)` 元素内滚动 |
