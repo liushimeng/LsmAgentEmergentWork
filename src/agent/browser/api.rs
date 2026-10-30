@@ -2055,11 +2055,35 @@ async fn act_scroll(mgr: &LsmBrowserManager, pid: &str, params: &Value) -> Engin
         .get_mut(pid)
         .ok_or_else(|| EngineError::page_not_found(pid))?;
     if let Some(sel) = p_str(params, "selector") {
-        let doc = tab_document(tab);
-        let nodes = doc.select(sel).map_err(EngineError::action_failed)?;
-        let node = nodes.get(nth(params)).ok_or_else(|| EngineError::action_failed("滚动目标未命中"))?;
-        let stable = Document::stable_selector(node);
-        if let Some((_, y, _, h)) = tab.layout.rect_for(&stable) {
+        // 文档对象不是 Send,不能跨 await 存活:取值后立刻释放。
+        let (stable, dy, cur, max, rect) = {
+            let doc = tab_document(tab);
+            let nodes = doc.select(sel).map_err(EngineError::action_failed)?;
+            let node = nodes
+                .get(nth(params))
+                .ok_or_else(|| EngineError::action_failed("滚动目标未命中"))?;
+            let stable = Document::stable_selector(node);
+            // 第 46 轮:带滚动量 → **元素内滚动**(`overflow:auto|scroll` 的容器);
+            // 只给选择器(无滚动量)→ 保持原语义「滚到视口可见处」。
+            let dy = p_f64(params, "delta_y").or_else(|| p_f64(params, "y"));
+            let cur = tab.scroll_offsets.get(&stable).copied().unwrap_or(0.0);
+            let max = tab.layout.scroll_max.get(&stable).copied().unwrap_or(0.0);
+            let rect = tab.layout.rect_for(&stable);
+            (stable, dy, cur, max, rect)
+        };
+        if let Some(dy) = dy {
+            let next = (cur + dy).clamp(0.0, max.max(0.0));
+            tab.scroll_offsets.insert(stable.clone(), next);
+            drop(inner);
+            relayout_and_push(mgr, pid).await;
+            return Ok(json!({
+                "mode": "element_scroll",
+                "selector": stable,
+                "scrollTop": next,
+                "maxScroll": max,
+            }));
+        }
+        if let Some((_, y, _, h)) = rect {
             tab.scroll_y = (y - tab.viewport.height as f64 / 3.0 + h / 2.0).max(0.0);
             if tab.mode.is_headed() {
                 mgr.push_frame(tab);

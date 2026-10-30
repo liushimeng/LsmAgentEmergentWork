@@ -44,6 +44,8 @@ pub const ATTR_PSEUDO_ACTIVE: &str = "data-lsm-active";
 
 /// `select` 展开态标记(内核私有):布局层据此铺出浮层 option 面板。
 pub const ATTR_SELECT_OPEN: &str = "data-lsm-select-open";
+/// 第 46 轮:元素级滚动偏移的内核私有标记(落到临时解析树,不入页面 HTML)。
+pub const ATTR_SCROLL_TOP: &str = "data-lsm-scroll-top";
 
 /// inspect(elements) 与交互候选集的默认选择器唯一真源。
 ///
@@ -193,6 +195,26 @@ impl Document {
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// 第 46 轮:元素级滚动偏移 → 临时解析树的 `data-lsm-scroll-top` 属性。
+    ///
+    /// 布局层据此把可滚动容器的内容上移(内容高超出盒高时按偏移滚动),
+    /// 与页面级 `scroll_y` 的口径一致(布局期就把偏移烘进坐标)。
+    pub fn apply_scroll_state(&mut self, scroll_offsets: &HashMap<String, f64>) {
+        for (sel, top) in scroll_offsets {
+            let Ok(nodes) = self.select(sel) else {
+                continue;
+            };
+            let Some(node) = nodes.first() else {
+                continue;
+            };
+            let Some(el) = node.as_element() else {
+                continue;
+            };
+            let mut attrs = el.attributes.borrow_mut();
+            attrs.insert(ATTR_SCROLL_TOP, format!("{top}"));
         }
     }
 

@@ -708,6 +708,7 @@ mod tests {
             viewport: Viewport { width: 800, height: 600, device_scale_factor: 1.0, mobile: false },
             scroll_x: 0.0,
             scroll_y: 0.0,
+            scroll_offsets: std::collections::HashMap::new(),
             network: vec![],
             console: vec![],
             form_values: Default::default(),
