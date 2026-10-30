@@ -1657,12 +1657,18 @@ impl<'a> LayoutCtx<'a> {
                 } else {
                     UNKNOWN_CB_H
                 };
-                let child_cb = (
-                    bx + style.padding_left + marker_inset,
-                    start_y + style.padding_top,
-                    (bw - style.padding_left - style.padding_right - marker_inset).max(0.0),
-                    cb_h,
-                );
+                let child_cb = if style.pos.position == "static" && style.transform.is_none() {
+                    // static 父盒不为 absolute 后代建立包含块:x/y/宽继续沿用
+                    // 最近定位祖先;高度仍按本盒内容高供普通百分比高度求解。
+                    (cb.0, cb.1, cb.2, cb_h)
+                } else {
+                    (
+                        bx + style.padding_left + marker_inset,
+                        start_y + style.padding_top,
+                        (bw - style.padding_left - style.padding_right - marker_inset).max(0.0),
+                        cb_h,
+                    )
+                };
                 // 第 46 轮:可滚动容器(`overflow:auto|scroll`)—— 内容按运行时
                 // 滚动偏移上移(偏移量落在临时解析树的 `data-lsm-scroll-top`),
                 // 超出盒高的部分由祖先裁剪链裁掉(见 `apply_group`)。
