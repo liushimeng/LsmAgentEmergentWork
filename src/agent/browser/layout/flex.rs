@@ -11,7 +11,7 @@ use super::super::document::{self, Document};
 use super::super::style::{ComputedStyle, FlexWrap};
 use super::{
     append, constrain_height, style_visible, translate, ElementBox, Fragment, LayoutCtx, PaintBox, PaintKind,
-    MAX_CONTENT_WIDTH,
+    TextDecor, MAX_CONTENT_WIDTH,
 };
 
 /// Flex 条目:元素子节点或匿名文本段。
@@ -233,7 +233,7 @@ pub(crate) fn layout_content(
     let gap_cross = if row { style.flex.row_gap } else { style.flex.col_gap };
 
     // 1. 收集条目(元素 + 匿名文本段);脱离流定位元素延后到条目之后。
-    let mut items = collect_items(ctx, node, style);
+    let mut items = collect_items(ctx, node, style, content_w);
     let deferred = std::mem::take(&mut items.1);
     let mut items = items.0;
     if items.is_empty() {
@@ -451,7 +451,8 @@ fn collect_items(
     ctx: &mut LayoutCtx,
     node: &NodeRef,
     style: &ComputedStyle,
-) -> (Vec<Item>, Vec<(NodeRef, ComputedStyle)>) {
+    content_w: f64,
+) -> (Vec<Item>, Vec<super::DeferredBox>) {
     let mut items = Vec::new();
     let mut deferred = Vec::new();
     let mut pending_text = String::new();
@@ -470,12 +471,17 @@ fn collect_items(
         if child.as_element().is_none() {
             continue;
         }
-        let cs = ctx.style_for(&child, style);
+        let cs = ctx.style_for(&child, style, content_w);
         if cs.display == "none" {
             continue;
         }
         if matches!(cs.pos.position.as_str(), "absolute" | "fixed") {
-            deferred.push((child.clone(), cs));
+            deferred.push(super::DeferredBox {
+                node: child.clone(),
+                static_x: cs.margin_left,
+                static_y: ctx.cursor_y() + cs.margin_top,
+                style: cs,
+            });
             continue;
         }
         if !pending_text.is_empty() {
@@ -887,7 +893,9 @@ pub(crate) fn text_fragment(ctx: &mut LayoutCtx, text: &str, cs: &ComputedStyle,
                 color: cs.color,
                 bold,
                 visible,
-            });
+                decor: TextDecor::default(),
+    highlight: None,
+});
             y += line_height;
             cur_w = 0.0;
         }
@@ -903,7 +911,9 @@ pub(crate) fn text_fragment(ctx: &mut LayoutCtx, text: &str, cs: &ComputedStyle,
             color: cs.color,
             bold,
             visible,
-        });
+            decor: TextDecor::default(),
+    highlight: None,
+});
         y += line_height;
     }
     Fragment {

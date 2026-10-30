@@ -58,6 +58,8 @@ LsmAgentBrowser 已有「HTML 解析 → CSS 计算 → 布局 → 显示列表 
 | 文件选择器 | act_upload 记录路径到 form_values | 按钮/文本框几何 | 🟡 | 不读真实文件系统、不显示文件列表 |
 | 滑块/颜色选择器 | min/max/step/value 属性保真 | 通用盒 | 🟡 | 无滑块轨道/拇指、颜色 swatch |
 | 输出框/output | DOM/文本 | inline 盒 | 🟡 | 无 for 关联即时计算 |
+| fieldset/legend | ✅（第 48 轮） | fieldset UA 边框+padding；legend 块级化；legend 嵌边为近似 |
+| label | 🟡 | 可寻址、参与 accessible name；点击不转发到关联控件 |
 
 ### 2. 语义化展示控件
 
@@ -66,10 +68,10 @@ LsmAgentBrowser 已有「HTML 解析 → CSS 计算 → 布局 → 显示列表 
 | h1~h6、p、行内容器、超链接、strong/em | ✅ | 块/行内排版、文本换行、链接可寻址 |
 | 引用块、预格式化、行内代码、代码块 | ✅/🟡 | pre/code 等宽字体；无语法高亮 |
 | ul/ol/li | 🆕 | ul disc、ol decimal、`list-style-type:none`；无 `::marker`、CSS counter、reversed |
-| dl/dt/dd | 🟡 | 普通块级堆叠，无浏览器默认缩进语义 |
-| mark、abbr、分隔线、换行符 | ✅/🟡 | 基础文本/块级几何 |
+| dl/dt/dd | 🟡→✅（第 48 轮） | 普通块级堆叠；dd 补 UA 40px 缩进 |
+| mark、abbr、分隔线、换行符 | ✅（第 48 轮） | mark 高亮背景；abbr 虚线下划线；del/ins/u 语义装饰线；hr 不再 0 高 |
 | table/thead/tbody/tfoot/tr/td/th | 🆕 | 真实行列网格、自动列宽、受控 colspan/rowspan；见下节 |
-| details/summary | 🆕 | 关闭只显示 summary，summary 点击切换；无动画 |
+| details/summary | 🆕→✅（第 48 轮） | 关闭只显示 summary，summary 点击切换；补 disclosure triangle；无动画 |
 | dialog | 🟡 | 无 `open` 不渲染，有 `open` 显示；无 top-layer、::backdrop、焦点圈禁 |
 | template | ✅ | 不渲染、不进可见快照 |
 | slot | 🟡 | 当普通容器；无 Web Components 分发语义 |
@@ -79,14 +81,14 @@ LsmAgentBrowser 已有「HTML 解析 → CSS 计算 → 布局 → 显示列表 
 | 控件 | 状态 | 说明/边界 |
 | --- | --- | --- |
 | 图片 | ✅ | HTTP/data 预取解码、固有尺寸、object-fit、截图 |
-| 响应式图片 srcset/picture | ⛔ | 属性已保真，但无候选选择算法/currentSrc |
+| 响应式图片 srcset/picture | ✅（第 45 轮） | 候选选择算法 + currentSrc 已落地 |
 | 图片 alt | 🟡 | 可访问名用 alt；加载失败不画可见 alt 文本 |
 | 画布 canvas | 🆕/✅ | HTML width/height/缺省 300×150 进布局；已有 RGBA 矩形/像素读写/PNG 回写 |
 | Canvas 高级 2D | ⛔ | 路径、文字、渐变、远程图片入 Canvas、WebGL 未实现 |
-| 矢量图形 svg | 🟡 | width/height/viewBox 固有几何；不光栅化 path/text/gradient |
-| 视频/音频/字幕轨道 | ⛔ | 仅 DOM/JS 构造器外壳，无解码、poster、controls、播放状态 |
-| 内联框架 iframe | 🟡 | 无尺寸缺省 300×150 占位；不加载/渲染子文档 |
-| 嵌入对象/参数/object/embed | ⛔/🟡 | 通用替换盒/文本退化，不执行插件 |
+| 矢量图形 svg | 🟡→✅（第 48 轮） | 固有几何 + MediaFrameNote 占位；仍不光栅化 path/text/gradient |
+| 视频/音频/字幕轨道 | 🟡→✅（第 48 轮） | video/object/embed 替换式几何 + poster/data/src 预取 + 占位框；无解码/controls/播放状态；source/track 计入结构内容 |
+| 内联框架 iframe | 🟡→✅（第 48 轮） | 缺省 300×150 + MediaFrameNote 占位；不加载/渲染子文档 |
+| 嵌入对象/参数/object/embed | 🟡→✅（第 48 轮） | 替换式几何 + data/src 预取 + 占位框；不执行插件 |
 
 ### 4. 容器与布局控件
 
@@ -94,9 +96,10 @@ LsmAgentBrowser 已有「HTML 解析 → CSS 计算 → 布局 → 显示列表 
 | --- | --- | --- |
 | div/section/article/aside/header/footer/main/nav/address/figure/figcaption | ✅/🟡 | 块级容器与文本流；无 UA 专属微语义 |
 | 盒模型 | ✅/🟡 | 项目默认 border-box 语义；百分比/包含块已有近似，非完整 CSS 盒模型 |
-| 正常流/Flex/Grid/浮动/定位 | ✅/🟡 | Flex/Grid/Float/absolute/fixed 已有；sticky 只按 relative，inline-flex 内部退化 |
+| 正常流/Flex/Grid/浮动/定位 | ✅/🟡 | Flex/Grid/Float/absolute/fixed 已有；第 48 轮补 absolute 静态位置；sticky 仍只按 relative，inline-flex 内部退化 |
 | 堆叠与溢出 | 🟡 | z-index/opacity/transform/overflow 有近似；无完整层叠上下文、滚动条、负 z-index 语义 |
 | 表单控件 display:block | 🆕 | 保留替换式固有尺寸，不再退化成 0 高全宽块 |
+| 文本装饰/语义高亮 | ✅（第 48 轮） | del/ins/u/abbr/mark 语义装饰 + CSS `text-decoration` 子集；address 斜体仍缺字形链 |
 
 ### 5. 脚本动态生成控件
 
@@ -140,6 +143,7 @@ LsmAgentBrowser 已有「HTML 解析 → CSS 计算 → 布局 → 显示列表 
 | --- | --- | --- |
 | 文档 | `src/agent/browser/document.rs::tests` | 语义属性序列化保真 |
 | 布局 | `src/agent/browser/layout/form_widget_tests.rs` | 运行时值、checkbox/radio/select/textarea、details/dialog、Canvas、marker、progress/meter |
+| 媒体/语义（第 48 轮） | `src/agent/browser/layout/media_embed_tests.rs` | video/object/embed 几何、poster 预取、MediaFrameNote、del/ins 装饰、hr 非 0 高、mark 高亮 |
 | 表格 | `src/agent/browser/layout/table_tests.rs` | 行列对齐、colspan/rowspan、非法跨距、单元格块级内容 |
 | 样式 | `src/agent/browser/style/state_tests.rs` | checked/disabled、details 抑制、option/datalist 隐藏 |
 | 渲染 | `src/agent/browser/render/widget_tests.rs` | WidgetGlyph 真实像素 |
@@ -159,8 +163,8 @@ cargo test --no-fail-fast
 ## 六、后续路线
 
 1. select 原生弹层/multiple、date/color/range 专用 UI。
-2. `srcset/picture` 候选选择与 `currentSrc`。
+2. ~~`srcset/picture` 候选选择与 `currentSrc`~~（第 45 轮已完成）。
 3. `border-collapse`/caption/colgroup/百分比列宽的完整表格算法。
 4. dialog top-layer/::backdrop/焦点圈禁。
-5. SVG 子集光栅化、video poster 静态显示、iframe 子文档隔离。
-6. Shadow DOM 与动画帧同步。
+5. SVG 子集光栅化；video poster 静态显示与 iframe 子文档隔离（poster/占位第 48 轮已落地，子文档隔离仍非目标）。
+6. Shadow DOM 与动画帧同步；sticky 真吸附。

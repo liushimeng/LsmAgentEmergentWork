@@ -207,6 +207,23 @@ pub fn collect_image_urls(html: &str, base_url: &str, viewport_width: f64) -> Ve
             }
         }
     }
+    // 第 48 轮:媒体/嵌入图源。`video[poster]` 是最常见的播放器首帧;
+    // `object[data]`/`embed[src]` 在站点用它们兜底图片时同样需要预取。
+    for node in doc
+        .select("video[poster], object[data], embed[src]")
+        .unwrap_or_default()
+    {
+        let attr = if document::tag_name(&node).eq_ignore_ascii_case("video") {
+            "poster"
+        } else if document::tag_name(&node).eq_ignore_ascii_case("object") {
+            "data"
+        } else {
+            "src"
+        };
+        if let Some(raw) = document::attr(&node, attr) {
+            push(&raw, &mut out);
+        }
+    }
     out
 }
 

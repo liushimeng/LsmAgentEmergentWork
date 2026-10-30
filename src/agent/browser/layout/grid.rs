@@ -164,7 +164,7 @@ pub(crate) fn layout_content(
     if depth > 60 {
         return 0.0;
     }
-    let (mut items, deferred) = collect_items(ctx, node, style);
+    let (mut items, deferred) = collect_items(ctx, node, style, content_w);
     if items.is_empty() {
         if !deferred.is_empty() {
             let pad_cb = (
@@ -285,7 +285,8 @@ fn collect_items(
     ctx: &mut LayoutCtx,
     node: &NodeRef,
     style: &ComputedStyle,
-) -> (Vec<Item>, Vec<(NodeRef, ComputedStyle)>) {
+    content_w: f64,
+) -> (Vec<Item>, Vec<super::DeferredBox>) {
     let mut items = Vec::new();
     let mut deferred = Vec::new();
     let mut pending_text = String::new();
@@ -304,12 +305,17 @@ fn collect_items(
         if child.as_element().is_none() {
             continue;
         }
-        let cs = ctx.style_for(&child, style);
+        let cs = ctx.style_for(&child, style, content_w);
         if cs.display == "none" {
             continue;
         }
         if matches!(cs.pos.position.as_str(), "absolute" | "fixed") {
-            deferred.push((child.clone(), cs));
+            deferred.push(super::DeferredBox {
+                node: child.clone(),
+                static_x: cs.margin_left,
+                static_y: ctx.cursor_y() + cs.margin_top,
+                style: cs,
+            });
             continue;
         }
         if !pending_text.is_empty() {

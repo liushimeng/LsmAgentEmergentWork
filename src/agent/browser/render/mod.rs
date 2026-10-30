@@ -308,6 +308,8 @@ impl FontSet {
                     ),
                     DisplayKind::TextShadow { .. } => "textshadow".to_string(),
                     DisplayKind::CanvasNote { .. } => "canvasnote".to_string(),
+                    DisplayKind::MediaFrameNote { tag, .. } => format!("mediaframe({tag})"),
+                    DisplayKind::TextDecor { kind, .. } => format!("textdecor({kind:?})"),
                     DisplayKind::WidgetGlyph { glyph, open, color } => {
                         format!("widget({glyph:?},open={open},color={color:?})")
                     }

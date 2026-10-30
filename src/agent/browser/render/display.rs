@@ -61,6 +61,17 @@ pub enum DisplayKind {
     /// canvas 区域占位说明块(尚无像素,或使用的 2D 路径/WebGL 能力未实现)。
     /// `pale`:元素自身无背景时先铺淡底(与旧渲染一致)。
     CanvasNote { pale: bool },
+    /// 第 48 轮:媒体/嵌入空盒占位(iframe/svg/video/object/embed)。
+    ///
+    /// 内核不加载子文档/不解码音视频/无 SVG 光栅化;无像素时必须画
+    /// 「能力边界占位」而不是白板,否则截图取证与坐标点击无法区分
+    /// 「未实现」与「页面本身空白」。
+    MediaFrameNote { pale: bool, tag: String },
+    /// 第 48 轮:文本装饰线(删除线/下划线/虚线下划线)。
+    TextDecor {
+        kind: TextDecorKind,
+        color: [u8; 3],
+    },
     /// 原生控件几何图元:勾/圆点/箭头/列表圆点。用几何光栅而非字体字形,
     /// 避免跨平台字体缺字导致豆腐块。
     ///
@@ -71,6 +82,14 @@ pub enum DisplayKind {
         open: bool,
         color: [u8; 3],
     },
+}
+
+/// 文本装饰线类型(第 48 轮)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextDecorKind {
+    StrikeThrough,
+    Underline,
+    DottedUnderline,
 }
 
 /// 控件图元类型。
@@ -151,9 +170,10 @@ impl DisplayItem {
             DisplayKind::Shadow { .. } => 0,
             DisplayKind::Background { .. } => 1,
             DisplayKind::Border { .. } => 2,
-            DisplayKind::CanvasNote { .. } => 3,
+            DisplayKind::CanvasNote { .. } | DisplayKind::MediaFrameNote { .. } => 3,
             DisplayKind::WidgetGlyph { .. } => 4,
             DisplayKind::Image { .. } => 5,
+            DisplayKind::TextDecor { .. } => 8,
             DisplayKind::TextShadow { .. } => 6,
             DisplayKind::Text { .. } => 7,
         }

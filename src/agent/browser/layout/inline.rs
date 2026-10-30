@@ -18,6 +18,10 @@
 //! - **窄容器换行**:断行后清零待入段宽(`seg_w`)、词界回退断行。
 
 use super::inline_atomic::{AtomicKind, InlineAtomic, VAlign};
+use super::super::render::display::WidgetGlyphKind;
+use super::super::render::display::DisplayKind;
+use super::super::render::display::DisplayItem;
+use super::super::style::CornerRadius;
 use super::*;
 
 /// 行内**片段盒**属主(第 47 轮):文本 run 的最内层普通行内元素。
@@ -111,6 +115,8 @@ pub(crate) struct InlineBuf {
     runs: Vec<InlineRun>,
     /// 行内原子盒(第 44 轮):替换元素与表单控件,参与行宽与基线计算。
     pub(super) atomics: Vec<InlineAtomic>,
+    /// 第 48 轮:`mark` 空文本 run 的 (order, 期望宽度)。
+    mark_widths: Vec<(u64, f64)>,
     /// 收集顺序计数器:文本 run 与原子盒共用,保证二者在行内的先后关系。
     order: u64,
     pub(super) chars: usize,
@@ -132,6 +138,10 @@ struct InlineRun {
     transform: Option<Affine>,
     /// 行内样式携带的 text-shadow 层。
     text_shadow: Vec<TextShadow>,
+    /// 第 48 轮:文本装饰线。
+    decor: super::TextDecor,
+    /// 第 48 轮:语义高亮背景(`mark`)。
+    highlight: Option<([u8; 3], u8)>,
     /// 收集顺序(与原子盒共用序号)。
     order: u64,
     /// 已「封口」:其后不允许再并入同风格文本(原子盒前后不得合并,
@@ -158,6 +168,31 @@ impl InlineBuf {
         text_shadow: Vec<TextShadow>,
         owner: Option<InlineOwner>,
     ) {
+        self.push_styled_decor(
+            text,
+            st,
+            x_base,
+            transform,
+            text_shadow,
+            owner,
+            TextDecor::default(),
+            None,
+        );
+    }
+
+    /// 带装饰/高亮的文本 run 收集(第 48 轮)。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn push_styled_decor(
+        &mut self,
+        text: &str,
+        st: &ComputedStyle,
+        x_base: f64,
+        transform: Option<Affine>,
+        text_shadow: Vec<TextShadow>,
+        owner: Option<InlineOwner>,
+        decor: super::TextDecor,
+        highlight: Option<([u8; 3], u8)>,
+    ) {
         self.chars += text.chars().count();
         let size = st.font_size;
         let bold = st.font_weight >= 600;
@@ -178,6 +213,8 @@ impl InlineBuf {
                 && last.preserve == preserve
                 && last.transform == transform
                 && last.text_shadow == text_shadow
+                && last.decor == decor
+                && last.highlight == highlight
                 && last.owner == owner
             {
                 last.text.push_str(text);
@@ -201,6 +238,8 @@ impl InlineBuf {
             preserve,
             transform,
             text_shadow,
+            decor,
+            highlight,
             order,
             sealed: false,
             owner,
@@ -241,6 +280,8 @@ impl InlineBuf {
             preserve: false,
             transform: None,
             text_shadow: Vec::new(),
+            decor: super::TextDecor::default(),
+            highlight: None,
             order,
             sealed: false,
             owner: None,
@@ -272,10 +313,42 @@ impl InlineBuf {
             preserve: false,
             transform: None,
             text_shadow: Vec::new(),
+            decor: super::TextDecor::default(),
+            highlight: None,
             order,
             sealed: false,
             owner: None,
         });
+    }
+
+    /// 第 48 轮:`mark` 空文本高亮 run —— 只发射背景,不产生文字。
+    pub(crate) fn push_mark(&mut self, st: &ComputedStyle, x_base: f64, w: f64) {
+        let order = self.next_order();
+        self.runs.push(InlineRun {
+            text: String::new(),
+            x: x_base + st.margin_left + st.padding_left,
+            size: st.font_size.max(8.0),
+            color: st.color,
+            bold: st.font_weight >= 600,
+            line_height: if st.line_height > 0.0 {
+                st.line_height
+            } else {
+                st.font_size * 1.45
+            },
+            visible: true,
+            align: st.text_align.clone(),
+            wrap: false,
+            preserve: false,
+            transform: None,
+            text_shadow: Vec::new(),
+            decor: super::TextDecor::default(),
+            highlight: Some(([255, 235, 130], 235)),
+            order,
+            sealed: false,
+            owner: None,
+        });
+        // 记录本 mark run 的零宽占位:flush 时按给定宽度画高亮背景。
+        self.mark_widths.push((order, w));
     }
 }
 
@@ -351,9 +424,10 @@ impl<'a> LayoutCtx<'a> {
             }
         }
         self.commit_line(&mut line, max_w, items);
-        // 缓冲已排空:文本 run 与原子盒都消费掉(否则下一次 flush 会重复排布)。
+        // 缓冲已排空:文本 run、原子盒与 mark 宽度都消费掉(否则下一次 flush 会重复排布)。
         buf.runs.clear();
         buf.atomics.clear();
+        buf.mark_widths.clear();
         buf.chars = 0;
     }
 
@@ -365,10 +439,24 @@ impl<'a> LayoutCtx<'a> {
         line: &mut LineState,
         max_w: f64,
     ) {
-        // 空文本占位 run:只用于预留行高,不产出文本。
+        // 空文本占位 run:预留行高;若带 mark 高亮,仍按登记宽度画背景。
         if run.text.is_empty() {
             line.ascent = line.ascent.max(run.size);
             line.descent = line.descent.max((run.line_height - run.size).max(0.0));
+            if let Some((_, w)) = items
+                .mark_widths
+                .iter()
+                .find(|(order, _)| *order == run.order)
+                .copied()
+            {
+                line.segs.push(Seg {
+                    text: String::new(),
+                    x: run.x,
+                    w,
+                    run: run.clone(),
+                });
+                line.flow_x = run.x + w;
+            }
             return;
         }
         let size = run.size.max(8.0);
@@ -540,7 +628,7 @@ impl<'a> LayoutCtx<'a> {
             } else {
                 seg.text.clone()
             };
-            if content.is_empty() {
+            if content.is_empty() && seg.run.highlight.is_none() {
                 continue;
             }
             emitted += 1;
@@ -563,6 +651,8 @@ impl<'a> LayoutCtx<'a> {
                 color: seg.run.color,
                 bold: seg.run.bold,
                 visible: seg.run.visible,
+                decor: seg.run.decor,
+                highlight: seg.run.highlight,
             };
             // 阶段六:文本显示项(flush 时取新 seq → 与前后块级兄弟正确分层)。
             self.emit_text(&text_line, seg.run.transform.clone(), &seg.run.text_shadow);
@@ -1057,7 +1147,7 @@ impl<'a> LayoutCtx<'a> {
             buf.force_break();
             return;
         }
-        if matches!(tag.as_str(), "img" | "svg" | "canvas" | "iframe") {
+        if super::helpers::is_replaced_tag_name(&tag) {
             let (iw, ih, _isrc) = self.replaced_size(node, style, avail_w, None);
             let atomic = InlineAtomic::new(
                 node.clone(),
@@ -1152,7 +1242,18 @@ impl<'a> LayoutCtx<'a> {
             box_w = w;
             inner_x = bx - style.margin_left - style.padding_left;
         }
+        // 第 48 轮:`mark` 子树为空时仍画高亮底(浏览器默认 UA 背景)。
+        if document::tag_name(node).eq_ignore_ascii_case("mark") && !node.children().any(|c| {
+            c.as_text()
+                .map(|t| !t.borrow().trim().is_empty())
+                .unwrap_or_else(|| c.as_element().is_some())
+        }) {
+            let w = self.inline_container_max_content(node, style);
+            buf.push_mark(style, inner_x, w);
+            return;
+        }
         // 表单控件文本/内置 UI 已由 `emit_form_control_text` 全权绘制,子文本
+
         // 不能再进普通行内缓冲 —— 否则 button/textarea 内容画两遍,textarea
         // 初始文本还会脱离控件盒溢出(第 42 轮)。
         // 行内块/控件盒为子代建立独立行内上下文(浮动不越出该盒),子代几何
@@ -1198,13 +1299,17 @@ impl<'a> LayoutCtx<'a> {
                 if !raw.trim().is_empty() {
                     // pen = 本元素当前游标;push_styled 再加自身
                     // margin+padding 得文本内容起点。
-                    buf.push_styled(
+                    let decor = merged_text_decor(style, node);
+                    let highlight = semantic_highlight(node);
+                    buf.push_styled_decor(
                         &raw,
                         style,
                         pen,
                         tf,
                         style.text_shadow.clone(),
                         owner.clone(),
+                        decor,
+                        highlight,
                     );
                     // 文本推进游标但不越出可用右缘(同块级分支)。
                     let tw = self.font.text_width(&raw, style.font_size);
@@ -1215,7 +1320,8 @@ impl<'a> LayoutCtx<'a> {
             if child.as_element().is_none() {
                 continue;
             }
-            let child_style = self.engine.computed(&child, style);
+            let mut child_style = self.engine.computed(&child, style);
+            child_style.resolve_padding_percent(avail_w);
             if child_style.display == "none" {
                 continue;
             }
@@ -1227,10 +1333,7 @@ impl<'a> LayoutCtx<'a> {
             // 第 44 轮:行内替换元素(<img>/<svg>/<canvas>/<iframe>)走**行内原子盒**
             // 路径 —— 参与行宽、断行与基线对齐(此前只抬高行高,宽度不占位、
             // 盒顶对齐行顶,且换行后仍停在段首)。
-            if matches!(
-                tag.to_ascii_lowercase().as_str(),
-                "img" | "svg" | "canvas" | "iframe"
-            ) {
+            if super::helpers::is_replaced_tag_name(&tag) {
                 let (iw, ih, _isrc) = self.replaced_size(&child, &child_style, avail_w, None);
                 let atomic = InlineAtomic::new(
                     child.clone(),
@@ -1273,6 +1376,31 @@ impl<'a> LayoutCtx<'a> {
             // (文本自身经 buf 流动,推进只为让**后续盒**落在文本之后;
             // 空/隐身元素推进 0,与 font-size:0 去缝容器语义一致)。
             let is_box_child = self.inline_box_worthy(&child, &child_style);
+            if tag.eq_ignore_ascii_case("summary") {
+                // 第 48 轮:summary 展开/折叠指示三角(浏览器 UA 语义)。
+                let tri = 12.0f64.min(child_style.font_size);
+                let open = document::attr(&child, "open").is_some();
+                let seq = self.next_seq();
+                self.display.push(DisplayItem {
+                    kind: DisplayKind::WidgetGlyph {
+                        glyph: WidgetGlyphKind::Caret,
+                        open,
+                        color: child_style.color,
+                    },
+                    x: child_x,
+                    y: self.y,
+                    w: tri,
+                    h: tri,
+                    radius: [CornerRadius::Px(0.0); 4],
+                    z: child_style.pos.z_index.max(self.z_floor),
+                    seq,
+                    opacity: child_style.opacity,
+                    clip: None,
+                    transform: tf,
+                    fixed: self.fixed_depth > 0,
+                    layer: self.layer_for(&child_style),
+                });
+            }
             self.collect_inline(&child, &child_style, buf, depth + 1, child_x, avail_w, tf, row);
             if is_box_child {
                 let (w, _h) = self.inline_box_size(&child, &child_style, avail_w);

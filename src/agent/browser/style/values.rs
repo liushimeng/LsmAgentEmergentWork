@@ -84,6 +84,9 @@ pub struct ComputedStyle {
     pub padding_right: f64,
     pub padding_bottom: f64,
     pub padding_left: f64,
+    /// 四侧 padding 的百分比原值(top/right/bottom/left)。CSS 百分比 padding
+    /// 一律相对包含块宽度,布局期按真实父宽求解,不能提前按视口宽猜值。
+    pub padding_percent: [Option<f64>; 4],
     pub width: Option<f64>,
     pub max_width: Option<f64>,
     pub min_width: Option<f64>,
@@ -467,6 +470,7 @@ impl Default for ComputedStyle {
             padding_right: 0.0,
             padding_bottom: 0.0,
             padding_left: 0.0,
+            padding_percent: [None; 4],
             width: None,
             max_width: None,
             min_width: None,
@@ -512,6 +516,20 @@ impl ComputedStyle {
             display: "block".to_string(),
             box_sizing_content: true,
             ..Default::default()
+        }
+    }
+
+    /// 用真实包含块宽度解析百分比 padding;保留百分比原值以便重排时重算。
+    pub fn resolve_padding_percent(&mut self, containing_width: f64) {
+        for (slot, pct) in [
+            (&mut self.padding_top, self.padding_percent[0]),
+            (&mut self.padding_right, self.padding_percent[1]),
+            (&mut self.padding_bottom, self.padding_percent[2]),
+            (&mut self.padding_left, self.padding_percent[3]),
+        ] {
+            if let Some(p) = pct {
+                *slot = (p / 100.0 * containing_width).max(0.0);
+            }
         }
     }
 
@@ -815,6 +833,7 @@ const BLOCK_TAGS: &[&str] = &[
     "figure",
     "figcaption",
     "fieldset",
+    "legend",
     "address",
     "hr",
     "details",
@@ -925,6 +944,53 @@ pub fn ua_default(tag: &str, parent: &ComputedStyle) -> ComputedStyle {
             st.border_colors = [BorderColor::Rgba([118, 118, 118], 255); 4];
             st.background = Some([255, 255, 255]);
         }
+        // 第 48 轮:此前 `hr` 走通用块级路径时 content_h=0 且无边框,
+        // 水平线整条不可见;fieldset 无 UA 边框、legend 仍按 inline 排版。
+        "hr" => {
+            st.border_widths = [1.0, 0.0, 0.0, 0.0];
+            st.border_drawn = [true, false, false, false];
+            st.border_colors = [BorderColor::Rgba([128, 128, 128], 255); 4];
+            st.background = Some([229, 229, 229]);
+            st.height = Some(2.0);
+            st.margin_top = 6.0;
+            st.margin_bottom = 6.0;
+        }
+        "fieldset" => {
+            st.border_widths = [1.0; 4];
+            st.border_drawn = [true; 4];
+            st.border_colors = [BorderColor::Rgba([128, 128, 128], 255); 4];
+            st.padding_top = 8.0;
+            st.padding_right = 8.0;
+            st.padding_bottom = 8.0;
+            st.padding_left = 8.0;
+            st.margin_top = 8.0;
+            st.margin_bottom = 8.0;
+        }
+        "legend" => {
+            st.padding_left = 4.0;
+            st.padding_right = 4.0;
+        }
+        "del" | "s" | "strike" => {
+            st.extra
+                .insert("text-decoration".to_string(), "line-through".to_string());
+        }
+        "u" | "ins" => {
+            st.extra
+                .insert("text-decoration".to_string(), "underline".to_string());
+        }
+        "abbr" => {
+            st.extra.insert(
+                "text-decoration".to_string(),
+                "underline dotted".to_string(),
+            );
+        }
+        "mark" => {
+            st.background = Some([255, 235, 130]);
+        }
+        "address" => {
+            // 无 italic 字形链时保留文字语义,不伪造斜体。
+            st.extra.insert("font-style".to_string(), "italic".to_string());
+        }
         _ => {}
     }
     // `list-style*` 是继承属性:从父级拷贝,否则 `ul` 上的声明传不到 `li`
@@ -942,6 +1008,15 @@ pub fn ua_default(tag: &str, parent: &ComputedStyle) -> ComputedStyle {
     if margin > 0.0 {
         st.margin_top = margin;
         st.margin_bottom = margin;
+    }
+    // 第 48 轮:UA 缺省缩进(Chrome 口径近似)。
+    match tag.as_str() {
+        "blockquote" | "figure" => {
+            st.margin_left = 40.0;
+            st.margin_right = 40.0;
+        }
+        "dd" => st.margin_left = 40.0,
+        _ => {}
     }
     if tag == "li" {
         st.margin_left = 20.0;
@@ -1174,10 +1249,26 @@ pub fn apply_declaration(
                 st.padding_right = r;
                 st.padding_bottom = b;
                 st.padding_left = l;
+                st.padding_percent = parse_box_percents(value);
             }
         }
         "padding-top" | "padding-right" | "padding-bottom" | "padding-left" => {
-            if let Some(v) = parse_length(value, st.font_size, ctx) {
+            let pct = parse_percent(value);
+            let idx = match key.as_str() {
+                "padding-top" => 0,
+                "padding-right" => 1,
+                "padding-bottom" => 2,
+                _ => 3,
+            };
+            st.padding_percent[idx] = pct;
+            if pct.is_some() {
+                match idx {
+                    0 => st.padding_top = 0.0,
+                    1 => st.padding_right = 0.0,
+                    2 => st.padding_bottom = 0.0,
+                    _ => st.padding_left = 0.0,
+                }
+            } else if let Some(v) = parse_length(value, st.font_size, ctx) {
                 match key.as_str() {
                     "padding-top" => st.padding_top = v.max(0.0),
                     "padding-right" => st.padding_right = v.max(0.0),
@@ -1195,7 +1286,8 @@ pub fn apply_declaration(
             st.width = if st.width_percent.is_some() {
                 None
             } else {
-                parse_length(value, st.font_size, ctx).filter(|v| *v > 0.0)
+                // 0 是合法的确定宽度,不能丢成 auto 让内容重新撑开盒。
+                parse_length(value, st.font_size, ctx)
             };
         }
         "max-width" => {
@@ -1226,7 +1318,8 @@ pub fn apply_declaration(
             st.height = if st.height_percent.is_some() {
                 None
             } else {
-                parse_length(value, st.font_size, ctx).filter(|v| *v > 0.0)
+                // height:0 常用于「零内容高 + padding 撑比例」的 Logo/卡片结构。
+                parse_length(value, st.font_size, ctx)
             };
         }
         "opacity" => {
@@ -2534,6 +2627,18 @@ fn parse_box_values(value: &str, font_size: f64, ctx: &ValueCtx) -> Vec<f64> {
             }
         })
         .collect()
+}
+
+/// 与 `expand_box` 同序保留 padding 百分比;非百分比分量留 None。
+fn parse_box_percents(value: &str) -> [Option<f64>; 4] {
+    let parts: Vec<Option<f64>> = value.split_whitespace().map(parse_percent).collect();
+    match parts.as_slice() {
+        [a] => [*a, *a, *a, *a],
+        [a, b] => [*a, *b, *a, *b],
+        [a, b, c] => [*a, *b, *c, *b],
+        [a, b, c, d] => [*a, *b, *c, *d],
+        _ => [None; 4],
+    }
 }
 
 fn expand_box(values: &[f64]) -> Option<(f64, f64, f64, f64)> {

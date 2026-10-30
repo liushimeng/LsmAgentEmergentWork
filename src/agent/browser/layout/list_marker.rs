@@ -13,7 +13,7 @@ use kuchikiki::NodeRef;
 use super::super::document;
 use super::super::render::display::WidgetGlyphKind;
 use super::super::style::ComputedStyle;
-use super::{LayoutCtx, TextLine};
+use super::{LayoutCtx, TextDecor, TextLine};
 
 /// marker 图形边长(方块/圆点/圆环)。
 const MARKER_SIZE: f64 = 10.0;
@@ -293,7 +293,9 @@ pub(crate) fn emit(
                     color: style.color,
                     bold: false,
                     visible: super::style_visible(style),
-                };
+                    decor: TextDecor::default(),
+    highlight: None,
+};
                 ctx.emit_text(&line, tf, &[]);
                 ctx.lines.push(line);
             }
@@ -331,7 +333,9 @@ pub(crate) fn emit(
                 color: style.color,
                 bold: false,
                 visible: super::style_visible(style),
-            };
+                decor: TextDecor::default(),
+    highlight: None,
+};
             ctx.emit_text(&line, tf, &[]);
             ctx.lines.push(line);
         }

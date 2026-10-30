@@ -109,13 +109,22 @@ pub(crate) fn push_border_and_shadow(
 /// 元素是否参与绘制(visibility/opacity)。
 /// 替换类标签:`<img>` 与 `<svg>`(后者按 viewBox/属性取固有尺寸)。
 pub(crate) fn is_replaced_tag(node: &NodeRef) -> bool {
+    is_replaced_tag_name(&document::tag_name(node))
+}
+
+/// 按标签名判定替换元素(供无 `NodeRef` 的调用点复用)。
+pub(crate) fn is_replaced_tag_name(tag: &str) -> bool {
     matches!(
-        document::tag_name(node).to_ascii_lowercase().as_str(),
+        tag.to_ascii_lowercase().as_str(),
         // iframe(第 174 轮):按替换元素参与布局 —— 无 CSS/属性尺寸时取
         // 浏览器建议缺省 300×150,而非塌缩 0×0(猎聘页脚 iframe 实测 0×0,
         // 坐标点击与 inspect 全部失真)。canvas 同理:HTML width/height 是
         // 位图缓冲固有尺寸,缺省 300×150。
-        "img" | "svg" | "iframe" | "canvas"
+        //
+        // 第 48 轮:video/audio/object/embed 同按替换元素处理。此前它们只在
+        // 「行内结构内容」白名单里,盒几何仍走普通行内近似(约 22×16),
+        // 带 width/height 的媒体控件会整体错位。
+        "img" | "svg" | "iframe" | "canvas" | "video" | "audio" | "object" | "embed"
     )
 }
 
@@ -125,6 +134,81 @@ pub(crate) fn is_form_control_tag(node: &NodeRef) -> bool {
         document::tag_name(node).to_ascii_lowercase().as_str(),
         "input" | "select" | "textarea" | "button" | "progress" | "meter"
     )
+}
+
+/// 可视媒体/嵌入标签:需要占位框或海报帧的替换类元素。
+pub(crate) fn is_visual_media_tag(node: &NodeRef) -> bool {
+    is_visual_media_tag_name(&document::tag_name(node))
+}
+
+/// 按标签名判定可视媒体/嵌入元素(供显示列表发射处复用)。
+pub(crate) fn is_visual_media_tag_name(tag: &str) -> bool {
+    matches!(
+        tag.to_ascii_lowercase().as_str(),
+        "video" | "object" | "embed" | "iframe" | "svg"
+    )
+}
+
+/// 带 UA 语义装饰/高亮的行内标签 → (装饰, 高亮)。
+///
+/// 第 48 轮:`del/ins/u/abbr/mark` 等此前只解析出 DOM,像素上完全没有
+/// 删除线/下划线/高亮背景,截图与真实浏览器差异明显。
+pub(crate) fn semantic_inline_decor(node: &NodeRef) -> (super::TextDecor, Option<([u8; 3], u8)>) {
+    let tag = document::tag_name(node).to_ascii_lowercase();
+    match tag.as_str() {
+        "del" | "s" | "strike" => (
+            super::TextDecor {
+                strike: true,
+                underline: false,
+                dotted_underline: false,
+            },
+            None,
+        ),
+        "u" | "ins" => (
+            super::TextDecor {
+                strike: false,
+                underline: true,
+                dotted_underline: false,
+            },
+            None,
+        ),
+        "abbr" => (
+            super::TextDecor {
+                strike: false,
+                underline: false,
+                dotted_underline: true,
+            },
+            None,
+        ),
+        "mark" => (
+            super::TextDecor::default(),
+            Some(([255, 235, 130], 235)),
+        ),
+        _ => (super::TextDecor::default(), None),
+    }
+}
+
+/// 在计算样式 `text-decoration` 基础上叠加 UA 语义装饰。
+pub(crate) fn merged_text_decor(
+    style: &ComputedStyle,
+    node: &NodeRef,
+) -> super::TextDecor {
+    let raw = style
+        .extra
+        .get("text-decoration")
+        .map(String::as_str)
+        .unwrap_or("");
+    let mut d = super::TextDecor::from_css(raw, &document::tag_name(node));
+    let (semantic, _) = semantic_inline_decor(node);
+    d.strike |= semantic.strike;
+    d.underline |= semantic.underline;
+    d.dotted_underline |= semantic.dotted_underline;
+    d
+}
+
+/// 语义高亮背景(`mark`);无则 `None`。
+pub(crate) fn semantic_highlight(node: &NodeRef) -> Option<([u8; 3], u8)> {
+    semantic_inline_decor(node).1
 }
 
 /// 行内子树是否含**结构性内容**(非空文本或可渲染元素)。
@@ -154,7 +238,7 @@ pub(crate) fn has_structural_inline_content(node: &NodeRef, depth: usize) -> boo
         if matches!(
             tag.as_str(),
             "img" | "svg" | "iframe" | "canvas" | "video" | "audio" | "object" | "embed"
-                | "input" | "select" | "textarea" | "button" | "br" | "hr"
+                | "source" | "track" | "input" | "select" | "textarea" | "button" | "br" | "hr"
         ) {
             return true;
         }

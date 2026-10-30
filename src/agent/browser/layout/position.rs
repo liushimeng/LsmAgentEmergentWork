@@ -8,17 +8,17 @@ use kuchikiki::NodeRef;
 
 use super::super::document::{self, Document};
 use super::super::style::ComputedStyle;
-use super::{style_visible, translate, ElementBox, LayoutCtx, PaintBox, PaintKind, UNKNOWN_CB_H};
+use super::{style_visible, translate, DeferredBox, ElementBox, LayoutCtx, PaintBox, PaintKind, UNKNOWN_CB_H};
 
 /// 布置一批延后处理的脱离流元素。
 pub(crate) fn layout_deferred(
     ctx: &mut LayoutCtx,
-    deferred: Vec<(NodeRef, ComputedStyle)>,
+    deferred: Vec<DeferredBox>,
     cb: (f64, f64, f64, f64),
     depth: usize,
 ) {
-    for (node, style) in deferred {
-        layout_abs(ctx, &node, &style, cb, depth);
+    for d in deferred {
+        layout_abs(ctx, &d.node, &d.style, cb, depth, (d.static_x, d.static_y));
     }
 }
 
@@ -28,6 +28,7 @@ fn layout_abs(
     style: &ComputedStyle,
     cb: (f64, f64, f64, f64),
     depth: usize,
+    static_pos: (f64, f64),
 ) {
     if depth > 60 {
         return;
@@ -94,25 +95,28 @@ fn layout_abs(
     let content_h = (bh - pad_t - pad_b).max(1.0);
     bh = content_h + pad_t + pad_b;
 
-    // 水平:left/right 百分比相对包含块宽;都无则贴左缘(静态位置简化)。
+    // 水平:left/right 百分比相对包含块宽;都无则取静态位置(第 48 轮修正:
+    // 此前一律贴包含块左缘,无 inset 的角标/徽标整体错位)。
+    let static_x = if fixed { cx + style.margin_left } else { static_pos.0 };
     let bx = if let Some(l) = style.pos.resolved_left(cw) {
         cx + l + style.margin_left
     } else if let Some(r) = style.pos.resolved_right(cw) {
         cx + cw - r - style.margin_right - bw
     } else {
-        cx + style.margin_left
+        static_x
     };
     // 垂直:top/bottom 百分比相对包含块高,不能复用视口宽近似。
+    let static_y = if fixed { cy + style.margin_top } else { static_pos.1 };
     let by = if let Some(t) = style.pos.resolved_top(ch) {
         cy + t + style.margin_top
     } else if let Some(b) = style.pos.resolved_bottom(ch) {
         if avail_h_known {
             cy + ch - b - style.margin_bottom - bh
         } else {
-            cy + style.margin_top
+            static_y
         }
     } else {
-        cy + style.margin_top
+        static_y
     };
 
     // 自身视觉的绘制序必须**早于**子树内容(浏览器语义:元素背景画在内容之下)。

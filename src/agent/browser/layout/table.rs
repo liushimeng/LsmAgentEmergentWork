@@ -126,7 +126,7 @@ fn layout_caption(
     let Some(caption) = select_nodes(table, "caption").into_iter().next() else {
         return 0.0;
     };
-    let cap_style = ctx.style_for(&caption, table_style);
+    let cap_style = ctx.style_for(&caption, table_style, inner_w.max(1.0));
     let top = ctx.cursor_y();
     let mut frag = ctx.measure_content(&caption, inner_w.max(1.0), &cap_style, depth + 1);
     let h = frag.height;
@@ -181,14 +181,14 @@ pub(crate) fn layout_content(
     let mut occupied: HashMap<(usize, usize), bool> = HashMap::new();
     let mut n_cols = 0usize;
     for (r, row_node) in rows.iter().enumerate() {
-        let row_style = ctx.style_for(row_node, style);
+        let row_style = ctx.style_for(row_node, style, content_w);
         let mut c = 0usize;
         for cell_node in row_node.children() {
             let tag = document::tag_name(&cell_node);
             if tag != "td" && tag != "th" {
                 continue;
             }
-            let cell_style = ctx.style_for(&cell_node, &row_style);
+            let cell_style = ctx.style_for(&cell_node, &row_style, content_w);
             let col_span = clamp_span(document::attr(&cell_node, "colspan"), 16);
             let row_span = clamp_span(document::attr(&cell_node, "rowspan"), rows.len() - r);
             while occupied.get(&(r, c)).copied().unwrap_or(false) {
@@ -307,7 +307,7 @@ pub(crate) fn layout_content(
     }
     // 行盒用于 inspect/点击寻址;自身无背景时只作几何锚点。
     for (r, row_node) in rows.iter().enumerate() {
-        let row_style = ctx.style_for(row_node, style);
+        let row_style = ctx.style_for(row_node, style, content_w);
         ctx.push_box(ElementBox {
             selector: Document::stable_selector(row_node),
             tag: document::tag_name(row_node),

@@ -40,6 +40,8 @@ mod inline_fragment_tests;
 #[cfg(test)]
 mod tests_jd_display;
 #[cfg(test)]
+mod media_embed_tests;
+#[cfg(test)]
 mod tests;
 
 use std::collections::HashMap;
@@ -53,7 +55,7 @@ use kuchikiki::NodeRef;
 
 use super::document::{self, Document};
 use super::images::ImageSizes;
-use super::render::display::{self, BgFill, DisplayItem, DisplayKind, WidgetGlyphKind};
+use super::render::display::{self, BgFill, DisplayItem, DisplayKind, TextDecorKind, WidgetGlyphKind};
 use super::render::FontSet;
 use super::style::{Affine, BgLayer, CornerRadius, BorderColor, ComputedStyle, MediaCtx, StyleEngine, TextShadow};
 use super::urlutil;
@@ -64,6 +66,15 @@ pub(crate) const MAX_CONTENT_WIDTH: f64 = 100_000.0;
 /// 包含块高度未知标记:布局期父盒高度未定时使用;此时 `bottom` 锚定退化
 /// 为 `top` 语义(见设计文档"已知边界")。
 pub(crate) const UNKNOWN_CB_H: f64 = f64::MAX / 2.0;
+
+/// 延后布置的绝对/固定定位盒(第 48 轮):携带静态位置。
+#[derive(Clone)]
+pub(crate) struct DeferredBox {
+    pub node: NodeRef,
+    pub style: ComputedStyle,
+    pub static_x: f64,
+    pub static_y: f64,
+}
 
 /// 元素自身的「确定高度」:显式长度,或包含块高度确定时的百分比高度。
 ///
@@ -92,6 +103,46 @@ pub struct TextLine {
     pub bold: bool,
     /// `visibility:hidden` 的文本仍占布局空间,但不绘制。
     pub visible: bool,
+    /// 第 48 轮:文本装饰(删除线/下划线/虚线)。
+    pub decor: TextDecor,
+    /// 第 48 轮:`mark` 等语义高亮背景色。
+    pub highlight: Option<([u8; 3], u8)>,
+}
+
+/// 行内文本装饰的轻量描述。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TextDecor {
+    pub strike: bool,
+    pub underline: bool,
+    pub dotted_underline: bool,
+}
+
+impl TextDecor {
+    /// 解析 CSS `text-decoration` 简写与语义标签默认装饰。
+    pub fn from_css(raw: &str, semantic_tag: &str) -> Self {
+        let lower = raw.trim().to_ascii_lowercase();
+        let mut d = TextDecor {
+            strike: lower.split_whitespace().any(|t| t == "line-through"),
+            underline: lower.split_whitespace().any(|t| t == "underline"),
+            dotted_underline: lower.split_whitespace().any(|t| t == "dotted")
+                && lower.split_whitespace().any(|t| t == "underline"),
+        };
+        if d.dotted_underline {
+            d.underline = false;
+        }
+        match semantic_tag.to_ascii_lowercase().as_str() {
+            "del" | "s" | "strike" => d.strike = true,
+            "u" | "ins" => d.underline = true,
+            "abbr" => d.dotted_underline = true,
+            _ => {}
+        }
+        d
+    }
+
+    /// 是否需要在文字之上补画装饰线。
+    pub fn any(&self) -> bool {
+        self.strike || self.underline || self.dotted_underline
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -277,13 +328,14 @@ pub fn compute_full(
         .map(|n| n.as_node().clone())
         .unwrap_or_else(|| doc.root().clone());
     let initial = engine.initial_style();
-    let html_style = doc
+    let mut html_style = doc
         .first("html")
         .ok()
         .flatten()
         .map(|n| engine.computed(&n, &initial))
         .unwrap_or_else(|| initial.clone());
-    let body_style = engine.computed(&body, &html_style);
+    html_style.resolve_padding_percent(ctx.width);
+    let mut body_style = engine.computed(&body, &html_style);
     // 第 175 轮:初始包含块消费**真实** body margin(UA 默认 8px 仍来自样式层
     // 默认值,站点 reset margin:0 后布局应全幅)。此前硬编码 8/16,与
     // ComputedStyle 脱钩 —— 百度地图 #MapHolder 被逼到 (8,27,1904×1080),
@@ -295,6 +347,7 @@ pub fn compute_full(
     ctx.y = body_margin_top;
     let mut buf = InlineBuf::default();
     let content_width = (ctx.width - body_margin_left - body_margin_right).max(40.0);
+    body_style.resolve_padding_percent(content_width);
     // 初始包含块:整页坐标。高度传播链:视口 → html → body。
     // 百分比高度仅在包含块高度确定时生效(CSS),故 html/body 的确定高
     // 逐级解析后作为 ICB 高度;chain 任一环 auto 则 ICB 高度未知,
@@ -708,6 +761,15 @@ impl<'a> LayoutCtx<'a> {
                 pale: style.background.is_none(),
             }));
         }
+        // 第 48 轮:媒体/嵌入空盒可见化。无像素来源时给淡底虚线占位,
+        // 避免 iframe/svg/video/object/embed 只剩一块白板,坐标点击与
+        // 截图取证都无法区分「未实现能力」与「页面空白」。
+        if is_visual_media_tag_name(tag) && w >= 48.0 && h >= 28.0 {
+            self.display.push(base(DisplayKind::MediaFrameNote {
+                pale: style.background.is_none(),
+                tag: tag.to_ascii_lowercase(),
+            }));
+        }
     }
 
     /// 图像显示项发射(与平铺 `PaintBox` 并行;`opacity` 为所属元素自身透明度,
@@ -754,6 +816,54 @@ impl<'a> LayoutCtx<'a> {
             return;
         }
         let seq = self.next_seq();
+        // 第 48 轮:`mark` 语义高亮背景 + 文本装饰线。装饰线画在文字之上,
+        // 但仍在同元素 seq 通道内按 rank 排序,不与后续兄弟文本串层。
+        if let Some((rgb, alpha)) = line.highlight {
+            self.display.push(DisplayItem {
+                kind: DisplayKind::Background {
+                    fill: BgFill::Solid(rgb, alpha),
+                },
+                x: line.x,
+                y: line.y,
+                w: self.font.text_width(&line.text, line.size),
+                h: line.size * 2.0,
+                radius: [CornerRadius::Px(0.0); 4],
+                z: 0,
+                seq,
+                opacity: 1.0,
+                clip: None,
+                transform,
+                fixed: self.fixed_depth > 0,
+                layer: self.positioned_layer,
+            });
+        }
+        for kind in [
+            (line.decor.strike, TextDecorKind::StrikeThrough),
+            (line.decor.underline, TextDecorKind::Underline),
+            (line.decor.dotted_underline, TextDecorKind::DottedUnderline),
+        ] {
+            if !kind.0 {
+                continue;
+            }
+            self.display.push(DisplayItem {
+                kind: DisplayKind::TextDecor {
+                    kind: kind.1,
+                    color: line.color,
+                },
+                x: line.x,
+                y: line.y,
+                w: 0.0,
+                h: line.size * 2.0,
+                radius: [CornerRadius::Px(0.0); 4],
+                z: 0,
+                seq,
+                opacity: 1.0,
+                clip: None,
+                transform,
+                fixed: self.fixed_depth > 0,
+                layer: self.positioned_layer,
+            });
+        }
         // 阴影层(先声明在下):每层一个 TextShadow 项,排在本体之前绘制。
         // 颜色 alpha 折进项透明度(与组透明度回补乘法复合)。
         for sh in shadows {
@@ -853,9 +963,16 @@ impl<'a> LayoutCtx<'a> {
         }
     }
 
-    /// 子元素计算样式(委托样式引擎)。
-    pub(crate) fn style_for(&self, node: &NodeRef, parent: &ComputedStyle) -> ComputedStyle {
-        self.engine.computed(node, parent)
+    /// 子元素计算样式(委托样式引擎),并按真实包含块宽解析百分比 padding。
+    pub(crate) fn style_for(
+        &self,
+        node: &NodeRef,
+        parent: &ComputedStyle,
+        containing_width: f64,
+    ) -> ComputedStyle {
+        let mut style = self.engine.computed(node, parent);
+        style.resolve_padding_percent(containing_width);
+        style
     }
 
     pub(crate) fn font(&self) -> &FontSet {
@@ -914,6 +1031,34 @@ impl<'a> LayoutCtx<'a> {
         self.srcset_pick(node)
             .or_else(|| self.src_attr_abs(node))
             .or_else(|| self.lazy_attr_abs(node))
+    }
+
+    /// 媒体/嵌入元素的显示图源:`video[poster]`、`object[data]`、`embed[src]`。
+    ///
+    /// 第 48 轮:视频海报此前完全不过图片预取链,带 poster 的播放器只剩空框。
+    pub(crate) fn media_image_src(&self, node: &NodeRef) -> Option<String> {
+        let tag = document::tag_name(node).to_ascii_lowercase();
+        let attr = match tag.as_str() {
+            "video" => "poster",
+            "object" => "data",
+            "embed" => "src",
+            _ => return None,
+        };
+        let raw = document::attr(node, attr)?.trim().to_string();
+        if raw.is_empty() {
+            return None;
+        }
+        urlutil::resolve(&self.base_url, &raw)
+    }
+
+    /// 替换元素图源:图片走 srcset 链,媒体走 poster/data/src。
+    pub(crate) fn replaced_image_src(&self, node: &NodeRef) -> Option<String> {
+        let tag = document::tag_name(node).to_ascii_lowercase();
+        if tag == "img" {
+            self.image_src(node)
+        } else {
+            self.media_image_src(node)
+        }
     }
 
     /// JS 懒加载兜底(`data-src`/`data-lazyimg` 族,2026-10-30 京东):`src`
@@ -976,20 +1121,29 @@ impl<'a> LayoutCtx<'a> {
 
     /// 实际用于显示的图片地址:优先已加载的 `srcset` 候选,回落已加载的 `src`。
     pub(crate) fn image_display_src(&self, node: &NodeRef) -> Option<String> {
-        let picked = self.srcset_pick(node);
-        if let Some(abs) = picked.as_ref() {
-            if self.image_loaded(abs) {
-                return Some(abs.clone());
+        if document::tag_name(node).eq_ignore_ascii_case("img") {
+            let picked = self.srcset_pick(node);
+            if let Some(abs) = picked.as_ref() {
+                if self.image_loaded(abs) {
+                    return Some(abs.clone());
+                }
             }
-        }
-        if let Some(abs) = self.src_attr_abs(node) {
+            if let Some(abs) = self.src_attr_abs(node) {
+                if self.image_loaded(&abs) {
+                    return Some(abs);
+                }
+            }
+            picked
+                .or_else(|| self.src_attr_abs(node))
+                .or_else(|| self.lazy_attr_abs(node))
+        } else {
+            let abs = self.media_image_src(node)?;
             if self.image_loaded(&abs) {
-                return Some(abs);
+                Some(abs)
+            } else {
+                None
             }
         }
-        picked
-            .or_else(|| self.src_attr_abs(node))
-            .or_else(|| self.lazy_attr_abs(node))
     }
 
     /// 图片固有尺寸(解码后的自然宽高);未加载返回 `None`。
@@ -1006,6 +1160,13 @@ impl<'a> LayoutCtx<'a> {
             }
         }
         None
+    }
+
+    /// 媒体/嵌入固有尺寸:优先已解码的 poster/data 图,缺省 300×150。
+    pub(crate) fn media_natural_size(&self, node: &NodeRef) -> (f64, f64) {
+        self.media_image_src(node)
+            .and_then(|src| self.images.natural(&src))
+            .unwrap_or((300.0, 150.0))
     }
 
     /// 图片是否已解码(未解码不产出绘制指令)。
@@ -1035,7 +1196,7 @@ impl<'a> LayoutCtx<'a> {
     ) -> (f64, f64, Option<String>) {
         let tag = document::tag_name(node);
         let is_svg = tag.eq_ignore_ascii_case("svg");
-        let src = if is_svg { None } else { self.image_src(node) };
+        let src = if is_svg { None } else { self.replaced_image_src(node) };
         let natural = src.as_ref().and_then(|u| self.images.natural(u)).or_else(|| {
             if is_svg {
                 Some(svg_natural_size(node))
@@ -1053,6 +1214,14 @@ impl<'a> LayoutCtx<'a> {
                     .filter(|v| *v > 0.0)
                     .unwrap_or(150.0);
                 Some((aw, ah))
+            } else if tag.eq_ignore_ascii_case("video")
+                || tag.eq_ignore_ascii_case("audio")
+                || tag.eq_ignore_ascii_case("object")
+                || tag.eq_ignore_ascii_case("embed")
+            {
+                // 第 48 轮:媒体/嵌入控件同按替换元素口径。width/height 属性
+                // 仍由下方 attr_w/attr_h 统一处理,固有尺寸仅作无属性兜底。
+                Some(self.media_natural_size(node))
             } else {
                 None
             }
@@ -1168,7 +1337,7 @@ impl<'a> LayoutCtx<'a> {
             self.positioned_layer = 1;
         }
         // 阶段三:脱离流的定位元素延后到兄弟节点布置完再处理。
-        let mut deferred: Vec<(NodeRef, ComputedStyle)> = Vec::new();
+        let mut deferred: Vec<DeferredBox> = Vec::new();
         // 阶段七:本容器内的浮动台账(浮动不跨块容器)。
         let mut floats = float::FloatState::default();
         // 阶段七:本容器内联上下文共享的行占用(行内浮动跨兄弟元素排同一行)。
@@ -1188,13 +1357,17 @@ impl<'a> LayoutCtx<'a> {
                     let base = pen - current.margin_left - current.padding_left;
                     // 块级文本的行内片段盒属主恒为空:块级容器自身的背景由
                     // 块级路径发射,行内片段盒只服务**普通行内元素**(第 47 轮)。
-                    buf.push_styled(
+                    let decor = merged_text_decor(current, parent);
+                    let highlight = semantic_highlight(parent);
+                    buf.push_styled_decor(
                         &raw,
                         current,
                         base,
                         None,
                         current.text_shadow.clone(),
                         None,
+                        decor,
+                        highlight,
                     );
                     // 文本推进游标,但不越出容器内容右缘(长文本换行后,
                     // 后续行内盒最多落在右缘内,而不是被总字宽推到天边)。
@@ -1206,13 +1379,22 @@ impl<'a> LayoutCtx<'a> {
             if child.as_element().is_none() {
                 continue;
             }
-            let style = self.engine.computed(&child, current);
+            let style = self.style_for(&child, current, width);
             if style.display == "none" {
                 continue;
             }
             let selector = Document::stable_selector(&child);
             if matches!(style.pos.position.as_str(), "absolute" | "fixed") {
-                deferred.push((child.clone(), style));
+                // 第 48 轮:CSS 2.1 静态位置 —— 无 inset 时 absolute 应取
+                // 其在正常流中的位置,而不是恒贴包含块左上角。
+                let static_x = pen + style.margin_left;
+                let static_y = self.y + style.margin_top;
+                deferred.push(DeferredBox {
+                    node: child.clone(),
+                    style,
+                    static_x,
+                    static_y,
+                });
                 continue;
             }
             // 第 41 轮:模态对话框走顶层语义(视口居中 + ::backdrop),
@@ -1676,8 +1858,9 @@ impl<'a> LayoutCtx<'a> {
         if inline_bottom > self.y {
             self.y = inline_bottom;
         }
-        if !deferred.is_empty() {
+        if !deferred.is_empty() && !self.intrinsic {
             // 绝对/固定定位子树脱流:不得消费流内 pending,其内边距亦不外泄。
+            // max-content 测量更不能发射其远端坐标;脱流子树对祖先内在尺寸贡献恒为零。
             let saved_pending = std::mem::take(&mut self.pending_margin_bottom);
             position::layout_deferred(self, deferred, cb, depth);
             self.pending_margin_bottom = saved_pending;

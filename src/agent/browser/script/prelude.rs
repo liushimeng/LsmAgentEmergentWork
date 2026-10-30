@@ -2827,6 +2827,8 @@ var console = {
   error: function () { __clog("error", Array.prototype.map.call(arguments, function (x) { return __str(x); }).join(" ")); },
   debug: function () { __clog("debug", Array.prototype.map.call(arguments, function (x) { return __str(x); }).join(" ")); },
   trace: function () { __clog("trace", Array.prototype.map.call(arguments, function (x) { return __str(x); }).join(" ")); },
+  // 站点会在初始化时取 console.clear.bind(console);缺少该方法会在定时器注册前直接断链。
+  clear: function () {},
   // console.assert 只记录失败、绝不抛错;站点初始化里的 UUID/配置自检
   // 若因方法缺失抛 TypeError,会让整个 React 挂载链静默中断。
   assert: function (condition) {
@@ -2859,12 +2861,85 @@ var confirm = function (m) { __clog("confirm", String(m == null ? "" : m)); retu
 var prompt = function (m) { __clog("prompt", String(m == null ? "" : m)); return null; };
 
 // ---------- fetch / XHR ----------
-function fetch(url, opts) {
+// Fetch 标准入口不只是 fetch(string):React/请求库常先构造 Request,
+// 再把 Request 交给 fetch。缺构造器会在应用初始化阶段直接 ReferenceError。
+function Headers(init) {
+  if (!(this instanceof Headers)) return new Headers(init);
+  this._map = {};
+  if (init == null) return;
+  var self = this;
+  if (init instanceof Headers || init._map) {
+    Object.keys(init._map).forEach(function (k) { self._map[k] = String(init._map[k]); });
+  } else if (Array.isArray(init)) {
+    init.forEach(function (pair) {
+      if (pair != null && pair.length >= 2) self.append(pair[0], pair[1]);
+    });
+  } else {
+    Object.keys(Object(init)).forEach(function (k) { self.set(k, init[k]); });
+  }
+}
+Headers.prototype.__key = function (k) { return String(k).toLowerCase(); };
+Headers.prototype.get = function (k) {
+  var key = this.__key(k);
+  return Object.prototype.hasOwnProperty.call(this._map, key) ? this._map[key] : null;
+};
+Headers.prototype.set = function (k, v) { this._map[this.__key(k)] = String(v); };
+Headers.prototype.has = function (k) {
+  return Object.prototype.hasOwnProperty.call(this._map, this.__key(k));
+};
+Headers.prototype.append = function (k, v) {
+  var key = this.__key(k), old = this.get(key);
+  this._map[key] = old == null ? String(v) : old + ", " + String(v);
+};
+Headers.prototype.delete = function (k) { delete this._map[this.__key(k)]; };
+Headers.prototype.forEach = function (fn, thisArg) {
+  var self = this;
+  Object.keys(this._map).forEach(function (k) { fn.call(thisArg, self._map[k], k, self); });
+};
+Headers.prototype.keys = function () { return Object.keys(this._map)[Symbol.iterator](); };
+Headers.prototype.values = function () {
+  var self = this;
+  return Object.keys(this._map).map(function (k) { return self._map[k]; })[Symbol.iterator]();
+};
+Headers.prototype.entries = function () {
+  var self = this;
+  return Object.keys(this._map).map(function (k) { return [k, self._map[k]]; })[Symbol.iterator]();
+};
+if (typeof Symbol !== "undefined" && Symbol.iterator) {
+  Headers.prototype[Symbol.iterator] = Headers.prototype.entries;
+}
+
+function Request(input, init) {
+  if (!(this instanceof Request)) return new Request(input, init);
+  var base = input instanceof Request ? input : null;
+  if (input == null) throw new TypeError("Request URL 不能为空");
+  init = init || {};
+  this.url = String(base ? base.url : (input && input.url ? input.url : input));
+  this.method = String(init.method != null ? init.method : (base ? base.method : "GET")).toUpperCase();
+  this.headers = new Headers(init.headers != null ? init.headers : (base ? base.headers : null));
+  var body = Object.prototype.hasOwnProperty.call(init, "body") ? init.body : (base ? base.body : null);
+  this.body = body == null ? null : (typeof body === "string" ? body : String(body));
+  this.credentials = String(init.credentials || (base && base.credentials) || "same-origin");
+  this.mode = String(init.mode || (base && base.mode) || "cors");
+  this.cache = String(init.cache || (base && base.cache) || "default");
+  this.redirect = String(init.redirect || (base && base.redirect) || "follow");
+  this.referrer = String(init.referrer || (base && base.referrer) || "about:client");
+  this.signal = init.signal || (base && base.signal) || new AbortSignal();
+  this.bodyUsed = false;
+}
+Request.prototype.clone = function () { return new Request(this); };
+
+function fetch(input, opts) {
   return Promise.resolve().then(function () {
-    var urlString = String(url && url.url ? url.url : url);
-    var o = { method: (opts && opts.method) || "GET", cookies: __lsmCookie };
-    if (opts && opts.headers) o.headers = opts.headers;
-    if (opts && opts.body != null) o.body = typeof opts.body === "string" ? opts.body : String(opts.body);
+    var base = input instanceof Request ? input : null;
+    opts = opts || {};
+    var urlString = String(base ? base.url : (input && input.url ? input.url : input));
+    var method = opts.method != null ? opts.method : (base ? base.method : "GET");
+    var headerInit = opts.headers != null ? opts.headers : (base ? base.headers : null);
+    var body = Object.prototype.hasOwnProperty.call(opts, "body") ? opts.body : (base ? base.body : null);
+    var o = { method: String(method || "GET").toUpperCase(), cookies: __lsmCookie };
+    if (headerInit != null) o.headers = new Headers(headerInit)._map;
+    if (body != null) o.body = typeof body === "string" ? body : String(body);
     var raw = "";
     try { raw = __lsmFetchNative(urlString, JSON.stringify(o)); } catch (e2) { raw = JSON.stringify({ error: String(e2) }); }
     var r = {};
@@ -2876,7 +2951,7 @@ function fetch(url, opts) {
       statusText: String(r.statusText || ""),
       url: String(r.url || urlString),
       redirected: !!r.redirect,
-      headers: { get: function (k) { return (r.headers && r.headers[String(k).toLowerCase()]) || null; } },
+      headers: new Headers(r.headers || {}),
       bodyUsed: false,
       clone: function () { return resp; },
       _read: function () {

@@ -15,7 +15,7 @@ use super::super::document;
 use super::super::render::display::{BgFill, DisplayItem, DisplayKind, WidgetGlyphKind};
 use super::super::style::{values, ComputedStyle};
 use super::super::style::Affine;
-use super::LayoutCtx;
+use super::{LayoutCtx, TextDecor};
 
 /// 内置 UI 图标的标准边长(像素)。
 const ICON_SIZE: f64 = 14.0;
@@ -778,7 +778,9 @@ pub(crate) fn emit_singleline_text(
         color,
         bold: style.font_weight >= 600,
         visible: super::style_visible(style),
-    };
+        decor: TextDecor::default(),
+    highlight: None,
+};
     ctx.emit_text(&line, tf, &[]);
     ctx.lines.push(line);
 }
@@ -831,7 +833,9 @@ pub(crate) fn emit_multiline_text(
             color,
             bold: style.font_weight >= 600,
             visible: super::style_visible(style),
-        };
+            decor: TextDecor::default(),
+    highlight: None,
+};
         ctx.emit_text(&line, tf, &[]);
         ctx.lines.push(line);
     }

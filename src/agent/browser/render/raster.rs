@@ -12,7 +12,7 @@ use tiny_skia::{Pixmap, PremultipliedColorU8};
 use super::super::images::{DecodedImage, ImageStore};
 use super::super::style::{Affine, CornerRadius, GradientKind, GradientSpec};
 use super::blur::{blur_mask, half_width_for, MAX_MASK_PIXELS};
-use super::display::{BgFill, DisplayItem, DisplayKind, WidgetGlyphKind};
+use super::display::{BgFill, DisplayItem, DisplayKind, TextDecorKind, WidgetGlyphKind};
 use super::FontSet;
 
 /// 像素裁剪窗口(半开区间 `[x0,x1) × [y0,y1)`,画布坐标)。
@@ -306,6 +306,12 @@ pub(crate) fn rasterize(
             }
             DisplayKind::CanvasNote { pale } => {
                 draw_canvas_note(font, pixmap, &sc, &mapper, item, *pale);
+            }
+            DisplayKind::MediaFrameNote { pale, tag } => {
+                draw_media_frame_note(font, pixmap, &sc, &mapper, item, *pale, tag);
+            }
+            DisplayKind::TextDecor { kind, color } => {
+                draw_text_decor(pixmap, &sc, &mapper, item, *kind, *color);
             }
             DisplayKind::WidgetGlyph { glyph, open, color } => {
                 draw_widget_glyph(pixmap, &sc, &mapper, item, *glyph, *open, *color);
@@ -1021,6 +1027,117 @@ fn draw_image(
             }
             blend_pixel(pixels, width, pxi, py, c[0], c[1], c[2], a);
         }
+    }
+}
+
+// ============ 第 48 轮:媒体/嵌入占位与文本装饰 ============
+
+/// 媒体/嵌入空盒占位:与 canvas 同款淡底虚线,文案点明能力边界。
+fn draw_media_frame_note(
+    font: &FontSet,
+    pixmap: &mut Pixmap,
+    sc: &Scissor,
+    mapper: &Mapper,
+    item: &DisplayItem,
+    pale: bool,
+    tag: &str,
+) {
+    let (bx, by, bw, bh) = (item.x, item.y, item.w, item.h);
+    if bw < 48.0 || bh < 28.0 {
+        return;
+    }
+    let bounds = mapper.scissor_of(sc, bx, by, bw, bh);
+    if bounds.empty() {
+        return;
+    }
+    let pw = pixmap.width() as i64;
+    let ph = pixmap.height() as i64;
+    let pixels = pixmap.pixels_mut();
+    let inside = |x: f64, y: f64| x >= bx && x <= bx + bw && y >= by && y <= by + bh;
+    if pale {
+        for py in bounds.y0.max(0)..bounds.y1.min(ph) {
+            for px in bounds.x0.max(0)..bounds.x1.min(pw) {
+                let (lx, ly) = mapper.local(px, py);
+                if inside(lx, ly) {
+                    blend_pixel(pixels, pw, px, py, 236, 238, 242, 255);
+                }
+            }
+        }
+    }
+    let dash = 8.0f64;
+    let edge = [176u8, 182, 190];
+    let mut px = bx;
+    while px < bx + bw {
+        let seg = dash.min(bx + bw - px);
+        fill_seg_mapped(pixels, pw, ph, &bounds, mapper, px, by, seg, 1.0, edge, inside);
+        fill_seg_mapped(pixels, pw, ph, &bounds, mapper, px, by + bh - 1.0, seg, 1.0, edge, inside);
+        px += dash * 2.0;
+    }
+    let mut py = by;
+    while py < by + bh {
+        let seg = dash.min(by + bh - py);
+        fill_seg_mapped(pixels, pw, ph, &bounds, mapper, bx, py, 1.0, seg, edge, inside);
+        fill_seg_mapped(pixels, pw, ph, &bounds, mapper, bx + bw - 1.0, py, 1.0, seg, edge, inside);
+        py += dash * 2.0;
+    }
+    let full = format!("{tag} 区域:内核未加载子文档/未解码媒体/无 SVG 光栅化,属能力边界");
+    let short = format!("{tag} 区域:能力未实现");
+    let label = if bw >= 520.0 { full } else { short };
+    let size = 13.0f64;
+    let est_w = label.chars().count() as f64 * size * 0.62;
+    let tx = bx + ((bw - est_w) / 2.0).max(8.0);
+    let ty = by + ((bh - size) / 2.0).max(4.0);
+    draw_text(font, pixmap, &bounds, mapper, &label, tx, ty, size, [120, 128, 138], false, 1.0, None);
+}
+
+/// 文本装饰线:基线由 `item.y + size` 还原(与 `draw_text` 同口径)。
+fn draw_text_decor(
+    pixmap: &mut Pixmap,
+    sc: &Scissor,
+    mapper: &Mapper,
+    item: &DisplayItem,
+    kind: TextDecorKind,
+    color: [u8; 3],
+) {
+    let size = item.h / 2.0;
+    if size <= 0.0 {
+        return;
+    }
+    let baseline = item.y + size;
+    let tw = item.w;
+    if tw <= 0.0 {
+        return;
+    }
+    let pw = pixmap.width() as i64;
+    let ph = pixmap.height() as i64;
+    let pixels = pixmap.pixels_mut();
+    let a = (item.opacity * 255.0).round().clamp(0.0, 255.0) as u8;
+    if a == 0 {
+        return;
+    }
+    let mut line = |y: f64, dotted: bool| {
+        let bounds = mapper.scissor_of(sc, item.x, y - 1.0, tw, 2.0);
+        if bounds.empty() {
+            return;
+        }
+        let inside = |x: f64, yy: f64| {
+            x >= item.x && x <= item.x + tw && yy >= y - 1.0 && yy <= y + 1.0
+        };
+        if dotted {
+            let mut x = item.x;
+            while x < item.x + tw {
+                let seg = 4.0f64.min(item.x + tw - x);
+                fill_seg_mapped(pixels, pw, ph, &bounds, mapper, x, y, seg, 1.0, color, inside);
+                x += 8.0;
+            }
+        } else {
+            fill_seg_mapped(pixels, pw, ph, &bounds, mapper, item.x, y, tw, 1.0, color, inside);
+        }
+    };
+    match kind {
+        TextDecorKind::StrikeThrough => line(baseline - size * 0.35, false),
+        TextDecorKind::Underline => line(baseline + size * 0.18, false),
+        TextDecorKind::DottedUnderline => line(baseline + size * 0.18, true),
     }
 }
 

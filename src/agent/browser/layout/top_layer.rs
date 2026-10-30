@@ -14,7 +14,7 @@ use kuchikiki::NodeRef;
 
 use super::super::document::{self, Document};
 use super::super::style::ComputedStyle;
-use super::{style_visible, LayoutCtx, TextLine};
+use super::{style_visible, LayoutCtx, TextDecor, TextLine};
 
 /// 顶层绘制层档位(0 = 常规流,1 = 定位元素,2 = 顶层)。
 pub(crate) const TOP_LAYER: u8 = 2;
@@ -235,7 +235,9 @@ pub(crate) fn emit_select_panel(
             },
             bold: false,
             visible: style_visible(style),
-        };
+            decor: TextDecor::default(),
+    highlight: None,
+};
         ctx.emit_text(&line, None, &[]);
         ctx.lines.push(line);
     }
