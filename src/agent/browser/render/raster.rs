@@ -54,7 +54,7 @@ impl Scissor {
 /// 项的画布位置却由 transform 决定 —— 两者不同步时,变换后的内容会被留在
 /// 原位的裁剪窗口整个裁掉(实测猎聘登录框 `translate(-50%,-50%)` 后白色
 /// 面板整块消失,只剩边框)。
-fn scissor_for(item: &DisplayItem, scroll_y: f64, pw: i64, ph: i64) -> Scissor {
+fn scissor_for(item: &DisplayItem, scroll_x: f64, scroll_y: f64, pw: i64, ph: i64) -> Scissor {
     let mut sc = Scissor::full(pw, ph);
     if let Some((cx, cy, cw, ch)) = item.clip {
         let (x0, y0, x1, y1) = match item.transform.as_ref() {
@@ -70,25 +70,27 @@ fn scissor_for(item: &DisplayItem, scroll_y: f64, pw: i64, ph: i64) -> Scissor {
             }
             None => (cx, cy, cx + cw, cy + ch),
         };
-        sc = sc.intersect_rect(x0, y0 - scroll_y, x1 - x0, y1 - y0);
+        sc = sc.intersect_rect(x0 - scroll_x, y0 - scroll_y, x1 - x0, y1 - y0);
     }
     sc
 }
 
 /// 画布像素 → 项**局部(页坐标)**映射(阶段六第二步:CSS 2D transform 逆映射)。
 ///
-/// 无变换时退化为恒等 + 滚动偏移(`local = (px+0.5, py+0.5+scroll_y)`),
-/// 与重构前「画布坐标 == 页坐标 - scroll_y」逐像素等价。
+/// 无变换时退化为恒等 + 滚动偏移(`local = (px+0.5+scroll_x, py+0.5+scroll_y)`),
+/// 与重构前「画布坐标 == 页坐标 - 滚动量」逐像素等价。
 struct Mapper<'a> {
     inv: Option<Affine>,
+    scroll_x: f64,
     scroll_y: f64,
     item: &'a DisplayItem,
 }
 
 impl<'a> Mapper<'a> {
-    fn new(item: &'a DisplayItem, scroll_y: f64) -> Self {
+    fn new(item: &'a DisplayItem, scroll_x: f64, scroll_y: f64) -> Self {
         Self {
             inv: item.transform.and_then(|t| t.invert()),
+            scroll_x,
             scroll_y,
             item,
         }
@@ -97,7 +99,7 @@ impl<'a> Mapper<'a> {
     /// 画布像素中心 → 页坐标局部点。
     #[inline]
     fn local(&self, px: i64, py: i64) -> (f64, f64) {
-        let x = px as f64 + 0.5;
+        let x = px as f64 + 0.5 + self.scroll_x;
         let y = py as f64 + 0.5 + self.scroll_y;
         match self.inv {
             None => (x, y),
@@ -105,10 +107,10 @@ impl<'a> Mapper<'a> {
         }
     }
 
-    /// 局部盒变换后的画布 AABB(x0, y0, w, h)。无变换时 = `(x, y-scroll_y, w, h)`。
+    /// 局部盒变换后的画布 AABB(x0, y0, w, h)。无变换时 = `(x-scroll_x, y-scroll_y, w, h)`。
     fn canvas_aabb(&self, x: f64, y: f64, w: f64, h: f64) -> (f64, f64, f64, f64) {
         let Some(t) = self.item.transform else {
-            return (x, y - self.scroll_y, w, h);
+            return (x - self.scroll_x, y - self.scroll_y, w, h);
         };
         let corners = [
             t.apply(x, y),
@@ -123,7 +125,7 @@ impl<'a> Mapper<'a> {
             y0 = y0.min(cy);
             y1 = y1.max(cy);
         }
-        (x0, y0 - self.scroll_y, (x1 - x0).max(0.0), (y1 - y0).max(0.0))
+        (x0 - self.scroll_x, y0 - self.scroll_y, (x1 - x0).max(0.0), (y1 - y0).max(0.0))
     }
 
     /// 局部盒 → 画布 scissor(与视口/项 clip 取交)。
@@ -213,6 +215,7 @@ pub(crate) fn rasterize(
     font: &FontSet,
     pixmap: &mut Pixmap,
     items: &[DisplayItem],
+    scroll_x: f64,
     scroll_y: f64,
     images: &ImageStore,
 ) {
@@ -225,8 +228,12 @@ pub(crate) fn rasterize(
         // `position: fixed`:盒坐标以**视口**为原点(布局层对 fixed 取包含块
         // (0,0,vw,vh)),与普通项的页面原点不同系 —— 这里必须把滚动量归零,
         // 否则固定控件会随页面滚动平移(地图缩放控件/工具栏一滚就跑位)。
-        let item_scroll = if item.fixed { 0.0 } else { scroll_y };
-        let mapper = Mapper::new(item, item_scroll);
+        let (item_sx, item_sy) = if item.fixed {
+            (0.0, 0.0)
+        } else {
+            (scroll_x, scroll_y)
+        };
+        let mapper = Mapper::new(item, item_sx, item_sy);
         // 局部盒:文本类按内容宽度(字形逐字绘制,盒宽取文本宽)。
         let (bx, by, bw, bh) = match &item.kind {
             DisplayKind::Text { text, size, .. }
@@ -245,7 +252,7 @@ pub(crate) fn rasterize(
         if ex1 < 0.0 || ex0 > pw as f64 || ey1 < 0.0 || ey0 > ph as f64 {
             continue;
         }
-        let sc = scissor_for(item, item_scroll, pw, ph);
+        let sc = scissor_for(item, item_sx, item_sy, pw, ph);
         if sc.empty() {
             continue;
         }

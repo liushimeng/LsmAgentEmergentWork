@@ -17,7 +17,7 @@ fn render_state(html: &str, values: &[(&str, &str)]) -> (image::RgbaImage, layou
     let font = FontSet::fallback();
     let lay = layout::compute(&doc, 640.0, &font);
     let pm = font
-        .render_pixmap(&lay, 640, 480, 0.0, false, &ImageStore::new())
+        .render_pixmap(&lay, 640, 480, 0.0, 0.0, false, &ImageStore::new())
         .unwrap();
     let img = image::load_from_memory(&pm.encode_png().unwrap()).unwrap().to_rgba8();
     (img, lay)

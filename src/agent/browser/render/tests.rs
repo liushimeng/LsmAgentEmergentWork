@@ -10,7 +10,7 @@ fn render_html(html: &str, vw: u32, vh: u32) -> (image::RgbaImage) {
     let font = FontSet::fallback();
     let l = layout::compute(&doc, vw as f64, &font);
     let pm = font
-        .render_pixmap(&l, vw, vh, 0.0, false, &ImageStore::new())
+        .render_pixmap(&l, vw, vh, 0.0, 0.0, false, &ImageStore::new())
         .unwrap();
     decode(&pm)
 }
@@ -101,7 +101,7 @@ fn 渲染输出_png_签名() {
     let doc = Document::parse("<body><h1>Hello</h1><p>World</p></body>", "https://a.test/");
     let font = FontSet::fallback();
     let l = layout::compute(&doc, 640.0, &font);
-    let png = font.render(&l, 640, 480, 0.0, false, &ImageStore::new());
+    let png = font.render(&l, 640, 480, 0.0, 0.0, false, &ImageStore::new());
     assert!(png.len() > 8);
     assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
 }
@@ -136,7 +136,7 @@ fn 渲染绘制图片() {
             rgba: (0..16).flat_map(|_| [255u8, 0, 0, 255]).collect(),
         }),
     );
-    let png = font.render(&l, 100, 100, 0.0, false, &store);
+    let png = font.render(&l, 100, 100, 0.0, 0.0, false, &store);
     let decoded = image::load_from_memory(&png).unwrap().to_rgba8();
     let inside = decoded.get_pixel(20, 20).0;
     assert_eq!(&inside[..3], &[255, 0, 0], "图片区域应为红色");
@@ -185,7 +185,7 @@ fn render_pixmap_与_render_一致() {
     let font = FontSet::fallback();
     let l = layout::compute(&doc, 320.0, &font);
     let pm = font
-        .render_pixmap(&l, 320, 240, 0.0, false, &ImageStore::new())
+        .render_pixmap(&l, 320, 240, 0.0, 0.0, false, &ImageStore::new())
         .unwrap();
     let png = pm.encode_png().unwrap();
     assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
@@ -486,7 +486,7 @@ fn text_shadow_阴影色可见() {
     let font = FontSet::load();
     let l = layout::compute(&doc, 300.0, &font);
     let pm = font
-        .render_pixmap(&l, 300, 300, 0.0, false, &ImageStore::new())
+        .render_pixmap(&l, 300, 300, 0.0, 0.0, false, &ImageStore::new())
         .unwrap();
     let img = decode(&pm);
     let red = img
@@ -505,7 +505,7 @@ fn text_shadow_模糊_边缘半透明() {
     let font = FontSet::load();
     let l = layout::compute(&doc, 300.0, &font);
     let pm = font
-        .render_pixmap(&l, 300, 300, 0.0, false, &ImageStore::new())
+        .render_pixmap(&l, 300, 300, 0.0, 0.0, false, &ImageStore::new())
         .unwrap();
     let img = decode(&pm);
     // 阴影区应出现红色分量明显高于绿/蓝的像素。
@@ -652,7 +652,7 @@ fn 缺字形推进pen_其后文字不错位() {
         let doc = Document::parse(html, "https://a.test/");
         let l = layout::compute(&doc, 200.0, &font);
         let pm = font
-            .render_pixmap(&l, 200, 80, 0.0, false, &ImageStore::new())
+            .render_pixmap(&l, 200, 80, 0.0, 0.0, false, &ImageStore::new())
             .unwrap();
         decode(&pm)
     };
@@ -666,5 +666,43 @@ fn 缺字形推进pen_其后文字不错位() {
     assert!(
         xb >= xa + 5 && xb <= xa + 40,
         "缺字形应按回退宽推进 pen(约一字宽):仅A起点={xa},缺字形+A起点={xb}"
+    );
+}
+
+/// 横向滚动进光栅化(2026-10-30 京东):此前 raster 只收 scroll_y,
+/// 横滚后截图内容纹丝不动。
+#[test]
+fn 横向滚动进光栅化() {
+    let html = "<html><body style='margin:0'><div style='width:100px;height:50px;background:#000;margin-left:150px'></div></body></html>";
+    let doc = Document::parse(html, "https://a.test/");
+    let font = FontSet::fallback();
+    let l = layout::compute(&doc, 200.0, &font);
+    let pm = font
+        .render_pixmap(&l, 200, 80, 100.0, 0.0, false, &ImageStore::new())
+        .unwrap();
+    let img = decode(&pm);
+    let dark = |x: u32, y: u32| {
+        let p = pixel(&img, x, y);
+        p[0] < 128 && p[1] < 128 && p[2] < 128
+    };
+    assert!(dark(60, 10), "scroll_x=100 后盒体(150..250)应落在画布 50..150");
+    assert!(!dark(10, 10), "盒体左缘外不应有墨");
+}
+
+/// 整页截图宽度包住横向溢出(2026-10-30 京东):此前恒视口宽,
+/// 越界内容在任何截图里都被右缘硬裁。
+#[test]
+fn 整页截图宽度包住横向溢出() {
+    let html = "<html><body style='margin:0'><div style='width:230px;height:50px;background:#000;margin-left:150px'></div></body></html>";
+    let doc = Document::parse(html, "https://a.test/");
+    let font = FontSet::fallback();
+    let l = layout::compute(&doc, 200.0, &font);
+    let pm = font
+        .render_pixmap(&l, 200, 80, 0.0, 0.0, true, &ImageStore::new())
+        .unwrap();
+    assert!(
+        pm.width() >= 380,
+        "整页宽应包住内容最右缘 380,实际 {}",
+        pm.width()
     );
 }

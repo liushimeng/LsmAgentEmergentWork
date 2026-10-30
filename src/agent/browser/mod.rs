@@ -1602,12 +1602,14 @@ impl LsmBrowserManager {
         // 整页截图的画布高 = page_height(整篇文档),此时若仍减 tab.scroll_y,
         // 文档内容会整体上移、顶部被切、底部留白(视口截图才需要减)。
         let scroll_y = if full_page { 0.0 } else { tab.scroll_y };
+        let scroll_x = if full_page { 0.0 } else { tab.scroll_x };
         let pixmap = self
             .font
             .render_pixmap(
                 &tab.layout,
                 tab.viewport.width,
                 tab.viewport.height,
+                scroll_x,
                 scroll_y,
                 full_page,
                 &tab.images,

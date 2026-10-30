@@ -229,7 +229,7 @@ impl FontSet {
         pen_x - x
     }
 
-    /// 渲染一页。`scroll_y` 为垂直滚动偏移;`full_page=true` 时高度取整页。
+    /// 渲染一页。`scroll_x`/`scroll_y` 为滚动偏移;`full_page=true` 时取整页。
     ///
     /// `images` 为已解码图片缓存(阶段三第三步);缺失的图片跳过绘制。
     pub fn render(
@@ -237,11 +237,12 @@ impl FontSet {
         layout: &Layout,
         viewport_w: u32,
         viewport_h: u32,
+        scroll_x: f64,
         scroll_y: f64,
         full_page: bool,
         images: &ImageStore,
     ) -> Vec<u8> {
-        self.render_pixmap(layout, viewport_w, viewport_h, scroll_y, full_page, images)
+        self.render_pixmap(layout, viewport_w, viewport_h, scroll_x, scroll_y, full_page, images)
             .map(|p| p.encode_png().unwrap_or_default())
             .unwrap_or_default()
     }
@@ -255,11 +256,30 @@ impl FontSet {
         layout: &Layout,
         viewport_w: u32,
         viewport_h: u32,
+        scroll_x: f64,
         scroll_y: f64,
         full_page: bool,
         images: &ImageStore,
     ) -> Option<Pixmap> {
-        let width = viewport_w.clamp(64, 7680);
+        let legacy;
+        let items: &[DisplayItem] = if layout.display.is_empty() {
+            legacy = display::build_legacy(layout);
+            &legacy
+        } else {
+            &layout.display
+        };
+        // 整页截图宽:内容横向溢出视口时把右缘包进来(2026-10-30 京东:
+        // 此前恒视口宽,搜索栏越界到 2237 的部分在任何截图里都被硬裁)。
+        let content_w = items
+            .iter()
+            .map(|it| (it.x + it.w).ceil().max(0.0) as u64)
+            .max()
+            .unwrap_or(0);
+        let width = if full_page {
+            ((viewport_w as u64).max(content_w) as u32).clamp(64, 7680)
+        } else {
+            viewport_w.clamp(64, 7680)
+        };
         let mut height = if full_page {
             (layout.page_height().ceil() as u32).clamp(64, 20_000)
         } else {
@@ -272,13 +292,6 @@ impl FontSet {
         }
         let mut pixmap = Pixmap::new(width, height)?;
         pixmap.fill(Color::WHITE);
-        let legacy;
-        let items: &[DisplayItem] = if layout.display.is_empty() {
-            legacy = display::build_legacy(layout);
-            &legacy
-        } else {
-            &layout.display
-        };
         // 诊断:显示列表全量落盘(LAEW_DUMP_DISPLAY=路径),定位「布局有文本/渲染无像素」类矛盾。
         if let Ok(path) = std::env::var("LAEW_DUMP_DISPLAY") {
             let mut buf = String::new();
@@ -306,7 +319,7 @@ impl FontSet {
             }
             std::fs::write(&path, buf).ok();
         }
-        raster::rasterize(self, &mut pixmap, items, scroll_y, images);
+        raster::rasterize(self, &mut pixmap, items, scroll_x, scroll_y, images);
         Some(pixmap)
     }
 }

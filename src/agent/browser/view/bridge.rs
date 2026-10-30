@@ -103,6 +103,7 @@ impl LsmBrowserManager {
             width,
             height,
             0.0,
+            0.0,
             false,
             &images::ImageStore::new(),
         )?;
@@ -171,6 +172,7 @@ impl LsmBrowserManager {
             &tab.layout,
             tab.viewport.width,
             tab.viewport.height,
+            tab.scroll_x,
             tab.scroll_y,
             false,
             &tab.images,

@@ -580,11 +580,15 @@ pub(crate) async fn run_pending_scripts(mgr: &LsmBrowserManager, pid: &str, budg
         // 廉价预检(第 174 轮性能):无待执行脚本就不进管线。此前每条 eval/事件
         // 都空跑一遍「解析+收集+排空」,重页(猎聘 372KB DOM)单条 eval
         // 25-35s 的大头就是它;页面无变化时这里直接归零。
+        // 2026-10-30 京东:管线超时截断(`script_budget_cut`)时即使无待执行
+        // 脚本也要进场——线程迟到轮次的动作堆在回复邮箱里等下一次请求合并
+        // 带回,跳过 = 模块挂载动作永不出邮箱,页面永远半成品。
         let mut probe = tab.executed_scripts.clone();
         let doc = tab_document(tab);
         let mut collected = script::dom_ops::collect_scripts(&doc, &tab.url, &mut probe);
         let deferred_left = std::mem::take(&mut collected.deferred);
-        let has_pending = !collected.items.is_empty() || !deferred_left.is_empty();
+        let has_pending =
+            !collected.items.is_empty() || !deferred_left.is_empty() || tab.script_budget_cut;
         (
             tab.html.clone(),
             tab.url.clone(),
