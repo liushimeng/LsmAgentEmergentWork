@@ -87,7 +87,7 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 | `LAEW_BROWSER_PATH` | Chrome/Edge 可执行文件路径 | MCP_Web_Chrome_Use 浏览器探测优先路径(缺省按平台默认安装位探测) |
 | `LAEW_WEB_SCRIPT` | `off`/`0`/`false`/`no` | 关闭页面脚本执行与 JS 线程(阶段二);`eval_js` 回退阶段一快照桥。见 `src/agent/browser/script/` |
 | `LAEW_WEB_SCRIPT_BUDGET_MS` | 正整数(默认 `10000`) | 单次页面脚本管线(导航/eval_js/事件分发)墙钟预算。见 `src/agent/browser/script/mod.rs::budget_ms` |
-| `LAEW_WEB_SCRIPT_PIPELINE_MS` | 正整数(默认 `120000`,下限 `2000`) | 整条脚本管线(多轮脚本取回执行)墙钟预算;同一预算也作为整批 RunScripts 的 JS 侧 deadline。重站点(百度地图首屏 60+ 脚本)40s 会被截断,故默认值提高到 120s。见 `src/agent/browser/script/mod.rs` |
+| `LAEW_WEB_SCRIPT_PIPELINE_MS` | 正整数(默认 `120000`,下限 `2000`) | 整条脚本管线(多轮脚本取回执行)墙钟预算;同一预算也作为整批 RunScripts 的 JS 侧 deadline。重站点会截断:百度地图首屏 60+ 脚本 40s 不够;京东 pc-tk.js 单脚本 Boa 实测 191s、首屏全链 222s,120s 仍不够,故默认值提高到 240s。见 `src/agent/browser/script/mod.rs` |
 | `LAEW_WEB_SCRIPT_INTERACT_MS` | 正整数(默认 `30000`,下限 `2000`) | 交互后(eval/点击等)单次脚本补齐墙钟预算。重站懒加载 chunk 链(登录弹层等组件)8s 装不完;截断状态经 eval 结果与 `page_health` 的 `script_pending`/`script_budget_cut` 字段可见。见 `src/agent/browser/api.rs::interaction_budget_ms` |
 | `LAEW_WEB_SCRIPT_GRACE_MS` | 正整数(默认 `60000`,下限 `1000`) | 管线轮**宽限续等**预算:常规等待超时后同一回复 channel 继续等,防「线程还在正常执行却被判超时→整轮 DOM 动作作废」(模块挂载丢回复,猎聘 hero 搜索条根因)。见 `src/agent/browser/script/mod.rs::grace_ms` |
 | `LAEW_WEB_EVAL_GRACE_MS` | 正整数(默认 `30000`,下限 `500`) | eval_js 宽限续等预算:常规 10s 超时后续等,仍超时才报 2002「线程忙碌」(不再静默回退阶段一桥)。见 `src/agent/browser/script/mod.rs::eval_grace_ms` |

@@ -226,7 +226,13 @@ async fn request_human(args: &Value, params: &Value) -> Result<String> {
     // 如实把系统提示拼进展示消息、并在结果里回 page_visible:false,避免
     // 「请在浏览器窗口完成滑块」这类不可能指令发给人工(实测 -f 后台管道
     // 任务默认 hidden,人工侧只看得到 HITL 弹窗)。
-    let page_visible = mgr.viewer_alive();
+    // 第一步先尝试复活:查看器曾被拉起过(页为有头)但中途退出(人工误关/
+    // 崩溃)时,直接重建窗口比让人工对着「隐藏模式」提示干等强——弹窗本
+    // 身就在等人工,人工却没有窗口可操作,任务必然卡死。
+    let mut page_visible = mgr.viewer_alive();
+    if !page_visible && !page_id.is_empty() {
+        page_visible = mgr.revive_viewer().await;
+    }
     let message = if page_visible {
         message
     } else {

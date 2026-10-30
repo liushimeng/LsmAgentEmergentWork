@@ -725,6 +725,23 @@ pub const GLOBALS_JS: &str = r##"
       return el;
     };
   }
+  if (typeof G.Audio === "undefined") {
+    // `new Audio(url)`:音频不渲染,但构造必须存在(实测京东首页脚本裸用
+    // `new Audio(...)`,缺失即 ReferenceError 断链)。
+    G.Audio = function Audio(src) {
+      return {
+        src: src == null ? "" : String(src),
+        currentSrc: "", duration: 0, currentTime: 0, volume: 1, muted: false,
+        paused: true, ended: false, loop: false, playbackRate: 1, readyState: 0,
+        canPlayType: function () { return ""; },
+        play: function () { this.paused = false; var p = this.onplay; if (typeof p === "function") { try { p(); } catch (e) {} } },
+        pause: function () { this.paused = true; var p = this.onpause; if (typeof p === "function") { try { p(); } catch (e) {} } },
+        load: function () {},
+        addEventListener: function (t, fn) { this["on" + String(t)] = fn; },
+        removeEventListener: function () {},
+      };
+    };
+  }
 
   // --- 编码 / 加密 ---
   if (typeof G.TextEncoder === "undefined") {

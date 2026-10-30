@@ -21,6 +21,8 @@ mod state_bridge_tests;
 mod tests;
 #[cfg(test)]
 mod tests_dom_insert;
+#[cfg(test)]
+mod tests_jd_compat;
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -334,7 +336,10 @@ const MAX_DRAIN_ROUNDS: u32 = 6;
 /// 整条脚本管线的墙钟预算(毫秒),可用 `LAEW_WEB_SCRIPT_PIPELINE_MS` 覆盖。
 // 整条脚本管线(多轮取回执行)的墙钟预算。40s 对百度地图这类首屏 60+ 脚本、
 // 含 195KB 反爬脚本的站点不够:实测在脚本链中途被截断,地图内核不启动。
-const PIPELINE_BUDGET_MS: u64 = 120_000;
+// 120s 又对京东不够:pc-tk.js(50KB 混淆加密,签名 SDK)单脚本在 Boa 下
+// 实测 191s,首屏全链 222s;120s 会在 pc-tk 中途掐断,后续搜索请求无签名
+// (2026-10-30 京东实测)。快站脚本跑完即收工,不受该上限影响。
+const PIPELINE_BUDGET_MS: u64 = 240_000;
 
 /// 管线墙钟预算(环境变量覆盖,下限 2000ms)。
 fn pipeline_budget_ms() -> u64 {

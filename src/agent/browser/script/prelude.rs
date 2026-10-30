@@ -276,8 +276,54 @@ if (globalThis.__lsmTraceToObjInstall) {
   } catch (e) {}
 }
 
+// ---------- Annex B 兼容:RegExp legacy 静态属性($1..$9 / $_) ----------
+// Boa 0.22 未实现 `RegExp.$1`(读出来 undefined)。安全/风控 SDK 常用
+// 「正则 test/match 后读 `RegExp.$1.length`」的老式日期格式化(实测京东
+// js_security_v3 `/(y+)/i.test(s)` → `RegExp.$1`),undefined 上取 length
+// 抛 "cannot convert 'null' or 'undefined' to object"(Boa 该文案与读
+// undefined 属性共用,见 docs 报错歧义记录),SDK 整链断。
+// 真实语义是引擎级联动(每次匹配都刷新);这里按 exec/test/match 三入口
+// 近似记录,未覆盖的入口(如 String.replace 回调)保留旧值 —— 比断链强。
+function __lsmRegExpStaticsInstall() {
+  var proto = RegExp.prototype;
+  if (proto.__lsmRegExpStatics) return;
+  try {
+    var origExec = proto.exec;
+    var origTest = proto.test;
+    var origMatch = String.prototype.match;
+    function record(m) {
+      try {
+        if (!m) return;
+        for (var i = 1; i <= 9; i++) {
+          var v = m[i] === undefined ? "" : String(m[i]);
+          Object.defineProperty(RegExp, "$" + i, { value: v, writable: true, configurable: true, enumerable: false });
+        }
+        Object.defineProperty(RegExp, "$_", { value: String(m.input == null ? "" : m.input), writable: true, configurable: true, enumerable: false });
+      } catch (e) {}
+    }
+    proto.exec = function (s) {
+      var r = origExec.call(this, s);
+      record(r);
+      return r;
+    };
+    proto.test = function (s) {
+      var r = origTest.call(this, s);
+      if (r) { try { record(origExec.call(this, s)); } catch (e) {} }
+      return r;
+    };
+    String.prototype.match = function (re) {
+      var r = origMatch.call(this, re);
+      try { if (re instanceof RegExp) record(r && r.index !== undefined ? r : (r && r.length ? r : null)); } catch (e) {}
+      return r;
+    };
+    proto.__lsmRegExpStatics = true;
+  } catch (e) {}
+}
+__lsmRegExpStaticsInstall();
+
 function __lsmRefresh(nodes, meta) {
   __lsmEnsureSubstr();
+  __lsmRegExpStaticsInstall();
   // 宿主侧变更 diff:与上一轮快照比对,合成 mutation 记录。
   // Agent 侧动作(input_text 写值、click 后 DOM 重建)只体现在快照里,
   // 页面脚本若无通知就只能轮询;这里把差异翻译成标准 mutation 记录喂给观察者。
@@ -1825,6 +1871,25 @@ function __newEl(tag) {
     }
     return false;
   };
+  // matches/matchesSelector/closest:动态节点此前整体缺失。快照元素的
+  // matchesSelector 会被 Sizzle 当作原生实现收编(`b.call(detachedDiv,"div")`
+  // 探测),this 落到 createElement 出的动态节点上时 `this.matches` 为
+  // undefined → "not a callable function",jQuery/Sizzle 装载即断(实测京东
+  // jQuery 1.6.4 的 Sizzle IIFE 探测链)。与快照接口同构:动态节点按标签/
+  // 类名/ID 宽松匹配,closest 沿 __parentDyn 链上溯。
+  el.matches = function (sel) {
+    return __lsmDynMatch(el, String(sel));
+  };
+  el.matchesSelector = function (sel) { return this.matches(sel); };
+  el.closest = function (sel) {
+    var cur = el;
+    var guard = 0;
+    while (cur && guard++ < 32) {
+      if (cur.matches && cur.matches(String(sel))) return cur;
+      cur = cur.__parentDyn || null;
+    }
+    return null;
+  };
   // 反射属性:站点用 `document.createElement("script").src = url` 动态插脚本,
   // 属性必须真正落到 __attrs 上,否则序列化出来的标签是空的,宿主取不到脚本。
   ["src", "href", "type", "rel", "media", "title", "alt", "charset", "name", "value",
@@ -2021,21 +2086,17 @@ function __newEl(tag) {
 // 缺 cloneNode/firstChild/lastChild 当场 "not a callable function",jQuery
 // 整体装载失败,首页全部动态内容(登录栏/轮播/楼层,含风控 wl.js 指纹采集)
 // 连锁静默死亡,页面只剩服务器静态壳。cloneNode 经 __newEl 重建会把
-// nodeType 回落成 1,故覆写一份保持 fragment 语义。
+// nodeType 回落成 1,故逐 clone 重贴 fragment 语义(克隆的克隆也保持 11)。
+function __fragify(d) {
+  d.nodeType = 11;
+  d.nodeName = "#document-fragment";
+  d.tagName = "#document-fragment";
+  var origClone = d.cloneNode;
+  d.cloneNode = function (deep) { return __fragify(origClone(deep)); };
+  return d;
+}
 function __mkFragment() {
-  var frag = __newEl("#document-fragment");
-  frag.nodeType = 11;
-  frag.nodeName = "#document-fragment";
-  frag.tagName = "#document-fragment";
-  var origClone = frag.cloneNode;
-  frag.cloneNode = function (deep) {
-    var d = origClone(deep);
-    d.nodeType = 11;
-    d.nodeName = "#document-fragment";
-    d.tagName = "#document-fragment";
-    return d;
-  };
-  return frag;
+  return __fragify(__newEl("#document-fragment"));
 }
 
 // ---------- detached innerHTML 轻量解析 ----------
@@ -2578,7 +2639,11 @@ var navigator = {
   cookieEnabled: true,
   hardwareConcurrency: 4,
   deviceMemory: 8,
-  maxTouchPoints: 0
+  maxTouchPoints: 0,
+  // javaEnabled:现代 Chrome 一直保留(恒 false)。京东风控 wl.js 的指纹采集
+  // `t&&t.javaEnabled()?1:0` 不带 typeof 守卫直接调用,缺失即
+  // "not a callable function",整条指纹链断在第一步。
+  javaEnabled: function () { return false; }
 };
 // ---------- navigator 身份派生(UA 单一真源,反-反爬指纹保真) ----------
 // 指纹层三处曾暴露自研内核身份:platform/appVersion 恒为 "LsmAgentBrowser"、

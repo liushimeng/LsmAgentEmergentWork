@@ -202,4 +202,24 @@ impl LsmBrowserManager {
             }
         }
     }
+
+    /// 有头模式下复活查看器(幂等,供工具层调用)。
+    ///
+    /// 查看器被人工误关/子进程崩溃后,登录/验证码类 HITL 要求人工在窗口里
+    /// 操作,但窗口已经不在了。此前 request_human 只能如实提示「隐藏模式,
+    /// 人工无法操作」;现在工具层先尝试复活,复活成功弹窗照常指向窗口,
+    /// 只有真·无头页面才走隐藏模式提示(2026-10-30 京东登录链实测)。
+    pub async fn revive_viewer(&self) -> bool {
+        let Some(page_id) = self.foreground_page_id().await else {
+            return false;
+        };
+        let inner = self.inner.lock().await;
+        match inner.tabs.get(&page_id) {
+            Some(tab) if tab.mode.is_headed() => {
+                self.ensure_view(tab);
+                true
+            }
+            _ => false,
+        }
+    }
 }
