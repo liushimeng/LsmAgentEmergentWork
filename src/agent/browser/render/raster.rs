@@ -300,8 +300,8 @@ pub(crate) fn rasterize(
             DisplayKind::CanvasNote { pale } => {
                 draw_canvas_note(font, pixmap, &sc, &mapper, item, *pale);
             }
-            DisplayKind::WidgetGlyph { glyph, open } => {
-                draw_widget_glyph(pixmap, &sc, &mapper, item, *glyph, *open);
+            DisplayKind::WidgetGlyph { glyph, open, color } => {
+                draw_widget_glyph(pixmap, &sc, &mapper, item, *glyph, *open, *color);
             }
         }
     }
@@ -315,6 +315,7 @@ fn draw_widget_glyph(
     item: &DisplayItem,
     glyph: WidgetGlyphKind,
     open: bool,
+    color: [u8; 3],
 ) {
     let rect = mapper.scissor_of(sc, item.x, item.y, item.w, item.h);
     if rect.empty() {
@@ -327,7 +328,7 @@ fn draw_widget_glyph(
         for px in rect.x0..rect.x1 {
             let (lx, ly) = mapper.local(px, py);
             if glyph_contains(glyph, open, lx, ly, item.x, item.y, item.w, item.h) {
-                blend_pixel(pixels, w, px, py, 45, 45, 45, a);
+                blend_pixel(pixels, w, px, py, color[0], color[1], color[2], a);
             }
         }
     }

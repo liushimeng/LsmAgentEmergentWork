@@ -8,6 +8,7 @@
 mod flex;
 mod float;
 mod inline;
+mod inline_atomic;
 mod list_marker;
 mod measure;
 mod grid;
@@ -19,6 +20,8 @@ mod widgets;
 mod position_tests;
 #[cfg(test)]
 mod form_widget_tests;
+#[cfg(test)]
+mod inline_atomic_tests;
 #[cfg(test)]
 mod list_marker_tests;
 #[cfg(test)]
@@ -35,6 +38,7 @@ mod tests;
 use std::collections::HashMap;
 
 use inline::InlineBuf;
+pub(crate) use widgets::select_is_list;
 pub(crate) use measure::{append, translate, Fragment};
 
 use kuchikiki::NodeRef;
@@ -1278,8 +1282,10 @@ impl<'a> LayoutCtx<'a> {
                     collapse_margin(self.pending_margin_bottom, style.margin_bottom);
                 continue;
             }
-            // 阶段三第三步:替换元素(<img>/<svg>)独占一行,避免与文本重叠。
-            if is_replaced_tag(&child) {
+            // 第 44 轮:替换元素只有**块级**(`display:block`)时独占一行;
+            // 行内替换元素(`img`/`svg`/`canvas`/`iframe`)走**行内原子盒**路径
+            // —— 占宽、参与断行、按基线对齐(此前一律独占一行且顶对齐)。
+            if is_replaced_tag(&child) && style.is_block() {
                 self.flush_inline(buf, width);
                 let avail_h = (cb.3 != UNKNOWN_CB_H).then_some(cb.3);
                 let (iw, ih, isrc) = self.replaced_size(&child, &style, width, avail_h);

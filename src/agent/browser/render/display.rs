@@ -63,9 +63,13 @@ pub enum DisplayKind {
     CanvasNote { pale: bool },
     /// 原生控件几何图元:勾/圆点/箭头/列表圆点。用几何光栅而非字体字形,
     /// 避免跨平台字体缺字导致豆腐块。
+    ///
+    /// `color` 为图元颜色(第 44 轮):勾/圆点取 `accent-color`(或 UA 默认强调色),
+    /// 禁用态控件灰化;列表 marker 取元素文字色。
     WidgetGlyph {
         glyph: WidgetGlyphKind,
         open: bool,
+        color: [u8; 3],
     },
 }
 

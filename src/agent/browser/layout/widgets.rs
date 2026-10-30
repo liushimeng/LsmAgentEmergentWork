@@ -41,6 +41,82 @@ const RANGE_TRACK_H: f64 = 4.0;
 /// 颜色色块边长。
 const SWATCH_SIZE: f64 = 18.0;
 
+/// UA 默认强调色(CSS `accent-color` 缺省值,Chrome 为 `#0075FF`)。
+const DEFAULT_ACCENT: [u8; 3] = [0, 117, 255];
+
+/// 禁用态控件的灰化色(UA 皮肤)。
+const DISABLED_GRAY: [u8; 3] = [150, 150, 150];
+
+/// meter 的三段配色:最优区(绿)/次优区(琥珀)/最差区(红)。
+const METER_GOOD: [u8; 3] = [80, 160, 90];
+const METER_FAIR: [u8; 3] = [215, 170, 60];
+const METER_POOR: [u8; 3] = [190, 75, 75];
+
+/// select 是否为**列表形态**(`size>1` 或 `multiple`)。
+///
+/// 浏览器语义:`size>1` 或 `multiple` 的 select 直接铺开全部 option 行,
+/// 不再有下拉箭头与浮层面板(第 44 轮)。
+pub(crate) fn select_is_list(node: &NodeRef) -> bool {
+    if document::attr(node, "multiple").is_some() {
+        return true;
+    }
+    document::attr(node, "size")
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .map(|n| n > 1.0)
+        .unwrap_or(false)
+}
+
+/// select 列表形态的行数(option 行 + optgroup 标题行)。
+pub(crate) fn select_list_rows(node: &NodeRef) -> usize {
+    let mut rows = 0usize;
+    for child in node.children() {
+        if child.as_element().is_none() {
+            continue;
+        }
+        let el = child.clone();
+        match document::tag_name(&el).to_ascii_lowercase().as_str() {
+            "option" => rows += 1,
+            "optgroup" => {
+                if document::attr(&el, "label").is_some() {
+                    rows += 1;
+                }
+                for opt in el.children() {
+                    if opt.as_element().is_some()
+                        && document::tag_name(&opt).eq_ignore_ascii_case("option")
+                    {
+                        rows += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    rows
+}
+
+/// 控件是否处于禁用态(`disabled` 属性;运行时状态不改写该属性)。
+pub(crate) fn is_disabled(node: &NodeRef) -> bool {
+    document::attr(node, "disabled").is_some()
+}
+
+/// 控件文字色:禁用态灰化(UA 皮肤),否则取元素文字色。
+pub(crate) fn control_text_color(node: &NodeRef, style: &ComputedStyle) -> [u8; 3] {
+    if is_disabled(node) {
+        DISABLED_GRAY
+    } else {
+        style.color
+    }
+}
+
+/// 控件强调色:`accent-color` 优先,禁用态灰化。
+pub(crate) fn accent_color(node: &NodeRef, style: &ComputedStyle) -> [u8; 3] {
+    if is_disabled(node) {
+        DISABLED_GRAY
+    } else {
+        style.accent_color.unwrap_or(DEFAULT_ACCENT)
+    }
+}
+
 /// `input[type=range]`:轨道 + 拇指。拇指按 `min/max/value` 的比例定位。
 pub(crate) fn emit_range(
     ctx: &mut LayoutCtx<'_>,
@@ -60,11 +136,12 @@ pub(crate) fn emit_range(
     let track_x = bx + RANGE_INSET;
     let track_w = (w - RANGE_INSET * 2.0).max(1.0);
     let track_y = by + (h - RANGE_TRACK_H) / 2.0;
-    // 轨道底色:浏览器为浅灰槽 + 已填充段为强调色。
+    // 轨道底色:浏览器为浅灰槽 + 已填充段为强调色(第 44 轮:`accent-color`)。
+    let accent = accent_color(node, style);
     ctx.push_widget_fill(style, [225, 225, 225], 255, track_x, track_y, track_w, RANGE_TRACK_H, tf);
     ctx.push_widget_fill(
         style,
-        [70, 130, 210],
+        accent,
         255,
         track_x,
         track_y,
@@ -79,6 +156,7 @@ pub(crate) fn emit_range(
     ctx.emit_widget_glyph(
         WidgetGlyphKind::SliderThumb,
         false,
+        accent,
         thumb_x,
         thumb_y,
         RANGE_THUMB_W,
@@ -115,26 +193,28 @@ pub(crate) fn emit_color(
 pub(crate) fn emit_calendar_icon(
     ctx: &mut LayoutCtx<'_>,
     style: &ComputedStyle,
+    color: [u8; 3],
     bx: f64,
     by: f64,
     w: f64,
     h: f64,
     tf: Option<Affine>,
 ) {
-    emit_right_icon(ctx, style, WidgetGlyphKind::CalendarIcon, bx, by, w, h, tf);
+    emit_right_icon(ctx, style, WidgetGlyphKind::CalendarIcon, color, bx, by, w, h, tf);
 }
 
 /// `input[type=time]`:右侧时钟图标。
 pub(crate) fn emit_clock_icon(
     ctx: &mut LayoutCtx<'_>,
     style: &ComputedStyle,
+    color: [u8; 3],
     bx: f64,
     by: f64,
     w: f64,
     h: f64,
     tf: Option<Affine>,
 ) {
-    emit_right_icon(ctx, style, WidgetGlyphKind::ClockIcon, bx, by, w, h, tf);
+    emit_right_icon(ctx, style, WidgetGlyphKind::ClockIcon, color, bx, by, w, h, tf);
 }
 
 /// 右侧图标区:统一放在控件右端,垂直居中。
@@ -142,6 +222,7 @@ fn emit_right_icon(
     ctx: &mut LayoutCtx<'_>,
     style: &ComputedStyle,
     glyph: WidgetGlyphKind,
+    color: [u8; 3],
     bx: f64,
     by: f64,
     w: f64,
@@ -151,7 +232,7 @@ fn emit_right_icon(
     let side = ICON_SIZE.min(h - 4.0).max(6.0);
     let x = bx + w - FIELD_ICON_W + (FIELD_ICON_W - side) / 2.0;
     let y = by + (h - side) / 2.0;
-    ctx.emit_widget_glyph(glyph, false, x, y, side, side, style, tf);
+    ctx.emit_widget_glyph(glyph, false, color, x, y, side, side, style, tf);
 }
 
 /// `input[type=number]`:右端上下微调箭头(上箭头 + 下箭头)。
@@ -161,6 +242,7 @@ fn emit_right_icon(
 pub(crate) fn emit_number_spinner(
     ctx: &mut LayoutCtx<'_>,
     style: &ComputedStyle,
+    color: [u8; 3],
     bx: f64,
     by: f64,
     w: f64,
@@ -173,6 +255,7 @@ pub(crate) fn emit_number_spinner(
     ctx.emit_widget_glyph(
         WidgetGlyphKind::CaretUp,
         false,
+        color,
         x,
         mid - arrow - 1.0,
         arrow,
@@ -183,6 +266,7 @@ pub(crate) fn emit_number_spinner(
     ctx.emit_widget_glyph(
         WidgetGlyphKind::Caret,
         true,
+        color,
         x,
         mid + 1.0,
         arrow,
@@ -225,6 +309,7 @@ pub(crate) fn emit_indeterminate(
     ctx: &mut LayoutCtx<'_>,
     _node: &NodeRef,
     style: &ComputedStyle,
+    color: [u8; 3],
     bx: f64,
     by: f64,
     w: f64,
@@ -235,6 +320,7 @@ pub(crate) fn emit_indeterminate(
     ctx.emit_widget_glyph(
         WidgetGlyphKind::Indeterminate,
         false,
+        color,
         bx + (w - side) / 2.0,
         by + (h - side) / 2.0,
         side,
@@ -248,6 +334,7 @@ pub(crate) fn emit_indeterminate(
 pub(crate) fn emit_radio_ring(
     ctx: &mut LayoutCtx<'_>,
     style: &ComputedStyle,
+    color: [u8; 3],
     bx: f64,
     by: f64,
     w: f64,
@@ -258,6 +345,7 @@ pub(crate) fn emit_radio_ring(
     ctx.emit_widget_glyph(
         WidgetGlyphKind::BulletRing,
         false,
+        color,
         bx + (w - side) / 2.0,
         by + (h - side) / 2.0,
         side,
@@ -300,8 +388,10 @@ pub(crate) fn emit_form_control_text(
                     // 第 41 轮:半选(indeterminate)优先于选中;未选中的
                     // radio 画圆环轮廓,让控件类型在截图里可辨。
                     let indeterminate = document::attr(node, "indeterminate").is_some();
+                    // 第 44 轮:勾/圆点取 `accent-color`(禁用态灰化)。
+                    let accent = accent_color(node, style);
                     if indeterminate {
-                        emit_indeterminate(ctx, node, style, bx, by, w, h, tf);
+                        emit_indeterminate(ctx, node, style, accent, bx, by, w, h, tf);
                     } else if checked {
                         let glyph = if ty == "checkbox" {
                             WidgetGlyphKind::CheckMark
@@ -312,6 +402,7 @@ pub(crate) fn emit_form_control_text(
                         ctx.emit_widget_glyph(
                             glyph,
                             false,
+                            accent,
                             bx + (w - side) / 2.0,
                             by + (h - side) / 2.0,
                             side,
@@ -320,7 +411,7 @@ pub(crate) fn emit_form_control_text(
                             tf,
                         );
                     } else if ty == "radio" {
-                        emit_radio_ring(ctx, style, bx, by, w, h, tf);
+                        emit_radio_ring(ctx, style, accent, bx, by, w, h, tf);
                     }
                 }
                 "" | "text" | "search" | "url" | "tel" | "email" | "password"
@@ -348,7 +439,7 @@ pub(crate) fn emit_form_control_text(
                         h,
                         tf,
                     );
-                    emit_number_spinner(ctx, style, bx, by, w, h, tf);
+                    emit_number_spinner(ctx, style, color, bx, by, w, h, tf);
                 }
                 // 第 41 轮:滑块 —— 轨道 + 拇指(内置 UI 独立计算几何)。
                 "range" => {
@@ -371,7 +462,7 @@ pub(crate) fn emit_form_control_text(
                         h,
                         tf,
                     );
-                    emit_calendar_icon(ctx, style, bx, by, w, h, tf);
+                    emit_calendar_icon(ctx, style, color, bx, by, w, h, tf);
                 }
                 "time" => {
                     let (text, color) = input_display_text(node, style, &ty);
@@ -385,7 +476,7 @@ pub(crate) fn emit_form_control_text(
                         h,
                         tf,
                     );
-                    emit_clock_icon(ctx, style, bx, by, w, h, tf);
+                    emit_clock_icon(ctx, style, color, bx, by, w, h, tf);
                 }
                 // 第 41 轮:文件选择器 —— 文件名 / 「选择文件」文案。
                 "file" => {
@@ -413,6 +504,11 @@ pub(crate) fn emit_form_control_text(
             emit_singleline_text(ctx, &text, style.color, style, bx, by, w, h, tf);
         }
         "select" => {
+            // 第 44 轮:列表形态(`size>1`/`multiple`)直接铺开全部 option 行。
+            if select_is_list(node) {
+                emit_select_list(ctx, node, style, bx, by, w, h, tf);
+                return;
+            }
             let text = super::select_display_text(node);
             let caret_w = 14.0_f64.min(w * 0.25);
             emit_singleline_text(ctx, 
@@ -436,6 +532,7 @@ pub(crate) fn emit_form_control_text(
             ctx.emit_widget_glyph(
                 caret,
                 true,
+                control_text_color(node, style),
                 bx + w - caret_w + (caret_w - side) / 2.0,
                 by + (h - side) / 2.0,
                 side,
@@ -464,14 +561,170 @@ pub(crate) fn emit_form_control_text(
     }
 }
 
+/// select 列表形态的一行:option 行或 optgroup 标题行。
+enum SelectRow {
+    /// option 行(带节点,用于登记几何)。
+    Option {
+        node: NodeRef,
+        label: String,
+        selected: bool,
+        disabled: bool,
+    },
+    /// optgroup 标题行。
+    Group(String),
+}
+
+/// select 的**列表形态**渲染(第 44 轮):逐行铺出 option,`optgroup` 出标题行,
+/// `multiple` 行首带勾选位,选中行铺高亮底色。
+fn emit_select_list(
+    ctx: &mut LayoutCtx<'_>,
+    node: &NodeRef,
+    style: &ComputedStyle,
+    bx: f64,
+    by: f64,
+    w: f64,
+    h: f64,
+    tf: Option<Affine>,
+) {
+    let size = style.font_size.max(8.0);
+    let row_h = (size * 1.45).max(14.0);
+    let multiple = document::attr(node, "multiple").is_some();
+    let marker_w = if multiple { 16.0 } else { 0.0 };
+    let max_rows = (((h - 4.0) / row_h).floor() as usize).max(1);
+    let text_color = control_text_color(node, style);
+    let accent = accent_color(node, style);
+
+    // 先收集行(标题行 + option 行),再统一绘制,避免闭包借用冲突。
+    let mut rows: Vec<SelectRow> = Vec::new();
+    for child in node.children() {
+        if child.as_element().is_none() {
+            continue;
+        }
+        let el = child.clone();
+        match document::tag_name(&el).to_ascii_lowercase().as_str() {
+            "option" => {
+                let label = document::collapse_ws(&el.text_contents());
+                let selected = document::attr(&el, "selected").is_some();
+                let disabled = document::attr(&el, "disabled").is_some();
+                rows.push(SelectRow::Option {
+                    label,
+                    selected,
+                    disabled,
+                    node: el,
+                });
+            }
+            "optgroup" => {
+                if let Some(label) = document::attr(&el, "label") {
+                    if !label.trim().is_empty() {
+                        rows.push(SelectRow::Group(label));
+                    }
+                }
+                for opt in el.children() {
+                    if opt.as_element().is_none()
+                        || !document::tag_name(&opt).eq_ignore_ascii_case("option")
+                    {
+                        continue;
+                    }
+                    let label = document::collapse_ws(&opt.text_contents());
+                    let selected = document::attr(&opt, "selected").is_some();
+                    let disabled = document::attr(&opt, "disabled").is_some();
+                    rows.push(SelectRow::Option {
+                        label,
+                        selected,
+                        disabled,
+                        node: opt.clone(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut y = by + 2.0;
+    let mut drawn = 0usize;
+    for row in rows.into_iter().take(max_rows) {
+        match row {
+            SelectRow::Group(label) => {
+                // 分组标题行(浏览器为禁用态小字)。
+                emit_singleline_text(
+                    ctx,
+                    &label,
+                    [120, 120, 120],
+                    style,
+                    bx + 3.0,
+                    y,
+                    (w - 6.0).max(1.0),
+                    row_h,
+                    tf,
+                );
+            }
+            SelectRow::Option {
+                node: opt,
+                label,
+                selected,
+                disabled,
+            } => {
+                let color = if disabled { DISABLED_GRAY } else { text_color };
+                if selected {
+                    // 选中行:铺高亮底色(浏览器为浅蓝)。
+                    ctx.push_widget_fill(style, [214, 232, 250], 255, bx + 1.0, y, w - 2.0, row_h, tf);
+                }
+                if multiple {
+                    // 勾选位:选中画勾,未选画方框(几何图元,避免字体缺字)。
+                    let side = 12.0_f64.min(row_h - 4.0).max(8.0);
+                    let mx = bx + 3.0;
+                    let my = y + (row_h - side) / 2.0;
+                    if selected {
+                        ctx.emit_widget_glyph(
+                            WidgetGlyphKind::CheckMark,
+                            false,
+                            accent,
+                            mx,
+                            my,
+                            side,
+                            side,
+                            style,
+                            tf,
+                        );
+                    } else {
+                        ctx.push_widget_fill(style, [150, 150, 150], 255, mx, my, side, side, tf);
+                    }
+                }
+                let text_x = bx + 3.0 + marker_w;
+                let text_w = (w - 6.0 - marker_w).max(1.0);
+                emit_singleline_text(ctx, &label, color, style, text_x, y, text_w, row_h, tf);
+                // option 行登记几何:列表形态下 option 常驻可见,必须可点可寻址。
+                ctx.boxes.push(super::ElementBox {
+                    selector: super::Document::stable_selector(&opt),
+                    tag: "option".to_string(),
+                    x: bx + 1.0,
+                    y,
+                    w: w - 2.0,
+                    h: row_h,
+                    background: None,
+                    background_alpha: 255,
+                    visible: !disabled,
+                    z_index: style.pos.z_index,
+                    out_of_flow: false,
+                });
+            }
+        }
+        y += row_h;
+        drawn += 1;
+    }
+    let _ = drawn;
+}
+
 pub(crate) fn input_display_text(
     node: &NodeRef,
     style: &ComputedStyle,
     ty: &str,
 ) -> (String, [u8; 3]) {
+    // 第 44 轮:禁用态控件文字灰化(UA 皮肤)。
+    let color = control_text_color(node, style);
     let value = document::attr(node, "value").unwrap_or_default();
     if !value.trim().is_empty() {
-        return (value, style.color);
+        return (value, color);
     }
     if matches!(ty, "submit" | "button" | "reset") {
         let fallback = match ty {
@@ -479,7 +732,7 @@ pub(crate) fn input_display_text(
             "reset" => "Reset",
             _ => "Button",
         };
-        return (fallback.to_string(), style.color);
+        return (fallback.to_string(), color);
     }
     (document::attr(node, "placeholder").unwrap_or_default(), [117, 117, 117])
 }
@@ -601,22 +854,130 @@ pub(crate) fn emit_meter_like(
     } else {
         0.0
     };
-    let max = super::parse_f64_attr(node, "max").unwrap_or(1.0).max(min + f64::EPSILON);
-    let value = super::parse_f64_attr(node, "value").unwrap_or(min);
+    let max = if is_meter {
+        super::parse_f64_attr(node, "max").unwrap_or(1.0)
+    } else {
+        1.0
+    }
+    .max(min + f64::EPSILON);
+    let raw_value = super::parse_f64_attr(node, "value");
+    let value = raw_value.unwrap_or(min);
     let ratio = ((value - min) / (max - min)).clamp(0.0, 1.0);
     let track_y = by + (h * 0.30).max(1.0);
     let track_h = (h * 0.40).max(2.0);
     let track_x = bx + 2.0;
     let track_w = (w - 4.0).max(1.0);
     ctx.push_widget_fill(style, [225, 225, 225], 255, track_x, track_y, track_w, track_h, tf);
+    if !is_meter {
+        // 第 44 轮:`progress` 的不确定态(无 `value` 属性)与强调色。
+        let accent = accent_color(node, style);
+        if raw_value.is_some() {
+            ctx.push_widget_fill(
+                style,
+                accent,
+                255,
+                track_x,
+                track_y,
+                track_w * ratio,
+                track_h,
+                tf,
+            );
+        } else {
+            // 不确定态:浏览器是循环动画,静态近似为轨道居中的一段。
+            let seg = (track_w * 0.3).max(2.0);
+            ctx.push_widget_fill(
+                style,
+                accent,
+                255,
+                track_x + (track_w - seg) / 2.0,
+                track_y,
+                seg,
+                track_h,
+                tf,
+            );
+        }
+        return;
+    }
+    // 第 44 轮:`meter` 按 `low`/`high`/`optimum` 三段配色 ——
+    // 经典 HTML 渲染口径:最优值所在侧为绿,次优为琥珀,最差为红。
+    let low = super::parse_f64_attr(node, "low")
+        .unwrap_or(min)
+        .clamp(min, max);
+    let high = super::parse_f64_attr(node, "high")
+        .unwrap_or(max)
+        .clamp(min, max);
+    let optimum = super::parse_f64_attr(node, "optimum")
+        .unwrap_or((min + max) / 2.0)
+        .clamp(min, max);
+    // 三区:低于 low / low..high / 高于 high。
+    let zone = |v: f64| -> usize {
+        if v < low {
+            0
+        } else if v > high {
+            2
+        } else {
+            1
+        }
+    };
+    let zone_color = |z: usize| -> [u8; 3] {
+        if optimum < low {
+            // 最优值在左端:左侧绿、中间琥珀、右侧红。
+            match z {
+                0 => METER_GOOD,
+                1 => METER_FAIR,
+                _ => METER_POOR,
+            }
+        } else if optimum > high {
+            // 最优值在右端:左侧红、中间琥珀、右侧绿。
+            match z {
+                0 => METER_POOR,
+                1 => METER_FAIR,
+                _ => METER_GOOD,
+            }
+        } else {
+            // 最优值居中:中段绿,两侧红。
+            match z {
+                1 => METER_GOOD,
+                _ => METER_POOR,
+            }
+        }
+    };
+    let fill = if is_disabled(node) {
+        DISABLED_GRAY
+    } else {
+        zone_color(zone(value))
+    };
     ctx.push_widget_fill(
         style,
-        if is_meter { [80, 160, 90] } else { [70, 130, 210] },
+        fill,
         255,
         track_x,
         track_y,
         track_w * ratio,
         track_h,
+        tf,
+    );
+    // `low`/`high` 分界刻度 + `optimum` 标记(浏览器在最优值位置画一道缺口)。
+    let tick = |ctx: &mut LayoutCtx<'_>, pos: f64, color: [u8; 3]| {
+        let x = track_x + (track_w * pos).clamp(0.0, 1.0);
+        ctx.push_widget_fill(style, color, 255, x, track_y, 1.5, track_h, tf);
+    };
+    if low > min {
+        tick(ctx, (low - min) / (max - min), [120, 120, 120]);
+    }
+    if high < max {
+        tick(ctx, (high - min) / (max - min), [120, 120, 120]);
+    }
+    let opt_pos = ((optimum - min) / (max - min)).clamp(0.0, 1.0);
+    let ox = track_x + track_w * opt_pos;
+    ctx.push_widget_fill(
+        style,
+        [40, 40, 40],
+        255,
+        (ox - 1.0).max(track_x),
+        track_y - 1.0,
+        2.0,
+        track_h + 2.0,
         tf,
     );
 }
@@ -658,6 +1019,7 @@ pub(crate) fn emit_widget_glyph(
     &mut self,
     glyph: WidgetGlyphKind,
     open: bool,
+    color: [u8; 3],
     x: f64,
     y: f64,
     w: f64,
@@ -667,7 +1029,7 @@ pub(crate) fn emit_widget_glyph(
 ) {
     let seq = self.next_seq();
     self.display.push(DisplayItem {
-        kind: DisplayKind::WidgetGlyph { glyph, open },
+        kind: DisplayKind::WidgetGlyph { glyph, open, color },
         x,
         y,
         w,

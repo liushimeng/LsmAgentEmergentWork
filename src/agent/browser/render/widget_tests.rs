@@ -23,7 +23,11 @@ fn render_state(html: &str, values: &[(&str, &str)]) -> (image::RgbaImage, layou
     (img, lay)
 }
 
-fn dark_count(img: &image::RgbaImage, lay: &layout::Layout, selector: &str) -> usize {
+/// 统计控件盒内的**墨迹像素**(非白底像素)。
+///
+/// 第 44 轮:勾/圆点/箭头等图元改用 `accent-color`(默认 `#0075FF` 蓝),
+/// 不再是深灰 —— 判据从「深色」改为「非背景色」。
+fn ink_count(img: &image::RgbaImage, lay: &layout::Layout, selector: &str) -> usize {
     let b = lay
         .boxes
         .iter()
@@ -37,7 +41,7 @@ fn dark_count(img: &image::RgbaImage, lay: &layout::Layout, selector: &str) -> u
     for y in y0..y1 {
         for x in x0..x1 {
             let p = img.get_pixel(x, y).0;
-            if p[0] < 90 && p[1] < 90 && p[2] < 90 && p[3] > 0 {
+            if (p[0] < 235 || p[1] < 235 || p[2] < 235) && p[3] > 0 {
                 n += 1;
             }
         }
@@ -61,7 +65,7 @@ fn 选中checkbox勾图元进入真实像素() {
         )),
         "布局显示列表应含勾图元"
     );
-    assert!(dark_count(&img, &lay, "#ok") > 8, "勾图元应产生深色像素");
+    assert!(ink_count(&img, &lay, "#ok") > 8, "勾图元应产生可见像素");
 }
 
 #[test]
@@ -80,7 +84,7 @@ fn select箭头图元进入真实像素() {
         )),
         "布局显示列表应含箭头图元"
     );
-    assert!(dark_count(&img, &lay, "#s") > 8, "select 箭头/文本应产生深色像素");
+    assert!(ink_count(&img, &lay, "#s") > 8, "select 箭头/文本应产生可见像素");
 }
 
 /// 第 41 轮:新增控件图元必须落到真实像素。
@@ -100,7 +104,7 @@ fn 滑块拇指图元进入真实像素() {
         )),
         "布局显示列表应含滑块拇指图元"
     );
-    assert!(dark_count(&img, &lay, "#r") > 8, "滑块拇指应产生深色像素");
+    assert!(ink_count(&img, &lay, "#r") > 8, "滑块拇指应产生可见像素");
 }
 
 #[test]
@@ -119,7 +123,7 @@ fn 日历图标图元进入真实像素() {
         )),
         "布局显示列表应含日历图标图元"
     );
-    assert!(dark_count(&img, &lay, "#d") > 8, "日历图标应产生深色像素");
+    assert!(ink_count(&img, &lay, "#d") > 8, "日历图标应产生可见像素");
 }
 
 #[test]
@@ -138,7 +142,7 @@ fn 数字微调箭头图元进入真实像素() {
         )),
         "布局显示列表应含上箭头图元"
     );
-    assert!(dark_count(&img, &lay, "#n") > 8, "微调箭头应产生深色像素");
+    assert!(ink_count(&img, &lay, "#n") > 8, "微调箭头应产生可见像素");
 }
 
 #[test]

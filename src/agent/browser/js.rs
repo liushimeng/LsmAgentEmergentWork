@@ -291,7 +291,10 @@ const PRELUDE_BODY: &str = r##"
         __push({ type: "set_attr", selector: n.sel, key: "open", value: "" });
         __push({ type: "set_attr", selector: n.sel, key: "data-lsm-modal", value: "" });
       },
-      close: function () {
+      close: function (ret) {
+        if (ret !== undefined && ret !== null) {
+          __push({ type: "set_attr", selector: n.sel, key: "returnValue", value: String(ret) });
+        }
         __push({ type: "remove_attr", selector: n.sel, key: "open" });
         __push({ type: "remove_attr", selector: n.sel, key: "data-lsm-modal" });
       },

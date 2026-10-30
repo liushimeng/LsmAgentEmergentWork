@@ -371,6 +371,17 @@ pub(crate) struct InlineRow {
 impl InlineRow {
     /// 登记一个非浮动行内盒(行内块/控件),后续浮动可排在当前行剩余带。
     pub(crate) fn register(&mut self, bx: f64, by: f64, w: f64, h: f64, container_right: f64) {
+        self.register_band(bx, by, w, h, container_right);
+        self.max_bottom = self.max_bottom.max(by + h);
+    }
+
+    /// 登记行内盒的**占用带**(供后续浮动排布),但**不**计入内容底。
+    ///
+    /// 第 44 轮:行内盒(行内块/表单控件)的高度已由行盒的基线分解承担,
+    /// 若再计入 `max_bottom`,块游标会在文本 flush 之前被提前推下去 ——
+    /// 段首凭空多出一个盒高的空洞(实测 `<p>Hello <a>link</a> World</p>`
+    /// 的文字整体下沉 23px)。此处只更新占用带,不动内容底。
+    pub(crate) fn register_band(&mut self, bx: f64, by: f64, w: f64, h: f64, container_right: f64) {
         if !self.active || by > self.y + 0.5 {
             self.active = true;
             self.y = by;
@@ -382,7 +393,6 @@ impl InlineRow {
             self.right = self.right.max(bx + w);
             self.h = self.h.max(h);
         }
-        self.max_bottom = self.max_bottom.max(by + h);
     }
 
     /// 行内浮动定位:返回 `(bx, by)`;同步更新行占用与内容底。

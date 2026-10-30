@@ -295,8 +295,8 @@ impl FontSet {
                     ),
                     DisplayKind::TextShadow { .. } => "textshadow".to_string(),
                     DisplayKind::CanvasNote { .. } => "canvasnote".to_string(),
-                    DisplayKind::WidgetGlyph { glyph, open } => {
-                        format!("widget({glyph:?},open={open})")
+                    DisplayKind::WidgetGlyph { glyph, open, color } => {
+                        format!("widget({glyph:?},open={open},color={color:?})")
                     }
                 };
                 buf.push_str(&format!(

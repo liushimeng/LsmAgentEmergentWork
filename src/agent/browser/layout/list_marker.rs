@@ -273,6 +273,7 @@ pub(crate) fn emit(
                 ctx.emit_widget_glyph(
                     glyph,
                     false,
+                    style.color,
                     content_x,
                     y + (h - MARKER_SIZE) / 2.0,
                     MARKER_SIZE,
@@ -310,6 +311,7 @@ pub(crate) fn emit(
             ctx.emit_widget_glyph(
                 glyph,
                 false,
+                style.color,
                 content_x - OUTSIDE_OFFSET,
                 y + 2.0,
                 MARKER_SIZE,

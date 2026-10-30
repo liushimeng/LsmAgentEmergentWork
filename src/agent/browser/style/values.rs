@@ -104,6 +104,14 @@ pub struct ComputedStyle {
     pub grid_item: GridItemStyle,
     /// `object-fit`(阶段三第三步):替换元素内容在盒内的填充方式。
     pub object_fit: String,
+    /// CSS `vertical-align`(第 44 轮):行内原子盒的垂直对齐方式(非继承)。
+    ///
+    /// 归一为关键字(`baseline`/`middle`/`top`/`bottom`/`sub`/`super`)或长度原值
+    /// (`12px`/`30%`);布局层(`layout/inline_atomic.rs`)解析成偏移量。
+    pub vertical_align: String,
+    /// CSS `accent-color`(第 44 轮):checkbox/radio/progress/range 的强调色(非继承)。
+    /// `None` = 未声明,控件图元回落 UA 默认色。
+    pub accent_color: Option<[u8; 3]>,
     /// `background-image` 背景层(阶段六第二步,按声明序自顶向下);`url()` 与
     /// `gradient()` 混排保序,`background` 简写与长写法都可能命中。
     pub background_layers: Vec<BgLayer>,
@@ -450,6 +458,8 @@ impl Default for ComputedStyle {
             grid: GridContainerStyle::default(),
             grid_item: GridItemStyle::default(),
             object_fit: "fill".to_string(),
+            vertical_align: "baseline".to_string(),
+            accent_color: None,
             background_layers: Vec::new(),
             background_position: None,
             background_size: "auto".to_string(),
@@ -664,6 +674,7 @@ impl ComputedStyle {
         // `transform` / `transform-origin` 的解析值含盒尺寸相关量(百分比),
         // 无法在样式层解析为标量,故不进 `to_map`(观测走 DOM 的 inline style 原文)。
         out.insert("background-size".into(), self.background_size.clone());
+        out.insert("vertical-align".into(), self.vertical_align.clone());
         out.insert("border-radius".into(), self.border_radius_text());
         out.insert(
             "overflow".into(),
@@ -1380,6 +1391,25 @@ pub fn apply_declaration(
             ) {
                 st.object_fit = v;
             }
+        }
+        // 第 44 轮:行内原子盒的垂直对齐(此前落 `extra`,布局层完全不可见)。
+        "vertical-align" => {
+            let v = value.trim().to_ascii_lowercase();
+            if matches!(
+                v.as_str(),
+                "baseline" | "middle" | "top" | "bottom" | "text-top" | "text-bottom" | "sub"
+                    | "super"
+            ) || v.ends_with('%')
+                || v.ends_with("px")
+                || v.ends_with("em")
+                || v.ends_with("rem")
+            {
+                st.vertical_align = v;
+            }
+        }
+        // 第 44 轮:控件强调色(checkbox/radio/progress/range)。
+        "accent-color" => {
+            st.accent_color = parse_color(value).flatten().map(|(rgb, _)| rgb);
         }
         // ---- 边框(绘制用结构化解析;top/right/bottom/left = 0/1/2/3)----
         "border" => {

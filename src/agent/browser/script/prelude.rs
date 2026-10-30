@@ -1351,7 +1351,12 @@ function __mk(n) {
       __push({ type: "set_attr", selector: n.sel, key: "data-lsm-modal", value: "" });
       return undefined;
     },
-    close: function () {
+    // 第 44 轮:`close(returnValue)` 带回结果值(HTMLDialogElement.returnValue)。
+    close: function (ret) {
+      if (ret !== undefined && ret !== null) {
+        __push({ type: "set_attr", selector: n.sel, key: "returnValue", value: String(ret) });
+        attrs["returnValue"] = String(ret);
+      }
       __push({ type: "remove_attr", selector: n.sel, key: "open" });
       __push({ type: "remove_attr", selector: n.sel, key: "data-lsm-modal" });
       return undefined;
@@ -1985,6 +1990,30 @@ function __newEl(tag) {
   return el;
 }
 
+// DocumentFragment:基于 __newEl 的完整节点接口建(fragment 此前是只有
+// appendChild 的裸对象)。实测京东 jQuery 1.6.4 support 探测首步就是
+// `l=c.createDocumentFragment(),l.appendChild(a.firstChild),
+//  k.checkClone=l.cloneNode(!0).cloneNode(!0).lastChild.checked`——裸对象
+// 缺 cloneNode/firstChild/lastChild 当场 "not a callable function",jQuery
+// 整体装载失败,首页全部动态内容(登录栏/轮播/楼层,含风控 wl.js 指纹采集)
+// 连锁静默死亡,页面只剩服务器静态壳。cloneNode 经 __newEl 重建会把
+// nodeType 回落成 1,故覆写一份保持 fragment 语义。
+function __mkFragment() {
+  var frag = __newEl("#document-fragment");
+  frag.nodeType = 11;
+  frag.nodeName = "#document-fragment";
+  frag.tagName = "#document-fragment";
+  var origClone = frag.cloneNode;
+  frag.cloneNode = function (deep) {
+    var d = origClone(deep);
+    d.nodeType = 11;
+    d.nodeName = "#document-fragment";
+    d.tagName = "#document-fragment";
+    return d;
+  };
+  return frag;
+}
+
 // ---------- detached innerHTML 轻量解析 ----------
 // 只服务于「建好子树后按标签/类查询」这类读路径(tangram/jQuery 特性探测、
 // widget 模板拼装)。不做实体解码/命名空间/错误恢复,序列化仍走 __pendingHtml 原文。
@@ -2345,7 +2374,7 @@ var document = {
     return { nodeType: 8, nodeName: "#comment", textContent: String(t == null ? "" : t), data: String(t == null ? "" : t), nodeValue: String(t == null ? "" : t) };
   },
   createDocumentFragment: function () {
-    return { __detached: true, __tag: "div", __attrs: {}, __kids: [], __text: "", nodeType: 11, appendChild: function (c) { this.__kids.push(c); return c; } };
+    return __mkFragment();
   },
   // createTreeWalker / createNodeIterator / createRange(第 174 轮):
   // 见上方实现注释;猎聘等站点探测脚本依赖,缺失即断。
@@ -2408,7 +2437,7 @@ var document = {
         createElementNS: function (ns, tag) { return __newEl(tag); },
         createTextNode: function (t) { return { nodeType: 3, textContent: String(t), data: String(t) }; },
         createDocumentFragment: function () {
-          return { __detached: true, __tag: "div", __attrs: {}, __kids: [], __text: "", nodeType: 11, appendChild: function (c) { this.__kids.push(c); return c; } };
+          return __mkFragment();
         },
         querySelector: function () { return null; },
         querySelectorAll: function () { return []; },

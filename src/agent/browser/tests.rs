@@ -308,6 +308,120 @@ async fn 禁用与只读控件拒绝交互() {
 }
 
 #[tokio::test]
+async fn reset按钮恢复表单默认值() {
+    let mgr = LsmBrowserManager::new();
+    let url = html_doc(
+        "<form id='f'><input id='t' name='t' value='默认'><input id='c' type='checkbox' checked><button id='r' type='reset'>重置</button></form>",
+    );
+    let out = mgr
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .await
+        .unwrap();
+    // 先改运行时值:输入框写入新值,复选框取消勾选。
+    api::control(
+        &mgr,
+        Some(&out.page_id),
+        "input_text",
+        &serde_json::json!({"selector": "#t", "text": "改过"}),
+        &serde_json::json!({}),
+    )
+    .await
+    .unwrap();
+    api::control(
+        &mgr,
+        Some(&out.page_id),
+        "click",
+        &serde_json::json!({"selector": "#c"}),
+        &serde_json::json!({}),
+    )
+    .await
+    .unwrap();
+    let before = inspect::inspect(
+        &mgr,
+        &out.page_id,
+        "elements",
+        &serde_json::json!({"selector": "#t"}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        before["value"].as_str().unwrap_or("").contains("改过"),
+        "输入前应写入运行时值:{before}"
+    );
+
+    let reset = api::control(
+        &mgr,
+        Some(&out.page_id),
+        "click",
+        &serde_json::json!({"selector": "#r"}),
+        &serde_json::json!({}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reset["form_reset"], true, "reset 应执行本地重置:{reset}");
+
+    let after = inspect::inspect(
+        &mgr,
+        &out.page_id,
+        "elements",
+        &serde_json::json!({"selector": "#t"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        after["value"].as_str().unwrap_or(""),
+        "默认",
+        "重置后应恢复 HTML 默认值:{after}"
+    );
+    let cb = inspect::inspect(
+        &mgr,
+        &out.page_id,
+        "elements",
+        &serde_json::json!({"selector": "#c"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        cb["state"]["checked"], true,
+        "重置后复选框应回到默认勾选:{cb}"
+    );
+    mgr.shutdown().await;
+}
+
+#[tokio::test]
+async fn Esc关闭顶层dialog() {
+    let mgr = LsmBrowserManager::new();
+    let url = html_doc("<dialog id='d' open>内容</dialog>");
+    let out = mgr
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .await
+        .unwrap();
+    let closed = api::control(
+        &mgr,
+        Some(&out.page_id),
+        "key_press",
+        &serde_json::json!({"key": "Escape"}),
+        &serde_json::json!({}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(closed["closed"], true, "Esc 应关闭顶层 dialog:{closed}");
+    let el = inspect::inspect(
+        &mgr,
+        &out.page_id,
+        "elements",
+        &serde_json::json!({"selector": "#d"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        el["state"]["open"], false,
+        "关闭后 dialog 不应再处于 open:{el}"
+    );
+    mgr.shutdown().await;
+}
+
+#[tokio::test]
 async fn 点击后active释放且hover命中祖先链() {
     let mgr = LsmBrowserManager::new();
     let url = html_doc("<div id='parent'><button id='child'>按钮</button></div>");

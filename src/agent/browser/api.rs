@@ -148,6 +148,92 @@ fn tab_document(tab: &super::TabState) -> Document {
     tab.document_with_state()
 }
 
+/// Esc 关闭最上层打开的 `<dialog>`(第 44 轮)。
+///
+/// 浏览器语义:顶层浮层优先 —— 文档序**最后一个**带 `open` 的 dialog 即顶层。
+/// 关闭走 DOM 属性改写(`open` / `data-lsm-modal` 移除),与页面脚本
+/// `dialog.close()` 落到同一条路径。
+async fn close_top_dialog(mgr: &LsmBrowserManager, pid: &str) -> EngineResult<Option<String>> {
+    let (html, base_url, actions) = {
+        let inner = mgr.inner.lock().await;
+        let Some(tab) = inner.tabs.get(pid) else {
+            return Ok(None);
+        };
+        let doc = tab_document(tab);
+        let Ok(dialogs) = doc.select("dialog") else {
+            return Ok(None);
+        };
+        let mut target: Option<String> = None;
+        for d in dialogs {
+            if document::attr(&d, "open").is_some() {
+                target = Some(Document::stable_selector(&d));
+            }
+        }
+        let Some(sel) = target else {
+            return Ok(None);
+        };
+        let actions = vec![
+            script::JsAction {
+                kind: "remove_attr".to_string(),
+                selector: sel.clone(),
+                key: "open".to_string(),
+                value: String::new(),
+                url: String::new(),
+                event: String::new(),
+            },
+            script::JsAction {
+                kind: "remove_attr".to_string(),
+                selector: sel.clone(),
+                key: "data-lsm-modal".to_string(),
+                value: String::new(),
+                url: String::new(),
+                event: String::new(),
+            },
+        ];
+        (tab.html.clone(), tab.url.clone(), actions)
+    };
+    {
+        let mut inner = mgr.inner.lock().await;
+        let Some(tab) = inner.tabs.get_mut(pid) else {
+            return Ok(None);
+        };
+        let (next_html, _summary) = apply_dom_actions(&html, &base_url, &actions);
+        tab.html = next_html;
+    }
+    Ok(actions.first().map(|a| a.selector.clone()))
+}
+
+/// 本地表单重置(第 44 轮):清掉表单内控件的运行时值,恢复 HTML 默认值。
+///
+/// 运行时值只落在 `TabState::form_values`,清掉后重新解析的文档即回到
+/// `value`/`checked`/`selected` 等 HTML 默认属性。
+async fn reset_form_controls(mgr: &LsmBrowserManager, pid: &str, form_sel: &str) -> usize {
+    let mut inner = mgr.inner.lock().await;
+    let Some(tab) = inner.tabs.get_mut(pid) else {
+        return 0;
+    };
+    let doc = tab_document(tab);
+    let Ok(forms) = doc.select(form_sel) else {
+        return 0;
+    };
+    let Some(form) = forms.into_iter().next() else {
+        return 0;
+    };
+    let mut cleared = 0usize;
+    for tag in ["input", "select", "textarea"] {
+        let Ok(nodes) = form.select(tag) else {
+            continue;
+        };
+        for n in nodes {
+            let sel = Document::stable_selector(n.as_node());
+            if tab.form_values.remove(&sel).is_some() {
+                cleared += 1;
+            }
+        }
+    }
+    cleared
+}
+
 /// 运行时控件状态变化后重算布局并推帧。
 async fn relayout_and_push(mgr: &LsmBrowserManager, pid: &str) {
     let mut inner = mgr.inner.lock().await;
@@ -1054,6 +1140,7 @@ async fn click_inner(
         laid_out,
         radio_scope,
         summary_details,
+        reset_form,
         select_toggle,
         option_pick,
         open_selects,
@@ -1095,13 +1182,20 @@ async fn click_inner(
             .unwrap_or_default();
         let mut select_toggle = None;
         let mut option_pick = None;
-        if tag == "select" && document::attr(node, "multiple").is_none() {
+        if tag == "select"
+            && document::attr(node, "multiple").is_none()
+            && !super::layout::select_is_list(node)
+        {
             let open = tab.widget_open.get(&stable).copied().unwrap_or(false);
             select_toggle = Some((stable.clone(), !open));
         } else if tag == "option" {
             if let Some(select) = document::closest_tag(node, "select") {
                 let select_sel = Document::stable_selector(&select);
-                if tab.widget_open.get(&select_sel).copied().unwrap_or(false) {
+                // 第 44 轮:列表形态 select(`size>1`/`multiple`)的 option 常驻可见,
+                // 无需展开面板即可点选。
+                if tab.widget_open.get(&select_sel).copied().unwrap_or(false)
+                    || super::layout::select_is_list(&select)
+                {
                     if let Ok(options) = select.select("option") {
                         for (i, opt) in options.into_iter().enumerate() {
                             if Document::stable_selector(opt.as_node()) == stable {
@@ -1120,11 +1214,23 @@ async fn click_inner(
         let mut toggled = None;
         let mut radio_scope = None;
         let mut summary_details = None;
+        // 第 44 轮:`reset` 按钮的默认行为是**本地表单重置**(不提交)。
+        let mut reset_form = None;
         if tag == "summary" {
             let mut cur = node.parent();
             while let Some(p) = cur {
                 if document::tag_name(&p) == "details" {
                     summary_details = Some(Document::stable_selector(&p));
+                    break;
+                }
+                cur = p.parent();
+            }
+        }
+        if matches!(tag.as_str(), "button" | "input") && typ == "reset" {
+            let mut cur = node.parent();
+            while let Some(p) = cur {
+                if document::tag_name(&p) == "form" {
+                    reset_form = Some(Document::stable_selector(&p));
                     break;
                 }
                 cur = p.parent();
@@ -1198,6 +1304,7 @@ async fn click_inner(
             rect_opt.is_some(),
             radio_scope,
             summary_details,
+            reset_form,
             select_toggle,
             option_pick,
             open_selects,
@@ -1359,6 +1466,27 @@ async fn click_inner(
             }
         }
         out["dropdown_closed"] = json!(true);
+    }
+
+    // 第 44 轮:`reset` 按钮执行**本地表单重置** —— 清掉表单内控件的运行时值,
+    // 恢复 HTML 默认值(不提交表单)。`reset` 事件先发给表单,页面可拦截。
+    if let Some(form_sel) = reset_form {
+        let mut prevented = false;
+        if let Some(reply) = js_dispatch_bounded(mgr, pid, &form_sel, "reset").await {
+            apply_js_reply(mgr, pid, &reply).await;
+            prevented = reply.default_prevented;
+        }
+        if prevented {
+            out["form_reset"] = json!(false);
+            out["default_prevented"] = json!(true);
+        } else {
+            let cleared = reset_form_controls(mgr, pid, &form_sel).await;
+            out["form_reset"] = json!(true);
+            out["reset_fields"] = json!(cleared);
+            out["form"] = json!(form_sel);
+        }
+        relayout_and_push(mgr, pid).await;
+        return Ok(out);
     }
 
     // summary 是 details 的原生展开开关:JS 未拦截时切换开合覆盖并重排。
@@ -1805,6 +1933,16 @@ async fn act_key_press(
     let key = p_str(params, "key").ok_or_else(|| EngineError::param("key_press 需要 key"))?;
     let selector = p_str(params, "selector");
     let timeout = timeout_ms(params, top, 60_000);
+    // 第 44 轮:Esc 关闭**最上层打开的 dialog**(浏览器语义:顶层浮层优先)。
+    if key.eq_ignore_ascii_case("escape") || key.eq_ignore_ascii_case("esc") {
+        if let Some(sel) = close_top_dialog(mgr, pid).await? {
+            relayout_and_push(mgr, pid).await;
+            return Ok(json!({
+                "key": key, "mode": "keyevent", "submitted": false,
+                "closed": true, "selector": sel,
+            }));
+        }
+    }
     if key.eq_ignore_ascii_case("enter") {
         if let Some((url, method, body)) = resolve_submit(mgr, pid, selector).await? {
             // 阶段二:submit 事件先分发,preventDefault 可拦截提交(冒泡命中 form listener)。
