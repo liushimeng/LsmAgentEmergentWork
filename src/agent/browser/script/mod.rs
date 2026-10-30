@@ -623,6 +623,13 @@ pub(crate) async fn run_pipeline(
             .saturating_duration_since(std::time::Instant::now())
             .as_millis()
             .max(2_000) as u64;
+        // 本轮即将发送的外链脚本指纹:超时(线程仍会执行)时按「发送即记账」
+        // 防后续轮次双执行;线程已退出(请求从未执行)时回退不记。
+        let sent_ext_fps: Vec<u64> = scripts
+            .iter()
+            .filter(|s| s.kind == "external")
+            .map(|s| dom_ops::fingerprint(&s.src_url))
+            .collect();
         let reply: Result<JsReply, String> = match tokio::task::spawn_blocking(move || {
             h.request_with_grace(
                 |tx| JsRequest::RunScripts {
@@ -639,7 +646,8 @@ pub(crate) async fn run_pipeline(
         .await
         {
             Ok(Ok(r)) => Ok(r),
-            _ => Err("脚本执行超时或线程不可用(含宽限)".to_string()),
+            Ok(Err(e)) => Err(e),
+            Err(e) => Err(format!("JS 任务执行失败:{e}")),
         };
         let reply = match reply {
             Ok(r) => r,
@@ -654,6 +662,25 @@ pub(crate) async fn run_pipeline(
                 // 等于整页状态归零,后续 eval 全在新 Context 上白手起家
                 // (实测 zhipin:超时丢句柄后 app 挂载链彻底死亡)。
                 // 保留句柄,后续 run_pending_scripts/eval 复用同一线程。
+                //
+                // 2026-10-30 京东:中断不再静默弃跑——
+                // ① 外链「发送即记账」:超时后线程仍会跑完本轮(迟到动作经
+                //    回复邮箱 merge_pending_into 合并回流),不记账会让后续
+                //    轮次重收重跑(双执行);线程已退出则请求从未执行,不记。
+                // ② 按截断上报(pending_scripts):wait/inspect/screenshot
+                //    等交互入口据此补泵续跑,动态模块(React 侧栏/楼层)能
+                //    在后续交互中补挂,而不是永远停在半成品态。
+                if !e.contains("线程已退出") {
+                    for fp in sent_ext_fps {
+                        executed.insert(fp);
+                    }
+                    out.budget_cut = true;
+                    let doc = super::document::Document::parse(&out.html, base_url);
+                    let mut probe = executed.clone();
+                    let mut left = dom_ops::collect_scripts(&doc, base_url, &mut probe);
+                    let deferred_left = std::mem::take(&mut left.deferred);
+                    out.pending_scripts = left.items.len() + deferred_left.len();
+                }
                 break;
             }
         };

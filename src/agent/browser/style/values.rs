@@ -45,9 +45,11 @@ impl Default for CornerRadius {
 pub struct ComputedStyle {
     pub display: String,
     pub visibility: String,
-    /// `box-sizing`:默认按 border-box 处理(主流站点 `*{box-sizing:border-box}`
-    /// 全局重置的既成事实语义,布局层据此从指定宽高中扣减 padding);
-    /// 站点显式声明 `content-box` 时置 false,宽高按内容盒语义还原。
+    /// `box-sizing`:按 CSS 初始值 **content-box** 处理(与 Chrome 一致);
+    /// 站点显式 `border-box` 时置 false,布局层从指定宽高中扣减 padding。
+    /// 2026-10-30 京东真机:旧默认 border-box 把 `.mod_service_unit{width:180px;
+    /// padding-left:45px}`(未声明 box-sizing)的内容宽算成 135,服务承诺文案
+    /// 末字被裁——凡未声明 box-sizing 的 width+padding 盒全站偏窄。
     pub box_sizing_content: bool,
     pub color: Rgb,
     pub background: Option<Rgb>,
@@ -443,7 +445,7 @@ impl Default for ComputedStyle {
         Self {
             display: "inline".to_string(),
             visibility: "visible".to_string(),
-            box_sizing_content: false,
+            box_sizing_content: true,
             color: [32, 32, 32],
             background: None,
             background_alpha: 255,
@@ -508,7 +510,7 @@ impl ComputedStyle {
     pub fn root() -> Self {
         Self {
             display: "block".to_string(),
-            box_sizing_content: false,
+            box_sizing_content: true,
             ..Default::default()
         }
     }

@@ -627,3 +627,44 @@ fn 字形栅格缓存命中一致() {
     assert_eq!(a.0, b.0, "度量应一致");
     assert_eq!(a.1, b.1, "位图应逐字节一致");
 }
+
+/// 缺字形必须按布局回退宽推进 pen(2026-10-30 京东):图标字体码位无字形时
+/// 旧实现 continue 不推 pen,其后文字相对布局左移、行内几何与像素错位。
+/// 需真实字体(`FontSet::load`);无字体环境走占位条路径,不适用,直接返回。
+#[test]
+fn 缺字形推进pen_其后文字不错位() {
+    fn leftmost_ink(img: &image::RgbaImage) -> u32 {
+        for x in 0..img.width() {
+            for y in 0..img.height() {
+                let p = pixel(img, x, y);
+                if p[3] > 32 && (p[0] < 200 || p[1] < 200 || p[2] < 200) {
+                    return x;
+                }
+            }
+        }
+        panic!("画面无墨迹");
+    }
+    let font = FontSet::load();
+    if !font.has_font() {
+        return;
+    }
+    let render = |html: &str| -> image::RgbaImage {
+        let doc = Document::parse(html, "https://a.test/");
+        let l = layout::compute(&doc, 200.0, &font);
+        let pm = font
+            .render_pixmap(&l, 200, 80, 0.0, false, &ImageStore::new())
+            .unwrap();
+        decode(&pm)
+    };
+    let a = render("<html><body style='margin:0'><div style='font-size:20px'>A</div></body></html>");
+    // U+0378 为未分配码位:全链无字形。
+    let b = render(
+        "<html><body style='margin:0'><div style='font-size:20px'>\u{0378}A</div></body></html>",
+    );
+    let xa = leftmost_ink(&a);
+    let xb = leftmost_ink(&b);
+    assert!(
+        xb >= xa + 5 && xb <= xa + 40,
+        "缺字形应按回退宽推进 pen(约一字宽):仅A起点={xa},缺字形+A起点={xb}"
+    );
+}

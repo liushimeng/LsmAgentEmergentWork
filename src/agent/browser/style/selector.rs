@@ -240,6 +240,8 @@ fn parse_compound(input: &str) -> Option<Compound> {
     let mut out = Compound::default();
     let chars: Vec<char> = input.chars().collect();
     let mut i = 0;
+    // 裸 `*`(通配)合法:compound 全空 = 匹配任意元素;特异性 (0,0,0)。
+    let mut universal = false;
     // 标签或 `*`
     if i < chars.len() && (chars[i].is_ascii_alphabetic() || chars[i] == '*') {
         let start = i;
@@ -250,6 +252,8 @@ fn parse_compound(input: &str) -> Option<Compound> {
         let tag: String = chars[start..i].iter().collect();
         if tag != "*" {
             out.tag = Some(tag.to_ascii_lowercase());
+        } else {
+            universal = true;
         }
     }
     while i < chars.len() {
@@ -329,7 +333,8 @@ fn parse_compound(input: &str) -> Option<Compound> {
             _ => return None,
         }
     }
-    if out.tag.is_none()
+    if !universal
+        && out.tag.is_none()
         && out.ids.is_empty()
         && out.classes.is_empty()
         && out.attrs.is_empty()

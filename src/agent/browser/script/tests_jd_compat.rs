@@ -168,3 +168,199 @@ fn jquery_support_探测链_最小同构不抛() {
     assert!(v.contains("cross_matches=true"), "Sizzle matchesSelector 收编探测必须可用: {v}");
     h.shutdown();
 }
+
+// ===================== 京东 html 能力探测类名回写(2026-10-30 真机) =====================
+// 首页 inline script[7] 原句:`document.getElementsByTagName("html")[0].className =
+// "root61 o2_wide"`(视口≥1370 探测)。真机 dump 里 `<html>` 无类名 →
+// `html.new_version`/`body.better_style` 限定的几十条 CSS 全不生效
+// (搜索栏 form 的 calc 宽度、fs_col 尺寸全错)。锁死「根元素 className
+// 写入能生成 set_attr 动作并落到序列化 HTML」。
+
+#[test]
+fn 京东html能力探测类名写入回传宿主() {
+    use crate::agent::browser::document::Document;
+    use super::dom_ops;
+
+    let h = JsHandle::spawn();
+    let page = "<html><head></head><body class='index'><div id='x'>hi</div></body></html>";
+    // script[6] 同构:定义 pageConfig 全局。
+    eval_str(&h, "window.pageConfig = {};");
+    // script[7] 原句 + 收尾探针:把关键中间值带回,便于断言自解释。
+    let reply = eval_on(
+        &h,
+        r#"!function(e){pageConfig.isWide=function(){var n=e,i=document,o=i.documentElement,t=i.getElementsByTagName("body")[0],a=n.innerWidth||o.clientWidth||t.clientWidth;return a>=1370}();var n=[];pageConfig.isWide?(n.push("root61"),n.push("o2_wide")):n.push("o2_mini");var i=document.getElementsByTagName("html")[0];i.className=n.join(" ")}(window,void 0);"#,
+        page,
+        "https://www.jd.com/",
+    );
+    assert!(reply.outcome.ok, "script[7] 同构不应抛错: {:?}", reply.outcome.error);
+    let has_action = reply.outcome.actions.iter().any(|a| {
+        a.kind == "set_attr" && a.key == "class" && a.selector.contains("html")
+    });
+    // 动作应携带类名回传(不要求具体档位:o2_wide/o2_mini 都算写入成功)。
+    let class_action = reply.outcome.actions.iter().find(|a| a.kind == "set_attr" && a.key == "class");
+    assert!(
+        has_action,
+        "className 写入应生成 set_attr(class) 动作(selector 命中 html): {:?}",
+        reply.outcome.actions.iter().map(|a| format!("{}:{}", a.kind, a.selector)).collect::<Vec<_>>()
+    );
+    let value = class_action.map(|a| a.value.clone()).unwrap_or_default();
+    assert!(
+        value.contains("o2_"),
+        "类名应含能力档位(o2_wide/o2_mini): {value}"
+    );
+    // 动作落到宿主序列化 HTML。
+    let doc = Document::parse(page, "https://www.jd.com/");
+    dom_ops::apply(&doc, &reply.outcome.actions, "https://www.jd.com/");
+    let html = doc.serialize_full();
+    assert!(html.contains("o2_"), "序列化 HTML 的 html 标签应带上能力类名: {html}");
+    h.shutdown();
+}
+
+#[test]
+fn body类名写入回传宿主_京东fillRootClass路径() {
+    use crate::agent::browser::document::Document;
+    use super::dom_ops;
+
+    let h = JsHandle::spawn();
+    let page = "<html><head></head><body class='index'><div id='x'>hi</div></body></html>";
+    // index.chunk.js fillRootClass 同构:`el.className` 读改写(addClass/toggleClass 内部形态)。
+    let reply = eval_on(
+        &h,
+        r#"(function(){
+            var el = document.body;
+            var cls = String(el.className || "");
+            el.className = cls + " o2_mac new_version better_style";
+            return el.className;
+        })()"#,
+        page,
+        "https://www.jd.com/",
+    );
+    assert!(reply.outcome.ok, "body className 读改写不应抛错: {:?}", reply.outcome.error);
+    assert!(
+        reply.outcome.value.contains("better_style"),
+        "读回应含新类名: {}",
+        reply.outcome.value
+    );
+    let class_action = reply.outcome.actions.iter().find(|a| a.kind == "set_attr" && a.key == "class");
+    assert!(class_action.is_some(), "应生成 set_attr(class) 动作: {:?}", reply.outcome.actions);
+    let doc = Document::parse(page, "https://www.jd.com/");
+    dom_ops::apply(&doc, &reply.outcome.actions, "https://www.jd.com/");
+    let html = doc.serialize_full();
+    assert!(
+        html.contains("better_style"),
+        "序列化 HTML 的 body 应带上新类名: {html}"
+    );
+    h.shutdown();
+}
+
+#[test]
+fn body_classList_add写入回传宿主() {
+    use crate::agent::browser::document::Document;
+    use super::dom_ops;
+
+    let h = JsHandle::spawn();
+    let page = "<html><head></head><body class='index'><div id='x'>hi</div></body></html>";
+    // index.chunk.js 同构:`document.body.classList.add("new_version")`(fillRootClass
+    // 之后的类名设置原句形态)。锁死 classList.add → set_attr(class) 回传链。
+    let reply = eval_on(
+        &h,
+        r#"(function(){
+            document.body.classList.add("new_version");
+            document.body.classList.add("better_style");
+            return document.body.className;
+        })()"#,
+        page,
+        "https://www.jd.com/",
+    );
+    assert!(reply.outcome.ok, "classList.add 不应抛错: {:?}", reply.outcome.error);
+    assert!(
+        reply.outcome.value.contains("better_style") && reply.outcome.value.contains("new_version"),
+        "className 读回应含新类名: {}",
+        reply.outcome.value
+    );
+    let class_action = reply.outcome.actions.iter().find(|a| a.kind == "set_attr" && a.key == "class");
+    assert!(class_action.is_some(), "应生成 set_attr(class) 动作: {:?}", reply.outcome.actions);
+    let doc = Document::parse(page, "https://www.jd.com/");
+    dom_ops::apply(&doc, &reply.outcome.actions, "https://www.jd.com/");
+    let html = doc.serialize_full();
+    assert!(
+        html.contains("new_version") && html.contains("better_style"),
+        "序列化 HTML 的 body 应带上新类名: {html}"
+    );
+    h.shutdown();
+}
+
+// ===================== 管线超时中断语义(2026-10-30 京东) =====================
+// 预算耗尽不再静默弃跑:超时轮次照常记账(防双执行)、按截断上报,
+// 补泵轮把线程迟到的动作经回复邮箱合并回流,页面从「半成品」收敛到完成态。
+
+#[tokio::test]
+async fn 管线超时中断后补泵收尾且不双执行() {
+    use crate::agent::browser::LsmBrowserManager;
+    use super::{run_pipeline, PipelineSeed};
+
+    // 宽限收到 300ms:用例墙钟不依赖默认 60s 宽限。
+    std::env::set_var("LAEW_WEB_SCRIPT_GRACE_MS", "300");
+    let mgr = LsmBrowserManager::new();
+    let html = r#"<html><body><div id='x'>base</div><script>
+window.__n = (window.__n || 0) + 1;
+var t0 = Date.now(); while (Date.now() - t0 < 5000) {}
+document.getElementById('x').textContent = 'heavy-ran';
+</script></body></html>"#;
+    let session = std::collections::HashMap::new();
+    let rects: std::collections::HashMap<String, (f64, f64, f64, f64)> = std::collections::HashMap::new();
+    // 轮1:300ms 预算(内部 +2s slack)+300ms 宽限 < 5s 忙等 → 超时中断。
+    let out1 = {
+        let mut inner = mgr.inner.lock().await;
+        run_pipeline(
+            &mut inner,
+            &mgr.http,
+            html,
+            "https://t.test/",
+            "ua",
+            (1280, 720),
+            &session,
+            None,
+            &rects,
+            PipelineSeed { budget_ms: 300, ..Default::default() },
+        )
+        .await
+    };
+    assert!(
+        out1.budget_cut,
+        "超时中断应按截断上报(pending={})",
+        out1.pending_scripts
+    );
+    // 轮2(补泵语义):同线程大预算 → 空轮排空,把 heavy 的迟到动作合并回来。
+    let out2 = {
+        let mut inner = mgr.inner.lock().await;
+        run_pipeline(
+            &mut inner,
+            &mgr.http,
+            &out1.html,
+            "https://t.test/",
+            "ua",
+            (1280, 720),
+            &session,
+            None,
+            &rects,
+            PipelineSeed {
+                handle: out1.js.clone(),
+                executed: out1.executed.clone(),
+                budget_ms: 15_000,
+                ..Default::default()
+            },
+        )
+        .await
+    };
+    assert!(
+        out2.html.contains("heavy-ran"),
+        "补泵应把线程迟到的 DOM 动作合并回流"
+    );
+    assert_eq!(out2.pending_scripts, 0, "补泵后应收敛");
+    // 不双执行:heavy 的窗口计数只 +1。
+    let h = out2.js.clone().expect("句柄应在");
+    let v = eval_on(&h, "String(window.__n)", &out2.html, "https://t.test/");
+    assert_eq!(v.outcome.value, "1", "超时轮次脚本不得重跑");
+    h.shutdown();
+}

@@ -190,6 +190,22 @@ pub fn collect_image_urls(html: &str, base_url: &str, viewport_width: f64) -> Ve
         if let Some(src) = document::attr(&node, "src") {
             push(&src, &mut out);
         }
+        // JS 懒加载兜底(2026-10-30 京东):`data-src`/`data-lazyimg` 族是动态图
+        // 的真实地址,等脚本换源;脚本链断就整片空白。预取把图先备好。
+        for key in [
+            "data-src",
+            "data-lazy-src",
+            "data-lazyimg",
+            "data-original",
+            "data-url",
+        ] {
+            if let Some(raw) = document::attr(&node, key) {
+                let val = crate::agent::browser::urlutil::lazy_attr_url(&raw);
+                if !val.is_empty() {
+                    push(val, &mut out);
+                }
+            }
+        }
     }
     out
 }

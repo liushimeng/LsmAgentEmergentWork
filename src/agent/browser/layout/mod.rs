@@ -911,7 +911,34 @@ impl<'a> LayoutCtx<'a> {
     ///
     /// 第 45 轮:`srcset`/`picture` 候选优先,`src` 兜底。
     pub(crate) fn image_src(&self, node: &NodeRef) -> Option<String> {
-        self.srcset_pick(node).or_else(|| self.src_attr_abs(node))
+        self.srcset_pick(node)
+            .or_else(|| self.src_attr_abs(node))
+            .or_else(|| self.lazy_attr_abs(node))
+    }
+
+    /// JS 懒加载兜底(`data-src`/`data-lazyimg` 族,2026-10-30 京东):`src`
+    /// 缺失时取址用;`src` 在场时仍显示 `src`(与真实浏览器换源前一致)。
+    /// 动态图常用这族属性等 IntersectionObserver 换源,脚本链一断就永不显示。
+    fn lazy_attr_abs(&self, node: &NodeRef) -> Option<String> {
+        for key in [
+            "data-src",
+            "data-lazy-src",
+            "data-lazyimg",
+            "data-original",
+            "data-url",
+        ] {
+            let Some(raw) = document::attr(node, key) else {
+                continue;
+            };
+            let val = crate::agent::browser::urlutil::lazy_attr_url(&raw);
+            if val.is_empty() {
+                continue;
+            }
+            if let Some(abs) = urlutil::resolve(&self.base_url, val) {
+                return Some(abs);
+            }
+        }
+        None
     }
 
     /// `<img src>` 的绝对地址。
@@ -960,7 +987,9 @@ impl<'a> LayoutCtx<'a> {
                 return Some(abs);
             }
         }
-        picked.or_else(|| self.src_attr_abs(node))
+        picked
+            .or_else(|| self.src_attr_abs(node))
+            .or_else(|| self.lazy_attr_abs(node))
     }
 
     /// 图片固有尺寸(解码后的自然宽高);未加载返回 `None`。

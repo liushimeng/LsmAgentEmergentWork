@@ -557,7 +557,7 @@ async fn apply_js_reply(
 /// 第 174 轮(猎聘):8s 装不完重站懒加载链 —— 首屏 3.3MB common.js 之后,
 /// 登录弹层/hero 组件 chunk 在交互注入,8s 窗口反复被截断,组件永远差一口
 /// 气装不上。默认提到 30s,`LAEW_WEB_SCRIPT_INTERACT_MS` 可覆盖(下限 2000)。
-fn interaction_budget_ms() -> u64 {
+pub(crate) fn interaction_budget_ms() -> u64 {
     std::env::var("LAEW_WEB_SCRIPT_INTERACT_MS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -571,7 +571,7 @@ const INTERACTION_SCRIPT_ROUNDS: usize = 24;
 ///
 /// 复用标签页持久 JS 线程(`tab.js`)与已执行指纹(`tab.executed_scripts`),
 /// 因此页面全局状态不丢、首屏脚本也不会重复初始化。
-async fn run_pending_scripts(mgr: &LsmBrowserManager, pid: &str, budget_ms: u64) {
+pub(crate) async fn run_pending_scripts(mgr: &LsmBrowserManager, pid: &str, budget_ms: u64) {
     let mut inner = mgr.inner.lock().await;
     let (html, url, ua, viewport, session, rects, seed, has_pending) = {
         let Some(tab) = inner.tabs.get(pid) else {
@@ -955,6 +955,9 @@ pub async fn control(
         }
         "screenshot" => {
             require_page(pid)?;
+            // 截断脚本补泵(2026-10-30 京东):管线预算耗尽弃跑的模块在取证前
+            // 尽量补挂——截图是 Agent 看页面的第一入口,静止半成品会被反复重拍。
+            run_pending_scripts(mgr, pid, interaction_budget_ms()).await;
             mgr.screenshot(pid, params).await
         }
         "download" => {
@@ -2357,6 +2360,9 @@ async fn act_wait(
     top: &Value,
 ) -> EngineResult<Value> {
     require_page(pid)?;
+    // 就绪等待前先补泵截断脚本(2026-10-30 京东):wait 是 Agent 判定页面
+    // 「好了没」的原语,管线弃跑的模块若不在这里补挂,后续判定全在半成品态。
+    run_pending_scripts(mgr, pid, interaction_budget_ms()).await;
     let selector = p_str(params, "selector").map(str::to_string);
     let state = p_str(params, "state")
         .unwrap_or("visible")

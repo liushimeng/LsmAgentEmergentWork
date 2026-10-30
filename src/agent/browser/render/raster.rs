@@ -763,6 +763,10 @@ fn draw_text(
             continue;
         }
         let Some((metrics, bitmap)) = font.rasterize_glyph(ch, size_f) else {
+            // 缺字形(如未加载的图标字体码位):不画但按布局侧回退宽推进 pen,
+            // 与 layout 的 char_width 同源 —— 否则其后文字相对布局左移,
+            // 行内几何与像素整体错位(2026-10-30 京东图标字体空缺实测)。
+            pen_x += font.char_width(ch, size_f as f64) as f32;
             continue;
         };
         if metrics.width > 0 && metrics.height > 0 {
@@ -852,6 +856,8 @@ fn draw_text_blurred(
             continue;
         }
         let Some((metrics, bitmap)) = font.rasterize_glyph(ch, size_f) else {
+            // 缺字形同样推进 pen(与主绘制路径一致),防阴影文字错位。
+            pen_x += font.char_width(ch, size_f as f64) as f32;
             continue;
         };
         if metrics.width > 0 && metrics.height > 0 {

@@ -197,3 +197,31 @@ mod tests {
         assert_eq!(canonical("https://A.test/p#x"), "https://a.test/p");
     }
 }
+
+/// JS 懒加载属性值归一(2026-10-30 京东):`data-lazyimg` 族常是 JSON
+/// (`{"src":"..."}`),其余属性是裸 URL。JSON 形态宽松抽取 `src` 字段值,
+/// 抽不出原样返回;调用方再做 URL 解析/校验。
+pub fn lazy_attr_url(raw: &str) -> &str {
+    let t = raw.trim();
+    if !t.starts_with('{') {
+        return t;
+    }
+    for key in ["\"src\"", "'src'"] {
+        if let Some(pos) = t.find(key) {
+            let rest = &t[pos + key.len()..];
+            let rest = rest.trim_start().trim_start_matches(':').trim_start();
+            if let Some(quote) = rest.chars().next() {
+                if quote == '"' || quote == '\'' {
+                    let rest2 = &rest[1..];
+                    if let Some(end) = rest2.find(quote) {
+                        let v = &rest2[..end];
+                        if !v.is_empty() {
+                            return v;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    t
+}

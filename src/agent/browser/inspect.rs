@@ -38,6 +38,9 @@ pub async fn inspect(
     if page_id.is_empty() {
         return Err(EngineError::param("inspect 需要 page_id"));
     }
+    // 截断脚本补泵(2026-10-30 京东):inspect 前把弃跑的模块补挂,读数才不是
+    // 「半成品 DOM」;无待执行脚本时预检直接归零,不拖慢常规读取。
+    super::api::run_pending_scripts(mgr, page_id, super::api::interaction_budget_ms()).await;
     let mut inner = mgr.inner.lock().await;
     // 「快照×布局」一致性守卫:html 在上次布局后被脚本改写时先重排,
     // 保证 rect_for/page_health 等读数与当前 DOM 一致。
