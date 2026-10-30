@@ -455,9 +455,7 @@ fn inspect_elements(
     doc: &Document,
     params: &Value,
 ) -> EngineResult<Value> {
-    let selector = p_str(params, "selector").unwrap_or(
-        "a[href], button, input, textarea, select, [role=\"button\"], [role=\"link\"], [onclick], [data-title], [aria-label]",
-    );
+    let selector = p_str(params, "selector").unwrap_or(document::INTERACTIVE_DEFAULT);
     let nodes = match doc.select(selector) {
         Ok(v) => v,
         Err(e) => {
@@ -477,7 +475,15 @@ fn inspect_elements(
             }
             let stable = Document::stable_selector(node);
             let rect = tab.layout.rect_for(&stable);
-            let mut v = doc.element_json(node, i, nodes.len(), rect, &tab.form_values);
+            let mut v = doc.element_json(
+                node,
+                i,
+                nodes.len(),
+                rect,
+                &tab.form_values,
+                &tab.pseudo_states,
+                tab.focused.as_deref(),
+            );
             let computed = engine.computed_chain(node);
             let visible = engine.is_rendered(node)
                 && computed.display != "none"
@@ -510,7 +516,15 @@ fn inspect_elements(
     let stable = Document::stable_selector(node);
     let rect = tab.layout.rect_for(&stable);
     let rect_found = rect.is_some();
-    let mut v = doc.element_json(node, idx, count, rect, &tab.form_values);
+    let mut v = doc.element_json(
+        node,
+        idx,
+        count,
+        rect,
+        &tab.form_values,
+        &tab.pseudo_states,
+        tab.focused.as_deref(),
+    );
     if !p_bool(params, "include_text", true) {
         if let Some(obj) = v.as_object_mut() {
             obj.remove("text");

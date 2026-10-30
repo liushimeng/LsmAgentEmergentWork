@@ -24,6 +24,76 @@ fn pixel(img: &image::RgbaImage, x: u32, y: u32) -> [u8; 4] {
     img.get_pixel(x, y).0
 }
 
+/// 构造带文本标签的显示项,便于断言 `sort_items` 的最终顺序。
+fn tier_item(text: &str, z: i64, layer: u8, seq: u64) -> super::DisplayItem {
+    super::DisplayItem {
+        kind: super::DisplayKind::Text {
+            text: text.to_string(),
+            size: 16.0,
+            color: [0, 0, 0],
+            bold: false,
+        },
+        x: 0.0,
+        y: 0.0,
+        w: 10.0,
+        h: 10.0,
+        radius: [Default::default(); 4],
+        z,
+        seq,
+        opacity: 1.0,
+        clip: None,
+        transform: None,
+        fixed: false,
+        layer,
+    }
+}
+
+#[test]
+fn 顶层绘制项压过高z定位内容() {
+    let mut items = vec![
+        tier_item("positioned", 1000, 1, 20),
+        tier_item("top-layer", 0, 2, 30),
+    ];
+    super::display::sort_items(&mut items);
+    let texts: Vec<&str> = items
+        .iter()
+        .map(|i| match &i.kind {
+            super::DisplayKind::Text { text, .. } => text.as_str(),
+            _ => "",
+        })
+        .collect();
+    assert_eq!(
+        texts,
+        vec!["positioned", "top-layer"],
+        "top layer 必须最后绘制,压过普通 z-index"
+    );
+}
+
+#[test]
+fn 负z定位内容绘制在常规流之下() {
+    let mut items = vec![
+        tier_item("normal", 0, 0, 10),
+        tier_item("negative", -5, 1, 20),
+    ];
+    super::display::sort_items(&mut items);
+    let texts: Vec<&str> = items
+        .iter()
+        .map(|i| match &i.kind {
+            super::DisplayKind::Text { text, .. } => text.as_str(),
+            _ => "",
+        })
+        .collect();
+    assert_eq!(texts, vec!["negative", "normal"], "负 z 定位项应沉回常规流档之下");
+}
+
+#[test]
+fn paint_tier_归一三层档位() {
+    assert_eq!(tier_item("top", 9999, 2, 1).paint_tier(), 2);
+    assert_eq!(tier_item("negative", -1, 1, 2).paint_tier(), 0);
+    assert_eq!(tier_item("positioned", 10, 1, 3).paint_tier(), 1);
+    assert_eq!(tier_item("normal", 0, 0, 4).paint_tier(), 0);
+}
+
 // ============ 既有用例(render.rs 搬迁,断言不变) ============
 
 #[test]

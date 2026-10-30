@@ -45,6 +45,12 @@ pub const ATTR_PSEUDO_ACTIVE: &str = "data-lsm-active";
 /// `select` 展开态标记(内核私有):布局层据此铺出浮层 option 面板。
 pub const ATTR_SELECT_OPEN: &str = "data-lsm-select-open";
 
+/// inspect(elements) 与交互候选集的默认选择器唯一真源。
+///
+/// 第 42 轮纳入 option/summary/label/tabindex/contenteditable:展开面板里的
+/// option、details 开关、表单标签与自定义可编辑控件此前完全不出现在默认发现集。
+pub const INTERACTIVE_DEFAULT: &str = "a[href], button, input, textarea, select, option, summary, label, [role=\"button\"], [role=\"link\"], [role=\"checkbox\"], [role=\"radio\"], [role=\"tab\"], [role=\"menuitem\"], [role=\"combobox\"], [role=\"slider\"], [onclick], [tabindex], [contenteditable], [data-title], [aria-label]";
+
 /// 运行时伪类状态位(按元素聚合)。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PseudoFlags {
@@ -301,6 +307,8 @@ impl Document {
         count: usize,
         rect: Option<(f64, f64, f64, f64)>,
         values: &HashMap<String, String>,
+        pseudo_states: &HashMap<String, PseudoFlags>,
+        focused: Option<&str>,
     ) -> Value {
         let selector = Self::stable_selector(node);
         let tag = tag_name(node);
@@ -321,6 +329,24 @@ impl Document {
                 .find(|t| !t.is_empty())
         });
         let label = accessible_name(node, &attrs, label_for);
+        let flags = pseudo_states.get(&selector).copied().unwrap_or_default();
+        // 控件/交互状态的一等字段。调用方不应理解 `value == "true"` 这类
+        // 字符串协议,也不应从内核私有 `data-lsm-*` 属性反推运行时状态。
+        let state = json!({
+            "checked": values
+                .get(&selector)
+                .map(|v| v == "true" || v == "on")
+                .unwrap_or_else(|| attr(node, "checked").is_some()),
+            "selected": attr(node, "selected").is_some(),
+            "disabled": attr(node, "disabled").is_some(),
+            "readonly": attr(node, "readonly").is_some(),
+            "indeterminate": attr(node, "indeterminate").is_some(),
+            "open": attr(node, "open").is_some(),
+            "select_open": attr(node, ATTR_SELECT_OPEN).is_some(),
+            "focused": focused == Some(selector.as_str()) || flags.focus,
+            "hovered": flags.hover,
+            "active": flags.active,
+        });
         let (x, y, w, h) = rect.unwrap_or((0.0, 0.0, 0.0, 0.0));
         json!({
             "ok": true,
@@ -333,6 +359,7 @@ impl Document {
             "text": text,
             "label": label,
             "value": value,
+            "state": state,
             "href": attr(node, "href").and_then(|h| urlutil::resolve(&self.base_url, &h)),
             "attributes": attrs,
             "visible": is_visible(node),
@@ -372,10 +399,8 @@ impl Document {
     /// CSS 背景图,DOM 里既无文本也无 href/role,不纳入就完全不可发现
     /// (实测百度地图路线按钮)。
     pub fn interactive_nodes(&self) -> Vec<NodeRef> {
-        self.select(
-            "a[href], button, input, textarea, select, [role=\"button\"], [role=\"link\"], [onclick], [data-title], [aria-label]",
-        )
-        .unwrap_or_default()
+        self.select(INTERACTIVE_DEFAULT)
+            .unwrap_or_default()
     }
 
     /// 按可见文本查找元素。
@@ -1126,9 +1151,58 @@ mod tests {
         <div class="route-button" data-title="路线"></div></body></html>"#;
         let d = Document::parse(html, "https://a.test/");
         let n = d.first(".route-button").unwrap().unwrap();
-        let v = d.element_json(&n, 0, 1, None, &HashMap::new());
+        let v = d.element_json(&n, 0, 1, None, &HashMap::new(), &HashMap::new(), None);
         assert_eq!(v["label"], "路线");
         assert_eq!(v["text"], "");
+    }
+
+    #[test]
+    fn 元素JSON输出归一化控件状态() {
+        let html = r#"<!doctype html><html><body>
+        <input id="half" type="checkbox" indeterminate>
+        <input id="ro" readonly>
+        <select id="s"><option selected>甲</option></select>
+        </body></html>"#;
+        let mut d = Document::parse(html, "https://a.test/");
+        let mut pseudo: HashMap<String, PseudoFlags> = HashMap::new();
+        pseudo.insert(
+            "#half".to_string(),
+            PseudoFlags {
+                hover: true,
+                ..Default::default()
+            },
+        );
+        d.apply_widget_state(&HashMap::new(), &HashMap::new(), &pseudo);
+        let node = d.first("#half").unwrap().unwrap();
+        let v = d.element_json(&node, 0, 1, None, &HashMap::new(), &pseudo, None);
+        assert_eq!(v["state"]["indeterminate"], true);
+        assert_eq!(v["state"]["hovered"], true);
+        assert_eq!(v["state"]["checked"], false);
+
+        let node = d.first("#ro").unwrap().unwrap();
+        let v = d.element_json(&node, 0, 1, None, &HashMap::new(), &pseudo, None);
+        assert_eq!(v["state"]["readonly"], true);
+
+        let node = d.first("#s option").unwrap().unwrap();
+        let v = d.element_json(&node, 0, 1, None, &HashMap::new(), &pseudo, None);
+        assert_eq!(v["state"]["selected"], true);
+    }
+
+    #[test]
+    fn 交互候选集包含浮层选项与折叠开关() {
+        let html = r#"<!doctype html><html><body>
+        <select><option>甲</option></select>
+        <details><summary>更多</summary><p>正文</p></details>
+        <label for="q">标签</label><input id="q">
+        <div tabindex="0">自定义焦点</div>
+        </body></html>"#;
+        let d = Document::parse(html, "https://a.test/");
+        let nodes = d.interactive_nodes();
+        let tags: Vec<String> = nodes.iter().map(|n| tag_name(n)).collect();
+        assert!(tags.contains(&"option".to_string()), "默认候选集应包含 option:{tags:?}");
+        assert!(tags.contains(&"summary".to_string()), "默认候选集应包含 summary:{tags:?}");
+        assert!(tags.contains(&"label".to_string()), "默认候选集应包含 label:{tags:?}");
+        assert!(tags.contains(&"div".to_string()), "默认候选集应包含 tabindex 控件:{tags:?}");
     }
 
     #[test]

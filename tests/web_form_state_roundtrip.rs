@@ -266,6 +266,7 @@ async fn 交互态伪类与下拉浮层端到端一致() {
         btn["attributes"]["data-lsm-hover"], "",
         "hover 状态必须落到运行时状态属性:{btn}"
     );
+    assert_eq!(btn["state"]["hovered"], true, "hover 状态必须进入一等 state 字段:{btn}");
     let (img, rect) = shot_button(&tool, &page_id, &dir, "hover.png").await;
     let red = count_color(&img, rect, [255, 0, 0]);
     assert!(red > 100, ":hover 样式必须真实进像素,红色像素数={red}");

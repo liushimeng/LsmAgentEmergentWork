@@ -41,7 +41,7 @@ use kuchikiki::NodeRef;
 
 use super::document::{self, Document};
 use super::images::ImageSizes;
-use super::render::display::{self, BgFill, DisplayItem, DisplayKind, WidgetGlyphKind};
+use super::render::display::{self, BgFill, DisplayItem, DisplayKind};
 use super::render::FontSet;
 use super::style::{Affine, BgLayer, BorderColor, ComputedStyle, MediaCtx, StyleEngine, TextShadow};
 use super::urlutil;

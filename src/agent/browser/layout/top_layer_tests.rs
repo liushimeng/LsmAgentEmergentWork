@@ -152,3 +152,81 @@ fn select未展开时不铺面板() {
         "未展开时不得列出其它 option,实际:{texts:?}"
     );
 }
+
+#[test]
+fn select面板option产生可寻址几何盒() {
+    let mut doc = Document::parse(
+        "<body><select id='s'><option value='a'>甲</option><option value='b'>乙</option></select></body>",
+        "https://a.test/",
+    );
+    let mut open: HashMap<String, bool> = HashMap::new();
+    open.insert("#s".to_string(), true);
+    doc.apply_widget_state(&HashMap::new(), &open, &HashMap::new());
+    let lay = compute(&doc, 800.0, &font());
+    let option_boxes: Vec<_> = lay
+        .boxes
+        .iter()
+        .filter(|b| b.tag == "option" && b.w > 0.0 && b.h > 0.0)
+        .collect();
+    assert_eq!(option_boxes.len(), 2, "面板 option 应各自产生几何盒:{lay:?}");
+    assert!(
+        option_boxes[0].y < option_boxes[1].y,
+        "option 盒应按面板行序垂直排列"
+    );
+}
+
+#[test]
+fn select面板重复label按选中项高亮() {
+    let mut doc = Document::parse(
+        "<body><select id='s'><option value='a'>同名</option><option value='b'>同名</option></select></body>",
+        "https://a.test/",
+    );
+    let mut values: HashMap<String, String> = HashMap::new();
+    values.insert("#s".to_string(), "b".to_string());
+    let mut open: HashMap<String, bool> = HashMap::new();
+    open.insert("#s".to_string(), true);
+    doc.apply_widget_state(&values, &open, &HashMap::new());
+    let lay = compute(&doc, 800.0, &font());
+    let highlights = lay
+        .display
+        .iter()
+        .filter(|it| {
+            it.layer >= 2
+                && matches!(
+                    &it.kind,
+                    DisplayKind::Background {
+                        fill: BgFill::Solid([0, 120, 215], 255),
+                    }
+                )
+        })
+        .count();
+    assert_eq!(highlights, 1, "重复 label 时也只能高亮真实选中的一项");
+}
+
+#[test]
+fn select面板视口下缘不足时向上翻转() {
+    let mut doc = Document::parse(
+        "<body><div style='height:650px'></div><select id='s'><option value='a'>甲</option><option value='b'>乙</option></select></body>",
+        "https://a.test/",
+    );
+    let mut open: HashMap<String, bool> = HashMap::new();
+    open.insert("#s".to_string(), true);
+    doc.apply_widget_state(&HashMap::new(), &open, &HashMap::new());
+    let lay = compute(&doc, 800.0, &font());
+    let select_box = lay
+        .boxes
+        .iter()
+        .find(|b| b.selector == "#s")
+        .expect("select 应有几何盒");
+    let first_option = lay
+        .boxes
+        .iter()
+        .find(|b| b.tag == "option")
+        .expect("展开面板应有 option 盒");
+    assert!(
+        first_option.y < select_box.y,
+        "下方放不下时面板应翻转到 select 上方:select_y={}, option_y={}",
+        select_box.y,
+        first_option.y
+    );
+}

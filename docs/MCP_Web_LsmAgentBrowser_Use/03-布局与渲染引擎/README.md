@@ -19,3 +19,4 @@
 | [36-验证页布局弹层与Canvas截图保真修复.md](36-验证页布局弹层与Canvas截图保真修复.md) | Flex column 主轴高度/inset 百分比包含块；Canvas 2D 真实 RGBA 与 PNG 截图回写 |
 | [40-Web控件全量能力盘点与增量实施方案.md](40-Web控件全量能力盘点与增量实施方案.md) | Web 控件全量能力矩阵；表单状态→布局→像素闭环、details/dialog、Canvas 尺寸、列表 marker、基础表格 |
 | [41-控件内置UI运行时状态与表格格式化上下文方案.md](41-控件内置UI运行时状态与表格格式化上下文方案.md) | 控件内置 UI（滑块/色块/日历/微调箭头）、运行时伪类状态（`:hover`/`:focus`）、顶层浮层（dialog + backdrop、裁剪逃逸）、表格 caption/colgroup/border-collapse、列表全类型 marker |
+| [42-控件交互语义与状态可见性修复方案.md](42-控件交互语义与状态可见性修复方案.md) | 顶层排序压过高 z、`showModal()` 可调用、`:indeterminate`、hover 祖先链 / active 释放、select 面板可选、控件固有尺寸、inspect `state` 状态总账 |

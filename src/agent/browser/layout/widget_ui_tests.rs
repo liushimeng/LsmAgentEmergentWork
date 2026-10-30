@@ -186,3 +186,73 @@ fn 内置UI不改变控件占位尺寸() {
         ra
     );
 }
+
+#[test]
+fn 长提示文本参与输入框固有宽() {
+    let lay = layout(
+        "<body><input id='p' type='text' placeholder='搜地点、查公交、找路线、看周边'></body>",
+    );
+    let input = lay
+        .boxes
+        .iter()
+        .find(|b| b.selector == "#p")
+        .expect("输入框应有几何盒");
+    assert!(
+        input.w > 140.0,
+        "长 placeholder 应参与固有宽,实际只有 {}px",
+        input.w
+    );
+}
+
+#[test]
+fn textarea按rows参与固有高() {
+    let one = layout("<body><textarea id='t' rows='1'></textarea></body>");
+    let four = layout("<body><textarea id='t' rows='4'></textarea></body>");
+    let one_h = one.boxes.iter().find(|b| b.selector == "#t").unwrap().h;
+    let four_h = four.boxes.iter().find(|b| b.selector == "#t").unwrap().h;
+    assert!(
+        four_h > one_h * 2.5,
+        "rows=4 应显著高于 rows=1:{four_h} vs {one_h}"
+    );
+}
+
+#[test]
+fn 图片按钮绘制alt占位文案() {
+    let lay = layout(
+        "<body><input id='imgbtn' type='image' alt='登录图标' style='width:90px;height:32px'></body>",
+    );
+    assert!(
+        lay.lines.iter().any(|l| l.text.contains("登录图标")),
+        "input[type=image] 应绘制 alt 文案:{:?}",
+        lay.lines.iter().map(|l| &l.text).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn 行内控件文本只绘制一次() {
+    let button = layout("<body><button id='b' style='width:100px'>唯一按钮</button></body>");
+    let button_count = button
+        .lines
+        .iter()
+        .filter(|l| l.text.contains("唯一按钮"))
+        .count();
+    let button_box = button.boxes.iter().find(|b| b.selector == "#b");
+    assert_eq!(
+        button_count, 1,
+        "button 子文本不得与控件文本重复绘制:{:?}, box={button_box:?}",
+        button.lines.iter().map(|l| &l.text).collect::<Vec<_>>()
+    );
+
+    let area = layout("<body><textarea id='t' style='width:100px'>唯一多行</textarea></body>");
+    let area_count = area
+        .lines
+        .iter()
+        .filter(|l| l.text.contains("唯一多行"))
+        .count();
+    let area_box = area.boxes.iter().find(|b| b.selector == "#t");
+    assert_eq!(
+        area_count, 1,
+        "textarea 初始文本只能绘制一次:{:?}, box={area_box:?}",
+        area.lines.iter().map(|l| &l.text).collect::<Vec<_>>()
+    );
+}

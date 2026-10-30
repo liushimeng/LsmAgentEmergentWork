@@ -126,6 +126,20 @@ pub struct DisplayItem {
 }
 
 impl DisplayItem {
+    /// 绘制大层:顶层最高;负 z-index 定位内容沉回常规流层。
+    ///
+    /// 排序不能直接用 `layer` 作第一键 —— 那会把所有定位元素(含负 z)
+    /// 整档抬到常规流之上。先归一成三档 paint tier,再在档内按 z 排序。
+    pub fn paint_tier(&self) -> u8 {
+        if self.layer >= 2 {
+            2
+        } else if self.layer == 1 && self.z < 0 {
+            0
+        } else {
+            self.layer
+        }
+    }
+
     /// 同元素通道序(越小越先画)。与旧管线通道顺序一致:
     /// 阴影→背景→边框→canvas 占位→图片→文字。
     pub fn rank(&self) -> u8 {
@@ -191,10 +205,26 @@ impl DisplayItem {
     }
 }
 
-/// 显示列表终排:先 z 分层(沿用 z-index 语义),同 z 恢复 DFS 先序(seq),
-/// 同元素的同类通道序由 rank 收尾。稳定排序保证同键保持发射序。
+/// 显示列表终排:先按绘制大层(常规流 / 定位 / 顶层),档内再按 z 分层,
+/// 同 z 恢复 DFS 先序(seq),同元素的同类通道序由 rank 收尾。
+/// 顶层必须先于一切普通 z —— 高 `z-index` 广告层不能盖住 dialog/select 面板。
 pub fn sort_items(items: &mut [DisplayItem]) {
-    items.sort_by(|a, b| (a.z, a.layer, a.seq, a.rank()).cmp(&(b.z, b.layer, b.seq, b.rank())));
+    items.sort_by(|a, b| {
+        (
+            a.paint_tier(),
+            a.z,
+            a.layer,
+            a.seq,
+            a.rank(),
+        )
+            .cmp(&(
+                b.paint_tier(),
+                b.z,
+                b.layer,
+                b.seq,
+                b.rank(),
+            ))
+    });
 }
 
 // ============ 旧管线回退合成器 ============

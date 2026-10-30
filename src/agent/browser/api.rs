@@ -65,6 +65,43 @@ fn set_pseudo_state(
     tab.pseudo_states.retain(|_, f| f.any());
 }
 
+/// 目标到根的元素链 stable selector(目标在前)。
+///
+/// CSS `:hover` 同时命中目标与全部祖先(`.parent:hover .child` 是菜单/下拉
+/// 组件的最常见写法)。DOM 句柄非 Send,必须在持锁块内先收敛成 selector。
+fn hover_chain_selectors(node: &kuchikiki::NodeRef) -> Vec<String> {
+    let mut chain = vec![Document::stable_selector(node)];
+    let mut cur = node.parent();
+    while let Some(p) = cur {
+        if p.as_element().is_some() {
+            chain.push(Document::stable_selector(&p));
+        }
+        cur = p.parent();
+    }
+    chain
+}
+
+/// 悬停目标 + 祖先链;指针移动语义下旧 hover 与 active 一并释放。
+fn set_hover_chain(tab: &mut super::TabState, chain: &[String]) {
+    // 先按既有 Hover 维度清空旧指针态(on=false 不再写入目标),再逐祖先置位。
+    set_pseudo_state(tab, "", PseudoDim::Hover, false);
+    for stable in chain {
+        tab.pseudo_states
+            .entry(stable.clone())
+            .or_default()
+            .hover = true;
+    }
+    tab.pseudo_states.retain(|_, f| f.any());
+}
+
+/// 释放按下态。内核动作是「点击已完成」语义,mouseup 后不应滞留 `:active`。
+fn release_active(tab: &mut super::TabState) {
+    for flags in tab.pseudo_states.values_mut() {
+        flags.active = false;
+    }
+    tab.pseudo_states.retain(|_, f| f.any());
+}
+
 fn p_str<'a>(params: &'a Value, key: &str) -> Option<&'a str> {
     params.get(key).and_then(Value::as_str).filter(|s| !s.is_empty())
 }
@@ -269,7 +306,8 @@ async fn apply_js_reply(
     if let Some(title) = &summary.title {
         t.title = title.clone();
     }
-    let state_changed = !summary.form_values.is_empty();
+    let state_changed =
+        !summary.form_values.is_empty() || summary.focus.is_some() || summary.blur;
     for (k, v) in summary.form_values {
         t.form_values.insert(k, v);
     }
@@ -280,9 +318,13 @@ async fn apply_js_reply(
         t.scroll_y = (t.scroll_y + s).max(0.0);
     }
     if let Some(f) = summary.focus {
+        set_pseudo_state(t, &f, PseudoDim::Focus, true);
         t.focused = Some(f);
     }
     if summary.blur {
+        if let Some(focused) = t.focused.clone() {
+            set_pseudo_state(t, &focused, PseudoDim::Focus, false);
+        }
         t.focused = None;
     }
     for log in &reply.outcome.logs {
@@ -1002,7 +1044,20 @@ async fn click_inner(
     let selector = require_selector(params)?;
     let idx = nth(params);
     let timeout = timeout_ms(params, params, 60_000);
-    let (plan, rect, stable, toggled, laid_out, radio_scope, summary_details) = {
+    let (
+        plan,
+        rect,
+        stable,
+        hover_chain,
+        disabled,
+        toggled,
+        laid_out,
+        radio_scope,
+        summary_details,
+        select_toggle,
+        option_pick,
+        open_selects,
+    ) = {
         let inner = mgr.inner.lock().await;
         let tab = inner
             .tabs
@@ -1022,6 +1077,46 @@ async fn click_inner(
         let typ = document::attr(node, "type")
             .unwrap_or_default()
             .to_ascii_lowercase();
+        let hover_chain = hover_chain_selectors(node);
+        let disabled = matches!(
+            tag.as_str(),
+            "input" | "button" | "select" | "textarea" | "option"
+        ) && document::attr(node, "disabled").is_some();
+
+        // 当前展开的 select 面板:点击面板外任何元素都应收起(light dismiss 近似)。
+        let open_selects: Vec<String> = doc
+            .select("select")
+            .map(|v| {
+                v.iter()
+                    .map(|n| Document::stable_selector(n))
+                    .filter(|s| tab.widget_open.get(s).copied().unwrap_or(false))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut select_toggle = None;
+        let mut option_pick = None;
+        if tag == "select" && document::attr(node, "multiple").is_none() {
+            let open = tab.widget_open.get(&stable).copied().unwrap_or(false);
+            select_toggle = Some((stable.clone(), !open));
+        } else if tag == "option" {
+            if let Some(select) = document::closest_tag(node, "select") {
+                let select_sel = Document::stable_selector(&select);
+                if tab.widget_open.get(&select_sel).copied().unwrap_or(false) {
+                    if let Ok(options) = select.select("option") {
+                        for (i, opt) in options.into_iter().enumerate() {
+                            if Document::stable_selector(opt.as_node()) == stable {
+                                let label = document::collapse_ws(&opt.as_node().text_contents());
+                                let value = document::attr(opt.as_node(), "value")
+                                    .unwrap_or_else(|| label.clone());
+                                option_pick = Some((select_sel, value, label, i));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let mut toggled = None;
         let mut radio_scope = None;
         let mut summary_details = None;
@@ -1074,29 +1169,60 @@ async fn click_inner(
                         }
                     });
                 }
-            } else if matches!(tag.as_str(), "button" | "input")
-                || typ == "submit"
-                || document::attr(node, "role").as_deref() == Some("button")
-            {
-                if let Some(form) = doc.form_request(node, &tab.form_values) {
-                    let (url, body) = form.to_request();
-                    plan = Some(NavPlan::Same {
-                        url,
-                        method: form.method,
-                        body,
-                    });
+            } else {
+                // 默认提交只属于 submit/image;button/reset 型按钮不触发表单。
+                let submitter = match tag.as_str() {
+                    "button" => !matches!(typ.as_str(), "button" | "reset"),
+                    "input" => matches!(typ.as_str(), "submit" | "image"),
+                    _ => document::attr(node, "role").as_deref() == Some("button"),
+                };
+                if submitter {
+                    if let Some(form) = doc.form_request(node, &tab.form_values) {
+                        let (url, body) = form.to_request();
+                        plan = Some(NavPlan::Same {
+                            url,
+                            method: form.method,
+                            body,
+                        });
+                    }
                 }
             }
         }
-        (plan, rect, stable, toggled, rect_opt.is_some(), radio_scope, summary_details)
+        (
+            plan,
+            rect,
+            stable,
+            hover_chain,
+            disabled,
+            toggled,
+            rect_opt.is_some(),
+            radio_scope,
+            summary_details,
+            select_toggle,
+            option_pick,
+            open_selects,
+        )
     };
 
-    // 第 41 轮:点击语义 —— 目标进入 hover + active 状态(指针悬停 + 按下),
-    // 使 `:hover`/`:active` 样式命中。状态只影响绘制,不改控件占位。
+    if disabled {
+        return Ok(json!({
+            "clicked": false,
+            "disabled": true,
+            "selector": stable,
+            "x": rect.0,
+            "y": rect.1,
+            "mode": kind,
+            "laid_out": laid_out,
+            "note": "目标带 disabled 属性,不分发事件也不执行默认行为",
+        }));
+    }
+
+    // 第 41 轮:点击语义 —— 目标与祖先进入 hover,目标进入 active。
+    // 状态只影响绘制,不改控件占位;动作收尾统一释放 active(mouseup 语义)。
     {
         let mut inner = mgr.inner.lock().await;
         if let Some(tab) = inner.tabs.get_mut(pid) {
-            set_pseudo_state(tab, &stable, PseudoDim::Hover, true);
+            set_hover_chain(tab, &hover_chain);
             set_pseudo_state(tab, &stable, PseudoDim::Active, true);
         }
     }
@@ -1126,6 +1252,12 @@ async fn click_inner(
             }
             if reply.default_prevented {
                 out["default_prevented"] = json!(true);
+                {
+                    let mut inner = mgr.inner.lock().await;
+                    if let Some(tab) = inner.tabs.get_mut(pid) {
+                        release_active(tab);
+                    }
+                }
                 return Ok(out);
             }
             if let Some(action) = pending.into_iter().next() {
@@ -1141,6 +1273,12 @@ async fn click_inner(
                     }
                     _ => Ok(None),
                 };
+                {
+                    let mut inner = mgr.inner.lock().await;
+                    if let Some(tab) = inner.tabs.get_mut(pid) {
+                        release_active(tab);
+                    }
+                }
                 match nav_result {
                     Ok(Some((url, title))) => {
                         out["final_url"] = json!(url);
@@ -1153,6 +1291,76 @@ async fn click_inner(
             }
         }
     }
+    // click 动作已完成(mouseup):释放按下态,只保留 hover 链。
+    {
+        let mut inner = mgr.inner.lock().await;
+        if let Some(tab) = inner.tabs.get_mut(pid) {
+            release_active(tab);
+        }
+    }
+    // option 点击 = 选中所属 select 并收起面板;change 事件按浏览器语义发给 select。
+    if let Some((select_sel, value, label, index)) = option_pick {
+        {
+            let mut inner = mgr.inner.lock().await;
+            if let Some(tab) = inner.tabs.get_mut(pid) {
+                tab.form_values.insert(select_sel.clone(), value.clone());
+                for opened in &open_selects {
+                    tab.widget_open.remove(opened);
+                }
+            }
+        }
+        let mut js_events = false;
+        if let Some(reply) = js_dispatch_bounded(mgr, pid, &select_sel, "change").await {
+            apply_js_reply(mgr, pid, &reply).await;
+            js_events = reply.handled;
+        }
+        out["selected"] = json!(true);
+        out["selector"] = json!(select_sel);
+        out["value"] = json!(value);
+        out["text"] = json!(label);
+        out["index"] = json!(index);
+        out["dropdown_closed"] = json!(true);
+        out["js_events"] = json!(js_events);
+        relayout_and_push(mgr, pid).await;
+        return Ok(out);
+    }
+
+    // 点击 select 本体 = 展开/收起浮层面板;其它已开面板一并收起。
+    if let Some((select_sel, next_open)) = select_toggle {
+        {
+            let mut inner = mgr.inner.lock().await;
+            if let Some(tab) = inner.tabs.get_mut(pid) {
+                for opened in &open_selects {
+                    if opened != &select_sel {
+                        tab.widget_open.remove(opened);
+                    }
+                }
+                if next_open {
+                    tab.widget_open.insert(select_sel.clone(), true);
+                } else {
+                    tab.widget_open.remove(&select_sel);
+                }
+            }
+        }
+        out["dropdown_open"] = json!(next_open);
+        out["selector"] = json!(select_sel);
+        relayout_and_push(mgr, pid).await;
+        return Ok(out);
+    }
+
+    // 点击 select 面板之外 = light dismiss,收起所有已展开面板。
+    if !open_selects.is_empty() {
+        {
+            let mut inner = mgr.inner.lock().await;
+            if let Some(tab) = inner.tabs.get_mut(pid) {
+                for opened in &open_selects {
+                    tab.widget_open.remove(opened);
+                }
+            }
+        }
+        out["dropdown_closed"] = json!(true);
+    }
+
     // summary 是 details 的原生展开开关:JS 未拦截时切换开合覆盖并重排。
     if let Some(details_sel) = summary_details {
         let next_open = {
@@ -1244,7 +1452,7 @@ async fn click_inner(
 async fn act_hover(mgr: &LsmBrowserManager, pid: &str, params: &Value) -> EngineResult<Value> {
     require_page(pid)?;
     let selector = require_selector(params)?;
-    let (stable, laid_out, rect) = {
+    let (stable, hover_chain, laid_out, rect) = {
         let inner = mgr.inner.lock().await;
         let tab = inner
             .tabs
@@ -1254,15 +1462,16 @@ async fn act_hover(mgr: &LsmBrowserManager, pid: &str, params: &Value) -> Engine
         let nodes = doc.select(selector).map_err(EngineError::action_failed)?;
         let node = nodes.get(nth(params)).ok_or_else(|| EngineError::action_failed("选择器未命中"))?;
         let stable = Document::stable_selector(node);
+        let hover_chain = hover_chain_selectors(node);
         let laid_out = tab.layout.rect_for(&stable).is_some();
         let rect = tab.layout.rect_for(&stable).unwrap_or((0.0, 0.0, 0.0, 0.0));
-        (stable, laid_out, rect)
+        (stable, hover_chain, laid_out, rect)
     };
-    // 第 41 轮:hover 进入运行时伪类状态 → `:hover` 样式命中 → 重排重绘。
+    // 第 42 轮:hover 命中目标与全部祖先(`.parent:hover .child`)。
     {
         let mut inner = mgr.inner.lock().await;
         if let Some(tab) = inner.tabs.get_mut(pid) {
-            set_pseudo_state(tab, &stable, PseudoDim::Hover, true);
+            set_hover_chain(tab, &hover_chain);
         }
     }
     relayout_and_push(mgr, pid).await;
@@ -1281,21 +1490,23 @@ async fn act_mouse_move(mgr: &LsmBrowserManager, pid: &str, params: &Value) -> E
         .get_mut(pid)
         .ok_or_else(|| EngineError::page_not_found(pid))?;
     let mut hovered: Option<String> = None;
+    let mut hover_chain: Vec<String> = Vec::new();
     let (x, y) = if let Some(sel) = p_str(params, "selector") {
         let doc = tab_document(tab);
         let nodes = doc.select(sel).map_err(EngineError::action_failed)?;
         let node = nodes.get(nth(params)).ok_or_else(|| EngineError::action_failed("选择器未命中"))?;
         let stable = Document::stable_selector(node);
         let r = tab.layout.rect_for(&stable).unwrap_or((0.0, 0.0, 0.0, 0.0));
+        hover_chain = hover_chain_selectors(node);
         hovered = Some(stable);
         (r.0 + r.2 / 2.0, r.1 + r.3 / 2.0)
     } else {
         (p_f64(params, "x").unwrap_or(0.0), p_f64(params, "y").unwrap_or(0.0))
     };
     tab.mouse = Some((x, y));
-    // 第 41 轮:按选择器移动指针等价于悬停该元素 → `:hover` 样式命中。
-    if let Some(stable) = hovered.as_deref() {
-        set_pseudo_state(tab, stable, PseudoDim::Hover, true);
+    // 第 42 轮:按选择器移动指针等价于悬停目标与祖先链。
+    if !hover_chain.is_empty() {
+        set_hover_chain(tab, &hover_chain);
     }
     drop(inner);
     if hovered.is_some() {
@@ -1322,6 +1533,15 @@ async fn act_input(mgr: &LsmBrowserManager, pid: &str, params: &Value) -> Engine
         let stable = Document::stable_selector(node);
         if !document::is_visible(node) {
             return Err(EngineError::action_failed("输入目标不可见").with_data(json!({"selector": stable})));
+        }
+        let tag = document::tag_name(node);
+        if document::attr(node, "disabled").is_some() {
+            return Err(EngineError::action_failed("输入目标已禁用").with_data(json!({"selector": stable, "disabled": true})));
+        }
+        if matches!(tag.as_str(), "input" | "textarea")
+            && document::attr(node, "readonly").is_some()
+        {
+            return Err(EngineError::action_failed("输入目标只读").with_data(json!({"selector": stable, "readonly": true})));
         }
         tab.form_values.insert(stable.clone(), text.to_string());
         stable
@@ -1359,6 +1579,15 @@ async fn act_clear(mgr: &LsmBrowserManager, pid: &str, params: &Value) -> Engine
         let nodes = doc.select(selector).map_err(EngineError::action_failed)?;
         let node = nodes.get(nth(params)).ok_or_else(|| EngineError::action_failed("清空目标未命中"))?;
         let stable = Document::stable_selector(node);
+        let tag = document::tag_name(node);
+        if document::attr(node, "disabled").is_some() {
+            return Err(EngineError::action_failed("清空目标已禁用").with_data(json!({"selector": stable, "disabled": true})));
+        }
+        if matches!(tag.as_str(), "input" | "textarea")
+            && document::attr(node, "readonly").is_some()
+        {
+            return Err(EngineError::action_failed("清空目标只读").with_data(json!({"selector": stable, "readonly": true})));
+        }
         tab.form_values.insert(stable.clone(), String::new());
         stable
     };
@@ -1386,6 +1615,12 @@ async fn act_select_option(mgr: &LsmBrowserManager, pid: &str, params: &Value) -
                 .ok_or_else(|| EngineError::action_failed("目标不是 select 且不在 select 内"))?
         };
         let select_selector = Document::stable_selector(&select);
+        if document::attr(&select, "disabled").is_some() {
+            return Err(EngineError::action_failed("目标 select 已禁用").with_data(json!({
+                "selector": select_selector,
+                "disabled": true,
+            })));
+        }
         let options: Vec<_> = select
             .select("option")
             .map_err(|_| EngineError::action_failed("非法选择器"))?
@@ -1402,6 +1637,9 @@ async fn act_select_option(mgr: &LsmBrowserManager, pid: &str, params: &Value) -
 
     let mut chosen: Option<(String, usize, String)> = None;
     for (i, opt) in options.iter().enumerate() {
+        if document::attr(opt.as_node(), "disabled").is_some() {
+            continue;
+        }
         let value = document::attr(opt.as_node(), "value")
             .unwrap_or_else(|| document::collapse_ws(&opt.text_contents()));
         let label = document::collapse_ws(&opt.text_contents());
@@ -1426,6 +1664,8 @@ async fn act_select_option(mgr: &LsmBrowserManager, pid: &str, params: &Value) -
     }
     let (value, idx, label) = chosen.ok_or_else(|| EngineError::action_failed("没有匹配的 option"))?;
         tab.form_values.insert(select_selector.clone(), value.clone());
+        // 显式选择完成后浮层面板收起(浏览器点选 option 的默认收口语义)。
+        tab.widget_open.remove(&select_selector);
         let mode = if value_filter.is_some() {
             "value"
         } else if text_filter.is_some() {
@@ -1534,6 +1774,12 @@ async fn act_toggle_dropdown(
             .ok_or_else(|| EngineError::action_failed("下拉目标未命中"))?;
         if document::tag_name(node).to_ascii_lowercase() != "select" {
             return Err(EngineError::action_failed("下拉目标不是 <select>"));
+        }
+        if document::attr(node, "multiple").is_some() {
+            return Err(EngineError::action_failed("multiple select 暂不支持浮层面板"));
+        }
+        if document::attr(node, "disabled").is_some() {
+            return Err(EngineError::action_failed("下拉目标已禁用"));
         }
         Document::stable_selector(node)
     };
@@ -1833,17 +2079,33 @@ async fn act_upload(mgr: &LsmBrowserManager, pid: &str, params: &Value) -> Engin
     if files.is_empty() {
         return Err(EngineError::param("upload_file 需要 file_paths 或 file_path"));
     }
-    let mut inner = mgr.inner.lock().await;
-    let tab = inner
-        .tabs
-        .get_mut(pid)
-        .ok_or_else(|| EngineError::page_not_found(pid))?;
-    let doc = tab_document(tab);
-    let nodes = doc.select(selector).map_err(EngineError::action_failed)?;
-    let node = nodes.get(nth(params)).ok_or_else(|| EngineError::action_failed("上传控件未命中"))?;
-    let stable = Document::stable_selector(node);
-    tab.form_values.insert(stable, files.join(","));
-    Ok(json!({"files": files, "count": files.len(), "note": "阶段一只记录文件路径;真实文件读取在阶段四接入"}))
+    let stable = {
+        let mut inner = mgr.inner.lock().await;
+        let tab = inner
+            .tabs
+            .get_mut(pid)
+            .ok_or_else(|| EngineError::page_not_found(pid))?;
+        let doc = tab_document(tab);
+        let nodes = doc.select(selector).map_err(EngineError::action_failed)?;
+        let node = nodes.get(nth(params)).ok_or_else(|| EngineError::action_failed("上传控件未命中"))?;
+        if document::tag_name(node) != "input"
+            || document::attr(node, "type")
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                != "file"
+        {
+            return Err(EngineError::action_failed("上传目标不是 input[type=file]"));
+        }
+        if document::attr(node, "disabled").is_some() {
+            return Err(EngineError::action_failed("上传目标已禁用"));
+        }
+        let stable = Document::stable_selector(node);
+        tab.form_values.insert(stable.clone(), files.join(","));
+        stable
+    };
+    // 文件名进入控件内置 UI,必须立即重排推帧;否则截图继续显示「选择文件」。
+    relayout_and_push(mgr, pid).await;
+    Ok(json!({"selector": stable, "files": files, "count": files.len(), "note": "阶段一只记录文件路径;真实文件读取在阶段四接入"}))
 }
 
 async fn act_drag(mgr: &LsmBrowserManager, pid: &str, params: &Value) -> EngineResult<Value> {
@@ -2151,7 +2413,7 @@ async fn act_eval(
         ThreadEval::NoThread => {}
     }
 
-    let (outcome, pending) = {
+    let (outcome, pending, runtime_state_changed) = {
         let mut inner = mgr.inner.lock().await;
         let some_tab = inner.tabs.get(pid).cloned();
         let Some(mut tab) = some_tab else {
@@ -2181,13 +2443,16 @@ async fn act_eval(
 
         // 非导航动作直接落到标签页/存储。
         let mut pending: Vec<js::JsAction> = Vec::new();
+        let mut runtime_state_changed = false;
         for action in &outcome.actions {
             match action.kind.as_str() {
                 "set_value" => {
                     tab.form_values.insert(action.selector.clone(), action.value.clone());
+                    runtime_state_changed = true;
                 }
                 "set_checked" => {
                     tab.form_values.insert(action.selector.clone(), action.value.clone());
+                    runtime_state_changed = true;
                 }
                 "set_cookie" => {
                     if let Some(t) = inner.tabs.get(pid) {
@@ -2236,8 +2501,18 @@ async fn act_eval(
                         tab.scroll_y = (tab.scroll_y + v).max(0.0);
                     }
                 }
-                "focus" => tab.focused = Some(action.selector.clone()),
-                "blur" => tab.focused = None,
+                "focus" => {
+                    set_pseudo_state(&mut tab, &action.selector, PseudoDim::Focus, true);
+                    tab.focused = Some(action.selector.clone());
+                    runtime_state_changed = true;
+                }
+                "blur" => {
+                    if let Some(prev) = tab.focused.clone() {
+                        set_pseudo_state(&mut tab, &prev, PseudoDim::Focus, false);
+                    }
+                    tab.focused = None;
+                    runtime_state_changed = true;
+                }
                 "fetch" => {
                     tab.network.push(super::NetworkRecord {
                         url: action.url.clone(),
@@ -2264,12 +2539,19 @@ async fn act_eval(
             t.title = tab.title;
             t.scroll_y = tab.scroll_y;
             t.focused = tab.focused;
+            t.pseudo_states = tab.pseudo_states;
             if tab.network.len() > t.network.len() {
                 t.network = tab.network;
             }
         }
-        (outcome, pending)
+        (outcome, pending, runtime_state_changed)
     };
+
+    // 回退桥没有 apply_js_reply 的统一重排入口;运行时状态变化后必须显式刷新,
+    // 否则 el.focus() 写进了状态但 :focus 样式与截图仍停留在旧布局。
+    if runtime_state_changed {
+        relayout_and_push(mgr, pid).await;
+    }
 
     // 导航/点击动作在锁外执行。
     finish_eval(mgr, pid, outcome, pending, await_promise).await

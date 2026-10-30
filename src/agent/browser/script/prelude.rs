@@ -1339,6 +1339,23 @@ function __mk(n) {
       var kids = Array.prototype.slice.call(arguments);
       for (var i = 0; i < kids.length; i++) __lsmInsertChild(el, n.sel, kids[i], false);
     },
+    // 第 42 轮:dialog 方法必须是**普通函数属性**。此前用 defineProperty
+    // 存取器定义,`dialog.showModal()` 实际调用 getter 返回的 undefined,
+    // 页面脚本标准模态链路当场 TypeError。
+    show: function () {
+      __push({ type: "set_attr", selector: n.sel, key: "open", value: "" });
+      return undefined;
+    },
+    showModal: function () {
+      __push({ type: "set_attr", selector: n.sel, key: "open", value: "" });
+      __push({ type: "set_attr", selector: n.sel, key: "data-lsm-modal", value: "" });
+      return undefined;
+    },
+    close: function () {
+      __push({ type: "remove_attr", selector: n.sel, key: "open" });
+      __push({ type: "remove_attr", selector: n.sel, key: "data-lsm-modal" });
+      return undefined;
+    },
     cloneNode: function () { return el; }
   };
   el.classList = {
@@ -1390,16 +1407,6 @@ function __mk(n) {
   }, function (v) {
     if (v) __push({ type: "set_attr", selector: n.sel, key: "indeterminate", value: "" });
     else __push({ type: "remove_attr", selector: n.sel, key: "indeterminate" });
-  });
-  // 第 41 轮:模态对话框。浏览器语义:只有 `showModal()` 打开的对话框才是
-  // 模态的(进顶层 + 有 `::backdrop` 遮罩);`open` 属性的对话框无模态遮罩。
-  define("showModal", function () { return undefined; }, function () {
-    __push({ type: "set_attr", selector: n.sel, key: "open", value: "" });
-    __push({ type: "set_attr", selector: n.sel, key: "data-lsm-modal", value: "" });
-  });
-  define("close", function () { return undefined; }, function () {
-    __push({ type: "remove_attr", selector: n.sel, key: "open" });
-    __push({ type: "remove_attr", selector: n.sel, key: "data-lsm-modal" });
   });
   // 真实的父子关系:站点脚本常走 `el.parentNode.insertBefore(...)` 这类路径,
   // 此前 parentNode 恒为 null、children 恒为空,脚本当场抛异常。

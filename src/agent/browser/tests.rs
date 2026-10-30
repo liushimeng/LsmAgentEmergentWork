@@ -181,6 +181,234 @@ async fn 输入文本写入运行时值() {
 }
 
 #[tokio::test]
+async fn 点击select展开面板并点击option选中收起() {
+    let mgr = LsmBrowserManager::new();
+    let url = html_doc("<select id='s'><option value='a'>甲</option><option value='b'>乙</option></select>");
+    let out = mgr
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .await
+        .unwrap();
+    let opened = api::control(
+        &mgr,
+        Some(&out.page_id),
+        "click",
+        &serde_json::json!({"selector": "#s"}),
+        &serde_json::json!({}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(opened["dropdown_open"], true, "点击 select 应展开浮层面板:{opened}");
+
+    let picked = api::control(
+        &mgr,
+        Some(&out.page_id),
+        "click",
+        &serde_json::json!({"selector": "#s option:nth-of-type(2)"}),
+        &serde_json::json!({}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(picked["selected"], true, "点击 option 应走选中语义:{picked}");
+    assert_eq!(picked["value"], "b");
+    assert_eq!(picked["dropdown_closed"], true);
+
+    let selected = inspect::inspect(
+        &mgr,
+        &out.page_id,
+        "elements",
+        &serde_json::json!({"selector": "#s"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(selected["value"], "b", "option 点击后运行时值必须同步:{selected}");
+    mgr.shutdown().await;
+}
+
+#[tokio::test]
+async fn 显式select_option后自动收起浮层面板() {
+    let mgr = LsmBrowserManager::new();
+    let url = html_doc("<select id='s'><option value='a'>甲</option><option value='b'>乙</option></select>");
+    let out = mgr
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .await
+        .unwrap();
+    api::control(
+        &mgr,
+        Some(&out.page_id),
+        "open_dropdown",
+        &serde_json::json!({"selector": "#s"}),
+        &serde_json::json!({}),
+    )
+    .await
+    .unwrap();
+    api::control(
+        &mgr,
+        Some(&out.page_id),
+        "select_option",
+        &serde_json::json!({"selector": "#s", "value": "b"}),
+        &serde_json::json!({}),
+    )
+    .await
+    .unwrap();
+    let reopened = api::control(
+        &mgr,
+        Some(&out.page_id),
+        "click",
+        &serde_json::json!({"selector": "#s"}),
+        &serde_json::json!({}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        reopened["dropdown_open"], true,
+        "select_option 后面板应已收起,再次点击 select 应重新展开:{reopened}"
+    );
+    mgr.shutdown().await;
+}
+
+#[tokio::test]
+async fn 禁用与只读控件拒绝交互() {
+    let mgr = LsmBrowserManager::new();
+    let url = html_doc("<input id='d' disabled><input id='r' readonly><button id='b' disabled>禁用</button>");
+    let out = mgr
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .await
+        .unwrap();
+    let clicked = api::control(
+        &mgr,
+        Some(&out.page_id),
+        "click",
+        &serde_json::json!({"selector": "#b"}),
+        &serde_json::json!({}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(clicked["clicked"], false, "禁用按钮不得执行点击:{clicked}");
+    assert_eq!(clicked["disabled"], true);
+
+    let disabled_input = api::control(
+        &mgr,
+        Some(&out.page_id),
+        "input_text",
+        &serde_json::json!({"selector": "#d", "text": "x"}),
+        &serde_json::json!({}),
+    )
+    .await;
+    assert!(disabled_input.is_err(), "禁用输入框必须拒绝写入");
+    let readonly_input = api::control(
+        &mgr,
+        Some(&out.page_id),
+        "input_text",
+        &serde_json::json!({"selector": "#r", "text": "x"}),
+        &serde_json::json!({}),
+    )
+    .await;
+    assert!(readonly_input.is_err(), "只读输入框必须拒绝写入");
+    mgr.shutdown().await;
+}
+
+#[tokio::test]
+async fn 点击后active释放且hover命中祖先链() {
+    let mgr = LsmBrowserManager::new();
+    let url = html_doc("<div id='parent'><button id='child'>按钮</button></div>");
+    let out = mgr
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .await
+        .unwrap();
+    api::control(
+        &mgr,
+        Some(&out.page_id),
+        "click",
+        &serde_json::json!({"selector": "#child"}),
+        &serde_json::json!({}),
+    )
+    .await
+    .unwrap();
+    let child = inspect::inspect(
+        &mgr,
+        &out.page_id,
+        "elements",
+        &serde_json::json!({"selector": "#child"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(child["state"]["hovered"], true, "点击后应保留 hover:{child}");
+    assert_eq!(child["state"]["active"], false, "动作完成后 active 必须释放:{child}");
+
+    let parent = inspect::inspect(
+        &mgr,
+        &out.page_id,
+        "elements",
+        &serde_json::json!({"selector": "#parent"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(parent["state"]["hovered"], true, "hover 必须命中祖先链:{parent}");
+    mgr.shutdown().await;
+}
+
+#[tokio::test]
+async fn 上传后文件名立即可见() {
+    let mgr = LsmBrowserManager::new();
+    let url = html_doc("<input id='f' type='file'>");
+    let out = mgr
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .await
+        .unwrap();
+    api::control(
+        &mgr,
+        Some(&out.page_id),
+        "upload_file",
+        &serde_json::json!({"selector": "#f", "file_paths": ["/tmp/报告.pdf"]}),
+        &serde_json::json!({}),
+    )
+    .await
+    .unwrap();
+    let el = inspect::inspect(
+        &mgr,
+        &out.page_id,
+        "elements",
+        &serde_json::json!({"selector": "#f"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(el["value"], "/tmp/报告.pdf", "上传路径应进入运行时值:{el}");
+    let text = inspect::inspect(&mgr, &out.page_id, "text", &serde_json::json!({}))
+        .await
+        .unwrap();
+    assert!(
+        text["text"].as_str().unwrap_or("").contains("报告.pdf"),
+        "上传后布局文本应立即显示文件名:{text}"
+    );
+    mgr.shutdown().await;
+}
+
+#[tokio::test]
+async fn button型按钮不触发表单提交() {
+    let mgr = LsmBrowserManager::new();
+    let url = html_doc("<form action='/search'><input name='q' value='x'><button id='b' type='button'>普通</button></form>");
+    let out = mgr
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .await
+        .unwrap();
+    let clicked = api::control(
+        &mgr,
+        Some(&out.page_id),
+        "click",
+        &serde_json::json!({"selector": "#b"}),
+        &serde_json::json!({}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(clicked["clicked"], true);
+    assert!(
+        clicked.get("final_url").is_none(),
+        "type=button 不得触发表单导航:{clicked}"
+    );
+    mgr.shutdown().await;
+}
+
+#[tokio::test]
 async fn eval_js_可查询_dom_并产生动作() {
     let mgr = LsmBrowserManager::new();
     let url = html_doc("<h1 id='h'>Hi</h1><input id='q'>");

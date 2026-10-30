@@ -46,6 +46,34 @@ fn disabled伪类命中禁用控件() {
 }
 
 #[test]
+fn indeterminate伪类按属性命中() {
+    let doc = state_doc(
+        "<head><style>input:indeterminate{color:#ff8800}</style></head><body><input id='half' type='checkbox' indeterminate></body>",
+        &[],
+        &[],
+    );
+    let st = engine(&doc).computed_chain(&doc.first("#half").unwrap().unwrap());
+    assert_eq!(st.color, [255, 136, 0], ":indeterminate 必须命中半选属性");
+}
+
+#[test]
+fn 无半选属性时indeterminate不命中() {
+    let doc = state_doc(
+        "<head><style>input:indeterminate{color:#ff8800}</style></head><body><input id='plain' type='checkbox'></body>",
+        &[],
+        &[],
+    );
+    let st = engine(&doc).computed_chain(&doc.first("#plain").unwrap().unwrap());
+    assert_ne!(st.color, [255, 136, 0], "无 indeterminate 属性时不得命中");
+}
+
+#[test]
+fn indeterminate计入伪类特异性() {
+    let (a, b, c) = selector_specificity("input:indeterminate");
+    assert_eq!((a, b, c), (0, 1, 1), ":indeterminate 必须计入伪类列");
+}
+
+#[test]
 fn 关闭details抑制非summary子树() {
     let doc = state_doc(
         "<body><details id='d'><summary>标题</summary><p>正文</p></details></body>",

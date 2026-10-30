@@ -77,12 +77,12 @@ src/agent/browser/               内核:窗口/标签页 / 网络 / DOM / 布局
 
 | control_action | 参数 | 阶段一实现 |
 | --- | --- | --- |
-| `click` / `human_click` | `selector*`、`nth` | `<a href>` 导航；`target=_blank` 新标签页；按钮/提交控件按表单提交；复选框切换值 |
+| `click` / `human_click` | `selector*`、`nth` | `<a href>` 导航；`target=_blank` 新标签页；submit/image 才提交表单；复选框切换值；点击 select 展开面板、点击 option 选中并收起；disabled 目标返回 `clicked:false + disabled:true` |
 | `right_click` / `double_click` | `selector*`、`nth` | 返回元素坐标与动作类型，不导航 |
-| `hover` / `mouse_move` | `selector*`/`x,y` | 记录指针位置 |
-| `input_text` / `human_input` | `selector*`、`text*` | 写入运行时值；`value_after` 返回长度/前缀 |
-| `clear_input` | `selector*` | 清空运行时值 |
-| `select_option` | `selector*`、`value/values/text/index` | 原生 `<select>` 选中 |
+| `hover` / `mouse_move` | `selector*`/`x,y` | 记录指针位置；selector 模式同时命中目标与祖先链的 `:hover` |
+| `input_text` / `human_input` | `selector*`、`text*` | 写入运行时值；`value_after` 返回长度/前缀；disabled/readonly 目标返回 2002 |
+| `clear_input` | `selector*` | 清空运行时值；disabled/readonly 目标返回 2002 |
+| `select_option` | `selector*`、`value/values/text/index` | 原生 `<select>` 选中并自动收起浮层面板 |
 | `select_dropdown` | `option_text*`、`selector` | 按选项文本匹配原生下拉 |
 | `key_press` | `key*`、`selector`、`modifiers` | `Enter` 提交所在表单；其余按键记录 |
 | `press_sequence` | `keys*`、`selector` | 顺序处理按键（含 Enter 提交） |
@@ -102,9 +102,9 @@ src/agent/browser/               内核:窗口/标签页 / 网络 / DOM / 布局
 | `screenshot` | `save_path`（兼容别名 `output_path`/`path`）、`full_page`、`format`、`ocr`、`return_base64` | 软件渲染 PNG；`ocr=true` 返回布局可见文本并标注 `ocr_source` |
 | `download` | `url` 或 `selector`、`save_dir`、`filename` | HTTP 下载落盘 |
 | `heartbeat` | — | 返回标题 |
-| `focus` / `blur` | `selector*` | 记录焦点选择器 |
+| `focus` / `blur` | `selector*` | 记录焦点选择器并同步 `:focus`/`:focus-visible` 运行时状态 |
 | `dispatch_event` | `selector*`、`event*` | click/submit 走真实语义；其余记录 |
-| `upload_file` | `selector*`、`file_paths`/`file_path` | 记录文件路径到表单值（阶段四读取文件） |
+| `upload_file` | `selector*`、`file_paths`/`file_path` | 记录文件路径到表单值并立即重排，文件名直接进入布局/截图（阶段四读取文件） |
 | `drag` | 源/目标 selector 或坐标 | 记录拖拽轨迹 |
 | `set_window` / `sync_viewport` | 宽高/位置 | 逻辑视口调整；原生窗口阶段三 |
 | `set_highlight` / `set_overlay` / `set_guard` / `auto_follow` | 兼容参数 | 记录状态，返回 `supported:false` + 说明 |
@@ -117,7 +117,7 @@ src/agent/browser/               内核:窗口/标签页 / 网络 / DOM / 布局
 | --- | --- |
 | `console` | `{events:[{level,text,at_ms}], count, collection_healthy, last_event_at}` |
 | `network` | `{events:[{url,method,status,content_type,bytes,elapsed_ms,redirect,at_ms}], count, ...}` |
-| `elements` | `{ok,tag,selector,id,classes,text,value,href,attributes,visible,rect{...},count,index}`；`rect.laid_out` 区分"没有布局盒"与"零尺寸盒"，被祖先 `display:none` 剪枝时附 `render_blocked_by`；`params.include_style=true` 时附加 `computed_style:{...}` |
+| `elements` | `{ok,tag,selector,id,classes,text,value,state,href,attributes,visible,rect{...},count,index}`；`state` 归一化 checked/selected/disabled/readonly/indeterminate/open/select_open/focused/hovered/active；`rect.laid_out` 区分"没有布局盒"与"零尺寸盒"，被祖先 `display:none` 剪枝时附 `render_blocked_by`；`params.include_style=true` 时附加 `computed_style:{...}` |
 | `stylesheets` | `{ok,count,rules,sheets:[{index,href,media,bytes,rules}],media:{width,height,prefers_dark,print}}` |
 | `dom` | `{ok,selector,node_count,tree}` 或 `{ok,selector,outer_html}` |
 | `localstorage` / `sessionstorage` | `{key: value}`（支持 `prefix`/`contains` 过滤） |

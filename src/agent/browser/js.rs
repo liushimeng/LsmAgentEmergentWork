@@ -286,6 +286,15 @@ const PRELUDE_BODY: &str = r##"
       focus: function () { __push({ type: "focus", selector: n.sel }); },
       blur: function () { __push({ type: "blur", selector: n.sel }); },
       submit: function () { __push({ type: "submit", selector: n.sel }); },
+      show: function () { __push({ type: "set_attr", selector: n.sel, key: "open", value: "" }); },
+      showModal: function () {
+        __push({ type: "set_attr", selector: n.sel, key: "open", value: "" });
+        __push({ type: "set_attr", selector: n.sel, key: "data-lsm-modal", value: "" });
+      },
+      close: function () {
+        __push({ type: "remove_attr", selector: n.sel, key: "open" });
+        __push({ type: "remove_attr", selector: n.sel, key: "data-lsm-modal" });
+      },
       dispatchEvent: function (e) { __push({ type: "event", selector: n.sel, event: String((e && e.type) || e) }); return true; },
       addEventListener: function () {},
       removeEventListener: function () {},

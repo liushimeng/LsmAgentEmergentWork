@@ -54,6 +54,8 @@ pub enum Pseudo {
     Root,
     Empty,
     Checked,
+    /// 第 42 轮:checkbox/progress 的半选/不确定态(由 `indeterminate` 属性承载)。
+    Indeterminate,
     Disabled,
     Enabled,
     Link,
@@ -438,6 +440,7 @@ fn parse_pseudo(name: &str, arg: Option<&str>) -> Option<Pseudo> {
         "root" => Pseudo::Root,
         "empty" => Pseudo::Empty,
         "checked" => Pseudo::Checked,
+        "indeterminate" => Pseudo::Indeterminate,
         "disabled" => Pseudo::Disabled,
         "enabled" => Pseudo::Enabled,
         "link" | "any-link" => Pseudo::Link,
@@ -598,6 +601,15 @@ fn pseudo_matches(node: &NodeRef, tag: &str, pseudo: &Pseudo) -> bool {
             };
             let attrs = el.attributes.borrow();
             attrs.contains("checked") || attrs.contains("selected")
+        }
+        // 与 JS 选择器桥同口径:内核以 `indeterminate` 属性承载半选态,
+        // `Document::apply_widget_state` 与 `el.indeterminate = true` 都会写它。
+        Pseudo::Indeterminate => {
+            matches!(tag, "input" | "progress")
+                && node
+                    .as_element()
+                    .map(|e| e.attributes.borrow().contains("indeterminate"))
+                    .unwrap_or(false)
         }
         Pseudo::Disabled => {
             let Some(el) = node.as_element() else {

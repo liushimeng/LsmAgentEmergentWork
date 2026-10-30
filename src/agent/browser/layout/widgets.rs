@@ -391,6 +391,15 @@ pub(crate) fn emit_form_control_text(
                 "file" => {
                     emit_file_picker(ctx, node, style, bx, by, w, h, tf);
                 }
+                // 第 42 轮:图片按钮。内核不发起真实文件选取,先以 alt/value
+                // 文案保住控件语义,缺省给可见中文占位而非空边框。
+                "image" => {
+                    let text = document::attr(node, "alt")
+                        .filter(|v| !v.trim().is_empty())
+                        .or_else(|| document::attr(node, "value"))
+                        .unwrap_or_else(|| "图片按钮".to_string());
+                    emit_singleline_text(ctx, &text, style.color, style, bx, by, w, h, tf);
+                }
                 _ => {}
             }
         }
@@ -455,7 +464,7 @@ pub(crate) fn emit_form_control_text(
     }
 }
 
-fn input_display_text(
+pub(crate) fn input_display_text(
     node: &NodeRef,
     style: &ComputedStyle,
     ty: &str,

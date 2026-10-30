@@ -329,22 +329,38 @@ pub(super) fn inline_box_size(&self, node: &NodeRef, style: &ComputedStyle, avai
         return (0.0, 0.0);
     }
     let tag = document::tag_name(node).to_ascii_lowercase();
+    let ty = document::attr(node, "type")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     // select 的 option 子树不参与布局;固有宽只看当前显示项 + 箭头位,
     // 否则 hidden option 的累计文本会把盒撑到页面外。
     let text = if tag == "select" {
         select_display_text(node)
+    } else if tag == "input" {
+        // input 是 void 元素,`text_contents()` 恒空;固有宽必须看
+        // value/placeholder/按钮默认文案,否则长提示只剩 40px 窄盒后被截断。
+        let (shown, _) = super::widgets::input_display_text(node, style, &ty);
+        shown
     } else {
         node.text_contents()
     };
     let text_w = self.font.text_width(&text, style.font_size);
+    let char_w = self
+        .font
+        .char_width('0', style.font_size)
+        .max(1.0);
+    let numeric_attr = |name: &str, default: f64| {
+        document::attr(node, name)
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(default)
+            .clamp(1.0, 100.0)
+    };
     // 第 41 轮:带内置 UI 的 input 类型给类型化固有宽(浏览器量级),
     // 免得滑轨/色块/日历图标被挤进 40px 的窄盒里看不出是控件。
+    // 第 42 轮:文本类再并入 value/placeholder 与 `size` 列宽。
     let intrinsic_floor = if tag == "select" {
         text_w + 22.0
     } else if tag == "input" {
-        let ty = document::attr(node, "type")
-            .unwrap_or_default()
-            .to_ascii_lowercase();
         match ty.as_str() {
             "range" => text_w.max(129.0),
             "color" => text_w.max(56.0),
@@ -352,8 +368,23 @@ pub(super) fn inline_box_size(&self, node: &NodeRef, style: &ComputedStyle, avai
             "time" => text_w.max(100.0),
             "file" => text_w.max(240.0),
             "number" => text_w.max(110.0),
-            _ => text_w.max(40.0),
+            "image" => {
+                let alt = document::attr(node, "alt")
+                    .filter(|v| !v.trim().is_empty())
+                    .or_else(|| document::attr(node, "value"))
+                    .unwrap_or_default();
+                self.font
+                    .text_width(&alt, style.font_size)
+                    .max(48.0)
+            }
+            _ => {
+                let cols = numeric_attr("size", 20.0);
+                (text_w.max(cols * char_w) + 12.0).max(40.0)
+            }
         }
+    } else if tag == "textarea" {
+        let cols = numeric_attr("cols", 20.0);
+        (text_w.max(cols * char_w) + 12.0).max(40.0)
     } else {
         text_w.max(40.0)
     };
@@ -362,10 +393,13 @@ pub(super) fn inline_box_size(&self, node: &NodeRef, style: &ComputedStyle, avai
     } else {
         style.width.unwrap_or(intrinsic_floor).max(1.0)
     };
-    let h = style
-        .height
-        .unwrap_or_else(|| (style.font_size * 1.45).max(16.0))
-        .max(1.0);
+    let natural_h = if tag == "textarea" {
+        let rows = numeric_attr("rows", 2.0);
+        (style.font_size * 1.35 * rows).max(16.0)
+    } else {
+        (style.font_size * 1.45).max(16.0)
+    };
+    let h = style.height.unwrap_or(natural_h).max(1.0);
     (w, h)
 }
 
@@ -391,7 +425,6 @@ pub(super) fn collect_inline(
     // 行内元素自身建盒。此前只有"块级盒的直接行内子节点"才拿到盒子,
     // 导致 `<div><input></div>` 这类结构完全取不到几何(inspect 的 rect 恒 0×0)。
     let own_box = self.inline_box_worthy(node, style);
-    let mut box_x = line_x;
     let mut box_w = avail_w;
     // 子代 x 基准 = 本元素 **margin-box x**(text/img/嵌套各自由此加
     // 自身 margin+padding 得内容起点);own_box 盒需回退自身偏移。
@@ -408,9 +441,14 @@ pub(super) fn collect_inline(
         if w > 0.0 && h > 0.0 {
             row.register(bx, by, w, h, line_x + avail_w);
         }
-        box_x = bx;
         box_w = w;
         inner_x = bx - style.margin_left - style.padding_left;
+    }
+    // 表单控件文本/内置 UI 已由 `emit_form_control_text` 全权绘制,子文本
+    // 不能再进普通行内缓冲 —— 否则 button/textarea 内容画两遍,textarea
+    // 初始文本还会脱离控件盒溢出(第 42 轮)。
+    if own_box && is_form_control_tag(node) {
+        return;
     }
     // 行内块/控件盒为子代建立独立行内上下文(浮动不越出该盒),子代几何
     // 也相对自身盒求解(此前一律沿用祖先 line_x/avail_w)。
@@ -590,6 +628,12 @@ pub(super) fn layout_inline_float(
     let (bx, by) = row.place_float(style, line_x, line_x + avail_w, self.y, w, h);
     self.y = by;
     let tf = self.emit_inline_box(node, style, bx, by, w, h, tf);
+    if is_form_control_tag(node) {
+        // 控件内容同样由 widgets 层唯一绘制,浮动路径不再收集子文本。
+        row.note_bottom(by + h);
+        self.y = by;
+        return;
+    }
     let mut inner = float::InlineRow::default();
     self.collect_inline_children(node, style, buf, depth + 1, bx, w, &mut inner, tf);
     row.note_bottom(inner.content_bottom());

@@ -16,6 +16,8 @@ pub mod runtime;
 #[cfg(test)]
 mod render_compat_tests;
 #[cfg(test)]
+mod state_bridge_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod tests_dom_insert;

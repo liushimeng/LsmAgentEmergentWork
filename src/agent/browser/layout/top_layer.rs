@@ -14,7 +14,7 @@ use kuchikiki::NodeRef;
 
 use super::super::document::{self, Document};
 use super::super::style::ComputedStyle;
-use super::{style_visible, LayoutCtx, TextLine, MAX_CONTENT_WIDTH};
+use super::{style_visible, LayoutCtx, TextLine};
 
 /// 顶层绘制层档位(0 = 常规流,1 = 定位元素,2 = 顶层)。
 pub(crate) const TOP_LAYER: u8 = 2;
@@ -164,17 +164,25 @@ pub(crate) fn emit_select_panel(
     if labels.is_empty() {
         return;
     }
-    let selected = options
+    // 选中项按 option 位置判定。运行时值经 `apply_widget_state` 已落到
+    // 匹配 option 的 `selected` 属性;不能按 label 文本比较 —— 重复 label
+    // 会高亮错项(两个 option 都叫「请选择」时实测必错)。
+    let selected_index = options
         .iter()
-        .find(|o| document::attr(o, "selected").is_some())
-        .map(|o| document::collapse_ws(&o.text_contents()))
-        .unwrap_or_default();
+        .position(|o| document::attr(o, "selected").is_some());
 
     let rows = labels.len().min(PANEL_MAX_ROWS);
     let panel_w = w.max(40.0);
     let panel_h = rows as f64 * PANEL_ROW_H + PANEL_PAD * 2.0;
     let panel_x = bx;
-    let panel_y = by + h;
+    let (_, vh) = ctx.viewport();
+    let below_y = by + h;
+    // 视口下缘放不下时向上翻转(浏览器原生下拉的同款策略)。
+    let panel_y = if below_y + panel_h > vh {
+        (by - panel_h).max(0.0)
+    } else {
+        below_y
+    };
 
     let prev_layer = ctx.positioned_layer;
     ctx.positioned_layer = TOP_LAYER;
@@ -185,7 +193,8 @@ pub(crate) fn emit_select_panel(
     let size = style.font_size.max(10.0);
     for (i, label) in labels.iter().take(rows).enumerate() {
         let row_y = panel_y + PANEL_PAD + i as f64 * PANEL_ROW_H;
-        if *label == selected && !selected.is_empty() {
+        let selected = selected_index == Some(i);
+        if selected {
             ctx.push_widget_fill(
                 style,
                 [0, 120, 215],
@@ -197,13 +206,30 @@ pub(crate) fn emit_select_panel(
                 None,
             );
         }
+        // option 行登记真实几何:面板不再是纯视觉文本,Agent 可以按 rect
+        // 定位/点击浮层选项(inspect elements 与 click 使用同一份盒子)。
+        ctx.boxes.push(super::ElementBox {
+            selector: Document::stable_selector(&options[i]),
+            tag: "option".to_string(),
+            x: panel_x,
+            y: row_y,
+            w: panel_w,
+            h: PANEL_ROW_H,
+            background: style.background,
+            background_alpha: style.background_alpha,
+            visible: style_visible(style) && document::attr(&options[i], "disabled").is_none(),
+            z_index: style.pos.z_index,
+            out_of_flow: true,
+        });
         let line = TextLine {
             text: label.clone(),
             x: panel_x + PANEL_PAD,
             y: row_y + (PANEL_ROW_H - size) / 2.0,
             size,
-            color: if *label == selected && !selected.is_empty() {
+            color: if selected {
                 [255, 255, 255]
+            } else if document::attr(&options[i], "disabled").is_some() {
+                [150, 150, 150]
             } else {
                 style.color
             },
