@@ -317,6 +317,10 @@ pub(crate) struct PipelineSeed {
     pub max_rounds: usize,
     /// 0 表示使用默认 `pipeline_budget_ms()`。
     pub budget_ms: u64,
+    /// 单轮宽限续等覆盖(毫秒);0 = 默认 `grace_ms()`。
+    /// 观察入口(inspect/screenshot)的补泵传小值快进快出,不把读取类
+    /// 工具调用拖到分钟级;wait/eval 等真·等待路径用默认宽限。
+    pub grace_ms: u64,
 }
 
 /// 脚本管线轮次上限。
@@ -407,6 +411,7 @@ pub(crate) async fn run_pipeline(
     // 外链取回失败次数(URL → 次数):第一次失败允许重试,第二次起不再取回。
     let mut fetch_failures: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
     let mut handle: Option<JsHandle> = seed.handle;
+    let grace = if seed.grace_ms > 0 { seed.grace_ms } else { grace_ms() };
     let max_rounds = if seed.max_rounds == 0 { MAX_ROUNDS } else { seed.max_rounds };
     let budget = if seed.budget_ms == 0 { pipeline_budget_ms() } else { seed.budget_ms };
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget);
@@ -640,7 +645,7 @@ pub(crate) async fn run_pipeline(
                     budget_ms: wait_ms,
                 },
                 wait_ms,
-                grace_ms(),
+                grace,
             )
         })
         .await

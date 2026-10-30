@@ -40,7 +40,8 @@ pub async fn inspect(
     }
     // 截断脚本补泵(2026-10-30 京东):inspect 前把弃跑的模块补挂,读数才不是
     // 「半成品 DOM」;无待执行脚本时预检直接归零,不拖慢常规读取。
-    super::api::run_pending_scripts(mgr, page_id, super::api::interaction_budget_ms()).await;
+    // 快进快出(5s+2s 宽限):JS 线程忙时快速失败,由后续观察点继续收割。
+    super::api::run_pending_scripts(mgr, page_id, 5_000, 2_000).await;
     let mut inner = mgr.inner.lock().await;
     // 「快照×布局」一致性守卫:html 在上次布局后被脚本改写时先重排,
     // 保证 rect_for/page_health 等读数与当前 DOM 一致。

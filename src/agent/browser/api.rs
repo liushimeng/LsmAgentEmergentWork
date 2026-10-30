@@ -454,7 +454,7 @@ async fn apply_js_reply(
     let dom_changed = final_html != tab_html;
     if !dom_changed && !state_changed {
         drop(inner);
-        run_pending_scripts(mgr, pid, interaction_budget_ms()).await;
+        run_pending_scripts(mgr, pid, interaction_budget_ms(), 0).await;
         return reply
             .outcome
             .actions
@@ -537,7 +537,7 @@ async fn apply_js_reply(
     // 交互后补齐懒加载脚本:真实浏览器里 `require.async`/动态 <script> 会在
     // 点击后立即取回执行;宿主若只在 open/navigate 跑管线,路线面板这类
     // 懒加载 widget 会永远停在 loading 态(实测百度地图路线按钮)。
-    run_pending_scripts(mgr, pid, interaction_budget_ms()).await;
+    run_pending_scripts(mgr, pid, interaction_budget_ms(), 0).await;
     reply
         .outcome
         .actions
@@ -571,7 +571,7 @@ const INTERACTION_SCRIPT_ROUNDS: usize = 24;
 ///
 /// 复用标签页持久 JS 线程(`tab.js`)与已执行指纹(`tab.executed_scripts`),
 /// 因此页面全局状态不丢、首屏脚本也不会重复初始化。
-pub(crate) async fn run_pending_scripts(mgr: &LsmBrowserManager, pid: &str, budget_ms: u64) {
+pub(crate) async fn run_pending_scripts(mgr: &LsmBrowserManager, pid: &str, budget_ms: u64, grace_ms: u64) {
     let mut inner = mgr.inner.lock().await;
     let (html, url, ua, viewport, session, rects, seed, has_pending) = {
         let Some(tab) = inner.tabs.get(pid) else {
@@ -601,6 +601,7 @@ pub(crate) async fn run_pending_scripts(mgr: &LsmBrowserManager, pid: &str, budg
                 executed: tab.executed_scripts.clone(),
                 max_rounds: INTERACTION_SCRIPT_ROUNDS,
                 budget_ms,
+                grace_ms,
             },
             has_pending,
         )
@@ -961,7 +962,8 @@ pub async fn control(
             require_page(pid)?;
             // 截断脚本补泵(2026-10-30 京东):管线预算耗尽弃跑的模块在取证前
             // 尽量补挂——截图是 Agent 看页面的第一入口,静止半成品会被反复重拍。
-            run_pending_scripts(mgr, pid, interaction_budget_ms()).await;
+            // 快进快出(5s+2s 宽限):JS 线程忙时快速失败,由后续观察点继续收割。
+            run_pending_scripts(mgr, pid, 5_000, 2_000).await;
             mgr.screenshot(pid, params).await
         }
         "download" => {
@@ -2366,7 +2368,8 @@ async fn act_wait(
     require_page(pid)?;
     // 就绪等待前先补泵截断脚本(2026-10-30 京东):wait 是 Agent 判定页面
     // 「好了没」的原语,管线弃跑的模块若不在这里补挂,后续判定全在半成品态。
-    run_pending_scripts(mgr, pid, interaction_budget_ms()).await;
+    // 等待语义用默认宽限(可慢,与 wait 本身一致)。
+    run_pending_scripts(mgr, pid, interaction_budget_ms(), 0).await;
     let selector = p_str(params, "selector").map(str::to_string);
     let state = p_str(params, "state")
         .unwrap_or("visible")
