@@ -307,8 +307,152 @@ pub async fn load_stylesheets(
             }
         }
     }
+    // 第 45 轮:抓取并内联 `@import`(此前只抓主样式表,`@import` 的依赖表
+    // 完全没取 —— 站点把公共样式放在被导入的表里时,页面就是**无样式**的)。
+    inline_css_imports(inner, http, &mut fetched, ua, timeout_ms, max_bytes, &mut out).await;
     out.html = apply_fetched_styles(html, base_url, &fetched);
     out
+}
+
+/// 抓取 `@import` 依赖并原位内联(广度优先;深度上限与循环检测沿用
+/// `resource::import` 口径)。
+///
+/// 抓取阶段与内联阶段分开:先把所有被导入的样式表取回来(异步),再用
+/// `import::resolve_imports` 同步内联 —— 避免异步递归借用冲突。
+async fn inline_css_imports(
+    inner: &mut Inner,
+    http: &net::HttpClient,
+    fetched: &mut Vec<(String, String)>,
+    ua: &str,
+    timeout_ms: u64,
+    max_bytes: usize,
+    out: &mut ResourceOutcome,
+) {
+    // 1) 广度优先收集要抓的 import 地址。
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut queue: Vec<(String, usize)> = Vec::new();
+    for (sheet_url, css) in fetched.iter() {
+        for (raw, _media) in super::resource::import_urls(css) {
+            if let Some(abs) = super::urlutil::resolve(sheet_url, &raw) {
+                if visited.insert(abs.clone()) {
+                    queue.push((abs, 1));
+                }
+            }
+        }
+    }
+    if queue.is_empty() {
+        return;
+    }
+    // 2) 逐层抓取(被导入表里的 @import 继续入队)。
+    let mut imported: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    while let Some((url, depth)) = queue.pop() {
+        if depth > super::resource::MAX_IMPORT_DEPTH {
+            out.skipped.push(format!("{url} @import 递归深度超限"));
+            continue;
+        }
+        let Some(css) = fetch_import_css(inner, http, &url, ua, timeout_ms, max_bytes, out).await
+        else {
+            continue;
+        };
+        for (raw, _media) in super::resource::import_urls(&css) {
+            if let Some(abs) = super::urlutil::resolve(&url, &raw) {
+                if visited.insert(abs.clone()) {
+                    queue.push((abs, depth + 1));
+                }
+            }
+        }
+        imported.insert(url, css);
+    }
+    // 3) 同步内联:逐张主样式表把 @import 换成被导入的 CSS 文本。
+    for (sheet_url, css) in fetched.iter_mut() {
+        if !super::resource::has_import(css) {
+            continue;
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut loader = |u: &str| -> Result<String, String> {
+            Ok(imported.get(u).cloned().unwrap_or_default())
+        };
+        if let Ok(inlined) =
+            super::resource::resolve_imports(css, sheet_url, 0, &mut seen, &mut loader)
+        {
+            *css = inlined;
+        }
+    }
+}
+
+/// 抓取一张被 `@import` 的样式表(走全内存缓存优先)。
+async fn fetch_import_css(
+    inner: &mut Inner,
+    http: &net::HttpClient,
+    url: &str,
+    ua: &str,
+    timeout_ms: u64,
+    max_bytes: usize,
+    out: &mut ResourceOutcome,
+) -> Option<String> {
+    if super::cache_enabled() {
+        if let Some(entry) = inner.http_cache.get(url) {
+            let css = super::urlutil::decode_body(
+                &entry.bytes,
+                &super::net::header_value(&entry.headers, "content-type").unwrap_or_default(),
+            );
+            out.network.push(NetworkRecord {
+                url: url.to_string(),
+                method: "GET".to_string(),
+                status: entry.status,
+                content_type: super::net::header_value(&entry.headers, "content-type")
+                    .unwrap_or_default(),
+                bytes: css.len(),
+                elapsed_ms: 0,
+                redirect: false,
+                from_cache: true,
+                at_ms: super::now_ms(),
+            });
+            return Some(css);
+        }
+    }
+    let mut req = net::FetchRequest::get(url, timeout_ms.min(CSS_FETCH_TIMEOUT_MS).max(1_000));
+    req.max_bytes = max_bytes;
+    req.context = Some(super::reqctx::RequestContext::subresource(
+        url,
+        super::reqctx::Dest::Style,
+        ua,
+    ));
+    match http.fetch(req, &mut inner.cookies).await {
+        Ok(resp) => {
+            let status = resp.status;
+            out.network.push(NetworkRecord {
+                url: url.to_string(),
+                method: "GET".to_string(),
+                status,
+                content_type: resp.content_type(),
+                bytes: resp.bytes.len(),
+                elapsed_ms: resp.elapsed_ms,
+                redirect: resp.redirect_chain.len() > 1,
+                from_cache: false,
+                at_ms: super::now_ms(),
+            });
+            if !(200..300).contains(&status) {
+                out.console.push(ConsoleRecord {
+                    level: "warn".to_string(),
+                    text: format!("@import 样式加载失败 {url}:HTTP {status}"),
+                    at_ms: super::now_ms(),
+                });
+                return None;
+            }
+            let css = resp.text();
+            super::cache_put(&mut inner.http_cache, url, &resp);
+            Some(css)
+        }
+        Err(e) => {
+            out.console.push(ConsoleRecord {
+                level: "warn".to_string(),
+                text: format!("@import 样式加载失败 {url}:{e}"),
+                at_ms: super::now_ms(),
+            });
+            None
+        }
+    }
 }
 
 fn decode_data_css(url: &str) -> Option<String> {

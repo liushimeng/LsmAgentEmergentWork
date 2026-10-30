@@ -761,6 +761,7 @@ impl LsmBrowserManager {
             &ua,
             timeout_ms,
             &images::ImageStore::new(),
+            viewport.width as f64,
         )
         .await;
         let mut doc = document::Document::parse(&html, &resp.final_url);
@@ -1073,6 +1074,7 @@ impl LsmBrowserManager {
             ua,
             timeout_ms,
             &images::ImageStore::new(),
+            viewport_w as f64,
         )
         .await;
         let mut doc = document::Document::parse(&html, &resp.final_url);
@@ -1130,9 +1132,13 @@ impl LsmBrowserManager {
             });
             tab.history_index = tab.history.len().saturating_sub(1);
         }
-        // 有头:导航完成后推帧(查看器展示最新页面)。
+        // 有头:导航完成后推帧(查看器展示最新页面)。查看器可能中途退出
+        // (人工误关窗口/查看器进程崩溃),push_frame 对死句柄是 no-op,页面
+        // 从此不可见且永不重生——登录类 HITL 要求人工在窗口扫码,窗口却
+        // 再也回不来,任务直接卡死(实测京东登录链)。改走 ensure_view:
+        // 幂等,死句柄重建查看器子进程,活句柄等价于推一帧。
         if tab.mode.is_headed() {
-            self.push_frame(tab);
+            self.ensure_view(tab);
         }
         record_network(
             tab,

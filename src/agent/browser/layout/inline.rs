@@ -494,7 +494,7 @@ impl<'a> LayoutCtx<'a> {
         match a.kind {
             AtomicKind::Replaced => {
                 // 替换元素的内容图:按固有尺寸与 `object-fit` 贴图。
-                if let Some(src) = self.image_src(node) {
+                if let Some(src) = self.image_display_src(node) {
                     if self.image_loaded(&src) {
                         let paint = PaintBox {
                             src,
