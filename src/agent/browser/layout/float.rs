@@ -329,7 +329,7 @@ fn float_width(
         // shrink-to-fit:max-content 估算后收敛到剩余带宽。
         // 不能用「大宽度铺开布局再量盒宽」:auto 块级子级会撑满测量宽,
         // 量出来的永远是容器宽(实测百度搜索卡片容器因此独占整行)。
-        let pref = max_content_width(ctx, child, style, depth + 1);
+        let pref = max_content_width(ctx, child, style, depth + 1, parent_w);
         pref.min(avail.max(1.0)).max(40.0)
     };
     if let Some(mw) = style.max_width {
@@ -551,7 +551,13 @@ impl InlineRow {
 /// 块级子级取最大值;行内子级与浮动子级参与同一行累加(它们本来就排在
 /// 同一行,如「输入框 329 + 路线按钮 39 = 内容盒 368」)。
 /// 显式宽/`img` 按自身尺寸;行内子树用 `inline_box_size` 的文本宽口径。
-fn max_content_width(ctx: &mut LayoutCtx, node: &NodeRef, style: &ComputedStyle, depth: usize) -> f64 {
+fn max_content_width(
+    ctx: &mut LayoutCtx,
+    node: &NodeRef,
+    style: &ComputedStyle,
+    depth: usize,
+    containing_width: f64,
+) -> f64 {
     if depth > 24 {
         return 0.0;
     }
@@ -569,7 +575,8 @@ fn max_content_width(ctx: &mut LayoutCtx, node: &NodeRef, style: &ComputedStyle,
         if child.as_element().is_none() {
             continue;
         }
-        let cs = ctx.engine.computed(&child, style);
+        let mut cs = ctx.engine.computed(&child, style);
+        cs.resolve_padding_percent(containing_width);
         if cs.display == "none" {
             continue;
         }
@@ -605,7 +612,7 @@ fn max_content_width(ctx: &mut LayoutCtx, node: &NodeRef, style: &ComputedStyle,
         } else {
             max_block = max_block.max(inline_acc);
             inline_acc = 0.0;
-            let own = max_content_width(ctx, &child, &cs, depth + 1);
+            let own = max_content_width(ctx, &child, &cs, depth + 1, containing_width);
             max_block = max_block.max(own + margins);
         }
     }

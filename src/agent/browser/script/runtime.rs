@@ -29,6 +29,18 @@ const MAX_TIMER_CALLBACKS: u64 = 64;
 const MAX_FETCH_BODY: usize = 2 * 1024 * 1024;
 const MAX_VALUE_CHARS: usize = 256 * 1024;
 
+/// 单脚本耗时诊断开关(`LAEW_JS_TIMING=1`)。
+fn js_timing_enabled() -> bool {
+    matches!(
+        std::env::var("LAEW_JS_TIMING")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 /// 带预算的微任务队列:超出上限的 Promise job 直接丢弃,
 /// 防止 `function f(){ Promise.resolve().then(f) }` 式无限链拖死线程。
 struct BudgetedJobQueue {
@@ -160,6 +172,16 @@ struct ThreadRuntime {
     /// 永远没有(实测猎聘:hero 搜索条/广告位模块挂载动作整轮丢掉,
     /// 页面停在「只剩登录卡」的半成品态)。上限 8 条,防病态站点撑爆。
     pending_replies: Vec<JsReply>,
+    /// 单次 `event_loop` 最多推进的定时器回调数。首屏加载轮用较小值(4),
+    /// 让「脚本取回/执行」与「动画定时器」交替推进:京东首页 64 个动画帧
+    /// 一轮就把管线预算烧光,楼层 chunk 永远轮不到。交互轮保持 64。
+    timer_budget: u64,
+    /// 单次 `event_loop` 的**墙钟上限**(毫秒,0 = 只受请求 deadline 约束)。
+    /// 脚本加载轮设为 10s:定时器回调在 Boa 里单个可达 20s+,若一轮把管线
+    /// 剩余预算全耗在动画/轮询上,后续 chunk 轮次拿到极小的等待预算 → 被
+    /// 宿主判超时 → 整条装载链中断(京东首页停在骨架屏的根因之一)。
+    /// 排水轮(无脚本)保持 0,让定时器照常排空。
+    event_wall_ms: u64,
 }
 
 /// 把邮箱里的旧回复合并进当前回复:旧动作/日志/网络**先于**当前请求发生,
@@ -218,6 +240,15 @@ impl ThreadRuntime {
             NativeFunction::from_fn_ptr(native_canvas_png),
         )
         .map_err(|e| format!("注册 Canvas PNG 原生函数失败:{e}"))?;
+        // 原始像素入口:JS 侧直接把 Uint8Array 交给宿主编码 PNG,避免在 Boa
+        // 里逐字节 `String.fromCharCode` + btoa 构造上百万字符的二进制串
+        // (京东 2000×200 指纹画布实测 >50s 不返回)。
+        ctx.register_global_callable(
+            js_string!("__lsmCanvasPngRaw"),
+            3,
+            NativeFunction::from_fn_ptr(native_canvas_png_raw),
+        )
+        .map_err(|e| format!("注册 Canvas PNG 原始像素函数失败:{e}"))?;
         // ToObject 调试探针必须在 PRELUDE 求值前决定是否安装(默认不安装,
         // 包装内建方法会改变属性身份,不能常驻)。
         let trace_to_obj = std::env::var("LAEW_JS_TRACE_TOOBJ")
@@ -261,6 +292,8 @@ impl ThreadRuntime {
             queue,
             last_pending_timers: 0,
             pending_replies: Vec::new(),
+            timer_budget: MAX_TIMER_CALLBACKS,
+            event_wall_ms: 0,
         })
     }
 
@@ -359,6 +392,12 @@ impl ThreadRuntime {
     /// 微任务 + 虚拟时钟定时器,直至无待处理/超上限/超预算。
     fn event_loop(&mut self) {
         let deadline = REQ_ENV.with(|c| c.borrow().deadline);
+        // 墙钟上限:加载轮给定时器回调设总闸,避免单轮吃掉整条管线预算。
+        let wall = (self.event_wall_ms > 0)
+            .then(|| Instant::now() + std::time::Duration::from_millis(self.event_wall_ms));
+        let out_of_time =
+            |wall: Option<Instant>| Instant::now() >= deadline || wall.is_some_and(|w| Instant::now() >= w);
+        let cap = self.timer_budget.max(1);
         let mut total_ran: u64 = 0;
         let mut last_pending = 0usize;
         let loop_trace = std::env::var("LAEW_JS_LOOP_TRACE").is_ok();
@@ -404,15 +443,15 @@ impl ThreadRuntime {
                     break;
                 }
                 last_pending = recount as usize;
-                if total_ran >= MAX_TIMER_CALLBACKS || Instant::now() >= deadline {
+                if total_ran >= cap || out_of_time(wall) {
                     break;
                 }
                 continue;
             }
-            if total_ran >= MAX_TIMER_CALLBACKS {
+            if total_ran >= cap {
                 break;
             }
-            if Instant::now() >= deadline {
+            if out_of_time(wall) {
                 break;
             }
         }
@@ -421,6 +460,7 @@ impl ThreadRuntime {
     }
 
     fn run_scripts(&mut self, scripts: &[ScriptSource], env: &PageEnv, nodes: &[SnapshotNode], budget_ms: u64) -> JsReply {
+        let has_scripts = !scripts.is_empty();
         self.begin_request(env, budget_ms);
         if let Err(e) = self.refresh(nodes, env) {
             return JsReply::error(e);
@@ -430,6 +470,9 @@ impl ThreadRuntime {
             // 失败时 JS 侧捕获 e.stack 回传,压缩大脚本也能定位到行列;
             // 此前直接 ctx.eval 只拿到 "TypeError: xxx" 一句,无从定位。
             let origin = if s.src_url.is_empty() { "(inline)".to_string() } else { s.src_url.clone() };
+            // 单脚本耗时诊断(LAEW_JS_TIMING=1):重站首屏动辄上百个脚本,
+            // 只有逐脚本墙钟才能定位「管线预算被谁吃掉」。
+            let script_started = std::time::Instant::now();
             // AMD 依赖数组静态补齐:无 deps 数组的 define(id, factory) 注入
             // ['require','exports','module', ...静态 require('lit')] —— Boa 的
             // fn.toString 壳让装载器源码级依赖解析落空,依赖不预载,工厂在
@@ -500,6 +543,14 @@ impl ThreadRuntime {
             }
             // 脚本间跑一次微任务,常见「立即 resolve 后继续」的链式逻辑可以衔接。
             self.drain_jobs();
+            if js_timing_enabled() {
+                eprintln!(
+                    "[jstime] {:>8}ms  {:>8}B  {}",
+                    script_started.elapsed().as_millis(),
+                    s.content.len(),
+                    origin
+                );
+            }
         }
         self.eval_quiet("__lsmFlushWrites()");
         self.eval_quiet("__lsmReady('interactive')");
@@ -507,7 +558,24 @@ impl ThreadRuntime {
         self.drain_jobs();
         self.eval_quiet("__lsmReady('complete')");
         self.eval_quiet("__lsmDispatchDoc('load')");
+        // 有脚本待执行的加载轮:定时器回调预算降到 4,让脚本取回/执行与
+        // 动画帧**强交替**(京东首页单个动画回调在 Boa 里可达数秒,16 个一批
+        // 仍能吃掉一分钟;React 的调度走 MessageChannel,不受该预算限制)。
+        // 脚本已排空的排水轮恢复 64,避免同到期批次被截得太碎。
+        let timer_cap = if has_scripts { 4 } else { MAX_TIMER_CALLBACKS };
+        self.timer_budget = timer_cap;
+        // 加载轮:定时器回调总墙钟 10s(见 `event_wall_ms` 注释);排水轮不设闸。
+        self.event_wall_ms = if has_scripts { 10_000 } else { 0 };
+        self.eval_quiet(&format!("__lsmTimerBudget={timer_cap}"));
+        let event_started = std::time::Instant::now();
         self.event_loop();
+        if js_timing_enabled() {
+            eprintln!(
+                "[jstime] event_loop {}ms pending_timers={}",
+                event_started.elapsed().as_millis(),
+                self.last_pending_timers
+            );
+        }
         self.collect(None)
     }
 
@@ -526,6 +594,9 @@ impl ThreadRuntime {
         let parsed: Value = serde_json::from_str(&res).unwrap_or_else(|_| {
             json!({"ok": false, "value": null, "type": "undefined", "error": "eval 结果非法"})
         });
+        self.timer_budget = MAX_TIMER_CALLBACKS;
+        self.event_wall_ms = 0;
+        self.eval_quiet("__lsmTimerBudget=64");
         self.event_loop();
         let ov = json!({
             "ok": parsed.get("ok").and_then(Value::as_bool).unwrap_or(false),
@@ -547,6 +618,9 @@ impl ThreadRuntime {
             serde_json::to_string(event).unwrap_or_else(|_| "\"\"".into())
         );
         self.eval_quiet(&src);
+        self.timer_budget = MAX_TIMER_CALLBACKS;
+        self.event_wall_ms = 0;
+        self.eval_quiet("__lsmTimerBudget=64");
         self.event_loop();
         self.collect(None)
     }
@@ -821,6 +895,34 @@ fn native_canvas_png(
     let rgba = base64::engine::general_purpose::STANDARD
         .decode(encoded.as_bytes())
         .map_err(|e| canvas_error(format!("RGBA Base64 非法:{e}")))?;
+    encode_canvas_png(width, height, &rgba)
+}
+
+/// 原始像素入口:第三个参数是 `Uint8Array`(可直接查看 `Uint8ClampedArray`
+/// 的同一 ArrayBuffer),宿主一次性拷贝字节后编码 PNG。
+fn native_canvas_png_raw(
+    _this: &JsValue,
+    args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    use boa_engine::object::builtins::JsUint8Array;
+    let width = args.get_or_undefined(0).to_number(ctx)? as u32;
+    let height = args.get_or_undefined(1).to_number(ctx)? as u32;
+    let obj = args
+        .get_or_undefined(2)
+        .as_object()
+        .ok_or_else(|| canvas_error("Canvas 像素不是 TypedArray".to_string()))?;
+    let array = JsUint8Array::from_object(obj)
+        .map_err(|_| canvas_error("Canvas 像素不是 Uint8Array 视图".to_string()))?;
+    let rgba = array
+        .to_vec(ctx)
+        .map_err(|e| canvas_error(format!("读取 Canvas 像素失败:{e}")))?;
+    encode_canvas_png(width, height, &rgba)
+}
+
+/// 把 RGBA8 像素编码成 `data:image/png;base64,...`。
+fn encode_canvas_png(width: u32, height: u32, rgba: &[u8]) -> JsResult<JsValue> {
+    use base64::Engine as _;
     let expected = (width as usize)
         .checked_mul(height as usize)
         .and_then(|n| n.checked_mul(4))
@@ -836,7 +938,7 @@ fn native_canvas_png(
     {
         use image::ImageEncoder as _;
         image::codecs::png::PngEncoder::new(&mut png)
-            .write_image(&rgba, width, height, image::ExtendedColorType::Rgba8)
+            .write_image(rgba, width, height, image::ExtendedColorType::Rgba8)
             .map_err(|e| canvas_error(format!("PNG 像素编码失败:{e}")))?;
     }
     let url = format!(

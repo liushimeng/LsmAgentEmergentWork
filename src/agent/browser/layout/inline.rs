@@ -1321,7 +1321,7 @@ impl<'a> LayoutCtx<'a> {
                 continue;
             }
             let mut child_style = self.engine.computed(&child, style);
-            child_style.resolve_padding_percent(avail_w);
+            child_style.resolve_padding_percent(if avail_w >= MAX_CONTENT_WIDTH { 0.0 } else { avail_w });
             if child_style.display == "none" {
                 continue;
             }

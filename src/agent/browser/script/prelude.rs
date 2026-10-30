@@ -29,6 +29,7 @@ var __lsmChainTrace = false;
 var __lsmTimerSeq = 0;
 var __lsmNow = 0;
 var __lsmTimerRan = 0;
+var __lsmTimerBudget = 64;
 function __lsmSetCurrentScript(o) { globalThis.__lsmCurrentScript = String(o || ""); }
 var __lsmFatal = null;
 var __lsmDispatchResult = { handled: false, defaultPrevented: false };
@@ -2789,7 +2790,9 @@ function requestAnimationFrame(fn) { return setTimeout(fn, 16); }
 function cancelAnimationFrame(id) { clearTimeout(id); }
 function __lsmTick() {
   var ran = 0;
-  while (ran < 64) {
+  // 宿主按轮次注入预算:加载轮 4(与脚本取回强交替),交互轮 64。
+  var budget = typeof __lsmTimerBudget === "number" ? __lsmTimerBudget : 64;
+  while (ran < budget) {
     var best = -1;
     for (var i = 0; i < __lsmTimers.length; i++) {
       if (best < 0 || __lsmTimers[i].next < __lsmTimers[best].next) best = i;

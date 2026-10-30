@@ -139,7 +139,14 @@ impl InlineAtomic {
     pub(crate) fn line_contribution(&self) -> (f64, f64) {
         match self.valign {
             VAlign::Baseline => (self.ascent, self.descent),
+            // middle 的盒中心对齐「基线 + 半个 x 高度」:行盒必须同时
+            // 容纳中心线以上/以下两段,不能只计控件 descent 把父高压成 20%。
+            VAlign::Middle => (
+                (self.h / 2.0 - 0.25 * self.style.font_size).max(0.0),
+                (self.h / 2.0 + 0.25 * self.style.font_size).max(0.0),
+            ),
             VAlign::Top => (0.0, self.h),
+            VAlign::Offset(d) => ((self.ascent - d).max(0.0), (self.descent + d).max(0.0)),
             _ => (0.0, self.descent),
         }
     }

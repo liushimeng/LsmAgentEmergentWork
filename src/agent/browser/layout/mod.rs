@@ -971,7 +971,13 @@ impl<'a> LayoutCtx<'a> {
         containing_width: f64,
     ) -> ComputedStyle {
         let mut style = self.engine.computed(node, parent);
-        style.resolve_padding_percent(containing_width);
+        // MAX_CONTENT_WIDTH 是测量哨兵而非真实包含块;此时百分比 padding
+        // 按不定包含块退化,最终宽度下的正式重排再按真实父宽求解。
+        style.resolve_padding_percent(if containing_width >= MAX_CONTENT_WIDTH {
+            0.0
+        } else {
+            containing_width
+        });
         style
     }
 

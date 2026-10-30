@@ -736,7 +736,7 @@ impl ComputedStyle {
     }
 }
 
-fn num(v: f64) -> String {
+pub(crate) fn num(v: f64) -> String {
     if (v - v.round()).abs() < 0.01 {
         format!("{}", v.round() as i64)
     } else {
