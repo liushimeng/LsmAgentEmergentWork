@@ -23,6 +23,8 @@ mod form_widget_tests;
 #[cfg(test)]
 mod inline_atomic_tests;
 #[cfg(test)]
+mod scroll_tests;
+#[cfg(test)]
 mod list_marker_tests;
 #[cfg(test)]
 mod pseudo_state_tests;
@@ -123,6 +125,9 @@ pub struct Layout {
     /// 绘制显示列表(阶段六):布局期 DFS 按真实绘制序发射,渲染层唯一消费源;
     /// 为空时渲染层回退旧管线(平铺五表合成)。上五表继续服务几何寻址/inspect。
     pub display: Vec<DisplayItem>,
+    /// 第 46 轮:可滚动容器(`overflow:auto|scroll`)的最大滚动量,
+    /// key = stable selector,value = px。供工具层钳制滚动偏移。
+    pub scroll_max: HashMap<String, f64>,
     pub width: f64,
     pub height: f64,
 }
@@ -248,6 +253,7 @@ pub fn compute_full(
         borders: Vec::new(),
         shadows: Vec::new(),
         display: Vec::new(),
+        scroll_max: HashMap::new(),
         seq: 0,
         images,
         base_url: doc.base_url.clone(),
@@ -382,6 +388,7 @@ pub fn compute_full(
         borders: ctx.borders,
         shadows: ctx.shadows,
         display: display_items,
+        scroll_max: ctx.scroll_max,
         width: ctx.width,
         height,
     }
@@ -607,6 +614,8 @@ pub(crate) struct LayoutCtx<'a> {
     shadows: Vec<ShadowDraw>,
     /// 绘制显示列表(阶段六):DFS 发射,终排后进 `Layout::display`。
     display: Vec<DisplayItem>,
+    /// 第 46 轮:可滚动容器的最大滚动量(stable selector → px)。
+    scroll_max: HashMap<String, f64>,
     /// DFS 先序序号(显示列表排序键之一)。
     seq: u64,
     /// 图片固有尺寸索引(阶段三第三步)。
@@ -658,6 +667,62 @@ impl<'a> LayoutCtx<'a> {
     /// 显示列表当前长度(组效果回补区间起点)。
     pub(crate) fn display_len(&self) -> usize {
         self.display.len()
+    }
+
+    /// 绘制滚动条(第 46 轮):右侧竖条,轨道浅灰 + 拇指深灰。
+    ///
+    /// `ratio` = 滚动位置比例(0..=1);`visible` = 可见比例(内容高 / 盒高)。
+    pub(crate) fn push_scrollbar(
+        &mut self,
+        style: &ComputedStyle,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        ratio: f64,
+        visible: f64,
+    ) {
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        let seq = self.next_seq();
+        self.display.push(DisplayItem {
+            kind: DisplayKind::Background {
+                fill: BgFill::Solid([235, 235, 235], 255),
+            },
+            x,
+            y,
+            w,
+            h,
+            radius: [CornerRadius::Px(0.0); 4],
+            z: style.pos.z_index.max(self.z_floor),
+            seq,
+            opacity: style.opacity,
+            clip: None,
+            transform: None,
+            fixed: self.fixed_depth > 0,
+            layer: self.layer_for(style),
+        });
+        let thumb_h = (h * visible).max(8.0).min(h);
+        let thumb_y = y + (h - thumb_h) * ratio;
+        let seq = self.next_seq();
+        self.display.push(DisplayItem {
+            kind: DisplayKind::Background {
+                fill: BgFill::Solid([150, 150, 150], 255),
+            },
+            x,
+            y: thumb_y,
+            w,
+            h: thumb_h,
+            radius: [CornerRadius::Px(0.0); 4],
+            z: style.pos.z_index.max(self.z_floor),
+            seq,
+            opacity: style.opacity,
+            clip: None,
+            transform: None,
+            fixed: self.fixed_depth > 0,
+            layer: self.layer_for(style),
+        });
     }
 
     /// 元素自身变换(页坐标,含 transform-origin);无 transform 返回 `None`。
@@ -1515,6 +1580,20 @@ impl<'a> LayoutCtx<'a> {
                     (bw - style.padding_left - style.padding_right - marker_inset).max(0.0),
                     cb_h,
                 );
+                // 第 46 轮:可滚动容器(`overflow:auto|scroll`)—— 内容按运行时
+                // 滚动偏移上移(偏移量落在临时解析树的 `data-lsm-scroll-top`),
+                // 超出盒高的部分由祖先裁剪链裁掉(见 `apply_group`)。
+                let scroll_top = if style.overflow_scroll && own_definite_h {
+                    document::attr(&child, document::ATTR_SCROLL_TOP)
+                        .and_then(|v| v.trim().parse::<f64>().ok())
+                        .unwrap_or(0.0)
+                        .max(0.0)
+                } else {
+                    0.0
+                };
+                if scroll_top > 0.0 {
+                    self.y -= scroll_top;
+                }
                 self.layout_children(
                     &child,
                     bx + style.padding_left + marker_inset,
@@ -1533,6 +1612,31 @@ impl<'a> LayoutCtx<'a> {
                 if contains_child_margins(&style) {
                     self.y += self.pending_margin_bottom;
                     self.pending_margin_bottom = 0.0;
+                }
+                // 第 46 轮:可滚动容器的内容真实高(含被滚出视口的部分)与滚动条。
+                if style.overflow_scroll && own_definite_h {
+                    let visible_h = (self.y - (start_y + style.padding_top)).max(0.0);
+                    let true_content_h = visible_h + scroll_top;
+                    let inner_h = (box_h - style.padding_top - style.padding_bottom).max(0.0);
+                    if true_content_h > inner_h + 0.5 {
+                        let max_scroll = true_content_h - inner_h;
+                        let stable = Document::stable_selector(&child);
+                        self.scroll_max.insert(stable.clone(), max_scroll);
+                        // 滚动条:右侧竖条(轨道 + 拇指),叠在内容之上。
+                        let track_w = 6.0f64.min(bw * 0.2).max(4.0);
+                        let track_x = bx + bw - track_w;
+                        let track_y = start_y + style.padding_top;
+                        let track_h = inner_h;
+                        self.push_scrollbar(
+                            &style,
+                            track_x,
+                            track_y,
+                            track_w,
+                            track_h,
+                            (scroll_top / max_scroll).clamp(0.0, 1.0),
+                            (inner_h / true_content_h).clamp(0.05, 1.0),
+                        );
+                    }
                 }
                 // 内容高按真实游标推进量;空块/纯空白块为 0(CSS 语义)。
                 // 此前 .max(1.0) 把空块顶成 1px,与相邻块2px假间隙叠加,

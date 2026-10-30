@@ -218,6 +218,11 @@ pub struct TabState {
     /// details/dialog 的运行时开合覆盖：key = stable selector，value = 是否 open。
     /// 仅作为 `tab.html` 属性之上的覆盖层，布局/样式计算前落到解析树。
     pub widget_open: HashMap<String, bool>,
+    /// 第 46 轮:元素级滚动偏移（key = stable selector，value = 纵向滚动量 px）。
+    ///
+    /// 落到临时解析树的 `data-lsm-scroll-top` 属性后由布局层把可滚动
+    /// 容器的内容上移；只对 `overflow:auto|scroll` 的元素有意义。
+    pub scroll_offsets: HashMap<String, f64>,
     /// 第 41 轮:运行时伪类状态（hover/focus/focus-visible/active）。
     /// key = stable selector，value = 状态位。落到临时解析树的 `data-lsm-*`
     /// 属性后由样式引擎的 `:hover`/`:focus`/`:focus-visible`/`:active` 命中。
@@ -276,6 +281,7 @@ impl TabState {
     pub fn document_with_state(&self) -> document::Document {
         let mut doc = document::Document::parse(&self.html, &self.url);
         doc.apply_widget_state(&self.form_values, &self.widget_open, &self.pseudo_states);
+        doc.apply_scroll_state(&self.scroll_offsets);
         doc
     }
 }
@@ -817,6 +823,7 @@ impl LsmBrowserManager {
             viewport,
             scroll_x: 0.0,
             scroll_y: 0.0,
+            scroll_offsets: HashMap::new(),
             network: {
                 let mut recs = vec![NetworkRecord {
                     url: requested.clone(),
