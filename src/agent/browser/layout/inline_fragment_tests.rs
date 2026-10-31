@@ -276,11 +276,17 @@ fn 行内片段盒_多行每行一段() {
     ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
     ys.dedup_by(|a, b| (*a - *b).abs() < 0.5);
     assert!(ys.len() >= 2, "片段应分处不同行:y={ys:?}");
-    // 链接文字应跨多行。
+    // 链接文字应跨多行。判定按**内容**(链接词)而非 x —— 换行后续行回到
+    // **容器内容左缘**,不再与首行同 x(那是被修掉的「行首取累计 pen」阶梯行为)。
+    let words = ["one", "two", "three", "four", "five", "six", "seven", "eight"];
     let link_lines: Vec<&super::TextLine> = lay
         .lines
         .iter()
-        .filter(|l| l.x >= frags[0].x - 1.0 && l.x <= frags[0].x + 200.0)
+        .filter(|l| {
+            words
+                .iter()
+                .any(|w| l.text.split_whitespace().any(|t| t.trim_matches(|c: char| !c.is_alphanumeric()) == *w))
+        })
         .collect();
     assert!(
         link_lines.len() >= 2,
@@ -420,4 +426,79 @@ fn br_嵌套进行内元素内仍换行() {
     let a = line_of(&lay, "a");
     let b = line_of(&lay, "b");
     assert!(b.y > a.y + 1.0, "行内元素内的 `<br>` 应换行");
+}
+
+// ===================== 源码换行折叠(2026-10-31 恢复) =====================
+
+#[test]
+fn 源码缩进换行折叠为空格_列表不阶梯右移() {
+    // `white-space:normal` 下,文本节点里的源码缩进换行必须折叠成单空格,
+    // 不能被 `flush_run` 当成硬换行 —— 否则每个 `<li>` 的 `<a>` 之间各起一行,
+    // 且行首 origin 取**累计 pen**,逐行阶梯右移、整段溢出容器右缘
+    //(arXiv 主题列表实测:整页宽被撑到 7473px)。
+    let html = r#"<html><body><ul>
+  <li>
+    <a href="/a">General Relativity</a>
+    (<strong>gr-qc</strong>
+    <a href="/n">new</a>,
+    <a href="/r">recent</a>,
+    <a href="/s">search</a>)
+  </li>
+</ul></body></html>"#;
+    let lay = layout_wide(html);
+    let ys: std::collections::BTreeSet<i64> = lay.lines.iter().map(|l| l.y.round() as i64).collect();
+    assert!(
+        ys.len() <= 2,
+        "源码换行被当硬换行 → 逐行阶梯,行数={} (y={:?})",
+        ys.len(),
+        ys
+    );
+    let max_x = lay.lines.iter().map(|l| l.x).fold(0.0f64, f64::max);
+    assert!(
+        max_x < 700.0,
+        "行首应回到容器左缘附近,不随累计 pen 右移:最大行首 x={max_x}"
+    );
+}
+
+#[test]
+fn 连续空白折叠为单空格_不产生多余断行() {
+    let lay = layout("<body><p>a   \n\t   b</p></body>");
+    let joined = lay.lines.iter().map(|l| l.text.clone()).collect::<Vec<_>>().join("|");
+    assert!(
+        joined.contains("a") && joined.contains("b"),
+        "折叠后 a/b 都应在布局里:{joined}"
+    );
+    // 折叠成单空格后应在同一行(a、b 的 y 相同)。
+    let a = line_of(&lay, "a");
+    let b = lay.lines.iter().find(|l| l.text.trim() == "b").unwrap_or(&a).clone();
+    assert!((a.y - b.y).abs() < 1.0, "连续空白应折叠为单空格同行:a.y={} b.y={}", a.y, b.y);
+}
+
+#[test]
+fn 长行换行后行首回到容器左缘_不阶梯右移() {
+    // 内容超过容器宽 → 必须换行。换行后行首必须回到**容器内容左缘**,
+    // 不能取累计 pen —— 否则每行起点逐行右移(阶梯),整段溢出容器右缘
+    //(arXiv 主题列表实测:整页宽被撑到 7473px)。
+    let mut html = String::from("<html><body><p>");
+    for i in 0..80 {
+        html.push_str(&format!("<a href='/l{}'>word{}</a>; ", i, i));
+    }
+    html.push_str("</p></body></html>");
+    let lay = layout_wide(&html);
+    use std::collections::BTreeMap;
+    let mut min_x_by_y: BTreeMap<i64, f64> = BTreeMap::new();
+    for l in &lay.lines {
+        let y = l.y.round() as i64;
+        let e = min_x_by_y.entry(y).or_insert(f64::MAX);
+        if l.x < *e {
+            *e = l.x;
+        }
+    }
+    let starts: Vec<f64> = min_x_by_y.values().copied().collect();
+    let max_start = starts.iter().copied().fold(0.0f64, f64::max);
+    assert!(
+        max_start < 200.0,
+        "换行后行首应回到容器左缘,不阶梯右移:各行行首 x={:?}",
+        starts
+    );
 }

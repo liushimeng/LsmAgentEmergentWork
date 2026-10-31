@@ -76,6 +76,9 @@ struct LineState {
     origin_x: f64,
     /// 当前流位置(下一个行内项的落点)。
     flow_x: f64,
+    /// 本行**首个** run 的收集期 x(累计 pen)。换行后行首回到容器左缘,
+    /// run.x 需减掉它才得到「行内相对位置」(见 `flush_run`)。
+    first_run_x: f64,
     /// 行是否已有内容。
     started: bool,
 }
@@ -89,6 +92,7 @@ impl LineState {
             descent: 0.0,
             origin_x: 0.0,
             flow_x: 0.0,
+            first_run_x: 0.0,
             started: false,
         }
     }
@@ -101,6 +105,7 @@ impl LineState {
         self.descent = 0.0;
         self.origin_x = 0.0;
         self.flow_x = 0.0;
+        self.first_run_x = 0.0;
         self.started = false;
     }
 
@@ -200,6 +205,17 @@ impl InlineBuf {
         let x = x_base + st.margin_left + st.padding_left;
         let preserve = matches!(st.white_space.as_str(), "pre" | "pre-wrap" | "break-spaces");
         let wrap = !matches!(st.white_space.as_str(), "pre" | "nowrap");
+        // `white-space: normal|nowrap` 的换行/制表/连续空格折叠成单个空格
+        // (CSS white-space 语义)。行内文本节点保留源码缩进换行,不折叠就会被
+        // 当成硬换行 —— 京东页脚每个 `<a>` 之间被缩进换行切成独立行、页面被
+        // 撑到 5777px;arXiv 主题列表同样逐行阶梯右移、整页宽溢出到 7473px。
+        // (2026-10-30:此折叠在 `9340641` 合并冲突里被丢掉,`preserve` 字段留下
+        // 而调用丢失,此处恢复。)
+        let text = if preserve {
+            text.to_string()
+        } else {
+            collapse_ws(text)
+        };
         let order = self.next_order();
         if let Some(last) = self.runs.last_mut() {
             if !last.sealed
@@ -217,7 +233,7 @@ impl InlineBuf {
                 && last.highlight == highlight
                 && last.owner == owner
             {
-                last.text.push_str(text);
+                last.text.push_str(&text);
                 return;
             }
         }
@@ -385,6 +401,28 @@ fn inline_paints(style: &ComputedStyle) -> bool {
         || !style.box_shadow.is_empty()
 }
 
+/// `white-space: normal|nowrap` 的空白折叠:连续空白(空格/换行/制表)压成
+/// 单个空格。行内文本节点保留源码缩进换行,不折叠就会被 `flush_run` 当成
+/// 硬换行 —— 每个源码换行各起一行,且行首 origin 取累计 pen,逐行阶梯右移、
+/// 整段溢出容器右缘(京东页脚 5777px、arXiv 主题列表 7473px 实测)。
+fn collapse_ws(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_ws = false;
+    for ch in text.chars() {
+        // CSS 可折叠空白只含 ASCII 空格/制表/换行/回车/换页;不折叠 NBSP。
+        if matches!(ch, ' ' | '\t' | '\n' | '\r' | '\u{000C}') {
+            if !in_ws {
+                out.push(' ');
+                in_ws = true;
+            }
+        } else {
+            out.push(ch);
+            in_ws = false;
+        }
+    }
+    out
+}
+
 impl<'a> LayoutCtx<'a> {
     /// 行内格式化上下文:把缓冲的样式 run 与原子盒排成**共享行盒**的段落流。
     ///
@@ -407,6 +445,15 @@ impl<'a> LayoutCtx<'a> {
     pub(super) fn flush_inline_floor(&mut self, buf: &mut InlineBuf, max_w: f64, floor: f64) {
         let max_w = max_w.max(floor);
         let items: &InlineBuf = buf;
+        // 容器内容左缘(缩进基准)= 缓冲里**首个非空 run** 的收集期 x。
+        // 换行后行首必须回到这里:run.x 是「不换行」时的**累计 pen**,
+        // 直接当行首会让每行起点逐行右移(阶梯),整段溢出容器右缘。
+        let base_x = items
+            .runs
+            .iter()
+            .find(|r| !r.text.is_empty())
+            .map(|r| r.x)
+            .unwrap_or(0.0);
         let mut line = LineState::new();
         let mut ri = 0usize;
         let mut ai = 0usize;
@@ -416,7 +463,7 @@ impl<'a> LayoutCtx<'a> {
             if run_first {
                 let run = items.runs[ri].clone();
                 ri += 1;
-                self.flush_run(&run, items, &mut line, max_w);
+                self.flush_run(&run, items, &mut line, max_w, base_x);
             } else {
                 let idx = ai;
                 ai += 1;
@@ -432,12 +479,16 @@ impl<'a> LayoutCtx<'a> {
     }
 
     /// 把一个文本 run 排入当前行(必要时断行)。
+    ///
+    /// `base_x` = 容器内容左缘(缓冲首个非空 run 的 x)。行首一律回到这里,
+    /// run.x 只用来算**行内相对位置**(见 `seg_x`)。
     fn flush_run(
         &mut self,
         run: &InlineRun,
         items: &InlineBuf,
         line: &mut LineState,
         max_w: f64,
+        base_x: f64,
     ) {
         // 空文本占位 run:预留行高;若带 mark 高亮,仍按登记宽度画背景。
         if run.text.is_empty() {
@@ -534,14 +585,17 @@ impl<'a> LayoutCtx<'a> {
                 continue;
             }
             if seg_text.is_empty() {
-                // 段落点:行首取 run.x(缩进语义),行中续流取 max(流点, run.x)
-                // ——行内 margin 有余量时让出间隙,同 x 样式段连续排布。
+                // 段落点:行首回到**容器内容左缘**(不再取累计 pen)。
+                // run.x 是「不换行」时的累计位置,减掉本行首 run 的 x 才得到
+                // 行内相对位置 —— 否则换行后行首逐行右移(阶梯),整段溢出容器。
                 if !line.started {
-                    line.origin_x = run.x;
-                    line.flow_x = run.x;
+                    line.origin_x = base_x;
+                    line.flow_x = base_x;
+                    line.first_run_x = run.x;
                     line.started = true;
                 }
-                seg_x = line.flow_x.max(run.x);
+                let rel = line.origin_x + (run.x - line.first_run_x);
+                seg_x = line.flow_x.max(rel);
             }
             seg_text.push(ch);
             seg_w += w;

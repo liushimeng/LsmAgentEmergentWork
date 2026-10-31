@@ -125,6 +125,30 @@ fn em_和_rem_单位解析() {
 }
 
 #[test]
+fn 百分比字号相对父字号而非视口宽() {
+    // CSS 规范:百分比字号相对**父元素字号**。旧实现直接落到 `parse_length`
+    // 的「% 按视口宽近似」分支,`font-size:90%` 会被算成 0.9×1920=1728px
+    //(再被 font-size 侧 clamp 到 200),其下所有未显式声明字号的继承者全部
+    // 炸成超大字 —— arXiv 首页 `#content{font-size:90%}` 实测根因。
+    let (doc, engine) = doc_engine(
+        "<head><style>
+            body { font-size: 20px; }
+            #content { font-size: 90%; }
+            p { font-size: 87.5%; }
+         </style></head><body><div id='content'><p>X</p></div></body>",
+        1920.0,
+    );
+    assert!(
+        (style_of(&doc, &engine, "#content").font_size - 18.0).abs() < 0.01,
+        "90% 应相对 body 的 20px = 18px,而非 0.9×1920"
+    );
+    assert!(
+        (style_of(&doc, &engine, "p").font_size - 15.75).abs() < 0.01,
+        "87.5% 应相对父(#content)的 18px = 15.75px"
+    );
+}
+
+#[test]
 fn 媒体查询按视口求值() {
     let html = "<head><style>@media (min-width: 900px) { p { color:red; } }</style></head>\
                 <body><p>X</p></body>";

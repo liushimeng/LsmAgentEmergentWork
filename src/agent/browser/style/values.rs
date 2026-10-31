@@ -2586,6 +2586,15 @@ fn parse_font_size(value: &str, parent_size: f64, ctx: &ValueCtx) -> Option<f64>
     if keyword.is_some() {
         return keyword;
     }
+    // 百分比字号相对**父元素字号**(CSS 规范),不是视口宽 —— `parse_length`
+    // 的 `%` 分支按视口宽近似,用于 `width`/`margin`/`padding` 等「相对包含块」
+    // 属性;字号必须走父字号,否则 `#content{font-size:90%}` 会算成
+    // 0.9×1920=1728px → 被 `font-size` 侧 clamp(6,200) 压到 200px,其下所有
+    // 未显式声明字号的继承者全部炸成超大字(arXiv 首页实测:hero 文案逐词断行、
+    // 整页宽度被撑到 7680)。
+    if let Some(n) = v.strip_suffix('%') {
+        return n.trim().parse::<f64>().ok().map(|n| parent_size * n / 100.0);
+    }
     parse_length(&v, parent_size, ctx)
 }
 
