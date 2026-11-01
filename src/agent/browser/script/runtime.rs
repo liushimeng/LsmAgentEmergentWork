@@ -411,9 +411,24 @@ impl ThreadRuntime {
             // React 18 scheduler 走 MessageChannel 通道,不清它则并发渲染
             // 永远排在定时器之外。
             self.eval_quiet("__lsmDrainMessages()");
-            let tick = self
-                .eval_string("__lsmTick()")
-                .unwrap_or_else(|_| "{\"pending\":0,\"ran\":0}".to_string());
+            // 每次只推进一个定时器,随后立即在下方 drain_jobs。
+            // 浏览器在每个宏任务结束后清空微任务;此前一次 __lsmTick 连续执行
+            // 整批定时器,首个回调注册的 Promise 续链要到最后一个回调后才运行,
+            // React/Preact 的 effect 与 rerender 因此跨批次错序。
+            let tick = match self.eval_string("__lsmTimerBudget=1,__lsmTick()") {
+                Ok(value) => value,
+                Err(error) => {
+                    // 不能把求值失败伪装成「无待办」:运行时限流/递归错误会因此
+                    // 静默跳过整批定时器,页面只表现为动态区域长期停在骨架。
+                    tracing::warn!(error = %error, "定时器批次求值失败,中止本轮事件循环");
+                    self.eval_quiet(&format!(
+                        "__cerror({})",
+                        serde_json::to_string(&format!("定时器批次执行失败:{error}"))
+                            .unwrap_or_else(|_| "\"定时器批次执行失败\"".into())
+                    ));
+                    break;
+                }
+            };
             let (pending, ran) = parse_tick(&tick);
             if loop_trace {
                 eprintln!(
@@ -490,7 +505,14 @@ impl ThreadRuntime {
             };
             // Boa 0.20 for-in 规范偏差守卫:遍历 null/undefined 会抛错(规范应零次迭代),
             // `EXPR||{}` 改写在一切取值下与规范等价(见 for_in_guard.rs)。
-            let mut guarded = super::for_in_guard::guard_for_in(&filled);
+            let guarded = super::for_in_guard::guard_for_in(&filled);
+            let mut guarded = super::preact_guard::defer_next_tick(&guarded);
+            if std::env::var("LAEW_JS_EFFECT_TRACE").is_ok() {
+                guarded = guarded.replace(
+                    "function cleanup(ee){kt.parentNode&&kt.parentNode.removeChild(kt),en[ee]=pn,clearTimeout(en[\"timer_\"+ee])}",
+                    "function cleanup(ee){console.error(\"cleanup step0 \"+typeof kt+\" parent=\"+(kt&&typeof kt.parentNode));kt.parentNode&&kt.parentNode.removeChild(kt);console.error(\"cleanup step1\");en[ee]=pn;console.error(\"cleanup step2\");clearTimeout(en[\"timer_\"+ee]);console.error(\"cleanup step3\")}",
+                );
+            }
             // 调试:逐条语句标记 define 工厂体(LAEW_JS_TRACE_STMT=1)。
             if std::env::var("LAEW_JS_TRACE_STMT")
                 .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))

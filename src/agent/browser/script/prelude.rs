@@ -25,6 +25,9 @@ var __lsmScriptCbs = {};
 // 线程内已同步装载过的动态脚本 URL(去重:同一 URL 只装一次)。
 var __lsmDynLoaded = {};
 var __lsmDynOk = {};
+// JSONP 延迟重试挂起标记(2026-11-01 天猫真机):绑定未定义的动态脚本体
+// 挂到下一宏任务重试期间,缓存命中分支不得提前派发 error。
+var __lsmDynPending = {};
 var __lsmChainTrace = false;
 var __lsmTimerSeq = 0;
 var __lsmNow = 0;
@@ -624,12 +627,18 @@ function __serEl(el) {
   // 原始 HTML 挂在这里,随 append_html/insert_html 的序列化原样带到宿主再解析,
   // widget「createElement → innerHTML=模板 → appendChild」模式的内容不再丢失。
   if (el.__pendingHtml != null) out += el.__pendingHtml;
+  // script/style 是 raw-text 元素:正文不得 HTML 转义(否则 `&&` 变 `&amp;&amp;`、
+  // `i<10` 变 `i&lt;10`,脚本文本被转义坏后宿主取回执行必炸,实测 s.text=code
+  // 注入链静默失效)。浏览器 innerHTML 序列化同语义。
+  var raw_text = (tag === "script" || tag === "style");
   var kids = el.__kids || [];
   for (var i = 0; i < kids.length; i++) {
     var c = kids[i];
-    out += (c.nodeType === 3) ? __escHtml(c.textContent || "") : __serEl(c);
+    out += (c.nodeType === 3)
+      ? (raw_text ? String(c.textContent || "") : __escHtml(c.textContent || ""))
+      : __serEl(c);
   }
-  if (el.__text) out += __escHtml(el.__text);
+  if (el.__text) out += raw_text ? String(el.__text) : __escHtml(el.__text);
   out += "</" + tag + ">";
   return out;
 }
@@ -719,6 +728,50 @@ function __lsmScriptKey(url) {
   var dir = path.replace(/[?#].*$/, "").replace(/[^/]*$/, "");
   return origin + dir + raw;
 }
+// JSONP 回调时序容错(2026-11-01 天猫真机):动态脚本注册即同步取回执行
+// (zhipin chunk 装载语义所需),而 JSONP 调用方常在 appendChild / 设 src
+// **之后**才注册回调 —— 浏览器里脚本异步执行天然错开该时序,eager 内核必
+// ReferenceError(实测 mtopjsonptbpc1 is not defined,楼层/导航数据链整条断掉)。
+// 命中「绑定未定义」时把执行挂到下一个宏任务重试(≤3 次),给调用方注册回调
+// 的机会;重试耗尽才走错误路径,不悬挂、不重复派发 load/error。
+var __lsmDynRetryQueue = [];
+function __lsmIsMissingBinding(e) {
+  try {
+    return (e && e.name === "ReferenceError") ||
+      String((e && e.message) || e).indexOf("is not defined") >= 0;
+  } catch (e0) { return false; }
+}
+function __lsmQueueDynRetry(code, url, el, attempt) {
+  if (attempt > 3) return false;
+  __lsmDynPending[url] = true;
+  __lsmDynRetryQueue.push({ code: code, url: url, el: el, attempt: attempt });
+  setTimeout(function () { __lsmDrainDynRetry(); }, 0);
+  return true;
+}
+function __lsmDrainDynRetry() {
+  var batch = __lsmDynRetryQueue;
+  __lsmDynRetryQueue = [];
+  for (var i = 0; i < batch.length; i++) {
+    var item = batch[i];
+    try {
+      (0, eval)(item.code);
+      delete __lsmDynPending[item.url];
+      __lsmDynOk[item.url] = true;
+      try { if (item.el && item.el.__attrs) item.el.__attrs["data-lsm-executed"] = "1"; } catch (e4) {}
+      __lsmFireScriptLoad(item.url);
+    } catch (e3) {
+      if (__lsmIsMissingBinding(e3) && __lsmQueueDynRetry(item.code, item.url, item.el, item.attempt + 1)) {
+        continue;
+      }
+      delete __lsmDynPending[item.url];
+      __cerror("动态脚本执行失败 " + item.url + ": " + __lsmErrText(e3));
+      // 与主路径「异常不阻断 load」语义一致:仍派发 load,不判死链。
+      __lsmDynOk[item.url] = true;
+      try { if (item.el && item.el.__attrs) item.el.__attrs["data-lsm-executed"] = "1"; } catch (e5) {}
+      __lsmFireScriptLoad(item.url);
+    }
+  }
+}
 function __lsmRegisterScriptLoad(el) {
   if (!el || !el.__attrs) return;
   // 只管 <script>:img 等替换元素也带 src,误当脚本装载会把图片二进制
@@ -750,6 +803,9 @@ function __lsmLoadDynScript(el, url) {
   // 站点的装载 Promise 永不 resolve(实测 zhipin verify 页 dynamicLoadJs:
   // captcha-sdk 装载成功但 .then 构造链整条饿死)。
   if (__lsmDynLoaded[url]) {
+    // 延迟重试挂起中的脚本不提前派发结局:重试收口时统一 fire
+    // (挂起期间的重复注册元素也在注册表里一并收到信号)。
+    if (__lsmDynPending[url]) return;
     if (__lsmDynOk[url]) __lsmFireScriptLoad(url);
     else __lsmFireScriptError(url);
     return;
@@ -773,7 +829,13 @@ function __lsmLoadDynScript(el, url) {
       var code = String(r.body == null ? "" : r.body);
       if (code.trim()) {
         try { (0, eval)(code); ok = true; }
-        catch (e3) { __cerror("动态脚本执行失败 " + url + ": " + String((e3 && e3.stack) || e3)); ok = true; }
+        catch (e3) {
+          // 绑定未定义(典型 JSONP 回调晚注册):挂下一宏任务重试,不判死。
+          if (__lsmIsMissingBinding(e3) && __lsmQueueDynRetry(code, url, el, 1)) {
+            return;
+          }
+          __cerror("动态脚本执行失败 " + url + ": " + __lsmErrText(e3)); ok = true;
+        }
       } else { ok = true; }
     }
   } catch (e) { __cerror("动态脚本装载异常 " + url + ": " + String(e)); }
@@ -1642,6 +1704,25 @@ function __lsmParseUrl(u, base) {
     pathname: pathname, search: query, hash: hash
   };
 }
+function __newText(t) {
+  var value = String(t);
+  var node = { nodeType: 3, nodeName: "#text", __lsmUid: ++__lsmUidSeq };
+  // core-js 在 Promise 不可直接使用时，以 MutationObserver 观察 Text.data
+  // 实现微任务队列。裸对象既不产生变更记录，会让所有 Promise 续链永久滞留；
+  // 这里只记账，不在 setter 内同步回调，保持浏览器微任务检查点的非重入语义。
+  function read() { return value; }
+  function write(v) {
+    var old = value;
+    value = String(v);
+    __lsmRec("characterData", node, { oldValue: old });
+  }
+  Object.defineProperties(node, {
+    data: { get: read, set: write, enumerable: true, configurable: true },
+    textContent: { get: read, set: write, enumerable: true, configurable: true },
+    nodeValue: { get: read, set: write, enumerable: true, configurable: true }
+  });
+  return node;
+}
 function __newEl(tag) {
   var t = String(tag || "div").toLowerCase();
   var el = {
@@ -2014,6 +2095,15 @@ function __newEl(tag) {
     __push({ type: "set_html", selector: "@created:" + t + ":" + el.__attrs.id, value: String(v) });
   });
   def("textContent", function () { return el.__pendingHtml != null ? el.__pendingHtml : el.__text; },
+    function (v) {
+      __lsmRec("characterData", el, { oldValue: el.__text || "" });
+      el.__text = String(v); el.__kids = []; el.__pendingHtml = null;
+    });
+  // `text` 是 textContent 的转发别名(HTMLScriptElement.text 的
+  // [PutForwards=textContent] 语义):`s.text = code` 是站点注入内联脚本的
+  // 经典写法,缺访问器会把代码写进普通属性、序列化丢内容、脚本静默不执行
+  // (2026-11-01 天猫真机回归发现)。
+  def("text", function () { return el.__pendingHtml != null ? el.__pendingHtml : el.__text; },
     function (v) {
       __lsmRec("characterData", el, { oldValue: el.__text || "" });
       el.__text = String(v); el.__kids = []; el.__pendingHtml = null;
@@ -2452,7 +2542,7 @@ var document = {
   // 但「建出来、能挂树、不崩」即可让面板/widget 完成初始化与挂载。
   createElementNS: function (ns, tag) { return __newEl(tag); },
   createSVGElement: function (tag) { return __newEl(tag); },
-  createTextNode: function (t) { return { nodeType: 3, textContent: String(t), data: String(t) }; },
+  createTextNode: function (t) { return __newText(t); },
   // createComment:Vue 1.x 的 VDOM 挂载路径用注释节点做 v-if 占位
   // (`createComment('v-if')`),缺失时挂载链当场 "not a callable function"
   // (实测 zhipin app 挂载)。
@@ -2521,7 +2611,7 @@ var document = {
         documentElement: __newEl("html"),
         createElement: function (tag) { return __newEl(tag); },
         createElementNS: function (ns, tag) { return __newEl(tag); },
-        createTextNode: function (t) { return { nodeType: 3, textContent: String(t), data: String(t) }; },
+        createTextNode: function (t) { return __newText(t); },
         createDocumentFragment: function () {
           return __mkFragment();
         },
@@ -2808,6 +2898,13 @@ function __lsmTick() {
     __lsmTimers = rest;
     for (var k = 0; k < batch.length; k++) {
       var tm = batch[k];
+      // 同到期批次也必须逐项受预算限制:否则外层 while 的 4/64 上限形同虚设,
+      // 首屏 React/动画的一次长批次会独占 JS 线程,后续动态脚本永远得不到调度。
+      // 未执行项保留原定时器记录直接回队;repeat 只在真正执行前重排,不丢也不双注册。
+      if (ran >= budget) {
+        __lsmTimers.push(tm);
+        continue;
+      }
       if (tm.repeat && __lsmTimerRan < 4096) {
         __lsmTimers.push({ id: tm.id, fn: tm.fn, args: tm.args, next: due + (tm.interval || 16), interval: tm.interval || 16, repeat: true });
       }
@@ -3273,6 +3370,8 @@ var __lsmWin = {
   }
 };
 var window = __lsmWin;
+// window→全局同步的保护名单(内核命脉,见 set 陷阱注释;缺失键按「跟随覆盖」)。
+var __lsmGlobalLocks = { eval: true, Function: true, globalThis: true, location: true, document: true };
 if (typeof Proxy === "function") {
   window = new Proxy(__lsmWin, {
     get: function (t, k) {
@@ -3311,9 +3410,24 @@ if (typeof Proxy === "function") {
       } catch (e) {}
       try { t[k] = v; } catch (e) {}
       // 同步为全局标识符:`window.foo = fn` 之后裸 `foo` 必须可见。
+      // 2026-11-01 天猫真机:同名再注册必须覆盖旧全局绑定(浏览器全局对象
+      // 语义),旧条件 `!(k in globalThis)` 会让更新被静默丢弃、全局滞留旧
+      // 回调(JSONP 回调同名复用时数据送进死闭包)。唯一例外:eval/Function/
+      // globalThis/location/document 五个内核命脉不跟随覆盖 —— 页面把 eval
+      // 换成探测器会打断内核装载管线,location 是带 setter 的导航访问器
+      // (覆盖会触发二次导航);真实浏览器动态脚本不走 eval,无此耦合。
       try {
-        if (typeof globalThis !== "undefined" && !(k in globalThis)) globalThis[k] = v;
+        if (typeof globalThis !== "undefined" && !__lsmGlobalLocks[k]) globalThis[k] = v;
       } catch (e) {}
+      return true;
+    },
+    // delete window.foo → 全局绑定同步消失(裸 foo 不再可见),与浏览器
+    // 全局对象语义一致;旧实现只删目标对象,全局侧残留旧绑定成僵尸回调。
+    deleteProperty: function (t, k) {
+      try { delete t[k]; } catch (e0) {}
+      try {
+        if (typeof globalThis !== "undefined" && !__lsmGlobalLocks[k]) delete globalThis[k];
+      } catch (e1) {}
       return true;
     }
   });

@@ -602,6 +602,8 @@ pub(crate) async fn run_pending_scripts(mgr: &LsmBrowserManager, pid: &str, budg
                 max_rounds: INTERACTION_SCRIPT_ROUNDS,
                 budget_ms,
                 grace_ms,
+                // 交互补泵沿用顺延语义(懒加载 chunk 链依赖),非硬预算。
+                hard_deadline: false,
             },
             has_pending,
         )
@@ -896,6 +898,7 @@ pub async fn control(
                     true,
                     false,
                     timeout_ms(params, top, 60_000),
+                    &super::NavHints::default(),
                 )
                 .await?;
             Ok(json!({

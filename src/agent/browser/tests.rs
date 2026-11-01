@@ -13,7 +13,7 @@ async fn 打开_data_页面并读取标题与正文() {
     let mgr = LsmBrowserManager::new();
     let url = html_doc("<h1>Hello</h1><p>World</p>");
     let out = mgr
-        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000, &NavHints::default())
         .await
         .unwrap();
     assert_eq!(out.title, "T");
@@ -47,7 +47,7 @@ async fn 正常业务风控词不误报为页面阻断() {
     let mgr = LsmBrowserManager::new();
     let url = html_doc("<h1>人工智能</h1><a>风控算法</a><p>风控工程师</p>");
     let out = mgr
-        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000, &NavHints::default())
         .await
         .unwrap();
     let v = inspect::inspect(&mgr, &out.page_id, "blockers", &serde_json::json!({}))
@@ -63,7 +63,7 @@ async fn 明确异常访问仍报告页面阻断() {
     let mgr = LsmBrowserManager::new();
     let url = html_doc("<h1>检测到异常访问,请完成核验</h1>");
     let out = mgr
-        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000, &NavHints::default())
         .await
         .unwrap();
     let v = inspect::inspect(&mgr, &out.page_id, "blockers", &serde_json::json!({}))
@@ -79,7 +79,7 @@ async fn 页面健康诊断不被webgl申请遮蔽脚本错误() {
     let mgr = LsmBrowserManager::new();
     let url = html_doc("<h1>静态页头</h1>");
     let out = mgr
-        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000, &NavHints::default())
         .await
         .unwrap();
     {
@@ -105,7 +105,7 @@ async fn 复用页面返回既有有头模式而非硬编码无头() {
     let mgr = LsmBrowserManager::new();
     let url = html_doc("<h1>P</h1>");
     let first = mgr
-        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000, &NavHints::default())
         .await
         .unwrap();
     {
@@ -113,7 +113,7 @@ async fn 复用页面返回既有有头模式而非硬编码无头() {
         inner.tabs.get_mut(&first.page_id).unwrap().mode = BrowserMode::Headed;
     }
     let reused = mgr
-        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000, &NavHints::default())
         .await
         .unwrap();
     assert!(reused.reused, "第二走同 URL 复用分支:{reused:?}");
@@ -127,7 +127,7 @@ async fn 点击链接导航到新页面() {
     let next = html_doc("<h2>Next</h2>");
     let url = html_doc(&format!("<a id='go' href=\"{next}\">go</a>"));
     let out = mgr
-        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000, &NavHints::default())
         .await
         .unwrap();
     let v = api::control(
@@ -156,7 +156,7 @@ async fn 输入文本写入运行时值() {
     let mgr = LsmBrowserManager::new();
     let url = html_doc("<input id='q' name='q' value=''>");
     let out = mgr
-        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000, &NavHints::default())
         .await
         .unwrap();
     api::control(
@@ -185,7 +185,7 @@ async fn 点击select展开面板并点击option选中收起() {
     let mgr = LsmBrowserManager::new();
     let url = html_doc("<select id='s'><option value='a'>甲</option><option value='b'>乙</option></select>");
     let out = mgr
-        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000, &NavHints::default())
         .await
         .unwrap();
     let opened = api::control(
@@ -229,7 +229,7 @@ async fn 显式select_option后自动收起浮层面板() {
     let mgr = LsmBrowserManager::new();
     let url = html_doc("<select id='s'><option value='a'>甲</option><option value='b'>乙</option></select>");
     let out = mgr
-        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000, &NavHints::default())
         .await
         .unwrap();
     api::control(
@@ -271,7 +271,7 @@ async fn 禁用与只读控件拒绝交互() {
     let mgr = LsmBrowserManager::new();
     let url = html_doc("<input id='d' disabled><input id='r' readonly><button id='b' disabled>禁用</button>");
     let out = mgr
-        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000, &NavHints::default())
         .await
         .unwrap();
     let clicked = api::control(
@@ -314,7 +314,7 @@ async fn reset按钮恢复表单默认值() {
         "<form id='f'><input id='t' name='t' value='默认'><input id='c' type='checkbox' checked><button id='r' type='reset'>重置</button></form>",
     );
     let out = mgr
-        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000, &NavHints::default())
         .await
         .unwrap();
     // 先改运行时值:输入框写入新值,复选框取消勾选。
@@ -393,7 +393,7 @@ async fn Esc关闭顶层dialog() {
     let mgr = LsmBrowserManager::new();
     let url = html_doc("<dialog id='d' open>内容</dialog>");
     let out = mgr
-        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000, &NavHints::default())
         .await
         .unwrap();
     let closed = api::control(
@@ -428,7 +428,7 @@ async fn 元素内滚动按偏移移动内容() {
         "<div id='s' style='overflow:auto;height:60px;width:300px'><p id='p1'>第一段</p><p id='p2'>第二段</p><p id='p3'>第三段</p><p id='p4'>第四段</p></div>",
     );
     let out = mgr
-        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000, &NavHints::default())
         .await
         .unwrap();
     let before = inspect::inspect(
@@ -478,7 +478,7 @@ async fn 点击后active释放且hover命中祖先链() {
     let mgr = LsmBrowserManager::new();
     let url = html_doc("<div id='parent'><button id='child'>按钮</button></div>");
     let out = mgr
-        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000, &NavHints::default())
         .await
         .unwrap();
     api::control(
@@ -518,7 +518,7 @@ async fn 上传后文件名立即可见() {
     let mgr = LsmBrowserManager::new();
     let url = html_doc("<input id='f' type='file'>");
     let out = mgr
-        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000, &NavHints::default())
         .await
         .unwrap();
     api::control(
@@ -554,7 +554,7 @@ async fn button型按钮不触发表单提交() {
     let mgr = LsmBrowserManager::new();
     let url = html_doc("<form action='/search'><input name='q' value='x'><button id='b' type='button'>普通</button></form>");
     let out = mgr
-        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000, &NavHints::default())
         .await
         .unwrap();
     let clicked = api::control(
@@ -579,7 +579,7 @@ async fn eval_js_可查询_dom_并产生动作() {
     let mgr = LsmBrowserManager::new();
     let url = html_doc("<h1 id='h'>Hi</h1><input id='q'>");
     let out = mgr
-        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000, &NavHints::default())
         .await
         .unwrap();
     let v = api::control(
@@ -611,7 +611,7 @@ async fn 截图生成_png_文件() {
     let mgr = LsmBrowserManager::new();
     let url = html_doc("<h1>Shot</h1>");
     let out = mgr
-        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000, &NavHints::default())
         .await
         .unwrap();
     let dir = std::env::temp_dir().join(format!("lsm_shot_{}", now_ms()));
@@ -634,7 +634,7 @@ async fn 截图生成_png_文件() {
 async fn close_all_清空内存页面() {
     let mgr = LsmBrowserManager::new();
     let url = html_doc("<p>x</p>");
-    mgr.new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+    mgr.new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000, &NavHints::default())
         .await
         .unwrap();
     assert!(mgr.has_browser().await);
@@ -656,7 +656,7 @@ async fn clip_截图裁剪区域() {
     let mgr = LsmBrowserManager::new();
     let url = html_doc("<h1>ClipTest</h1>");
     let out = mgr
-        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000, &NavHints::default())
         .await
         .unwrap();
     let dir = std::env::temp_dir().join(format!("lsm_clip_{}", now_ms()));
@@ -760,7 +760,7 @@ async fn 页面文本与健康度可观测() {
     let mgr = LsmBrowserManager::new();
     let url = html_doc("<h1>标题文字</h1><p>正文段落</p>");
     let out = mgr
-        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000, &NavHints::default())
         .await
         .unwrap();
     let text = inspect::inspect(&mgr, &out.page_id, "text", &serde_json::json!({}))
@@ -790,7 +790,7 @@ async fn 文本极少时_inspect_text_列出控件可访问名() {
          <input id=sole-input placeholder='搜地点、查公交、找路线'>",
     );
     let out = mgr
-        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000, &NavHints::default())
         .await
         .unwrap();
     let text = inspect::inspect(&mgr, &out.page_id, "text", &serde_json::json!({}))
@@ -817,7 +817,7 @@ async fn 空白页健康度给出可执行结论() {
     let mgr = LsmBrowserManager::new();
     let url = html_doc("");
     let out = mgr
-        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000, &NavHints::default())
         .await
         .unwrap();
     let health = inspect::inspect(&mgr, &out.page_id, "page_health", &serde_json::json!({}))
@@ -836,7 +836,7 @@ async fn 被祖先隐藏的元素不再自报可见() {
     let mgr = LsmBrowserManager::new();
     let url = html_doc("<div style='display:none'><input id='box'></div>");
     let out = mgr
-        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000, &NavHints::default())
         .await
         .unwrap();
     let v = inspect::inspect(&mgr, &out.page_id, "elements", &serde_json::json!({"selector": "#box"}))
@@ -853,7 +853,7 @@ async fn 行内元素矩形不再恒为零() {
     let mgr = LsmBrowserManager::new();
     let url = html_doc("<div><input id='box' style='width:200px;height:30px'></div>");
     let out = mgr
-        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000, &NavHints::default())
         .await
         .unwrap();
     let v = inspect::inspect(&mgr, &out.page_id, "elements", &serde_json::json!({"selector": "#box"}))
@@ -872,7 +872,7 @@ async fn 截图尊重_output_path_别名() {
     let mgr = LsmBrowserManager::new();
     let url = html_doc("<p>截图</p>");
     let out = mgr
-        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000, &NavHints::default())
         .await
         .unwrap();
     let dir = std::env::temp_dir().join(format!("laew_shot_{}", std::process::id()));
@@ -900,7 +900,7 @@ async fn extract_未声明字段时自动抽取文本() {
     let mgr = LsmBrowserManager::new();
     let url = html_doc("<ul><li>甲条目</li><li>乙条目</li></ul>");
     let out = mgr
-        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000, &NavHints::default())
         .await
         .unwrap();
     let v = inspect::inspect(
@@ -929,7 +929,7 @@ async fn 工具栏导航命令_驱动引擎换页() {
     let first = html_doc("<h1>PAGE-1</h1>");
     let second = html_doc("<h1>PAGE-2</h1>");
     let out = mgr
-        .new_page(&first, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .new_page(&first, BrowserMode::Hidden, None, None, None, false, true, 5_000, &NavHints::default())
         .await
         .unwrap();
     let pid = out.page_id.clone();
@@ -960,7 +960,7 @@ async fn canvas_区域_渲染出显式占位说明() {
     let b64 = base64::engine::general_purpose::STANDARD.encode(html.as_bytes());
     let url = format!("data:text/html;base64,{b64}");
     let out = mgr
-        .new_page(&url, BrowserMode::Hidden, None, Some(800), Some(500), false, true, 10_000)
+        .new_page(&url, BrowserMode::Hidden, None, Some(800), Some(500), false, true, 10_000, &NavHints::default())
         .await
         .unwrap();
     let shot = mgr
@@ -1012,7 +1012,7 @@ async fn 截图ocr参数不吞掉落盘() {
     let b64 = base64::engine::general_purpose::STANDARD.encode(html.as_bytes());
     let url = format!("data:text/html;base64,{b64}");
     let out = mgr
-        .new_page(&url, BrowserMode::Hidden, None, Some(800), Some(500), false, true, 10_000)
+        .new_page(&url, BrowserMode::Hidden, None, Some(800), Some(500), false, true, 10_000, &NavHints::default())
         .await
         .unwrap();
     let path = std::env::temp_dir().join(format!("laew_ocr_test_{}.png", std::process::id()));
@@ -1062,7 +1062,7 @@ async fn 查看器上报尺寸_更新前台页视口() {
     let mgr = LsmBrowserManager::new_arc();
     let url = html_doc("<h1>P</h1>");
     let out = mgr
-        .new_page(&url, BrowserMode::Hidden, None, Some(800), Some(600), false, true, 5_000)
+        .new_page(&url, BrowserMode::Hidden, None, Some(800), Some(600), false, true, 5_000, &NavHints::default())
         .await
         .unwrap();
     let pid = out.page_id.clone();
@@ -1094,7 +1094,7 @@ async fn 查看器上报尺寸_越界按宿主视口范围夹紧() {
     let mgr = LsmBrowserManager::new_arc();
     let url = html_doc("<h1>P</h1>");
     let out = mgr
-        .new_page(&url, BrowserMode::Hidden, None, Some(800), Some(600), false, true, 5_000)
+        .new_page(&url, BrowserMode::Hidden, None, Some(800), Some(600), false, true, 5_000, &NavHints::default())
         .await
         .unwrap();
     let pid = out.page_id.clone();
@@ -1126,7 +1126,7 @@ async fn 查看器上报尺寸_非有头页忽略() {
     let mgr = LsmBrowserManager::new_arc();
     let url = html_doc("<h1>P</h1>");
     let out = mgr
-        .new_page(&url, BrowserMode::Hidden, None, Some(800), Some(600), false, true, 5_000)
+        .new_page(&url, BrowserMode::Hidden, None, Some(800), Some(600), false, true, 5_000, &NavHints::default())
         .await
         .unwrap();
     let pid = out.page_id.clone();
@@ -1193,7 +1193,7 @@ async fn inspect_html_返回整页源码() {
     let mgr = LsmBrowserManager::new();
     let url = html_doc("<h1>Hello</h1>");
     let out = mgr
-        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000, &NavHints::default())
         .await
         .unwrap();
     let v = inspect::inspect(&mgr, &out.page_id, "html", &serde_json::json!({}))
@@ -1212,7 +1212,7 @@ async fn inspect_elements_列表模式返回全部匹配项() {
     let mgr = LsmBrowserManager::new();
     let url = html_doc("<a class='x'>A</a><a class='x'>B</a><a class='x'>C</a>");
     let out = mgr
-        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000)
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 5_000, &NavHints::default())
         .await
         .unwrap();
     let v = inspect::inspect(

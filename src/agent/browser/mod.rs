@@ -343,6 +343,12 @@ pub struct OpenOutcome {
     /// 页面内 `<video>` 数量:内核不渲染视频画面(hero 背景视频区域会留
     /// 纯色/空白)。如实计数告知,与 webgl/iframe 同款边界上报。
     pub video_count: usize,
+    /// 脚本管线是否被截断(墙钟预算耗尽或 wait_until 轮次到点)。截断事实
+    /// 必须在 open 响应里直接可见(2026-11-01:免得 Agent 再补一轮
+    /// inspect(page_health) 才发现首屏没跑完)。
+    pub script_budget_cut: bool,
+    /// 截断时仍未取回执行的脚本数(正常收敛 = 0)。
+    pub script_pending: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -355,6 +361,48 @@ pub struct NavOutcome {
     pub content_type: String,
     pub source_bytes: usize,
     pub redirect_chain: Vec<String>,
+}
+
+/// 导航预算与就绪语义提示(2026-11-01 天猫真机:`open` 契约落地)。
+///
+/// 真机实测:`open(timeout_ms=45000, wait_until=domcontentloaded)` 实际
+/// 282.9s 才返回 —— `wait_until` 只写在 schema 里零消费,`timeout_ms` 只约束
+/// 网络抓取,脚本管线独立吃满 240s(+2×60s 延长)预算。本结构把调用方语义
+/// 带进管线种子:
+/// - `whole_call_budget_ms`:**显式**传入 `timeout_ms` 时给出,作为整次调用的
+///   墙钟上限(抓取已耗时从预算里扣除,管线只吃剩余);未显式传入为 `None`,
+///   维持「抓取 60s + 管线默认预算」的旧行为,避免重站点回归;
+/// - `wait_until`:`domcontentloaded` → 管线 `max_rounds=1`(首轮同步脚本,
+///   约当 DOMContentLoaded 语义,快速返回,pending 由 `script_pending` /
+///   `script_budget_cut` 如实上报);`networkidle`/缺省 → 整管线。
+#[derive(Debug, Clone, Default)]
+pub struct NavHints {
+    /// `"load"` / `"domcontentloaded"` / `"networkidle"` / 空(缺省)
+    pub wait_until: &'static str,
+    /// 整次调用墙钟上限(毫秒);仅调用方显式传 `timeout_ms` 时设置
+    pub whole_call_budget_ms: Option<u64>,
+}
+
+impl NavHints {
+    /// 按 hints 把管线种子夹紧:轮次与墙钟预算、宽限都受调用方语义约束。
+    fn pipeline_seed(&self, started: std::time::Instant) -> script::PipelineSeed {
+        let mut seed = script::PipelineSeed::default();
+        if self.wait_until == "domcontentloaded" {
+            seed.max_rounds = 1;
+        }
+        if let Some(total) = self.whole_call_budget_ms {
+            let elapsed = started.elapsed().as_millis() as u64;
+            let remaining = total.saturating_sub(elapsed);
+            // 预算必须是正数(0 语义是「用默认」,不能让夹紧退化成默认大预算)
+            seed.budget_ms = remaining.clamp(1, u64::MAX);
+            // 宽限续等也计入调用方预算:给 2s 小宽限,防「线程在跑被判超时」
+            // 又不至于把整次调用拖出预算(默认宽限 60s 会破约)。
+            seed.grace_ms = 2_000;
+            // 硬预算:到点即截断,跳过「有待取回脚本就顺延 60s」续期。
+            seed.hard_deadline = true;
+        }
+        seed
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -586,7 +634,9 @@ impl LsmBrowserManager {
         new_window: bool,
         reuse: bool,
         timeout_ms: u64,
+        hints: &NavHints,
     ) -> EngineResult<OpenOutcome> {
+        let started = std::time::Instant::now();
         let requested = urlutil::resolve("", url)
             .ok_or_else(|| EngineError::param(format!("URL 非法:{url}")))?;
         if !urlutil::is_navigable(&requested) {
@@ -611,11 +661,11 @@ impl LsmBrowserManager {
                     .map(|t| t.user_agent.clone())
                     .unwrap_or_else(|| user_agent.unwrap_or(DEFAULT_UA).to_string());
                 match self
-                    .navigate_locked(&mut inner, &pid, &requested, timeout_ms, true, &ua)
+                    .navigate_locked(&mut inner, &pid, &requested, timeout_ms, true, &ua, hints)
                     .await
                 {
                     Ok(nav) => {
-                        let (window_id, vw, vh, webgl_asked, tab_mode) = inner
+                        let (window_id, vw, vh, webgl_asked, tab_mode, script_budget_cut, script_pending) = inner
                             .tabs
                             .get(&pid)
                             .map(|t| {
@@ -625,9 +675,11 @@ impl LsmBrowserManager {
                                     t.viewport.height,
                                     t.webgl_asked,
                                     t.mode,
+                                    t.script_budget_cut,
+                                    t.script_pending,
                                 )
                             })
-                            .unwrap_or((String::new(), 0, 0, 0, mode));
+                            .unwrap_or((String::new(), 0, 0, 0, mode, false, 0));
                         let iframe_count = inner
                             .tabs
                             .get(&existing)
@@ -656,6 +708,8 @@ impl LsmBrowserManager {
                             webgl_asked: webgl_asked,
                             iframe_count,
                             video_count,
+                            script_budget_cut,
+                            script_pending,
                         });
                     }
                     Err(err) => {
@@ -748,7 +802,7 @@ impl LsmBrowserManager {
             &empty_session,
             csp_policy.as_ref(),
             &pre_rects,
-            script::PipelineSeed::default(),
+            hints.pipeline_seed(started),
         )
         .await;
         let html = pipeline.html;
@@ -920,6 +974,8 @@ impl LsmBrowserManager {
             webgl_asked: pipeline.webgl_asked,
             iframe_count: doc.select("iframe").map(|v| v.len()).unwrap_or(0),
             video_count: doc.select("video").map(|v| v.len()).unwrap_or(0),
+            script_budget_cut: pipeline.budget_cut,
+            script_pending: pipeline.pending_scripts,
         })
     }
 
@@ -937,7 +993,7 @@ impl LsmBrowserManager {
             .get(page_id)
             .map(|t| t.user_agent.clone())
             .ok_or_else(|| EngineError::page_not_found(page_id))?;
-        self.navigate_locked(&mut inner, page_id, &requested, timeout_ms, true, &ua)
+        self.navigate_locked(&mut inner, page_id, &requested, timeout_ms, true, &ua, &NavHints::default())
             .await
     }
 
@@ -949,6 +1005,7 @@ impl LsmBrowserManager {
         timeout_ms: u64,
         push_history: bool,
         ua: &str,
+        hints: &NavHints,
     ) -> EngineResult<NavOutcome> {
         self.load_locked(
             inner,
@@ -959,6 +1016,7 @@ impl LsmBrowserManager {
             ua,
             "GET",
             None,
+            hints,
         )
         .await
     }
@@ -978,7 +1036,7 @@ impl LsmBrowserManager {
             .get(page_id)
             .map(|t| t.user_agent.clone())
             .ok_or_else(|| EngineError::page_not_found(page_id))?;
-        self.load_locked(&mut inner, page_id, url, timeout_ms, true, &ua, method, body)
+        self.load_locked(&mut inner, page_id, url, timeout_ms, true, &ua, method, body, &NavHints::default())
             .await
     }
 
@@ -993,7 +1051,9 @@ impl LsmBrowserManager {
         ua: &str,
         method: &str,
         body: Option<Vec<u8>>,
+        hints: &NavHints,
     ) -> EngineResult<NavOutcome> {
+        let started = std::time::Instant::now();
         if !urlutil::is_navigable(url) {
             return Err(EngineError::param(format!("不支持的协议:{url}")));
         }
@@ -1068,7 +1128,7 @@ impl LsmBrowserManager {
             &session_snapshot,
             csp_policy.as_ref(),
             &pre_rects,
-            script::PipelineSeed::default(),
+            hints.pipeline_seed(started),
         )
         .await;
         let html = pipeline.html;
@@ -1252,7 +1312,7 @@ impl LsmBrowserManager {
             .map(|t| t.user_agent.clone())
             .unwrap_or_else(|| DEFAULT_UA.to_string());
         let mut out = self
-            .navigate_locked(&mut inner, page_id, &target, timeout_ms, false, &ua)
+            .navigate_locked(&mut inner, page_id, &target, timeout_ms, false, &ua, &NavHints::default())
             .await?;
         if let Some(tab) = inner.tabs.get_mut(page_id) {
             if let Some(idx) = target_index {
@@ -1378,7 +1438,7 @@ impl LsmBrowserManager {
                 .ok_or_else(|| EngineError::page_not_found(from_page))?
         };
         let mut out = self
-            .new_page(url, BrowserMode::Hidden, None, None, None, false, false, timeout_ms)
+            .new_page(url, BrowserMode::Hidden, None, None, None, false, false, timeout_ms, &NavHints::default())
             .await?;
         if out.window_id != source_window {
             let mut inner = self.inner.lock().await;

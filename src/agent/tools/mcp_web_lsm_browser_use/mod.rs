@@ -245,12 +245,12 @@ control_action=set_control_state,params.state=\"user\"(交人工)或 \"agent\"(�
                 "block_selectors": { "type": "array", "items": { "type": "string" }, "maxItems": 8 },
                 "guard_note": { "type": "string", "maxLength": 60 },
                 "overlay": { "type": "boolean", "default": true },
-                "timeout_ms": { "type": "integer", "description": "open 加载超时,默认 60000" },
+                "timeout_ms": { "type": "integer", "description": "open 预算(毫秒,默认 60000):显式传入时作为整次调用(网络抓取+脚本管线)的墙钟上限,脚本未跑完以 script_budget_cut/script_pending 如实上报;不传维持「抓取 60s + 管线默认预算」旧语义,重站点不受默认值误伤" },
                 "connect_url": { "type": "string", "description": "兼容参数;新内核无外部浏览器可接管,返回 3002" },
                 "reuse_existing": { "type": "boolean", "default": false, "description": "兼容参数;新内核返回 3002" },
                 "auto_relaunch": { "type": "boolean", "default": false },
                 "user_agent": { "type": "string" },
-                "wait_until": { "type": "string", "enum": ["load", "domcontentloaded", "networkidle"] },
+                "wait_until": { "type": "string", "enum": ["load", "domcontentloaded", "networkidle"], "description": "就绪判定:domcontentloaded=首轮同步脚本后即返回(后续脚本经 inspect/wait/交互继续推进,pending 状态如实上报);load/networkidle/缺省=整条脚本管线收敛后返回" },
                 "block_resources": { "type": "array", "items": { "type": "string" } },
                 "page_id": { "type": "string", "description": "close/control/inspect 必填;close 可为 all/background/others" },
                 "keep": { "type": "string", "description": "close(page_id=others) 时保留的 page_id" },
@@ -453,12 +453,27 @@ pub(super) async fn run_open(mut args: Value) -> Result<String> {
     let width = u64_arg(&args, "window_width").map(|v| v as u32);
     let height = u64_arg(&args, "window_height").map(|v| v as u32);
     let reuse = bool_arg(&args, "reuse", true);
-    let timeout = u64_arg(&args, "timeout_ms").unwrap_or(60_000).clamp(1_000, 600_000);
+    let timeout_explicit = u64_arg(&args, "timeout_ms");
+    let timeout = timeout_explicit.unwrap_or(60_000).clamp(1_000, 600_000);
+    // 2026-11-01 天猫真机:wait_until/timeout_ms 契约落地 —— 调用方语义
+    // 透传进脚本管线种子(此前 wait_until 零消费、timeout_ms 只管抓取,
+    // open(timeout=45s) 实测拖到 282.9s)。
+    let wait_until = match str_arg(&args, "wait_until").unwrap_or("").trim() {
+        "domcontentloaded" => "domcontentloaded",
+        "networkidle" => "networkidle",
+        _ => "load",
+    };
+    let hints = crate::agent::browser::NavHints {
+        wait_until,
+        // 仅显式传入 timeout_ms 时升级为整调用预算;缺省维持旧行为,
+        // 避免 60s 默认值误伤重站点首屏管线。
+        whole_call_budget_ms: timeout_explicit.map(|_| timeout),
+    };
     let ua = str_arg(&args, "user_agent");
     let mgr = McpWebLsmBrowserUseTool::mgr();
     let had_pages = mgr.has_browser().await;
     let out = match mgr
-        .new_page(&url, mode, ua, width, height, new_window, reuse, timeout)
+        .new_page(&url, mode, ua, width, height, new_window, reuse, timeout, &hints)
         .await
     {
         Ok(v) => v,
@@ -506,6 +521,9 @@ pub(super) async fn run_open(mut args: Value) -> Result<String> {
         "content_type": out.content_type,
         "byte_size": out.source_bytes,
         "redirect_chain": out.redirect_chain,
+        "wait_until": wait_until,
+        "script_budget_cut": out.script_budget_cut,
+        "script_pending": out.script_pending,
         "highlight": bool_arg(&args, "highlight", true),
         "guard": {
             "mode": guard_mode,
@@ -916,7 +934,7 @@ async fn run_explore(args: Value) -> Result<String> {
             return envelope(1001, "explore 需要 page_id 或 url", json!({}));
         };
         let mut open_args = json!({"action": "open", "url": url});
-        for key in ["timeout_ms", "mode", "reuse", "user_agent"] {
+        for key in ["timeout_ms", "mode", "reuse", "user_agent", "wait_until"] {
             if let Some(v) = args.get(key) {
                 open_args[key] = v.clone();
             }

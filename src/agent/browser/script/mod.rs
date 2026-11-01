@@ -10,6 +10,7 @@ pub mod diag;
 pub mod dom_ops;
 pub mod env_js;
 pub mod for_in_guard;
+pub mod preact_guard;
 pub mod prelude;
 pub mod runtime;
 
@@ -23,6 +24,8 @@ mod tests;
 mod tests_dom_insert;
 #[cfg(test)]
 mod tests_jd_compat;
+#[cfg(test)]
+mod tests_jsonp;
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -321,6 +324,10 @@ pub(crate) struct PipelineSeed {
     /// 观察入口(inspect/screenshot)的补泵传小值快进快出,不把读取类
     /// 工具调用拖到分钟级;wait/eval 等真·等待路径用默认宽限。
     pub grace_ms: u64,
+    /// 调用方显式预算 = **硬约束**(2026-11-01 天猫真机:`open(timeout_ms)`
+    /// 契约落地):到点即截断,不做「有待取回脚本就顺延 60s」的续期 ——
+    /// 调用方语义是「X ms 内必须返回」,顺延机制会把硬预算架空。
+    pub hard_deadline: bool,
 }
 
 /// 脚本管线轮次上限。
@@ -437,7 +444,7 @@ pub(crate) async fn run_pipeline(
                 let deferred_left = std::mem::take(&mut left.deferred);
                 left.items.len() + deferred_left.len()
             };
-            if pending > 0 && budget_extensions < PIPELINE_MAX_EXTENSIONS {
+            if pending > 0 && !seed.hard_deadline && budget_extensions < PIPELINE_MAX_EXTENSIONS {
                 budget_extensions += 1;
                 deadline = std::time::Instant::now()
                     + std::time::Duration::from_millis(PIPELINE_EXTENSION_MS);

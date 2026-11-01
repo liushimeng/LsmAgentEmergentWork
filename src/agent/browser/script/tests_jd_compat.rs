@@ -21,7 +21,7 @@
 //! 本文件用京东真实脚本的**同构最小片段**锁死以上四个缺口;不引入网络与
 //! 真站依赖,毫秒级跑完。
 
-use super::tests::{env, eval_on};
+use super::tests::{eval_on, run_scripts};
 use super::JsHandle;
 
 const PAGE: &str = "<html><body><div id='x'>hi</div></body></html>";
@@ -363,4 +363,147 @@ document.getElementById('x').textContent = 'heavy-ran';
     let v = eval_on(&h, "String(window.__n)", &out2.html, "https://t.test/");
     assert_eq!(v.outcome.value, "1", "超时轮次脚本不得重跑");
     h.shutdown();
+}
+
+#[test]
+fn 同到期定时器批次_也受单轮预算限制且延后项不丢不重() {
+    let handle = JsHandle::spawn();
+    let first = run_scripts(
+        &handle,
+        vec![r#"
+            window.__calls = [];
+            for (var i = 0; i < 4; i++) {
+                (function (n) { setTimeout(function () { __calls.push(n); }, 16); })(i);
+            }
+            var intervalId = setInterval(function () {
+                __calls.push('interval');
+                clearInterval(intervalId);
+            }, 16);
+            for (var j = 4; j < 12; j++) {
+                (function (n) { setTimeout(function () { __calls.push(n); }, 16); })(j);
+            }
+        "#],
+        PAGE,
+        "https://a.test/",
+    );
+    assert!(first.outcome.ok, "{:?}", first.outcome.error);
+    assert_eq!(
+        first.outcome.pending_timers, 9,
+        "装载轮预算为 4:13 个同到期回调只能先跑 4 个,interval 尚被延后"
+    );
+
+    let second = eval_on(&handle, "'drain'", PAGE, "https://a.test/");
+    assert_eq!(second.outcome.pending_timers, 0, "排水轮应跑完剩余 9 个回调");
+    let third = eval_on(&handle, "JSON.stringify(window.__calls)", PAGE, "https://a.test/");
+    assert_eq!(
+        third.outcome.value,
+        "[0,1,2,3,\"interval\",4,5,6,7,8,9,10,11]",
+        "延后回调应保持原顺序且恰好执行一次"
+    );
+    handle.shutdown();
+}
+
+#[test]
+fn 文本节点变更_驱动corejs微任务且不在setter内重入() {
+    let handle = JsHandle::spawn();
+    // core-js gHnn 的同构调度器:优先用 MutationObserver 观察 Text.data,
+    // 任务入队时翻转文本;浏览器在赋值返回后的微任务检查点冲刷队列。
+    let value = eval_str(
+        &handle,
+        r#"(function(){
+            var calls = [], head, tail, toggle = true;
+            var text = document.createTextNode("");
+            function flush() {
+                calls.push("flush");
+                while (head) {
+                    var task = head;
+                    head = head.next;
+                    task.fn();
+                }
+                tail = void 0;
+            }
+            new MutationObserver(flush).observe(text, { characterData: true });
+            function schedule(fn) {
+                var task = { fn: fn, next: void 0 };
+                if (tail) tail.next = task;
+                if (!head) { head = task; text.data = toggle = !toggle; }
+                tail = task;
+            }
+            calls.push("before");
+            schedule(function(){ calls.push("task"); });
+            calls.push("after");
+            __lsmFlushMutations();
+            return JSON.stringify({ calls: calls, data: text.data });
+        })()"#,
+    );
+    assert_eq!(
+        value, "{\"calls\":[\"before\",\"after\",\"flush\",\"task\"],\"data\":\"false\"}",
+        "Text.data 必须触发 observer,且回调不得同步插入 after 之前"
+    );
+    handle.shutdown();
+}
+
+#[test]
+fn 每个定时器后_先清空Promise微任务再推进下一宏任务() {
+    let handle = JsHandle::spawn();
+    let loaded = run_scripts(
+        &handle,
+        vec![r#"
+            window.__order = [];
+            var shared = Promise.resolve();
+            setTimeout(function () {
+                __order.push('before');
+                shared.then(function () { __order.push('microtask'); });
+                __order.push('after');
+            }, 0);
+            setTimeout(function () { __order.push('timer2'); }, 16);
+        "#],
+        PAGE,
+        "https://a.test/",
+    );
+    assert!(loaded.outcome.ok, "{:?}", loaded.outcome.error);
+    let result = eval_on(
+        &handle,
+        "JSON.stringify(window.__order)",
+        PAGE,
+        "https://a.test/",
+    );
+    assert_eq!(
+        result.outcome.value,
+        "[\"before\",\"after\",\"microtask\",\"timer2\"]",
+        "首个定时器的微任务必须在第二个定时器前执行,不能等整批结束"
+    );
+    handle.shutdown();
+}
+
+#[test]
+fn jsonp回调_cleanup后仍回传响应数据() {
+    let handle = JsHandle::spawn();
+    let page = "<html><head></head><body><div id='x'></div></body></html>";
+    let reply = eval_on(
+        &handle,
+        r#"(function(){
+            window.__jsonpResult = null;
+            var en = window, pn = function(){}, at = "getCategoryCallback";
+            var kt = document.createElement("script");
+            kt.src = "about:blank";
+            document.head.appendChild(kt);
+            function cleanup(name) {
+                kt.parentNode && kt.parentNode.removeChild(kt);
+                en[name] = pn;
+                clearTimeout(en["timer_" + name]);
+            }
+            en[at] = function(data) {
+                cleanup(at);
+                window.__jsonpResult = data;
+            };
+            en[at]({ data: [1] });
+            return JSON.stringify(window.__jsonpResult);
+        })()"#,
+        page,
+        "https://a.test/",
+    );
+    assert!(reply.outcome.ok, "JSONP cleanup 不应抛错: {:?}", reply.outcome.error);
+    assert_eq!(reply.outcome.value, "{\"data\":[1]}");
+    handle.shutdown();
 }
