@@ -2515,3 +2515,98 @@ fn canvas_to_data_url_大画布走原始像素通道() {
         started.elapsed()
     );
 }
+
+/// 2026-11-01 天猫二轮:RunScripts 批次执行中,Eval 短请求应在**脚本边界**
+/// 让道服务,而不是排在批次后面挨饿(天猫真机:管线硬预算截断后残留批次
+/// 在线程里继续跑数分钟,eval_js 连续 2002「线程忙碌」,`wait ms=2500`
+/// 实付 117.9s)。判定用**顺序**而非时长:eval 的标记必须落在批次脚本标记
+/// 中间(让道语义),若退化成「批次跑完才执行 eval」,eval 会是最后一个。
+#[test]
+fn runscripts批次执行中eval让道不挨饿() {
+    let handle = JsHandle::spawn();
+    // 慢批次:120 个内联脚本,每个 push 标记 + 小忙循环拉长批次(整体 ~10s 量级,
+    // 保证 400ms 后发出的 eval 落在批次中段;Boa debug 档实测每 25k 次循环
+    // 约百毫秒级,机器慢时批次更长但不影响顺序断言)。
+    let body = "window.__ord=(window.__ord||[]);window.__ord.push('s');\
+                for(var i=0;i<25_000;i++){;}"
+        .to_string();
+    let scripts: Vec<ScriptSource> = (0..120)
+        .map(|_| ScriptSource {
+            kind: "inline",
+            content: body.clone(),
+            src_url: String::new(),
+        })
+        .collect();
+    let e = env("https://yield.test/");
+    let h = handle.clone();
+    let batch_env = e.clone();
+    let batch = std::thread::spawn(move || {
+        h.request_with_budget(
+            |tx| JsRequest::RunScripts {
+                scripts,
+                env: batch_env,
+                nodes: vec![],
+                reply: tx,
+                budget_ms: 120_000,
+            },
+            180_000,
+        )
+    });
+    // 批次启动后立即发 eval;让道正确时它会在批次脚本之间(含首脚本前,
+    // 高负载下批次线程可能晚于本 sleep 才被调度)执行。脚本自带 `||[]`
+    // 兜底,保证在「任何批次脚本尚未运行」的让道点也能求值成功。
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let eval_reply = handle
+        .request_with_budget(
+            |tx| JsRequest::Eval {
+                script: "window.__ord=(window.__ord||[]);window.__ord.push('eval')"
+                    .to_string(),
+                env: e.clone(),
+                nodes: vec![],
+                reply: tx,
+            },
+            60_000,
+        )
+        .expect("eval 应在批次完成前让道执行,而不是 60s 超时(批内未让道)");
+    let batch_result = batch.join().expect("批次线程不应 panic");
+    assert!(batch_result.is_ok(), "慢批次应正常完成:{batch_result:?}");
+    assert!(eval_reply.outcome.ok, "{:?}", eval_reply.outcome.error);
+    // 判定顺序要用**批次结束后**的终态:eval 执行那一刻它必然是最新一条。
+    // 让道正确 ⇒ 'eval' 之后还有批次脚本(pos < total-1);退化成批次跑完才
+    // 执行 ⇒ eval 是最后一条(pos == total-1)。
+    let check = handle
+        .request(|tx| JsRequest::Eval {
+            script: "window.__ord.lastIndexOf('eval') + '/' + window.__ord.length".to_string(),
+            env: e.clone(),
+            nodes: vec![],
+            reply: tx,
+        })
+        .expect("终态读取不应失败");
+    assert!(check.outcome.ok, "{:?}", check.outcome.error);
+    let value = check.outcome.value.trim_matches('"');
+    let (pos_s, total_s) = value
+        .split_once('/')
+        .unwrap_or_else(|| panic!("eval 返回应为 pos/total 形式,实际:{value}"));
+    let pos: usize = pos_s.trim().parse().expect("位置应为数字");
+    let total: usize = total_s.trim().parse().expect("总长应为数字");
+    assert!(
+        pos + 1 < total,
+        "eval 落在批次末尾(pos={pos}, total={total})—— 批内未让道,eval 在挨饿"
+    );
+}
+
+/// 2026-11-01 天猫二轮:递归上限 256(611c10f 引入)杀死 mtop.js Request
+/// 递归链与 react-dom 调和 —— 千层递归是重数据链站点的常规深度,
+/// 默认 2048 下必须能跑通(旧值 256 时本用例必挂 RuntimeLimitError)。
+#[test]
+fn 千层递归不被RuntimeLimit误杀() {
+    let handle = JsHandle::spawn();
+    let reply = eval_on(
+        &handle,
+        "(function f(n){ return n<=0?0:1+f(n-1); })(1000)",
+        PAGE,
+        "https://a.test/",
+    );
+    assert!(reply.outcome.ok, "{:?}", reply.outcome.error);
+    assert_eq!(reply.outcome.value.trim_matches('"'), "1000");
+}

@@ -349,6 +349,12 @@ pub struct OpenOutcome {
     pub script_budget_cut: bool,
     /// 截断时仍未取回执行的脚本数(正常收敛 = 0)。
     pub script_pending: usize,
+    /// 各阶段耗时账单(毫秒,2026-11-01 天猫二轮):`fetch_ms/styles_ms/
+    /// pipeline_ms/images_ms/layout_ms/total_ms`(+ 复用路径 `pump_ms`)与
+    /// `pipeline_rounds/scripts_executed`。Agent 据此自校准「要不要带更大
+    /// timeout_ms 重开 / 是否已被截断」;缺 `..Default` 旧调用点由
+    /// `OpenOutcome::default_timings()` 兜底空对象。
+    pub timings: serde_json::Value,
 }
 
 #[derive(Debug, Clone)]
@@ -381,9 +387,21 @@ pub struct NavHints {
     pub wait_until: &'static str,
     /// 整次调用墙钟上限(毫秒);仅调用方显式传 `timeout_ms` 时设置
     pub whole_call_budget_ms: Option<u64>,
+    /// 强制重载(2026-11-01 天猫二轮):精确同 URL 复用默认改为**廉价复用**
+    /// (小额补泵 + 返回现态,不重新导航);调用方要求全新加载时置 true,
+    /// 走既有全量导航(重站全管线分钟级,只在明确要新页面时才付这笔钱)。
+    pub force_reload: bool,
 }
 
 impl NavHints {
+    /// 显式整调用预算的**剩余量**(毫秒);未显式传预算返回 None。
+    /// 用途(P1-4):管线之外的后置阶段(样式预取/图片/重排)都以它夹紧,
+    /// 让 `timeout_ms` 真正是整次调用的墙钟上界,而不是只管脚本管线。
+    fn whole_call_remaining(&self, started: std::time::Instant) -> Option<u64> {
+        self.whole_call_budget_ms
+            .map(|total| total.saturating_sub(started.elapsed().as_millis() as u64))
+    }
+
     /// 按 hints 把管线种子夹紧:轮次与墙钟预算、宽限都受调用方语义约束。
     fn pipeline_seed(&self, started: std::time::Instant) -> script::PipelineSeed {
         let mut seed = script::PipelineSeed::default();
@@ -654,6 +672,102 @@ impl LsmBrowserManager {
         }
         if reuse && !new_window {
             if let Some(existing) = find_reusable(&inner, &requested) {
+                // 2026-11-01 天猫二轮:精确同 URL 复用改**廉价复用** ——
+                // 原实现无条件全量重导航:重站(天猫)全管线 240s+顺延 60s+图片 20s
+                // ≈ 327.7s 黑盒,且导航会 shutdown 旧 JS 线程,把首开后台自建的
+                // 半成品进度整页丢弃。现语义与 Chrome 工具「同 URL 自动复用无主页」
+                // 对齐:小额补泵(≤8s)推进半成品页,返回现态;要全新页面用
+                // `params.reload=true`(NavHints::force_reload)。同源**不同 URL**
+                // 仍走全量导航(本来就是去新页面)。
+                let exact_hit = inner
+                    .tabs
+                    .get(&existing)
+                    .map(|t| urlutil::canonical(&t.url) == urlutil::canonical(&requested))
+                    .unwrap_or(false);
+                if exact_hit && !hints.force_reload {
+                    let pid = existing.clone();
+                    drop(inner);
+                    let pump_started = std::time::Instant::now();
+                    let pump_budget = api::interaction_budget_ms().min(8_000);
+                    api::run_pending_scripts(self, &pid, pump_budget, 1_000).await;
+                    let pump_ms = pump_started.elapsed().as_millis() as u64;
+                    let mut inner = self.inner.lock().await;
+                    let (window_id, vw, vh, webgl_asked, tab_mode, script_budget_cut, script_pending) = inner
+                        .tabs
+                        .get(&pid)
+                        .map(|t| {
+                            (
+                                t.window_id.clone(),
+                                t.viewport.width,
+                                t.viewport.height,
+                                t.webgl_asked,
+                                t.mode,
+                                t.script_budget_cut,
+                                t.script_pending,
+                            )
+                        })
+                        .unwrap_or((String::new(), 0, 0, 0, mode, false, 0));
+                    let iframe_count = inner
+                        .tabs
+                        .get(&pid)
+                        .and_then(|t| document::Document::parse(&t.html, &t.url).select("iframe").ok().map(|v| v.len()))
+                        .unwrap_or(0);
+                    let video_count = inner
+                        .tabs
+                        .get(&pid)
+                        .and_then(|t| document::Document::parse(&t.html, &t.url).select("video").ok().map(|v| v.len()))
+                        .unwrap_or(0);
+                    let (title, final_url, status, content_type, source_bytes, redirect_chain) = inner
+                        .tabs
+                        .get(&pid)
+                        .map(|t| {
+                            (
+                                t.title.clone(),
+                                t.url.clone(),
+                                t.status,
+                                t.content_type.clone(),
+                                t.source_bytes,
+                                t.redirect_chain.clone(),
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            (String::new(), requested.clone(), 0, String::new(), 0, Vec::new())
+                        });
+                    tracing::info!(
+                        page_id = %pid,
+                        pump_ms,
+                        budget_cut = script_budget_cut,
+                        pending = script_pending,
+                        "open 精确同 URL 廉价复用(未重导航;强制重载用 reload=true)"
+                    );
+                    return Ok(OpenOutcome {
+                        page_id: pid,
+                        title,
+                        final_url,
+                        request_url: requested,
+                        mode: tab_mode.as_str().to_string(),
+                        mode_hint: mode_hint(mode),
+                        reused: true,
+                        status,
+                        content_type,
+                        source_bytes,
+                        redirect_chain,
+                        window_id,
+                        viewport_width: vw,
+                        viewport_height: vh,
+                        webgl_asked,
+                        iframe_count,
+                        video_count,
+                        script_budget_cut,
+                        script_pending,
+                        timings: json!({
+                            "reused": true,
+                            "pump_ms": pump_ms,
+                            "total_ms": started.elapsed().as_millis() as u64,
+                            "note": "廉价复用:未重新导航;强制重载 open params.reload=true",
+                        }),
+                    });
+                }
                 let pid = existing.clone();
                 let ua = inner
                     .tabs
@@ -710,6 +824,11 @@ impl LsmBrowserManager {
                             video_count,
                             script_budget_cut,
                             script_pending,
+                            timings: json!({
+                                "reused": true,
+                                "navigated": true,
+                                "total_ms": started.elapsed().as_millis() as u64,
+                            }),
                         });
                     }
                     Err(err) => {
@@ -762,6 +881,7 @@ impl LsmBrowserManager {
             ..Default::default()
         };
         let (resp, from_cache) = self.fetch_main(&mut inner, &requested, &ua, timeout_ms).await?;
+        let t_fetch = std::time::Instant::now();
         // 第 175 轮:非 HTML 主文档(图片/纯文本/JSON)合成展示页,避免黑屏。
         let raw_html = synthesize_non_html_document(&resp.content_type(), &resp.bytes, &resp.final_url)
             .unwrap_or_else(|| resp.text());
@@ -770,15 +890,21 @@ impl LsmBrowserManager {
         // 阶段四第二步：解析主文档 CSP 头，供脚本管线门禁。
         let csp_policy = parse_csp_header(&resp.headers);
         // 外链样式表先预取内联,脚本执行与布局都消费同一份样式。
+        // 显式整调用预算时请求级超时按剩余量夹紧(P1-4:预算覆盖全部后置阶段)。
+        let css_timeout = match hints.whole_call_remaining(started) {
+            Some(remaining) => timeout_ms.min(remaining.max(1_000)),
+            None => timeout_ms,
+        };
         let resources_out = resources::load_stylesheets(
             &mut inner,
             &self.http,
             &raw_html,
             &resp.final_url,
             &ua,
-            timeout_ms,
+            css_timeout,
         )
         .await;
+        let t_styles = std::time::Instant::now();
         // 脚本前预布局(空图片尺寸):JS 桥的 clientWidth 等几何属性需要真实矩形,
         // 容器 CSS 定宽场景(BMap 初始化读 #MapHolder 尺寸)不依赖图片固有尺寸。
         let pre_rects = {
@@ -805,14 +931,14 @@ impl LsmBrowserManager {
             hints.pipeline_seed(started),
         )
         .await;
+        let t_pipeline = std::time::Instant::now();
         let html = pipeline.html;
-        // LAEW_DUMP_HTML=<路径>:把管线后的整页 HTML 落盘(诊断「JS 建好的 UI 没回写 /
-        // 布局空白」类问题的离线分析入口,与 tests 里的布局探针配套),默认关闭。
-        if let Ok(p) = std::env::var("LAEW_DUMP_HTML") {
-            let _ = std::fs::write(&p, &html);
-            eprintln!("[dump] wrote {} bytes to {}", html.len(), p);
-        }
+        dump_html_if_env(&html);
         // 阶段三第三步:预取图片(替换元素固有尺寸参与布局)。
+        // P1-4(2026-11-01 天猫二轮):显式整调用预算必须覆盖图片阶段 ——
+        // 真机实测 timeout_ms=60000 返回 83.9s,超预算 40% 全部超在这里
+        // (图片吃独立 20s 预算)。剩余预算归零时直接跳过(skipped 如实记账)。
+        let images_budget_cap = hints.whole_call_remaining(started);
         let images_out = images::load_images(
             &mut inner,
             &self.http,
@@ -822,8 +948,10 @@ impl LsmBrowserManager {
             timeout_ms,
             &images::ImageStore::new(),
             viewport.width as f64,
+            images_budget_cap,
         )
         .await;
+        let t_images = std::time::Instant::now();
         let mut doc = document::Document::parse(&html, &resp.final_url);
         doc.apply_widget_state(&pipeline.form_values, &HashMap::new(), &HashMap::new());
         let title = pipeline.title.clone().unwrap_or_else(|| doc.title());
@@ -835,6 +963,7 @@ impl LsmBrowserManager {
             &media,
             &images_out.sizes,
         );
+        let t_layout = std::time::Instant::now();
         let page_id = format!("p_{:08x}", inner.seq + 1);
         inner.seq += 1;
         let window_id = if new_window || inner.windows.is_empty() {
@@ -867,6 +996,9 @@ impl LsmBrowserManager {
                 t.foreground = false;
             }
         }
+        // 管线观测快照(在 TabState 构造 move `pipeline.executed/js` 前取值)。
+        let pipeline_rounds = pipeline.rounds;
+        let scripts_executed = pipeline.executed.len();
         let tab = TabState {
             id: page_id.clone(),
             window_id: window_id.clone(),
@@ -956,6 +1088,25 @@ impl LsmBrowserManager {
                 self.ensure_view(tab);
             }
         }
+        let timings = json!({
+            "fetch_ms": t_fetch.duration_since(started).as_millis() as u64,
+            "styles_ms": t_styles.duration_since(t_fetch).as_millis() as u64,
+            "pipeline_ms": t_pipeline.duration_since(t_styles).as_millis() as u64,
+            "images_ms": t_images.duration_since(t_pipeline).as_millis() as u64,
+            "layout_ms": t_layout.duration_since(t_images).as_millis() as u64,
+            "total_ms": t_layout.duration_since(started).as_millis() as u64,
+            "pipeline_rounds": pipeline_rounds,
+            "scripts_executed": scripts_executed,
+        });
+        tracing::info!(
+            url = %resp.final_url,
+            budget_cut = pipeline.budget_cut,
+            pending = pipeline.pending_scripts,
+            rounds = pipeline_rounds,
+            executed = scripts_executed,
+            total_ms = t_layout.duration_since(started).as_millis() as u64,
+            "open 完成(阶段耗时见响应 timings)"
+        );
         Ok(OpenOutcome {
             page_id,
             title,
@@ -976,6 +1127,7 @@ impl LsmBrowserManager {
             video_count: doc.select("video").map(|v| v.len()).unwrap_or(0),
             script_budget_cut: pipeline.budget_cut,
             script_pending: pipeline.pending_scripts,
+            timings,
         })
     }
 
@@ -1132,7 +1284,10 @@ impl LsmBrowserManager {
         )
         .await;
         let html = pipeline.html;
+        dump_html_if_env(&html);
         // 阶段三第三步:预取图片(替换元素固有尺寸参与布局)。
+        // P1-4:整调用预算同样夹紧图片阶段(与新页路径同语义)。
+        let images_budget_cap = hints.whole_call_remaining(started);
         let images_out = images::load_images(
             inner,
             &self.http,
@@ -1142,6 +1297,7 @@ impl LsmBrowserManager {
             timeout_ms,
             &images::ImageStore::new(),
             viewport_w as f64,
+            images_budget_cap,
         )
         .await;
         let mut doc = document::Document::parse(&html, &resp.final_url);
@@ -1846,6 +2002,18 @@ fn env_limit(key: &str, default: usize, min: usize) -> usize {
         .and_then(|v| v.trim().parse::<usize>().ok())
         .map(|v| v.max(min))
         .unwrap_or(default)
+}
+
+/// LAEW_DUMP_HTML=<路径>:把管线后的整页 HTML 落盘(诊断「JS 建好的 UI 没回写 /
+/// 布局空白」类问题的离线分析入口,与 tests 里的布局探针配套),默认关闭。
+/// 2026-11-01 天猫二轮:抽成共用助手 —— 此前只在新页 `load_locked` 落盘,
+/// navigate 复用路径的第二次全量导航**不落盘**,真机排障时 dump 停在首开
+/// 状态,离线分析断粮。
+fn dump_html_if_env(html: &str) {
+    if let Ok(p) = std::env::var("LAEW_DUMP_HTML") {
+        let _ = std::fs::write(&p, html);
+        eprintln!("[dump] wrote {} bytes to {}", html.len(), p);
+    }
 }
 
 fn mode_hint(requested: BrowserMode) -> Option<String> {

@@ -154,9 +154,11 @@ impl JsHandle {
         // 页面脚本线程需要较大的栈:Boa 0.22 解析/求值 20 万字符级压缩脚本
         // (百度地图 initmap/反爬脚本)时递归深度显著高于默认 2MB,实测会
         // stack overflow 直接 abort 整个进程(不可 catch)。
+        // 2026-11-01 天猫二轮:栈加大到 64MB —— 递归上限提到 2048 后,
+        // 深递归(mtop/React)在 32MB 栈上贴边;64MB 虚拟预留按需提交,零常驻成本。
         let builder = std::thread::Builder::new()
             .name("lsm-page-js".to_string())
-            .stack_size(32 * 1024 * 1024);
+            .stack_size(64 * 1024 * 1024);
         let _ = builder.spawn(move || runtime::thread_main(rx));
         Self { tx }
     }
@@ -307,6 +309,16 @@ pub struct PipelineOut {
     pub budget_cut: bool,
     /// 截断时仍未取回执行的脚本数(正常收敛 = 0)。
     pub pending_scripts: usize,
+    /// 管线实际执行的轮次(2026-11-01 天猫二轮:真机排障要能回答「管线跑到
+    /// 哪」,随 open 响应 timings 上报,Agent 据此自校准重开预算)。
+    pub rounds: u32,
+}
+
+impl PipelineOut {
+    /// 已执行脚本累计数(指纹集合大小)。
+    pub fn executed_len(&self) -> usize {
+        self.executed.len()
+    }
 }
 
 /// 管线续跑种子。交互(eval_js / click 等)后页面可能注入新的 `<script>`
@@ -425,16 +437,20 @@ pub(crate) async fn run_pipeline(
     let grace = if seed.grace_ms > 0 { seed.grace_ms } else { grace_ms() };
     let max_rounds = if seed.max_rounds == 0 { MAX_ROUNDS } else { seed.max_rounds };
     let budget = if seed.budget_ms == 0 { pipeline_budget_ms() } else { seed.budget_ms };
-    let mut deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget);
+    let started_at = std::time::Instant::now();
+    let mut deadline = started_at + std::time::Duration::from_millis(budget);
     // 预算顺延次数:到点时若仍有**待取回脚本**(不是空转的定时器),说明
     // 页面 UI chunk 还没装完,直接截断会让首页楼层整片缺失。每次顺延 60s,
     // 最多两次(总上限 budget + 120s),只给「有脚本待办」的情况。
     let mut budget_extensions: u32 = 0;
+    // 实际执行轮次记账(进 `out.rounds` → open 响应 timings;真机排障用)。
+    let mut rounds_done: u32 = 0;
     let title_now = {
         let doc = super::document::Document::parse(raw_html, base_url);
         doc.title()
     };
     for round in 0..max_rounds {
+        rounds_done = round as u32 + 1;
         if std::time::Instant::now() >= deadline {
             // 量化「还差多少」:截断/顺延前统计仍未执行的脚本数。
             let pending = {
@@ -723,6 +739,19 @@ pub(crate) async fn run_pipeline(
         let doc = super::document::Document::parse(&out.html, base_url);
         append_reply(&mut out, inner, base_url, &reply, &doc);
         out.html = doc.serialize_full();
+        // 2026-11-01 天猫二轮:管线轮次 tracing —— 此前 script/mod.rs 零日志,
+        // `--debug` 真机排障完全无法回答「管线跑到哪/每轮收了几个脚本」,
+        // 只能靠响应字段与 console 台账倒推。
+        tracing::info!(
+            round = rounds_done,
+            sent_scripts = had_scripts as u8,
+            actions = reply.outcome.actions.len(),
+            executed_total = executed.len(),
+            html_len = out.html.len(),
+            pending_timers = reply.outcome.pending_timers,
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            "脚本管线轮次完成"
+        );
         // 静默轮次记账:既无新脚本又无新动作 = 页面已无待办(定时器排空了)。
         if reply.outcome.actions.is_empty() && !had_scripts {
             idle_rounds += 1;
@@ -752,6 +781,14 @@ pub(crate) async fn run_pipeline(
     }
     out.js = handle;
     out.executed = executed;
+    out.rounds = rounds_done;
+    tracing::info!(
+        rounds = rounds_done,
+        executed = out.executed.len(),
+        budget_cut = out.budget_cut,
+        pending = out.pending_scripts,
+        "脚本管线结束"
+    );
     out
 }
 

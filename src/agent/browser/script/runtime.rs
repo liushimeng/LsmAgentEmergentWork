@@ -21,7 +21,22 @@ use super::{
 use crate::agent::browser::document::SnapshotNode;
 
 const MAX_LOOP_ITERATIONS: u64 = 20_000_000;
-const MAX_RECURSION: usize = 256;
+/// 函数递归上限。2026-11-01 天猫二轮:611c10f(arXiv 轮)为防失控递归压到
+/// 256 —— 真机证明它**杀死重数据链**:mtop.js 的 Request 递归链
+/// (`tT→_i→_a→r→Request`)与 react-dom 调和递归都超 256,
+/// `RuntimeLimitError` 一炸 mtop 数据 API 整层死掉,楼层/搜索框两轮建不出。
+/// 真实浏览器无此低限(V8 实测可承载数千帧);JS 线程栈已加大(64MB),
+/// 默认 2048 兼顾深度与栈安全,env `LAEW_JS_RECURSION_LIMIT` 可调(下限 512)。
+const MAX_RECURSION: usize = 2048;
+
+/// 读取递归上限(env 覆盖,下限 512 防误配回 256 类问题)。
+fn recursion_limit_from_env() -> usize {
+    std::env::var("LAEW_JS_RECURSION_LIMIT")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v >= 512)
+        .unwrap_or(MAX_RECURSION)
+}
 const MAX_JOB_ENQUEUE: u64 = 20_000;
 // 单次请求只快进一小批定时器。真实浏览器不会在一次任务里连续跑数百帧；
 // 永久动画链若占满整个墙钟预算，后续点击/求值都会被拖慢。
@@ -64,6 +79,9 @@ impl JobExecutor for BudgetedJobQueue {
 }
 
 /// 每请求线程态(供 native fetch 读取)。
+/// `Clone` 供批内让道快照/恢复(2026-11-01 天猫二轮:RunScripts 批次执行中
+/// 让道短请求时,必须原样带回批次的网络台账与 deadline,不让让道污染批次状态)。
+#[derive(Clone)]
 struct ReqEnv {
     base_url: String,
     cookies: String,
@@ -107,44 +125,61 @@ pub(super) fn thread_main(rx: std::sync::mpsc::Receiver<JsRequest>) {
         if matches!(req, JsRequest::Shutdown) {
             break;
         }
-        let reply_tx = take_reply(&mut req);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.handle(req)));
-        match result {
-            Ok(reply) => {
-                if let (Some(tx), Some(out)) = (reply_tx, reply) {
-                    // 先把邮箱里「宿主已放弃但线程后来跑完」的旧轮合并进本回复,
-                    // 再发回宿主;发送仍失败(宿主又超时了)则回到邮箱等下下一轮。
-                    let merged = merge_pending_into(out, std::mem::take(&mut rt.pending_replies));
-                    if tx.send(merged.clone()).is_err() {
-                        if rt.pending_replies.len() > 8 {
-                            rt.pending_replies.remove(0);
-                        }
-                        rt.pending_replies.push(merged);
+        process_request(&mut rt, req, &rx);
+        // 批内让道期间被暂扣的长请求(RunScripts/Dispatch)在此补处理,
+        // 处理过程中自身同样具备让道能力。
+        while let Some(deferred_req) = rt.deferred.pop_front() {
+            if matches!(deferred_req, JsRequest::Shutdown) {
+                return;
+            }
+            process_request(&mut rt, deferred_req, &rx);
+        }
+    }
+}
+
+/// 处理单个请求:执行 + 回复发送 + panic 恢复(健康检查决定是否重建 Context)。
+fn process_request(
+    rt: &mut ThreadRuntime,
+    mut req: JsRequest,
+    rx: &std::sync::mpsc::Receiver<JsRequest>,
+) {
+    let reply_tx = take_reply(&mut req);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.handle(req, rx)));
+    match result {
+        Ok(reply) => {
+            if let (Some(tx), Some(out)) = (reply_tx, reply) {
+                // 先把邮箱里「宿主已放弃但线程后来跑完」的旧轮合并进本回复,
+                // 再发回宿主;发送仍失败(宿主又超时了)则回到邮箱等下下一轮。
+                let merged = merge_pending_into(out, std::mem::take(&mut rt.pending_replies));
+                if tx.send(merged.clone()).is_err() {
+                    if rt.pending_replies.len() > 8 {
+                        rt.pending_replies.remove(0);
                     }
+                    rt.pending_replies.push(merged);
                 }
             }
-            Err(_) => {
-                // Boa 0.20 的 VM panic(实测 `new Function` 函数体含 class 声明时
-                // 必抛 `must be declarative environment`)。**不能直接重建 Context**:
-                // 页面已经跑了几百个脚本,全局状态(map 实例/模块注册表/事件总线)全在
-                // Context 里,重建等于整页失忆、后续脚本全部静默失效。先做一次
-                // 最小求值健康检查 —— 还能跑就保留旧 Context,真坏了才重建。
-                tracing::warn!("JS 线程 panic(Boa VM),做健康检查后决定是否重建");
-                if let Some(tx) = reply_tx {
-                    let _ = tx.send(JsReply::error(
-                        "JS 执行器内部 panic(Boa VM bug),该次调用失败",
-                    ));
-                }
-                let healthy = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    rt.eval_src("1")
-                }))
-                .is_ok();
-                if !healthy {
-                    tracing::warn!("JS Context 健康检查失败,重建");
-                    match ThreadRuntime::new() {
-                        Ok(new_rt) => rt = new_rt,
-                        Err(_) => break,
-                    }
+        }
+        Err(_) => {
+            // Boa 0.20 的 VM panic(实测 `new Function` 函数体含 class 声明时
+            // 必抛 `must be declarative environment`)。**不能直接重建 Context**:
+            // 页面已经跑了几百个脚本,全局状态(map 实例/模块注册表/事件总线)全在
+            // Context 里,重建等于整页失忆、后续脚本全部静默失效。先做一次
+            // 最小求值健康检查 —— 还能跑就保留旧 Context,真坏了才重建。
+            tracing::warn!("JS 线程 panic(Boa VM),做健康检查后决定是否重建");
+            if let Some(tx) = reply_tx {
+                let _ = tx.send(JsReply::error(
+                    "JS 执行器内部 panic(Boa VM bug),该次调用失败",
+                ));
+            }
+            let healthy = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                rt.eval_src("1")
+            }))
+            .is_ok();
+            if !healthy {
+                tracing::warn!("JS Context 健康检查失败,重建");
+                match ThreadRuntime::new() {
+                    Ok(new_rt) => *rt = new_rt,
+                    Err(_) => return,
                 }
             }
         }
@@ -182,6 +217,10 @@ struct ThreadRuntime {
     /// 宿主判超时 → 整条装载链中断(京东首页停在骨架屏的根因之一)。
     /// 排水轮(无脚本)保持 0,让定时器照常排空。
     event_wall_ms: u64,
+    /// **批内让道暂扣队列**(2026-11-01 天猫二轮):RunScripts 批次执行中让道
+    /// 短请求时,若邮箱里取到的是其它长请求(RunScripts/Dispatch)或 Shutdown,
+    /// 不抢占当前批次,先压在这里,批次结束后由 `thread_main` 补处理。
+    deferred: std::collections::VecDeque<JsRequest>,
 }
 
 /// 把邮箱里的旧回复合并进当前回复:旧动作/日志/网络**先于**当前请求发生,
@@ -215,7 +254,7 @@ impl ThreadRuntime {
             .map_err(|e| format!("Boa Context 构建失败:{e}"))?;
         ctx.runtime_limits_mut()
             .set_loop_iteration_limit(MAX_LOOP_ITERATIONS);
-        ctx.runtime_limits_mut().set_recursion_limit(MAX_RECURSION);
+        ctx.runtime_limits_mut().set_recursion_limit(recursion_limit_from_env());
         ctx.register_global_callable(
             js_string!("__lsmFetchNative"),
             2,
@@ -294,10 +333,15 @@ impl ThreadRuntime {
             pending_replies: Vec::new(),
             timer_budget: MAX_TIMER_CALLBACKS,
             event_wall_ms: 0,
+            deferred: std::collections::VecDeque::new(),
         })
     }
 
-    fn handle(&mut self, req: JsRequest) -> Option<JsReply> {
+    fn handle(
+        &mut self,
+        req: JsRequest,
+        rx: &std::sync::mpsc::Receiver<JsRequest>,
+    ) -> Option<JsReply> {
         match req {
             JsRequest::RunScripts {
                 scripts,
@@ -305,7 +349,7 @@ impl ThreadRuntime {
                 nodes,
                 budget_ms,
                 ..
-            } => Some(self.run_scripts(&scripts, &env, &nodes, budget_ms)),
+            } => Some(self.run_scripts(&scripts, &env, &nodes, budget_ms, rx)),
             JsRequest::Eval {
                 script, env, nodes, ..
             } => Some(self.eval_user(&script, &env, &nodes)),
@@ -320,6 +364,70 @@ impl ThreadRuntime {
                 ..
             } => Some(self.dispatch(&selector, &event, &env, &nodes)),
             JsRequest::Shutdown => None,
+        }
+    }
+
+    /// **批内让道**(2026-11-01 天猫二轮,天猫真机:管线硬预算截断后残留批次
+    /// 在线程里继续跑数分钟,后续 Eval 全部排在邮箱后面挨饿 —— eval_js 连续
+    /// 2002「线程忙碌」、`wait ms=2500` 实付 117.9s)。真实浏览器里 devtools
+    /// 求值是插在页面任务**之间**的任务,永不饿死;这里对齐该语义:在
+    /// RunScripts 的**脚本边界**掏一次邮箱,短请求(Eval/Diag)当场完整服务,
+    /// 长请求/Shutdown 暂扣到 `deferred` 等批次结束。单脚本内部不可抢占
+    /// (Boa eval 无法安全中断),但脚本边界粒度已把 eval 的最坏等待从
+    /// 「整批数分钟」压到「单个脚本时长」。
+    ///
+    /// 现场保护三件套(让道不污染批次状态):
+    /// 1. `REQ_ENV` 整体快照/恢复 —— Eval 的 `begin_request` 会清网络台账、
+    ///    重设 deadline;批次已累计的网络记录必须原样带回,deadline 顺延
+    ///    让道耗时(不让让道吃掉批次预算);
+    /// 2. PRELUDE 的 `__lsmStashPending/__lsmRestorePending` —— `__lsmBegin`
+    ///    会清空批次未收集的 actions/console 台账,先暂存后回填;
+    /// 3. `timer_budget/event_wall_ms` 由批次收尾统一重设,无需恢复。
+    fn service_yieldable(&mut self, rx: &std::sync::mpsc::Receiver<JsRequest>) {
+        loop {
+            let Ok(mut req) = rx.try_recv() else {
+                return;
+            };
+            match req {
+                JsRequest::Eval { .. } | JsRequest::Diag { .. } => {
+                    let reply_tx = take_reply(&mut req);
+                    let saved_env = REQ_ENV.with(|c| c.borrow().clone());
+                    let stashed = self
+                        .eval_string("__lsmStashPending()")
+                        .unwrap_or_else(|_| "{}".to_string());
+                    let yield_started = Instant::now();
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        self.handle(req, rx)
+                    }));
+                    // 让道耗时从批次预算里豁免:deadline 按让道时长顺延。
+                    let yielded = yield_started.elapsed();
+                    let restore_src = format!(
+                        "__lsmRestorePending({})",
+                        serde_json::to_string(&stashed).unwrap_or_else(|_| "\"{}\"".into())
+                    );
+                    self.eval_quiet(&restore_src);
+                    REQ_ENV.with(|c| {
+                        let mut env = c.borrow_mut();
+                        *env = saved_env;
+                        env.deadline += yielded;
+                    });
+                    if let (Some(tx), Ok(Some(out))) = (reply_tx, result) {
+                        let merged =
+                            merge_pending_into(out, std::mem::take(&mut self.pending_replies));
+                        if tx.send(merged.clone()).is_err() {
+                            if self.pending_replies.len() > 8 {
+                                self.pending_replies.remove(0);
+                            }
+                            self.pending_replies.push(merged);
+                        }
+                    }
+                }
+                // 长请求不抢占当前批次;Shutdown 也按序等批次结束(与改造前一致)。
+                other => {
+                    self.deferred.push_back(other);
+                    return;
+                }
+            }
         }
     }
 
@@ -390,7 +498,10 @@ impl ThreadRuntime {
     }
 
     /// 微任务 + 虚拟时钟定时器,直至无待处理/超上限/超预算。
-    fn event_loop(&mut self) {
+    /// 单请求内的事件循环排空。`yield_rx = Some` 时(仅 RunScripts 加载/排水
+    /// 路径)在定时器批次间让道短请求;eval/dispatch 自身是交互短请求,传
+    /// `None` 防嵌套让道递归。
+    fn event_loop(&mut self, yield_rx: Option<&std::sync::mpsc::Receiver<JsRequest>>) {
         let deadline = REQ_ENV.with(|c| c.borrow().deadline);
         // 墙钟上限:加载轮给定时器回调设总闸,避免单轮吃掉整条管线预算。
         let wall = (self.event_wall_ms > 0)
@@ -405,6 +516,9 @@ impl ThreadRuntime {
             eprintln!("[looptrace] === event_loop 开始 ===");
         }
         loop {
+            if let Some(rx) = yield_rx {
+                self.service_yieldable(rx);
+            }
             self.drain_jobs();
             // MessageChannel 消息队列:postMessage 入队,事件循环每轮排空
             // (真实浏览器是独立任务队列;内核无任务队列,借事件循环近似)。
@@ -474,13 +588,23 @@ impl ThreadRuntime {
         self.last_pending_timers = last_pending;
     }
 
-    fn run_scripts(&mut self, scripts: &[ScriptSource], env: &PageEnv, nodes: &[SnapshotNode], budget_ms: u64) -> JsReply {
+    fn run_scripts(
+        &mut self,
+        scripts: &[ScriptSource],
+        env: &PageEnv,
+        nodes: &[SnapshotNode],
+        budget_ms: u64,
+        rx: &std::sync::mpsc::Receiver<JsRequest>,
+    ) -> JsReply {
         let has_scripts = !scripts.is_empty();
         self.begin_request(env, budget_ms);
         if let Err(e) = self.refresh(nodes, env) {
             return JsReply::error(e);
         }
         for s in scripts {
+            // 脚本边界让道:短请求(Eval/Diag)当场服务,批次继续(见
+            // `service_yieldable` 文档;天猫真机:残留批次把 eval 饿死 2002)。
+            self.service_yieldable(rx);
             // 经 `__lsmRunScript` 间接求值(全局作用域,与浏览器 <script> 一致):
             // 失败时 JS 侧捕获 e.stack 回传,压缩大脚本也能定位到行列;
             // 此前直接 ctx.eval 只拿到 "TypeError: xxx" 一句,无从定位。
@@ -590,7 +714,9 @@ impl ThreadRuntime {
         self.event_wall_ms = if has_scripts { 10_000 } else { 0 };
         self.eval_quiet(&format!("__lsmTimerBudget={timer_cap}"));
         let event_started = std::time::Instant::now();
-        self.event_loop();
+        // 排水事件循环同样让道:重站常驻轮询定时器(天猫 baxia/jstracker)
+        // 让 event_loop 长时间不停,脚本边界之外的整段排水也会饿死 eval。
+        self.event_loop(Some(rx));
         if js_timing_enabled() {
             eprintln!(
                 "[jstime] event_loop {}ms pending_timers={}",
@@ -619,7 +745,7 @@ impl ThreadRuntime {
         self.timer_budget = MAX_TIMER_CALLBACKS;
         self.event_wall_ms = 0;
         self.eval_quiet("__lsmTimerBudget=64");
-        self.event_loop();
+        self.event_loop(None);
         let ov = json!({
             "ok": parsed.get("ok").and_then(Value::as_bool).unwrap_or(false),
             "value": parsed.get("value").cloned().unwrap_or(Value::Null),
@@ -643,7 +769,7 @@ impl ThreadRuntime {
         self.timer_budget = MAX_TIMER_CALLBACKS;
         self.event_wall_ms = 0;
         self.eval_quiet("__lsmTimerBudget=64");
-        self.event_loop();
+        self.event_loop(None);
         self.collect(None)
     }
 
@@ -1252,6 +1378,8 @@ mod diag_probe {
             &env,
             &[],
             0,
+            // 测试环境无宿主邮箱:空 channel,让道 try_recv 恒空(零让道)。
+            &std::sync::mpsc::channel::<JsRequest>().1,
         );
         eprintln!("生产路径 outcome.error = {:?}", reply.outcome.error);
         let guarded = super::super::for_in_guard::guard_for_in(&src);

@@ -251,6 +251,7 @@ control_action=set_control_state,params.state=\"user\"(交人工)或 \"agent\"(�
                 "auto_relaunch": { "type": "boolean", "default": false },
                 "user_agent": { "type": "string" },
                 "wait_until": { "type": "string", "enum": ["load", "domcontentloaded", "networkidle"], "description": "就绪判定:domcontentloaded=首轮同步脚本后即返回(后续脚本经 inspect/wait/交互继续推进,pending 状态如实上报);load/networkidle/缺省=整条脚本管线收敛后返回" },
+                "reload": { "type": "boolean", "default": false, "description": "强制重载:精确同 URL 的 open 默认**廉价复用**(小额补泵+返回现态,不重新导航,后台自建进度不丢);需要全新加载时传 true 走全量导航(重站全管线可达分钟级)" },
                 "block_resources": { "type": "array", "items": { "type": "string" } },
                 "page_id": { "type": "string", "description": "close/control/inspect 必填;close 可为 all/background/others" },
                 "keep": { "type": "string", "description": "close(page_id=others) 时保留的 page_id" },
@@ -468,6 +469,9 @@ pub(super) async fn run_open(mut args: Value) -> Result<String> {
         // 仅显式传入 timeout_ms 时升级为整调用预算;缺省维持旧行为,
         // 避免 60s 默认值误伤重站点首屏管线。
         whole_call_budget_ms: timeout_explicit.map(|_| timeout),
+        // 2026-11-01 天猫二轮:精确同 URL 复用改「廉价复用」(不重导航,
+        // 小额补泵返回现态);调用方要全新页面时显式 reload=true。
+        force_reload: bool_arg(&args, "reload", false) || bool_arg(&args, "force", false),
     };
     let ua = str_arg(&args, "user_agent");
     let mgr = McpWebLsmBrowserUseTool::mgr();
@@ -524,6 +528,9 @@ pub(super) async fn run_open(mut args: Value) -> Result<String> {
         "wait_until": wait_until,
         "script_budget_cut": out.script_budget_cut,
         "script_pending": out.script_pending,
+        // 2026-11-01 天猫二轮:阶段耗时账单随响应上报 —— Agent 据此自校准
+        // 「要不要带更大 timeout_ms 重开」;复用路径带 pump_ms/note。
+        "timings": out.timings,
         "highlight": bool_arg(&args, "highlight", true),
         "guard": {
             "mode": guard_mode,

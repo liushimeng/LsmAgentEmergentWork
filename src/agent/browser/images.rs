@@ -297,6 +297,11 @@ pub fn extract_css_urls(css: &str) -> Vec<String> {
 }
 
 /// 预取并解码页面图片。`existing` 中已有的图片跳过(增量加载)。
+///
+/// `budget_cap_ms`(2026-11-01 天猫二轮 P1-4):显式整调用预算的剩余量;
+/// 图片预算取「env 预算 ∩ 剩余量」,剩余为 0 时**整体跳过**(skipped 如实
+/// 记账)—— 真机实测 `open(timeout_ms=60000)` 返回 83.9s,超预算的 24s
+/// 全部超在本阶段(图片吃独立 20s 预算,不受调用方 timeout 约束)。
 pub async fn load_images(
     inner: &mut Inner,
     http: &net::HttpClient,
@@ -306,6 +311,7 @@ pub async fn load_images(
     timeout_ms: u64,
     existing: &ImageStore,
     viewport_width: f64,
+    budget_cap_ms: Option<u64>,
 ) -> ImageLoadOutcome {
     let mut out = ImageLoadOutcome {
         store: existing.clone(),
@@ -317,7 +323,17 @@ pub async fn load_images(
     }
     let max_images = env_usize("LAEW_WEB_MAX_IMAGES", MAX_IMAGES_DEFAULT, 1);
     let max_bytes = env_usize("LAEW_WEB_MAX_IMAGE_BYTES", MAX_IMAGE_BYTES_DEFAULT, 1024);
-    let budget_ms = env_u64("LAEW_WEB_IMAGE_BUDGET_MS", IMAGE_BUDGET_MS_DEFAULT, 1_000);
+    let env_budget = env_u64("LAEW_WEB_IMAGE_BUDGET_MS", IMAGE_BUDGET_MS_DEFAULT, 1_000);
+    let budget_ms = match budget_cap_ms {
+        // 未显式传整调用预算:沿用 env 预算(旧行为)。
+        None => env_budget,
+        // 剩余预算已归零:整阶段跳过,skipped 如实记账。
+        Some(0) => {
+            out.skipped.push("整调用预算耗尽,跳过图片阶段".to_string());
+            return out;
+        }
+        Some(cap) => env_budget.min(cap).max(1),
+    };
     let canvases = collect_canvas_images(html, base_url);
     let active_canvas_keys: std::collections::HashSet<String> =
         canvases.iter().map(|(key, _)| key.clone()).collect();

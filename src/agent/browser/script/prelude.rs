@@ -4453,6 +4453,22 @@ function __lsmBegin() {
   __lsmFatal = null;
   __lsmDispatchResult = { handled: false, defaultPrevented: false };
 }
+// 批内让道暂存/回填(2026-11-01 天猫二轮):RunScripts 批次执行中让道 Eval 时,
+// Eval 的 __lsmBegin 会清空批次尚未收集的 actions/console 台账;先暂存、
+// 让道结束后回填到新台账头部,批次自身的 collect 才能如数带回宿主。
+function __lsmStashPending() {
+  var out = { actions: __lsmActions, console: __lsmConsole, fatal: __lsmFatal };
+  __lsmBegin();
+  return JSON.stringify(out);
+}
+function __lsmRestorePending(stash) {
+  try {
+    var s = (typeof stash === "string") ? JSON.parse(stash) : stash;
+    if (s && s.actions && s.actions.length) __lsmActions = s.actions.concat(__lsmActions);
+    if (s && s.console && s.console.length) __lsmConsole = s.console.concat(__lsmConsole);
+    if (s && s.fatal) __lsmFatal = s.fatal;
+  } catch (e) { /* 回填失败不致命:让道轮已带走的记录仍在宿主台账 */ }
+}
 function __lsmFlushWrites() {
   for (var i = 0; i < __lsmWriteBuf.length; i++) {
     __push({ type: "append_html", selector: "body", value: __lsmWriteBuf[i] });

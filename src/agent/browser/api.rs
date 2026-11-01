@@ -488,6 +488,8 @@ async fn apply_js_reply(
         15_000,
         &existing_images,
         viewport_width,
+        // 交互后的增量图片补载:不设整调用预算上界(沿用 env 预算)。
+        None,
     )
     .await;
     if let Some(tab) = inner.tabs.get_mut(pid) {
@@ -721,6 +723,19 @@ async fn js_eval_thread(
     pid: &str,
     script_text: &str,
 ) -> ThreadEval {
+    js_eval_thread_with_budget(mgr, pid, script_text, script::budget_ms(), script::eval_grace_ms())
+        .await
+}
+
+/// 带显式等待/宽限预算的 eval(见 `sync_page_with_budget` 文档:等待类动作的
+/// 泵预算以调用方上限为准;`wait_js` 等轻量判定同样受益)。
+async fn js_eval_thread_with_budget(
+    mgr: &LsmBrowserManager,
+    pid: &str,
+    script_text: &str,
+    wait_ms: u64,
+    grace_ms: u64,
+) -> ThreadEval {
     if !script::scripts_enabled() {
         return ThreadEval::NoThread;
     }
@@ -771,6 +786,7 @@ async fn js_eval_thread(
         // eval 也走宽限续等:重页面(猎聘/百度地图)事件循环排定时器单轮可到
         // 数十秒,常规 10s 预算内回不来就报「忙碌」,调用方还得再烧一轮迭代
         // 重试。宽限 30s(与管线宽限同机制),仍超时才判忙碌(2002)。
+        // 带显式预算的调用方(wait/sync 轻量路径)按传入值等待。
         handle.request_with_grace(
             |tx| script::JsRequest::Eval {
                 script: script_text,
@@ -778,8 +794,8 @@ async fn js_eval_thread(
                 nodes,
                 reply: tx,
             },
-            script::budget_ms(),
-            script::eval_grace_ms(),
+            wait_ms,
+            grace_ms,
         )
     })
     .await;
@@ -798,6 +814,23 @@ async fn js_eval_thread(
 /// 截图/等待前同步页面:复用持久 JS Context 推进微任务与定时器,应用 DOM/Canvas
 /// 动作并按需重排。无脚本页面零成本;绝不为了取一帧重建页面全局状态。
 pub(crate) async fn sync_page(mgr: &LsmBrowserManager, pid: &str) -> bool {
+    sync_page_with_budget(mgr, pid, script::budget_ms(), script::eval_grace_ms()).await
+}
+
+/// 带预算上限的页面同步(2026-11-01 天猫二轮:交互泵预算与调用方意图挂钩)。
+///
+/// 真机根因:管线截断后 JS 线程被残留批次占据数分钟,`wait ms=2500` 实付
+/// 117.9s —— 入口补泵吃满 30s 交互预算,循环内每次 `sync_page` 又吃满
+/// 30s+30s 全档等待。等待类动作的泵预算必须以**调用方声明的等待上限**为
+/// cap:忙页上快速返回(连同 eval 的 2002 一起按显式预算提前),页面推进
+/// 交给后台线程继续,而不是把调用方的 2.5s 拖成两分钟。截图等取证路径仍走
+/// `sync_page` 全档默认(要的是状态准确,可慢)。
+pub(crate) async fn sync_page_with_budget(
+    mgr: &LsmBrowserManager,
+    pid: &str,
+    wait_ms: u64,
+    grace_ms: u64,
+) -> bool {
     let has_js = {
         let inner = mgr.inner.lock().await;
         inner.tabs.get(pid).and_then(|tab| tab.js.as_ref()).is_some()
@@ -805,7 +838,7 @@ pub(crate) async fn sync_page(mgr: &LsmBrowserManager, pid: &str) -> bool {
     if !has_js {
         return false;
     }
-    match js_eval_thread(mgr, pid, "undefined").await {
+    match js_eval_thread_with_budget(mgr, pid, "undefined", wait_ms.max(200), grace_ms).await {
         ThreadEval::Reply(reply) => {
             apply_js_reply(mgr, pid, &reply).await;
             true
@@ -2371,8 +2404,11 @@ async fn act_wait(
     require_page(pid)?;
     // 就绪等待前先补泵截断脚本(2026-10-30 京东):wait 是 Agent 判定页面
     // 「好了没」的原语,管线弃跑的模块若不在这里补挂,后续判定全在半成品态。
-    // 等待语义用默认宽限(可慢,与 wait 本身一致)。
-    run_pending_scripts(mgr, pid, interaction_budget_ms(), 0).await;
+    // 2026-11-01 天猫二轮:补泵预算与调用方声明的等待总上限挂钩 ——
+    // `wait ms=2500` 不再先吃满 30s 交互预算(真机实测把 2.5s 等成 117.9s);
+    // 调用方显式给大 timeout_ms 时仍可拿到完整交互预算推进半成品页。
+    let total = timeout_ms(params, top, 30_000).min(120_000);
+    run_pending_scripts(mgr, pid, interaction_budget_ms().min(total.max(2_000)), 0).await;
     let selector = p_str(params, "selector").map(str::to_string);
     let state = p_str(params, "state")
         .unwrap_or("visible")
@@ -2390,7 +2426,6 @@ async fn act_wait(
             Some(Value::Bool(true)) => Some(800),
             _ => None,
         });
-    let total = timeout_ms(params, top, 30_000).min(120_000);
 
     // 无任何条件:等待期间仍推进页面事件循环;纯 sleep 会让动态弹层/验证组件
     // 在没有任何新 <script> 可装载时永远停在旧 DOM。
@@ -2402,7 +2437,11 @@ async fn act_wait(
             .min(30_000);
         let started = std::time::Instant::now();
         loop {
-            sync_page(mgr, pid).await;
+            // 循环内同步预算 ≤ 剩余等待时长且封顶 2s:忙页上每轮快速返回
+            // (预算耗尽即放弃本轮推进),调用方的 ms 就是真实上限。
+            let elapsed = started.elapsed().as_millis() as u64;
+            let sync_budget = ms.saturating_sub(elapsed).clamp(50, 2_000);
+            sync_page_with_budget(mgr, pid, sync_budget, sync_budget / 2).await;
             let elapsed = started.elapsed().as_millis() as u64;
             if elapsed >= ms {
                 break;
@@ -2415,7 +2454,10 @@ async fn act_wait(
     let started = std::time::Instant::now();
     let mut last = json!({});
     loop {
-        sync_page(mgr, pid).await;
+        // 条件轮同步预算:剩余等待与 2s 取小(理由同上;天猫真机 117.9s 根因)。
+        let elapsed = started.elapsed().as_millis() as u64;
+        let sync_budget = total.saturating_sub(elapsed).clamp(50, 2_000);
+        sync_page_with_budget(mgr, pid, sync_budget, sync_budget / 2).await;
         let mut cond = serde_json::Map::new();
         let mut ok = true;
         if let Some(sel) = &selector {

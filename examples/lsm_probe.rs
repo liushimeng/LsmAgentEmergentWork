@@ -38,6 +38,7 @@ async fn main() {
             false,
             false,
             60_000,
+            &browser::NavHints::default(),
         )
         .await
         .expect("open failed");
