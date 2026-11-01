@@ -1456,3 +1456,88 @@ fn parse_plan_markdown_supports_alphanumeric_id_wf1b() {
     assert_eq!(plan.workflows[2].id, "wf-2");
     assert_eq!(plan.workflows[2].depends_on, vec!["wf-1b".to_string()]);
 }
+
+    // ========== thinking 回退污染防御(2026-11-01 天猫真机) ==========
+
+    /// 真机事故复现:thinking 回退段里的提纲 bullet、草稿 `### WorkFlow 1:` 与
+    /// 被 max_tokens 截断的半截步骤曾被当成真结构,只解析出 1 个 wf-1,
+    /// 真正的 3 个 WorkFlow 全部漏解析。防御后必须解析出真方案的全部 WF。
+    #[test]
+    fn thinking回退污染文件仍解析出全部workflows() {
+        let md = r#"
+⚠ [模型内部思考回退 — 原始响应仅含 thinking 块,无可见文本]
+Now I have all facts. Let me write the plan.
+- 二、WorkFlow 拆解 (WorkFlow 1..N, each with 步骤 / 委派 Agent / 依赖 / 验收标准)
+### WorkFlow 1:草稿假单元(闸门)
+- 步骤:
+  - [ ] 档 A 人工介入:control(request_human, message 写明「扫码;若二维码过期
+# 任务方案:真方案
+
+## 一、目标
+目标内容
+
+## 二、WorkFlow 拆解
+### WorkFlow 1:前置复核与人工登录
+- 步骤:
+  - [ ] 复核页面现状
+- 依赖: 无
+- 验收标准: 登录完成
+
+### WorkFlow 2:入口固化
+- 步骤:
+  - [ ] 记录搜索框 selector
+- 依赖: wf-1
+- 验收标准: 入口清单落盘
+
+### WorkFlow 3:候选池采集
+- 步骤:
+  - [ ] 按品类搜索采集
+- 依赖: wf-2
+- 验收标准: 候选清单落盘
+
+## 三、关键决策
+决策
+"#;
+        let plan = parse_plan_markdown(md).expect("解析失败");
+        assert_eq!(
+            plan.workflows.len(),
+            3,
+            "污染段必须被剥离,只解析真方案的 3 个 WF: {:?}",
+            plan.workflows.iter().map(|w| &w.id).collect::<Vec<_>>()
+        );
+        assert_eq!(plan.workflows[0].name, "前置复核与人工登录");
+        assert_eq!(plan.workflows[2].depends_on, vec!["wf-2".to_string()]);
+        let all_steps: String = plan
+            .workflows
+            .iter()
+            .flat_map(|w| w.steps.iter())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !all_steps.contains("二维码过期"),
+            "草稿的截断步骤不得混进真解析: {all_steps}"
+        );
+    }
+
+    /// 提纲 bullet 里的「WorkFlow 拆解」字样不触发进段(必须是标题行)。
+    #[test]
+    fn 提纲bullet不触发workflow段() {
+        let md = r#"
+# 任务方案:提纲误匹配防御
+
+- 二、WorkFlow 拆解 (WorkFlow 1..N, each with 步骤)
+### WorkFlow 1:假单元
+- 步骤:
+  - [ ] 假步骤
+
+## 三、关键决策
+决策
+"#;
+        let err = parse_plan_markdown(md)
+            .expect_err("bullet 提纲不得触发进段,应报未解析出任何 WorkFlow");
+        assert!(
+            format!("{err}").contains("未解析出任何 WorkFlow"),
+            "意外错误: {err}"
+        );
+    }

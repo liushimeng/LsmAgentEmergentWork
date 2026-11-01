@@ -151,6 +151,30 @@
         assert_eq!(r.verdict, Verdict::Pass);
     }
 
+    /// 2026-11-01 天猫真机:模型把「无缺陷」残留成占位符元素(`"{}"`/空串),
+    /// 不得触发一致性消解把 pass 误杀成 Fail(当日 Plan 差点被整轮回流)。
+    #[test]
+    fn parse_quality_report_placeholder_issues_do_not_kill_pass() {
+        let text = r#"
+```json
+{
+  "verdict": "pass",
+  "source": "plan",
+  "issues": ["{}", ""],
+  "suggestion": "",
+  "retryable": false,
+  "evidence": "结构完整"
+}
+```"#;
+        let r = parse_quality_report(text, AgentRole::Plan).unwrap();
+        assert_eq!(
+            r.verdict,
+            Verdict::Pass,
+            "占位符 issues 应被净化,不得消解为 Fail"
+        );
+        assert!(r.issues.is_empty(), "占位符元素应被丢弃: {:?}", r.issues);
+    }
+
     // ========== P0 fail-closed 测试 ==========
     // 验证 JSON 解析失败时返回 Verdict::Fail + retryable=true
     // (替代历史的 fail-open 默认 Pass)

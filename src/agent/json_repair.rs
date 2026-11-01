@@ -257,6 +257,22 @@ fn coerce_to_string_vec(val: &mut serde_json::Value) {
         }
         serde_json::Value::Array(_) => None, // 保留原数组,仅逐元素字符串化
         serde_json::Value::Null => return,
+        serde_json::Value::Object(map) => {
+            // 空对象是模型写「无内容」的高频形态(如 issues:{}),必须归一为空数组。
+            // 旧逻辑落进 `ref other` 分支把 `{}` 字符串化成单元素 `["{}"]` ——
+            // 「无缺陷」被整型成「1 条阻断缺陷」,QC 一致性消解随之把 pass
+            // 误杀成 Fail(2026-11-01 天猫真机实测,plan 被空理由杀掉整轮回流)。
+            if map.is_empty() {
+                *val = serde_json::Value::Array(vec![]);
+                return;
+            }
+            // 非空对象取 values 字符串化,不再把整块 JSON 塞成单个元素。
+            Some(serde_json::Value::Array(
+                map.values()
+                    .map(|v| serde_json::Value::String(value_brief_string(v)))
+                    .collect(),
+            ))
+        }
         ref other => Some(serde_json::Value::Array(vec![serde_json::Value::String(
             value_brief_string(other),
         )])),
@@ -275,6 +291,15 @@ fn coerce_to_string_vec(val: &mut serde_json::Value) {
                 other => serde_json::Value::String(value_brief_string(&other)),
             };
         }
+        // 占位符净化(与 depends_on 净化同语义):模型把「空写法」残留成
+        // `"{}"`/`"[]"`/`"null"`/空串元素时按占位符直接丢弃,不让假条目
+        // 冒充 issues/steps 内容。
+        items.retain(|it| {
+            !matches!(
+                it.as_str().map(str::trim),
+                Some("") | Some("{}") | Some("[]") | Some("null")
+            )
+        });
     }
 }
 
@@ -1182,5 +1207,50 @@ mod tests {
         let ok = serde_json::from_str::<serde_json::Value>(&once)
             .or_else(|_| serde_json::from_str::<serde_json::Value>(&twice));
         assert!(ok.is_ok(), "两遍修复后应合法\nonce={once}\ntwice={twice}");
+    }
+
+    // ========== 空对象/占位符整型(2026-11-01 天猫真机) ==========
+
+    /// 天猫真机实测:模型把「无缺陷」写成 `issues:{}`,Tier-3 旧逻辑整型成
+    /// `["{}"]` —— QC 一致性消解把 pass 误杀成 Fail,plan 被空理由拒收。
+    #[test]
+    fn tier3_empty_object_coerced_to_empty_vec() {
+        #[derive(Debug, Deserialize)]
+        struct FakeQc {
+            verdict: String,
+            issues: Vec<String>,
+        }
+        let parsed: FakeQc = try_parse(r#"{"verdict":"pass","issues":{}}"#).unwrap();
+        assert_eq!(parsed.verdict, "pass");
+        assert!(
+            parsed.issues.is_empty(),
+            "空对象必须归一为空数组,不能产 [\"{{}}\"] 垃圾元素: {:?}",
+            parsed.issues
+        );
+    }
+
+    /// 非空对象取 values 字符串化,不把整块 JSON 塞成单个元素。
+    #[test]
+    fn tier3_object_values_used_as_vec_elements() {
+        let mut v = serde_json::json!({"issues": {"a": "缺依赖声明", "b": "步骤截断"}});
+        coerce_known_shapes(&mut v);
+        let issues = v["issues"].as_array().expect("应整型为数组");
+        let texts: Vec<&str> = issues.iter().filter_map(|x| x.as_str()).collect();
+        assert!(texts.contains(&"缺依赖声明"), "{texts:?}");
+        assert!(texts.contains(&"步骤截断"), "{texts:?}");
+    }
+
+    /// 占位符元素(空串/`{}`/`[]`/`null`)按「占位符直接丢弃」语义剔除。
+    /// 注意:Tier-3 只在直解失败后运行,故用混型数组触发纠偏路径;
+    /// 类型本就合法的 `["{}"…]` 由 QC 消解层的占位符防御兜底。
+    #[test]
+    fn tier3_placeholder_elements_are_dropped() {
+        #[derive(Debug, Deserialize)]
+        struct FakeQc {
+            issues: Vec<String>,
+        }
+        let parsed: FakeQc =
+            try_parse(r#"{"issues":[{}, "", "真缺陷:步骤截断", "[]", "null"]}"#).unwrap();
+        assert_eq!(parsed.issues, vec!["真缺陷:步骤截断"]);
     }
 }

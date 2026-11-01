@@ -5,6 +5,45 @@
 
 use super::*;
 
+/// 累计文本(真文本与 thinking 回退段分账)。
+///
+/// 2026-11-01 天猫真机实测:模型 thinking-only 响应(被 max_tokens 截断)触发
+/// 「模型内部思考回退」后,后续真文本与回退段被拼进同一缓冲并落盘进 plan 产物,
+/// thinking 草稿里的伪节标把 Plan 机械解析器带进沟里(只解析出 1 个 wf-1、
+/// 步骤截断,真正 9 个 WorkFlow 全部漏解析)。
+/// 分账后:**存在任何真文本即丢弃全部回退段**;全程只有回退段时才保留
+/// (保住 2026-10-16 闲鱼那轮「防空文件」语义)。
+#[derive(Default)]
+struct AccumulatedText {
+    real: String,
+    fallback: String,
+}
+
+impl AccumulatedText {
+    fn push_real(&mut self, s: &str) {
+        if !self.real.is_empty() {
+            self.real.push('\n');
+        }
+        self.real.push_str(s);
+    }
+
+    fn push_fallback(&mut self, s: &str) {
+        if !self.fallback.is_empty() {
+            self.fallback.push('\n');
+        }
+        self.fallback.push_str(s);
+    }
+
+    /// 收口取用的最终文本:真文本优先,回退段仅在全程无真文本时兜底。
+    fn resolved(&self) -> &str {
+        if self.real.trim().is_empty() {
+            self.fallback.as_str()
+        } else {
+            self.real.as_str()
+        }
+    }
+}
+
 impl Agent {
     /// 单轮任务:传入用户提示,返回最终文本、本次累计 token 用量与执行轨迹。
     pub async fn run_once(&self, user_input: &str) -> Result<(String, Usage, ExecutionTrace)> {
@@ -140,7 +179,7 @@ impl Agent {
         // 避免循环外只设一次与最后一轮策略分歧)。`LAEW_FORCED_TOOLS=off` 可全局关闭
         // (仅关 wire 注入,循环短路逻辑保留)。
         let mut total_usage = Usage::default();
-        let mut accumulated_text = String::new();
+        let mut accumulated_text = AccumulatedText::default();
         let mut truncation_resumes: usize = 0;
 
         // 关联报告: 20260908_203854 D-001
@@ -493,10 +532,7 @@ impl Agent {
             if !completion.has_tool_calls() {
                 // 累计文本(续接场景下可能多次进入此分支)
                 if !completion.text.trim().is_empty() {
-                    if !accumulated_text.is_empty() {
-                        accumulated_text.push('\n');
-                    }
-                    accumulated_text.push_str(&completion.text);
+                    accumulated_text.push_real(&completion.text);
                     session
                         .context_mut()
                         .push(ChatMessage::assistant(vec![ContentBlock::text(
@@ -514,10 +550,7 @@ impl Agent {
                         thinking_chars = completion.thinking.chars().count(),
                         "end_turn 空文本但 thinking 非空,已回退为文本输出"
                     );
-                    if !accumulated_text.is_empty() {
-                        accumulated_text.push('\n');
-                    }
-                    accumulated_text.push_str(&fallback);
+                    accumulated_text.push_fallback(&fallback);
                     session.context_mut().push(ChatMessage::assistant(vec![
                         ContentBlock::text(fallback),
                     ]));
@@ -544,7 +577,7 @@ impl Agent {
                         return Self::finalize_logged(
                             &self.profile.name,
                             trace,
-                            &accumulated_text,
+                            accumulated_text.resolved(),
                             total_usage,
                             max_tokens_state.as_ref(),
                         );
@@ -557,11 +590,11 @@ impl Agent {
                     trace.early_terminated = true;
                     trace.early_terminate_reason =
                         format!("no_tool_use_{}_rounds", consecutive_no_tool_rounds);
-                    trace.collect_failure_signals(&accumulated_text);
+                    trace.collect_failure_signals(accumulated_text.resolved());
                     return Self::finalize_logged(
                         &self.profile.name,
                         trace,
-                        &accumulated_text,
+                        accumulated_text.resolved(),
                         total_usage,
                         max_tokens_state.as_ref(),
                     );
@@ -593,7 +626,7 @@ impl Agent {
                         return Self::finalize_logged(
                             &self.profile.name,
                             trace,
-                            &accumulated_text,
+                            accumulated_text.resolved(),
                             total_usage,
                             max_tokens_state.as_ref(),
                         );
@@ -618,7 +651,7 @@ impl Agent {
                 return Self::finalize_logged(
                     &self.profile.name,
                     trace,
-                    &accumulated_text,
+                    accumulated_text.resolved(),
                     total_usage,
                     max_tokens_state.as_ref(),
                 );
@@ -1071,15 +1104,12 @@ impl Agent {
             // (`parse_classification` / `parse_quality_report` 的 extract_json_block)
             // 直接命中,无需感知本机制的存在。
             if let Some(json) = structured_output {
-                if !accumulated_text.is_empty() {
-                    accumulated_text.push('\n');
-                }
-                accumulated_text.push_str(&format!("```json\n{json}\n```"));
+                accumulated_text.push_real(&format!("```json\n{json}\n```"));
                 debug!("agent finished with structured tool_use output");
                 return Self::finalize_logged(
                     &self.profile.name,
                     trace,
-                    &accumulated_text,
+                    accumulated_text.resolved(),
                     total_usage,
                     max_tokens_state.as_ref(),
                 );
@@ -1115,12 +1145,13 @@ impl Agent {
                 trace.early_terminate_reason =
                     format!("doom_loop_no_progress tool={tool} repeats={repeats}");
                 trace.doom_loop_repeats = loop_guard.max_repeats();
-                trace.collect_failure_signals(&accumulated_text);
+                trace.collect_failure_signals(accumulated_text.resolved());
                 if trace.tool_calls > 0 {
-                    let text = if accumulated_text.trim().is_empty() {
+                    let resolved = accumulated_text.resolved();
+                    let text = if resolved.trim().is_empty() {
                         fallback
                     } else {
-                        format!("{accumulated_text}\n\n{fallback}")
+                        format!("{resolved}\n\n{fallback}")
                     };
                     return Self::finalize_logged(
                         &self.profile.name,
@@ -1153,12 +1184,13 @@ impl Agent {
                 let kind_tag = diag.kind.as_str();
                 trace.dead_loop = Some(diag);
                 trace.dead_loop_repeats = dead_loop.max_repeats();
-                trace.collect_failure_signals(&accumulated_text);
+                trace.collect_failure_signals(accumulated_text.resolved());
                 if trace.tool_calls > 0 {
-                    let text = if accumulated_text.trim().is_empty() {
+                    let resolved = accumulated_text.resolved();
+                    let text = if resolved.trim().is_empty() {
                         fallback
                     } else {
-                        format!("{accumulated_text}\n\n{fallback}")
+                        format!("{resolved}\n\n{fallback}")
                     };
                     return Self::finalize_logged(
                         &self.profile.name,
@@ -1442,4 +1474,46 @@ fn render_tool_history(history: &[(String, String, bool)]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AccumulatedText;
+
+    /// 2026-11-01 天猫真机回归:thinking 回退段不得混进真文本产物
+    /// (伪节标曾把 Plan 机械解析器带进沟里,整份 WorkFlow 拆解漏解析)。
+    #[test]
+    fn 有真文本时回退段被整体丢弃() {
+        let mut acc = AccumulatedText::default();
+        acc.push_fallback("⚠ [模型内部思考回退]\n草稿:### WorkFlow 1:假节标");
+        acc.push_real("# 任务方案\n## 二、WorkFlow 拆解");
+        assert_eq!(acc.resolved(), "# 任务方案\n## 二、WorkFlow 拆解");
+    }
+
+    /// 全程 thinking-only 时保留回退段(保住闲鱼那轮「防空文件」语义)。
+    #[test]
+    fn 全程无真文本时回退段兜底保留() {
+        let mut acc = AccumulatedText::default();
+        acc.push_fallback("⚠ [模型内部思考回退]\n只有思考");
+        assert!(acc.resolved().contains("只有思考"));
+    }
+
+    /// 多段真文本按序换行拼接,与旧 String 缓冲行为一致。
+    #[test]
+    fn 多段真文本按序拼接() {
+        let mut acc = AccumulatedText::default();
+        acc.push_real("第一段");
+        acc.push_real("第二段");
+        assert_eq!(acc.resolved(), "第一段\n第二段");
+    }
+
+    /// 结构化输出 JSON 也是真文本:不应被先行回退段顶掉。
+    #[test]
+    fn 结构化json视为真文本() {
+        let mut acc = AccumulatedText::default();
+        acc.push_fallback("⚠ [模型内部思考回退]\n垃圾");
+        acc.push_real("```json\n{\"verdict\":\"pass\"}\n```");
+        assert!(acc.resolved().contains("verdict"));
+        assert!(!acc.resolved().contains("垃圾"));
+    }
 }

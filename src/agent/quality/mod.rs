@@ -109,6 +109,12 @@ impl QualityReport {
     /// 两个方向都不引入新的价值判断 —— 唯一判据是「`issues` 里有没有模型
     /// 自己认定的阻断缺陷」,与它把 verdict 写成什么无关。
     fn reconcile_verdict(mut self) -> Self {
+        // 占位符净化(与 depends_on 净化同语义):模型偶发把「空写法」残留成
+        // `"{}"`/`"[]"`/`"null"`/空串的 issues 元素(2026-11-01 天猫真机实测
+        // `issues:{}` 被 Tier-3 整型成 `["{}"]` 差点熔断整个 Plan)。这类元素
+        // 不构成「阻断缺陷」,按占位符直接丢弃,不让它触发一致性消解误杀 pass。
+        self.issues
+            .retain(|s| !matches!(s.trim(), "" | "{}" | "[]" | "null"));
         if self.verdict == Verdict::Pass && !self.issues.is_empty() {
             tracing::warn!(
                 source = ?self.source,

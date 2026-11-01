@@ -161,12 +161,49 @@ fn extract_standalone_json(text: &str) -> Option<&str> {
     end.map(|e| &text[start..e])
 }
 
+/// 剥离「⚠ [模型内部思考回退」标记段:标记行至下一个一级标题(`# `)之间的行
+/// 是 thinking 原文草稿(含伪节标与被 max_tokens 截断的半截步骤),不参与结构
+/// 解析。无标记时原样返回。见 2026-11-01 天猫真机事故:污染段的伪节标把解析器
+/// 带进沟里,只解析出 1 个 wf-1。
+fn strip_thinking_fallback_block(content: &str) -> String {
+    const MARKER: &str = "⚠ [模型内部思考回退";
+    if !content.contains(MARKER) {
+        return content.to_string();
+    }
+    let mut out = String::with_capacity(content.len());
+    let mut skipping = false;
+    for line in content.lines() {
+        let t = line.trim_start();
+        if t.starts_with(MARKER) {
+            skipping = true;
+            continue;
+        }
+        if skipping {
+            // 回退段终点 = 下一个一级标题(真方案的起手标题)
+            if t.starts_with("# ") {
+                skipping = false;
+            } else {
+                continue;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 /// 从 Plan Markdown 提取 WorkFlow 列表。
 ///
 /// 双通道解析:
 /// 1) JSON 代码块兜底(兼容 Plan Agent 直接输出 JSON 的场景)
 /// 2) Markdown 行级解析(基于 `## 二、WorkFlow 拆解` 段的 `### WorkFlow N:` 块)
 pub fn parse_plan_markdown(content: &str) -> Result<WorkFlowPlan> {
+    // 2026-11-01 天猫真机:产物污染防御 —— thinking 回退段(⚠ 标记开头)里的
+    // 草稿节标与半截步骤曾被当成真结构解析(只解析出 1 个 wf-1、步骤截断,
+    // 真正 9 个 WorkFlow 全部漏解析)。标记行至下一个一级标题之间的行一律
+    // 不参与结构解析(Plan 文档以一级标题起手,回退段必在其前)。
+    let content = strip_thinking_fallback_block(content);
+    let content = content.as_str();
     // 0) 兜底:尝试从 JSON 代码块解析(兼容 Plan Agent 输出 JSON 代码块格式的场景)
     // 关联修复: 2026-09-10 hard 任务 Plan 解析 Bug — Plan Agent 输出 JSON 代码块,
     // 但 parse_plan_markdown 只支持 markdown 行级格式,导致解析失败触发无意义重试循环。
@@ -199,7 +236,12 @@ pub fn parse_plan_markdown(content: &str) -> Result<WorkFlowPlan> {
         if in_fence {
             continue;
         }
-        if !in_workflows_section && (t.starts_with("## 二") || t.contains("WorkFlow 拆解")) {
+        // 进段条件(2026-11-01 收紧):「WorkFlow 拆解」必须出现在**标题行**上 ——
+        // thinking 草稿的提纲 bullet「- 二、WorkFlow 拆解 (WorkFlow 1..N…)」
+        // 曾靠 contains 命中进段,把垃圾区当成了 WorkFlow 段。
+        if !in_workflows_section
+            && (t.starts_with("## 二") || (t.starts_with('#') && t.contains("WorkFlow 拆解")))
+        {
             in_workflows_section = true;
             continue;
         }
