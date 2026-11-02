@@ -135,6 +135,9 @@ pub struct DisplayItem {
     /// `position.rs` 对 fixed 取包含块 (0,0,vw,vh)),而普通项以页面为原点。
     /// 光栅化时滚动量 `scroll_y` 只对后者生效 —— 否则固定控件会随页面滚动平移。
     pub fixed: bool,
+    /// absolute/fixed 脱流子树:坐标已相对真实定位祖先确定,
+    /// 不再随 Flex/Grid/局部测量片段做第二次平移。
+    pub out_of_flow: bool,
     /// 绘制层:0 = 常规流内容,1 = 定位元素(position != static)及其子树,
     /// 2 = **顶层**(top layer:`dialog[open]`、`select` 展开面板)。
     ///
@@ -195,6 +198,9 @@ impl DisplayItem {
     /// 使变换原点随几何一起平移 —— 否则 `transform-origin` 会相对盒偏移
     /// (片段平移用于 flex/grid 条目内容、absolute 内容、relative 偏移)。
     pub fn translate(&mut self, dx: f64, dy: f64) {
+        if self.out_of_flow {
+            return;
+        }
         self.x += dx;
         self.y += dy;
         if let Some(c) = &mut self.clip {
@@ -287,7 +293,8 @@ pub fn build_legacy(layout: &Layout) -> Vec<DisplayItem> {
                 clip: None,
                 transform: None,
                 fixed: false,
-                layer: 0,
+                out_of_flow: false,
+            layer: 0,
             });
         }
     }
@@ -316,6 +323,7 @@ pub fn build_legacy(layout: &Layout) -> Vec<DisplayItem> {
             clip: None,
             transform: None,
             fixed: false,
+            out_of_flow: false,
             layer: 0,
         });
     }
@@ -366,6 +374,7 @@ fn shadow_item(s: &ShadowDraw, seq: u64) -> DisplayItem {
         clip: None,
         transform: None,
         fixed: false,
+        out_of_flow: false,
         layer: 0,
     }
 }
@@ -387,6 +396,7 @@ fn border_item(b: &BorderDraw, seq: u64) -> DisplayItem {
         clip: None,
         transform: None,
         fixed: false,
+        out_of_flow: false,
         layer: 0,
     }
 }
@@ -410,6 +420,7 @@ fn image_item(p: &PaintBox, seq: u64) -> DisplayItem {
         clip: None,
         transform: None,
         fixed: false,
+        out_of_flow: false,
         layer: 0,
     }
 }
@@ -433,6 +444,7 @@ fn text_item(l: &TextLine, seq: u64) -> DisplayItem {
         clip: None,
         transform: None,
         fixed: false,
+        out_of_flow: false,
         layer: 0,
     }
 }

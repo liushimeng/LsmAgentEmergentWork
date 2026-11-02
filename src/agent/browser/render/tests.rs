@@ -44,6 +44,7 @@ fn tier_item(text: &str, z: i64, layer: u8, seq: u64) -> super::DisplayItem {
         clip: None,
         transform: None,
         fixed: false,
+        out_of_flow: false,
         layer,
     }
 }

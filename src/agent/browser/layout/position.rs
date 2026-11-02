@@ -18,7 +18,53 @@ pub(crate) fn layout_deferred(
     depth: usize,
 ) {
     for d in deferred {
+        let mark = ctx.display_len();
         layout_abs(ctx, &d.node, &d.style, cb, depth, (d.static_x, d.static_y));
+        for it in &mut ctx.display[mark..] {
+            it.out_of_flow = true;
+        }
+    }
+}
+
+/// 最近定位祖先的实际包含块。static 父盒与 Flex/Grid 的局部测量都会
+/// 产生自己的临时坐标系,但它们都不是 CSS absolute 的包含块;必须沿 DOM
+/// 上溯,不能直接使用调用方恰好传入的临时 cb。
+fn nearest_positioned_cb(
+    ctx: &LayoutCtx,
+    node: &NodeRef,
+    fallback: (f64, f64, f64, f64),
+) -> (f64, f64, f64, f64) {
+    let mut cur = node.parent();
+    let mut positioned_seen = false;
+    while let Some(ancestor) = cur {
+        if ancestor.as_element().is_some() {
+            let style = ctx.engine.computed_chain(&ancestor);
+            if style.pos.position != "static" || style.transform.is_some() {
+                positioned_seen = true;
+                let selector = Document::stable_selector(&ancestor);
+                if let Some(b) = ctx.boxes.iter().rev().find(|b| b.selector == selector) {
+                    return (
+                        b.x + style.padding_left,
+                        b.y + style.padding_top,
+                        (b.w - style.padding_left - style.padding_right).max(0.0),
+                        if b.h > 1.0 {
+                            (b.h - style.padding_top - style.padding_bottom).max(0.0)
+                        } else {
+                            fallback.3
+                        },
+                    );
+                }
+            }
+        }
+        cur = ancestor.parent();
+    }
+    if positioned_seen {
+        // 定位祖先可能尚未收口写盒,沿用调用方携带的同一包含块。
+        fallback
+    } else {
+        // 没有定位祖先时是初始包含块,不能回退到零宽临时父盒。
+        let (vw, vh) = ctx.viewport();
+        (0.0, 0.0, vw, vh)
     }
 }
 
@@ -38,7 +84,7 @@ fn layout_abs(
         let (vw, vh) = ctx.viewport();
         (0.0, 0.0, vw, vh)
     } else {
-        cb
+        nearest_positioned_cb(ctx, node, cb)
     };
     let pad_l = style.padding_left;
     let pad_r = style.padding_right;

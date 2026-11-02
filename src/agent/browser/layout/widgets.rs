@@ -1015,6 +1015,7 @@ impl<'a> LayoutCtx<'a> {
         clip: None,
         transform: tf,
         fixed: self.fixed_depth > 0,
+        out_of_flow: false,
         layer: self.layer_for(style),
     });
 }
@@ -1045,6 +1046,7 @@ pub(crate) fn emit_widget_glyph(
         clip: None,
         transform: tf,
         fixed: self.fixed_depth > 0,
+        out_of_flow: false,
         layer: self.layer_for(style),
     });
 }

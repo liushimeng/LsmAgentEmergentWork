@@ -1452,6 +1452,7 @@ impl<'a> LayoutCtx<'a> {
                     clip: None,
                     transform: tf,
                     fixed: self.fixed_depth > 0,
+                    out_of_flow: false,
                     layer: self.layer_for(&child_style),
                 });
             }

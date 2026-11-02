@@ -19,6 +19,7 @@
 | [45-京东首屏jQuery链断裂与查看器死亡五根因.md](45-京东首屏jQuery链断裂与查看器死亡五根因.md) | 京东 jQuery 1.6.4 断链五根因:fragment 裸对象 / 动态节点缺 matches / navigator.javaEnabled / RegExp.$1 / 查看器死亡不重生;显示不全与风控弹验证同根因 |
 | [46-天猫首屏FetchRequest与Console初始化断链.md](46-天猫首屏FetchRequest与Console初始化断链.md) | 天猫首屏骨架与登录入口缺失:Request / Request.signal / console.clear 三处初始化断链;mtop JSONP 与性能诊断 |
 | [46-京东显示不全布局混乱七处通用根因修复.md](46-京东显示不全布局混乱七处通用根因修复.md) | box-sizing 初始值 / `*` 通配被守卫误杀 / 管线截断无人收尾(发送即记账+邮箱收割) / 缺字形 pen 不推进 / 懒加载兜底 / scroll_x / 整页截图宽;附「测试假绿双 bug 抵消」排查口诀 |
+| [47-天猫搜索Logo骨架卡与绝对定位布局根因.md](47-天猫搜索Logo骨架卡与绝对定位布局根因.md) | 搜索框被压窄 / height:0 丢失 / 百分比 padding 按视口预解 / middle 行高 / absolute 包含块与二次平移;区分骨架与商品数据缺失 |
 | [49-arXiv显示不全根因与字号百分比及源码换行折叠修复.md](49-arXiv显示不全根因与字号百分比及源码换行折叠修复.md) | 三根因:百分比字号按视口宽求解(应相对父字号) / 合并冲突丢失源码换行折叠 / 换行后行首取累计 pen;附 `git log -S` 照妖镜与「行首阶梯」特征指纹 |
 | [50-天猫首屏数据链断链与JSONP回调时序多根因修复.md](50-天猫首屏数据链断链与JSONP回调时序多根因修复.md) | JSONP 回调时序(eager 执行早于回调注册)/ window 全局同步丢更新 / script.text 注入失效 / open 契约(timeout_ms·wait_until 零消费,283s vs 45s) |
 | [51-天猫二轮递归上限杀数据链与交互饥饿open复用契约.md](51-天猫二轮递归上限杀数据链与交互饥饿open复用契约.md) | 递归上限 256 杀 mtop/React 数据链(网络全 200 但回调注册方已死) / 残留批次饿死 eval(wait 2.5s 实付 118s)与批内让道 / open 同 URL 复用改廉价复用(reload=true 强制重载) / 整调用预算夹紧图片阶段 / HITL 键鼠能力如实化 |

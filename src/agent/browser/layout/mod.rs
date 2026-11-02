@@ -427,7 +427,8 @@ pub fn compute_full(
                     clip: None,
                     transform: None,
                     fixed: false,
-                    layer: 0,
+                    out_of_flow: false,
+            layer: 0,
                 });
             };
             if let Some(bg) = style.background {
@@ -563,6 +564,7 @@ impl<'a> LayoutCtx<'a> {
             clip: None,
             transform: None,
             fixed: self.fixed_depth > 0,
+            out_of_flow: false,
             layer: self.layer_for(style),
         });
         let thumb_h = (h * visible).max(8.0).min(h);
@@ -583,6 +585,7 @@ impl<'a> LayoutCtx<'a> {
             clip: None,
             transform: None,
             fixed: self.fixed_depth > 0,
+            out_of_flow: false,
             layer: self.layer_for(style),
         });
     }
@@ -646,6 +649,7 @@ impl<'a> LayoutCtx<'a> {
             clip: None,
             transform: self.own_transform(style, x, y, w, h),
             fixed: self.fixed_depth > 0,
+            out_of_flow: false,
             layer: self.layer_for(style),
         });
     }
@@ -711,6 +715,7 @@ impl<'a> LayoutCtx<'a> {
             clip: None,
             transform: tf,
             fixed: is_fixed,
+            out_of_flow: false,
             layer,
         };
         for layer in &style.box_shadow {
@@ -797,6 +802,7 @@ impl<'a> LayoutCtx<'a> {
             clip: None,
             transform,
             fixed: self.fixed_depth > 0,
+            out_of_flow: false,
             layer: self.positioned_layer,
         });
     }
@@ -834,7 +840,8 @@ impl<'a> LayoutCtx<'a> {
                 clip: None,
                 transform,
                 fixed: self.fixed_depth > 0,
-                layer: self.positioned_layer,
+                out_of_flow: false,
+            layer: self.positioned_layer,
             });
         }
         for kind in [
@@ -861,7 +868,8 @@ impl<'a> LayoutCtx<'a> {
                 clip: None,
                 transform,
                 fixed: self.fixed_depth > 0,
-                layer: self.positioned_layer,
+                out_of_flow: false,
+            layer: self.positioned_layer,
             });
         }
         // 阴影层(先声明在下):每层一个 TextShadow 项,排在本体之前绘制。
@@ -886,7 +894,8 @@ impl<'a> LayoutCtx<'a> {
                 clip: None,
                 transform,
                 fixed: self.fixed_depth > 0,
-                layer: self.positioned_layer,
+                out_of_flow: false,
+            layer: self.positioned_layer,
             });
         }
         self.display.push(DisplayItem {
@@ -907,6 +916,7 @@ impl<'a> LayoutCtx<'a> {
             clip: None,
             transform,
             fixed: self.fixed_depth > 0,
+            out_of_flow: false,
             layer: self.positioned_layer,
         });
     }

@@ -79,7 +79,7 @@ mtopjsonptbpc1({"api":"...","data":{},"ret":["FAIL_SYS_ILLEGAL_ACCESS::非法请
 - `tests/web_console_api.rs`：真实页面执行 `setTimeout(console.clear.bind(console), 500)`，验证初始化链不断。
 - `tests/web_use_engine.rs` 原有字符串 URL fetch 用例保持通过。
 - Release 真站阶段复测：主应用从 0 个 input 推进到 7 个 input、完整搜索按钮、分类导航与商品/链接节点；搜索选择器 `#q` 可用。
-- console.clear 修复后的最终真站结果以本轮最终日志为准；若页头仍缺登录入口，应继续取 console 的**下一首个异常**，不要重复修改已证实的三处。
+- console.clear 修复后的 Release 真站复测：`open` 返回 `blockers.blocked=true / kind=login / evidence=请登录`；执行层能定位“亲，请登录”，并成功触发 `request_human` 原生弹窗、移交用户控制，登录入口缺失问题已闭环。
 
 ## 诊断方法
 

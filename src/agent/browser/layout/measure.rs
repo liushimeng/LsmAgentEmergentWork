@@ -25,6 +25,9 @@ pub(crate) fn translate(fragment: &mut Fragment, dx: f64, dy: f64) {
         l.y += dy;
     }
     for b in &mut fragment.boxes {
+        if b.out_of_flow {
+            continue;
+        }
         b.x += dx;
         b.y += dy;
     }
