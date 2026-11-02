@@ -2963,83 +2963,271 @@ var prompt = function (m) { __clog("prompt", String(m == null ? "" : m)); return
 // ---------- fetch / XHR ----------
 // Fetch 标准入口不只是 fetch(string):React/请求库常先构造 Request,
 // 再把 Request 交给 fetch。缺构造器会在应用初始化阶段直接 ReferenceError。
-function Headers(init) {
-  if (!(this instanceof Headers)) return new Headers(init);
-  this._map = {};
-  if (init == null) return;
-  var self = this;
-  if (init instanceof Headers || init._map) {
-    Object.keys(init._map).forEach(function (k) { self._map[k] = String(init._map[k]); });
-  } else if (Array.isArray(init)) {
-    init.forEach(function (pair) {
-      if (pair != null && pair.length >= 2) self.append(pair[0], pair[1]);
-    });
-  } else {
-    Object.keys(Object(init)).forEach(function (k) { self.set(k, init[k]); });
+// 读取对象属性但**绝不触发 getter**:站点可能在 init/headers 上定义 getter,
+// getter 内部又回调 `new Headers(...)`/`new Request(...)`,拷贝时触发即无限递归
+// 爆栈(实测天猫首屏 RuntimeLimitError)。只取数据属性,访问器一律按缺省处理。
+function __lsmDataProp(obj, key) {
+  if (obj == null) return undefined;
+  try {
+    var d = Object.getOwnPropertyDescriptor(obj, key);
+    if (d) return "value" in d ? d.value : undefined;
+    var proto = Object.getPrototypeOf(obj);
+    while (proto) {
+      var pd = Object.getOwnPropertyDescriptor(proto, key);
+      if (pd) return "value" in pd ? pd.value : undefined;
+      proto = Object.getPrototypeOf(proto);
+    }
+  } catch (e) {}
+  return undefined;
+}
+
+// 构造器重入深度:站点可能在 getter/toString 内部回调 `new Headers(...)`,
+// 造成构造器互相调用。深度>0 说明已在构造链内,此时不再触发任何站点代码
+// (不读 getter、不调 toString),保证递归必然终止。
+var __lsmCtorDepth = 0;
+
+// 安全字符串化:只对原始值直接 String;对象在**构造链内**一律不调用其
+// toString(站点自定义 toString 可能回调 `new Request(...)`,与构造器互调
+// 形成无限递归并爆栈);构造链外才允许调用。
+function __lsmSafeStr(v) {
+  if (v == null) return "";
+  var t = typeof v;
+  if (t === "string") return v;
+  if (t === "number" || t === "boolean") return String(v);
+  if (__lsmCtorDepth > 0) return "";
+  try {
+    return String(v);
+  } catch (e) {
+    return "";
   }
 }
-Headers.prototype.__key = function (k) { return String(k).toLowerCase(); };
+
+// 内核私有引用:站点可能覆盖全局 Headers/AbortSignal,内核构造器不得改用
+// 站点实现(可能与站点 Request polyfill 互调递归)。
+var __lsmHeadersCtor = Headers;
+var __lsmAbortSignalCtor = null;
+var __lsmRequestCtor = Request;
+
+function Headers(init) {
+  if (!(this instanceof __lsmHeadersCtor)) return new __lsmHeadersCtor(init);
+  // 深度计数必须**先于任何外来对象访问**自增:`instanceof` 对 Proxy 入参会
+  // 触发站点 getPrototypeOf trap,trap 里又回调构造器 —— 先计数才能让递归在
+  // 阈值处终止。
+  __lsmCtorDepth++;
+  try {
+    this._map = {};
+    // 重入过深(站点构造器与内核互调):只给空表,不再读取任何外来对象 ——
+    // 外来对象可能是 Proxy/惰性 getter,读取即回调站点代码形成递归爆栈。
+    if (__lsmCtorDepth >= 4) return;
+    if (init == null) return;
+    var self = this;
+    var srcMap = __lsmDataProp(init, "_map");
+    if (srcMap && typeof srcMap === "object") {
+      Object.keys(srcMap).forEach(function (k) {
+        var v = __lsmDataProp(srcMap, k);
+        if (v !== undefined) self._map[k] = __lsmSafeStr(v);
+      });
+    } else if (Array.isArray(init)) {
+      init.forEach(function (pair) {
+        if (pair == null) return;
+        var k = __lsmDataProp(pair, 0);
+        var v = __lsmDataProp(pair, 1);
+        if (k !== undefined && v !== undefined) self.append(k, v);
+      });
+    } else {
+      Object.keys(Object(init)).forEach(function (k) {
+        var v = __lsmDataProp(init, k);
+        if (v !== undefined) self.set(k, v);
+      });
+    }
+  } finally {
+    __lsmCtorDepth--;
+  }
+}
+// 取本实例的 header 表:**只读自有数据属性**。站点可能让自己的类继承内核的
+// `Headers.prototype` 并用 `_map` 惰性 getter;内核一旦读 `this._map` 就会触发
+// 站点 getter,getter 内部又 `new Request(...)`,与内核构造器互调形成无限递归
+// 爆栈(实测天猫首屏 RuntimeLimitError)。取不到就按空表处理,宁可少读也不递归。
+function __lsmHdrMap(self) {
+  var m = __lsmDataProp(self, "_map");
+  return (m && typeof m === "object") ? m : {};
+}
+
+// header 表访问熔断:站点的 headers 对象常把 `_map` 做成 Proxy/惰性 getter,
+// 内核枚举它会触发站点代码,站点代码又 `new Request(...)` 回到内核构造器 ——
+// 两侧互调即无限递归爆栈。内核在处理 header 表期间再次进入就立刻退化为空表,
+// 保证互调必然终止(代价:极端场景下读不到那批 header)。
+var __lsmHdrBusy = false;
+function __lsmHdrEnter() {
+  if (__lsmHdrBusy) return false;
+  __lsmHdrBusy = true;
+  return true;
+}
+function __lsmHdrLeave() { __lsmHdrBusy = false; }
+Headers.prototype.__key = function (k) { return __lsmSafeStr(k).toLowerCase(); };
 Headers.prototype.get = function (k) {
   var key = this.__key(k);
-  return Object.prototype.hasOwnProperty.call(this._map, key) ? this._map[key] : null;
+  if (!__lsmHdrEnter()) return null;
+  try {
+    var map = __lsmHdrMap(this);
+    return Object.prototype.hasOwnProperty.call(map, key) ? map[key] : null;
+  } catch (e) {
+    return null;
+  } finally {
+    __lsmHdrLeave();
+  }
 };
-Headers.prototype.set = function (k, v) { this._map[this.__key(k)] = String(v); };
+Headers.prototype.set = function (k, v) {
+  if (!__lsmHdrEnter()) return;
+  try {
+    var map = __lsmHdrMap(this);
+    map[this.__key(k)] = __lsmSafeStr(v);
+  } catch (e) {
+  } finally {
+    __lsmHdrLeave();
+  }
+};
 Headers.prototype.has = function (k) {
-  return Object.prototype.hasOwnProperty.call(this._map, this.__key(k));
+  if (!__lsmHdrEnter()) return false;
+  try {
+    return Object.prototype.hasOwnProperty.call(__lsmHdrMap(this), this.__key(k));
+  } catch (e) {
+    return false;
+  } finally {
+    __lsmHdrLeave();
+  }
 };
 Headers.prototype.append = function (k, v) {
-  var key = this.__key(k), old = this.get(key);
-  this._map[key] = old == null ? String(v) : old + ", " + String(v);
+  if (!__lsmHdrEnter()) return;
+  try {
+    // 直接读表:本方法已持有熔断标志,再走 this.get() 会被熔断成 null。
+    var key = this.__key(k);
+    var map = __lsmHdrMap(this);
+    var old = Object.prototype.hasOwnProperty.call(map, key) ? map[key] : null;
+    var val = __lsmSafeStr(v);
+    map[key] = old == null ? val : old + ", " + val;
+  } catch (e) {
+  } finally {
+    __lsmHdrLeave();
+  }
 };
-Headers.prototype.delete = function (k) { delete this._map[this.__key(k)]; };
+Headers.prototype.delete = function (k) {
+  if (!__lsmHdrEnter()) return;
+  try {
+    delete __lsmHdrMap(this)[this.__key(k)];
+  } catch (e) {
+  } finally {
+    __lsmHdrLeave();
+  }
+};
 Headers.prototype.forEach = function (fn, thisArg) {
-  var self = this;
-  Object.keys(this._map).forEach(function (k) { fn.call(thisArg, self._map[k], k, self); });
+  if (!__lsmHdrEnter()) return;
+  try {
+    var map = __lsmHdrMap(this);
+    Object.keys(map).forEach(function (k) { fn.call(thisArg, map[k], k, this); }, this);
+  } catch (e) {
+  } finally {
+    __lsmHdrLeave();
+  }
 };
-Headers.prototype.keys = function () { return Object.keys(this._map)[Symbol.iterator](); };
+Headers.prototype.keys = function () {
+  if (!__lsmHdrEnter()) return [][Symbol.iterator]();
+  try {
+    return Object.keys(__lsmHdrMap(this))[Symbol.iterator]();
+  } catch (e) {
+    return [][Symbol.iterator]();
+  } finally {
+    __lsmHdrLeave();
+  }
+};
 Headers.prototype.values = function () {
-  var self = this;
-  return Object.keys(this._map).map(function (k) { return self._map[k]; })[Symbol.iterator]();
+  if (!__lsmHdrEnter()) return [][Symbol.iterator]();
+  try {
+    var map = __lsmHdrMap(this);
+    return Object.keys(map).map(function (k) { return map[k]; })[Symbol.iterator]();
+  } catch (e) {
+    return [][Symbol.iterator]();
+  } finally {
+    __lsmHdrLeave();
+  }
 };
 Headers.prototype.entries = function () {
-  var self = this;
-  return Object.keys(this._map).map(function (k) { return [k, self._map[k]]; })[Symbol.iterator]();
+  if (!__lsmHdrEnter()) return [][Symbol.iterator]();
+  try {
+    var map = __lsmHdrMap(this);
+    return Object.keys(map).map(function (k) { return [k, map[k]]; })[Symbol.iterator]();
+  } catch (e) {
+    return [][Symbol.iterator]();
+  } finally {
+    __lsmHdrLeave();
+  }
 };
 if (typeof Symbol !== "undefined" && Symbol.iterator) {
   Headers.prototype[Symbol.iterator] = Headers.prototype.entries;
 }
 
 function Request(input, init) {
-  if (!(this instanceof Request)) return new Request(input, init);
-  var base = input instanceof Request ? input : null;
-  if (input == null) throw new TypeError("Request URL 不能为空");
-  init = init || {};
-  this.url = String(base ? base.url : (input && input.url ? input.url : input));
-  this.method = String(init.method != null ? init.method : (base ? base.method : "GET")).toUpperCase();
-  this.headers = new Headers(init.headers != null ? init.headers : (base ? base.headers : null));
-  var body = Object.prototype.hasOwnProperty.call(init, "body") ? init.body : (base ? base.body : null);
-  this.body = body == null ? null : (typeof body === "string" ? body : String(body));
-  this.credentials = String(init.credentials || (base && base.credentials) || "same-origin");
-  this.mode = String(init.mode || (base && base.mode) || "cors");
-  this.cache = String(init.cache || (base && base.cache) || "default");
-  this.redirect = String(init.redirect || (base && base.redirect) || "follow");
-  this.referrer = String(init.referrer || (base && base.referrer) || "about:client");
-  this.signal = init.signal || (base && base.signal) || new AbortSignal();
-  this.bodyUsed = false;
+  if (!(this instanceof __lsmRequestCtor)) return new __lsmRequestCtor(input, init);
+  // 深度计数先于任何外来对象访问自增(见 Headers 同处注释):入参可能是 Proxy,
+  // `instanceof` 会触发站点 trap,trap 里回调构造器 —— 必须能被阈值截断。
+  __lsmCtorDepth++;
+  try {
+    // 重入过深(站点 Request polyfill 与内核构造器互调):退化为最小对象,
+    // 不读 input/init 的任何属性(可能是 Proxy/getter,读取即回调站点代码)。
+    if (__lsmCtorDepth >= 4) {
+      this.url = typeof input === "string" ? input : "";
+      this.method = "GET";
+      this.headers = new __lsmHeadersCtor();
+      this.body = null;
+      this.credentials = "same-origin";
+      this.mode = "cors";
+      this.cache = "default";
+      this.redirect = "follow";
+      this.referrer = "about:client";
+      this.signal = new (__lsmAbortSignalCtor || AbortSignal)();
+      this.bodyUsed = false;
+      return;
+    }
+    var base = input instanceof __lsmRequestCtor ? input : null;
+    if (input == null) throw new TypeError("Request URL 不能为空");
+    init = init || {};
+    // 全部走 __lsmDataProp:不触发站点 getter(见其上注释的递归爆栈根因)。
+    var inputUrl = base ? base.url : (__lsmDataProp(input, "url") !== undefined ? __lsmDataProp(input, "url") : input);
+    this.url = __lsmSafeStr(inputUrl);
+    var initMethod = __lsmDataProp(init, "method");
+    this.method = __lsmSafeStr(initMethod != null ? initMethod : (base ? base.method : "GET")).toUpperCase();
+    var initHeaders = __lsmDataProp(init, "headers");
+    this.headers = new __lsmHeadersCtor(initHeaders != null ? initHeaders : (base ? base.headers : null));
+    var body = Object.prototype.hasOwnProperty.call(init, "body") ? __lsmDataProp(init, "body") : (base ? base.body : null);
+    this.body = body == null ? null : (typeof body === "string" ? body : __lsmSafeStr(body));
+    this.credentials = __lsmSafeStr(__lsmDataProp(init, "credentials") || (base && base.credentials) || "same-origin");
+    this.mode = __lsmSafeStr(__lsmDataProp(init, "mode") || (base && base.mode) || "cors");
+    this.cache = __lsmSafeStr(__lsmDataProp(init, "cache") || (base && base.cache) || "default");
+    this.redirect = __lsmSafeStr(__lsmDataProp(init, "redirect") || (base && base.redirect) || "follow");
+    this.referrer = __lsmSafeStr(__lsmDataProp(init, "referrer") || (base && base.referrer) || "about:client");
+    this.signal = __lsmDataProp(init, "signal") || (base && base.signal) || new (__lsmAbortSignalCtor || AbortSignal)();
+    this.bodyUsed = false;
+  } finally {
+    __lsmCtorDepth--;
+  }
 }
-Request.prototype.clone = function () { return new Request(this); };
+Request.prototype.clone = function () { return new __lsmRequestCtor(this); };
 
 function fetch(input, opts) {
   return Promise.resolve().then(function () {
-    var base = input instanceof Request ? input : null;
+    var base = input instanceof __lsmRequestCtor ? input : null;
     opts = opts || {};
-    var urlString = String(base ? base.url : (input && input.url ? input.url : input));
-    var method = opts.method != null ? opts.method : (base ? base.method : "GET");
-    var headerInit = opts.headers != null ? opts.headers : (base ? base.headers : null);
-    var body = Object.prototype.hasOwnProperty.call(opts, "body") ? opts.body : (base ? base.body : null);
+    // 与 Request 一致:只读数据属性,不触发站点 getter。
+    var inputUrl = base ? base.url : (__lsmDataProp(input, "url") !== undefined ? __lsmDataProp(input, "url") : input);
+    var urlString = String(inputUrl);
+    var optMethod = __lsmDataProp(opts, "method");
+    var method = optMethod != null ? optMethod : (base ? base.method : "GET");
+    var headerInit = __lsmDataProp(opts, "headers");
+    if (headerInit == null) headerInit = base ? base.headers : null;
+    var body = Object.prototype.hasOwnProperty.call(opts, "body") ? __lsmDataProp(opts, "body") : (base ? base.body : null);
     var o = { method: String(method || "GET").toUpperCase(), cookies: __lsmCookie };
-    if (headerInit != null) o.headers = new Headers(headerInit)._map;
-    if (body != null) o.body = typeof body === "string" ? body : String(body);
+    if (headerInit != null) o.headers = new __lsmHeadersCtor(headerInit)._map;
+    if (body != null) o.body = typeof body === "string" ? body : __lsmSafeStr(body);
     var raw = "";
     try { raw = __lsmFetchNative(urlString, JSON.stringify(o)); } catch (e2) { raw = JSON.stringify({ error: String(e2) }); }
     var r = {};
@@ -3051,7 +3239,7 @@ function fetch(input, opts) {
       statusText: String(r.statusText || ""),
       url: String(r.url || urlString),
       redirected: !!r.redirect,
-      headers: new Headers(r.headers || {}),
+      headers: new __lsmHeadersCtor(r.headers || {}),
       bodyUsed: false,
       clone: function () { return resp; },
       _read: function () {
@@ -4154,6 +4342,7 @@ AbortSignal.prototype.addEventListener = function (t, fn) {
 AbortSignal.prototype.removeEventListener = function () {};
 AbortSignal.prototype.dispatchEvent = function () { return true; };
 function AbortController() { this.signal = new AbortSignal(); }
+__lsmAbortSignalCtor = AbortSignal;
 AbortController.prototype.abort = function (reason) {
   if (this.signal.aborted) return;
   this.signal.aborted = true;

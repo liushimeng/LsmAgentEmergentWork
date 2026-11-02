@@ -71,12 +71,46 @@ mtopjsonptbpc1({"api":"...","data":{},"ret":["FAIL_SYS_ILLEGAL_ACCESS::非法请
 3. `fetch(input, init)` 同时接受字符串与 Request；调用方 init 正确覆盖 Request 的 method/headers/body，响应头也统一为 Headers。
 4. 增加可 bind、可注册定时器的 `console.clear`。
 
+### 5. 站点 polyfill 与内核构造器互调 → 无限递归爆栈
+
+补齐 Request/Headers 后首屏**反而更糟**：主应用抛
+`RuntimeLimitError: reached the maximum stack size`，`#q` 消失、DOM 节点从 5009 掉到 1879。
+栈形态固定为 `site r → 内核 Request → site _a → site r → …`。
+
+按页面实际全局取证（`eval_js` 读 `String(window.Request)`）：
+
+```js
+// 站点自己的 Request polyfill（覆盖了内核实现）
+function r(t, r) {
+  var n = new e(t, r);
+  return t instanceof e && (n.signal = t.signal),
+         n.signal = r.signal || n.signal || (new AbortController).signal, n;
+}
+```
+
+站点覆盖 `window.Request` 后仍会回调**它捕获的原始实现**（内核 Request），
+而内核构造器在读取 `input/init/headers` 的属性时可能触发站点的 Proxy trap
+或惰性 getter，站点 trap 内部又 `new Request(...)` —— 两侧互调成环。
+
+通用修复（`script/prelude.rs`）：
+
+1. `__lsmDataProp(obj, key)`：只取**数据属性**，访问器/Proxy 一律按缺省处理，
+   拷贝属性时绝不调用站点 getter。
+2. `__lsmSafeStr(v)`：构造链内不调用外来对象的 `toString`。
+3. `__lsmCtorDepth` 重入阈值：构造器**先自增深度**再访问任何外来对象
+   （`instanceof` 对 Proxy 入参同样会触发 trap），超过阈值直接退化为最小对象。
+4. `__lsmHdrBusy` 熔断：处理 header 表期间再次进入立即返回空结果。
+5. 构造器内部改用私有引用 `__lsmHeadersCtor` / `__lsmAbortSignalCtor` /
+   `__lsmRequestCtor`，不再引用可能被站点替换的全局名。
+
 这些实现不含天猫域名判断，其他使用 React Router、Fetch 或 console 初始化清理的站点共用。
 
 ## 验证
 
-- `tests/web_fetch_request.rs`：真实 mock HTTP 验证 Request 的 method/headers/body 进入请求线、init 覆盖语义、Headers 大小写与 Request.signal。
+- `tests/web_fetch_request.rs`：真实 mock HTTP 验证 Request 的 method/headers/body 进入请求线、init 覆盖语义、Headers 大小写与 Request.signal；另有一条**恶意 getter/toString 回归**：站点 getter 内回调构造器时，构造链不得触发该 getter，也不得递归爆栈。
 - `tests/web_console_api.rs`：真实页面执行 `setTimeout(console.clear.bind(console), 500)`，验证初始化链不断。
+- 真站复测（Release + `examples/lsm_probe`）：`#q` 恢复为 **792×34 @ (688,54)**（此前被压到 6.2px），DOM 节点 5009，`RuntimeLimitError` 消失；首屏 open 由 44s 变为 210s（不再爆栈而是真正跑完脚本管线），总耗时 333s。
+
 - `tests/web_use_engine.rs` 原有字符串 URL fetch 用例保持通过。
 - Release 真站阶段复测：主应用从 0 个 input 推进到 7 个 input、完整搜索按钮、分类导航与商品/链接节点；搜索选择器 `#q` 可用。
 - console.clear 修复后的 Release 真站复测：`open` 返回 `blockers.blocked=true / kind=login / evidence=请登录`；执行层能定位“亲，请登录”，并成功触发 `request_human` 原生弹窗、移交用户控制，登录入口缺失问题已闭环。

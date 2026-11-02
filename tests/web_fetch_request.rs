@@ -111,6 +111,64 @@ async fn exec(tool: &McpWebLsmBrowserUseTool, args: Value) -> Value {
 }
 
 #[tokio::test]
+async fn 构造器不触发站点自定义getter避免递归爆栈() {
+    // 站点常在 headers/init 上定义 getter,getter 内部又回调 `new Headers(...)`:
+    // 拷贝属性时触发 getter 即无限递归(实测天猫首屏 RuntimeLimitError)。
+    let site = start_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+    let open = exec(&tool, json!({"action":"open","url":site,"mode":"hidden","reuse":false})).await;
+    assert_eq!(open["code"], 0, "mock 页面应打开成功: {open}");
+    let page_id = open["data"]["page_id"].as_str().unwrap().to_string();
+    let script = "window.__probe = (function(){ \
+        var hostile = {}; \
+        Object.defineProperty(hostile, 'x-token', { enumerable: true, get: function(){ \
+          return new Headers([['reentrant', 'yes']]).get('reentrant'); \
+        }}); \
+        var h = new Headers(hostile); \
+        var r = new Request('/probe', { headers: hostile }); \
+        var hostileInit = {}; \
+        Object.defineProperty(hostileInit, 'signal', { enumerable: true, get: function(){ \
+          return new AbortSignal(); \
+        }}); \
+        var r2 = new Request('/probe2', hostileInit); \
+        var hostileValue = { toString: function(){ return new Headers([['cycle', '1']]).get('cycle'); } }; \
+        var h2 = new Headers({ 'x-cycle': hostileValue }); \
+        var r3 = new Request('/probe3', { headers: { 'x-cycle': hostileValue } }); \
+        return JSON.stringify({ \
+          header: h.get('x-token'), \
+          reqHeader: r.headers.get('x-token'), \
+          url: r.url, \
+          url2: r2.url, \
+          signalType: typeof r2.signal, \
+          cycleValue: h2.get('x-cycle'), \
+          cycleReq: r3.headers.get('x-cycle') \
+        }); \
+      })()";
+    let eval = exec(&tool, json!({"action":"control","control_action":"eval_js","page_id":page_id,
+                                  "params":{"expression":script}})).await;
+    assert_eq!(eval["code"], 0, "脚本应正常执行(不得递归爆栈): {eval}");
+    let value = exec(&tool, json!({"action":"control","control_action":"eval_js","page_id":page_id,
+                                   "params":{"expression":"window.__probe || ''"}})).await;
+    let text = value["data"]["result"].as_str().unwrap_or("");
+    assert!(!text.contains("RuntimeLimitError"), "不得递归爆栈: {text}");
+    let parsed: Value = serde_json::from_str(text).unwrap_or_else(|e| panic!("结果应为 JSON: {e}\n{text}"));
+    assert_eq!(parsed["header"], Value::Null, "站点 getter 不应被触发: {text}");
+    assert_eq!(parsed["reqHeader"], Value::Null, "站点 getter 不应被触发: {text}");
+    assert_eq!(parsed["url"], "/probe", "普通字段仍应正确读取: {text}");
+    assert_eq!(parsed["url2"], "/probe2", "普通字段仍应正确读取: {text}");
+    assert_eq!(parsed["signalType"], "object", "signal 缺省时仍应给出 AbortSignal: {text}");
+    assert_eq!(
+        parsed["cycleValue"], "",
+        "构造链内不得调用站点自定义 toString(否则与构造器互调递归爆栈): {text}"
+    );
+    assert_eq!(
+        parsed["cycleReq"], "",
+        "构造链内不得调用站点自定义 toString(否则与构造器互调递归爆栈): {text}"
+    );
+    exec(&tool, json!({"action":"close","page_id":page_id})).await;
+}
+
+#[tokio::test]
 async fn fetch支持request对象与init覆盖并发送真实请求线() {
     std::env::set_var("LAEW_ALLOW_PRIVATE_ENDPOINT", "1");
     std::env::set_var("LAEW_SITE_RISK_PERSIST", "off");
