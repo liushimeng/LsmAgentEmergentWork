@@ -5,6 +5,7 @@
 use serde_json::{json, Value};
 
 use super::document::{self, Document};
+use super::render::display::{BgFill, DisplayKind};
 use super::style::{MediaCtx, StyleEngine};
 use super::{EngineError, EngineResult, LsmBrowserManager};
 
@@ -307,6 +308,25 @@ pub async fn inspect(
             let errors: Vec<&super::ConsoleRecord> =
                 tab.console.iter().filter(|c| c.level == "error").collect();
             let blank = layout_text_chars == 0 && visible_boxes == 0;
+            // 加载/风控遮罩探测:站点自身的「整幅不透明遮罩」(常见于 antd Spin
+            // 包裹层、风控挑战层)在显示列表里表现为一个铺满视口、z 全场最高的
+            // 不透明背景项。命中时页面「看起来全白」并不是渲染故障,而是站点停在
+            // 加载/验证态 —— 不报出来,Agent 会对着白屏反复截图重试(实测猎聘
+            // `/zhaopin/` 的 `.searchjobs-spin-loading-box` 即此形态)。
+            let vp_w = tab.viewport.width as f64;
+            let vp_h = tab.viewport.height as f64;
+            let max_z = tab.layout.display.iter().map(|i| i.z).max().unwrap_or(0);
+            let overlay = detect_loading_overlay(&tab.layout.display, vp_w, vp_h);
+            let loading_overlay = match overlay {
+                Some(it) => json!({
+                    "present": true,
+                    "z": it.z,
+                    "is_topmost": it.z >= max_z,
+                    "covers_viewport": true,
+                    "note": "页面被站点自身的加载/风控遮罩整幅覆盖,下方内容不可见;这是站点状态而非内核渲染故障",
+                }),
+                None => json!({"present": false}),
+            };
             // 能力缺口:站点申请过 WebGL 上下文(百度地图等)→ 内核无 GPU 后端,
             // 该区域画不出像素。这是**内核边界**而非页面故障,如实说明,免得
             // Agent 对同一片空白反复截图/重试。
@@ -345,7 +365,12 @@ pub async fn inspect(
                 .map(|((method, path), n)| {
                     json!({"method": method, "path": path, "count": n})
                 });
-            let (diagnosis, hint) = if script_cut {
+            let (diagnosis, hint) = if loading_overlay["present"] == true {
+                (
+                    "页面被站点自身的加载/风控遮罩整幅覆盖(不透明背景铺满视口且位于最高层),下方内容不可见",
+                    "这不是内核渲染故障:先看 inspect(console) 与 inspect(network) 定位站点接口/脚本错误;若站点要求登录或风控验证,请 request_human 人工处理",
+                )
+            } else if script_cut {
                 (
                     "页面脚本管线被墙钟预算截断,仍有模块未装载,动态组件可能尚未挂载",
                     "这是加载中状态而非页面故障:先 control(wait) 1-3 秒或再次执行一次轻量 eval_js 触发补齐,脚本会从上次断点继续;若持续截断可提高 LAEW_WEB_SCRIPT_INTERACT_MS",
@@ -388,6 +413,7 @@ pub async fn inspect(
                 "console_errors": errors.len(),
                 "first_errors": errors.iter().take(3).map(|e| e.text.clone()).collect::<Vec<_>>(),
                 "blank_page": blank,
+                "loading_overlay": loading_overlay,
                 "webgl_requested": tab.webgl_asked,
                 "iframe_count": iframe_count,
                 "iframe_note": if iframe_count > 0 {
@@ -850,4 +876,133 @@ fn inspect_blockers(tab: &super::TabState, doc: &Document) -> Value {
         "page_id": tab.id,
         "note": "阶段一按页面文本关键词判断;结构化弹层检测在阶段二实现",
     })
+}
+
+/// 加载/风控遮罩识别:显示列表里「不透明背景 + 铺满视口(≥95%)+ 位于最高层」的项。
+///
+/// 站点自身的 loading 包裹层(antd Spin 的 `.ant-spin-nested-loading` 加站点
+/// 自定义白底)与风控挑战层都是这个形态。命中说明页面**看起来全白**是站点状态
+/// 而非内核渲染故障,应如实上报而不是让 Agent 反复截图重试。
+fn detect_loading_overlay(
+    display: &[super::render::display::DisplayItem],
+    vp_w: f64,
+    vp_h: f64,
+) -> Option<&super::render::display::DisplayItem> {
+    // 内容(文字/图片/边框等非背景项)的最高 z:遮罩必须**严格高于**全部内容,
+    // 否则「整页 hero 背景」「根画布背景」都会被判成遮罩(根画布背景恒铺满
+    // 视口且不透明,是最典型的假阳性源)。
+    let content_max_z = display
+        .iter()
+        .filter(|it| !matches!(it.kind, DisplayKind::Background { .. }))
+        .map(|it| it.z)
+        .max()?;
+    display
+        .iter()
+        .filter(|it| {
+            it.opacity > 0.95
+                && it.w >= vp_w * 0.95
+                && it.h >= vp_h * 0.95
+                && it.z > content_max_z
+                && matches!(it.kind, DisplayKind::Background { fill: BgFill::Solid(_, a) } if a > 250)
+        })
+        .max_by_key(|it| it.z)
+}
+
+#[cfg(test)]
+mod overlay_tests {
+    use super::*;
+    use crate::agent::browser::render::display::DisplayItem;
+    use crate::agent::browser::style::CornerRadius;
+
+    fn bg(z: i64, w: f64, h: f64, alpha: u8) -> DisplayItem {
+        DisplayItem {
+            kind: DisplayKind::Background {
+                fill: BgFill::Solid([255, 255, 255], alpha),
+            },
+            x: 0.0,
+            y: 0.0,
+            w,
+            h,
+            radius: [CornerRadius::Px(0.0); 4],
+            z,
+            seq: 0,
+            opacity: 1.0,
+            clip: None,
+            transform: None,
+            fixed: false,
+            out_of_flow: false,
+            layer: 1,
+        }
+    }
+
+    /// 内容项(文字):遮罩必须严格高于内容最高 z 才算。
+    fn text(z: i64) -> DisplayItem {
+        DisplayItem {
+            kind: DisplayKind::Text {
+                text: "x".into(),
+                size: 14.0,
+                color: [0, 0, 0],
+                bold: false,
+            },
+            x: 1.0,
+            y: 1.0,
+            w: 10.0,
+            h: 14.0,
+            radius: [CornerRadius::Px(0.0); 4],
+            z,
+            seq: 1,
+            opacity: 1.0,
+            clip: None,
+            transform: None,
+            fixed: false,
+            out_of_flow: false,
+            layer: 0,
+        }
+    }
+
+    #[test]
+    fn 全视口不透明遮罩被识别为加载遮罩() {
+        let items = vec![text(0), bg(0, 1920.0, 200.0, 255), bg(9999, 1920.0, 1080.0, 255)];
+        let hit = detect_loading_overlay(&items, 1920.0, 1080.0);
+        assert!(hit.is_some(), "铺满视口且高于内容的不透明背景应被识别");
+        assert_eq!(hit.unwrap().z, 9999, "取 z 最高的一层");
+    }
+
+    #[test]
+    fn 根画布背景不算遮罩() {
+        // 根画布背景恒为「铺满视口 + 不透明 + z=i64::MIN」,是最典型的假阳性源。
+        let items = vec![bg(i64::MIN, 1920.0, 1080.0, 255), text(0)];
+        assert!(
+            detect_loading_overlay(&items, 1920.0, 1080.0).is_none(),
+            "根画布背景必须排除"
+        );
+    }
+
+    #[test]
+    fn 与内容同层的整页背景不算遮罩() {
+        // hero 区整页背景与文字同 z:文字画在它之后,内容没有被遮住。
+        let items = vec![bg(0, 1920.0, 1080.0, 255), text(0)];
+        assert!(
+            detect_loading_overlay(&items, 1920.0, 1080.0).is_none(),
+            "与内容同层(z 不严格更高)的背景不算遮罩"
+        );
+    }
+
+    #[test]
+    fn 局部背景与半透明背景不算遮罩() {
+        let small = vec![text(0), bg(9999, 800.0, 600.0, 255)];
+        assert!(detect_loading_overlay(&small, 1920.0, 1080.0).is_none());
+        let translucent = vec![text(0), bg(9999, 1920.0, 1080.0, 120)];
+        assert!(
+            detect_loading_overlay(&translucent, 1920.0, 1080.0).is_none(),
+            "半透明遮罩下方内容仍可见,不算"
+        );
+    }
+
+    #[test]
+    fn 无遮罩时返回无() {
+        assert!(detect_loading_overlay(&[], 1920.0, 1080.0).is_none());
+        // 只有背景、没有任何内容项时也不应判成遮罩(那是空白页,归 blank_page 管)
+        assert!(detect_loading_overlay(&[bg(9999, 1920.0, 1080.0, 255)], 1920.0, 1080.0).is_none());
+    }
 }

@@ -289,6 +289,9 @@ struct Decl {
 #[derive(Debug, Clone)]
 struct Rule {
     selectors: Vec<Selector>,
+    /// 与 `selectors` 平行的主体拒绝特征(见 `selector::SubjectHint`)。
+    /// 构造时一次算好,供 `computed` 做 O(1) 否决。
+    subjects: Vec<selector::SubjectHint>,
     decls: Vec<Decl>,
     media: MediaExpr,
     order: usize,
@@ -371,11 +374,28 @@ impl StyleEngine {
         let mut st = values::ua_default(&tag, parent);
         let value_ctx = self.media.value_ctx(self.root_font_size);
 
+        // 主体预过滤的节点侧特征:一次取齐,避免逐规则重复借 RefCell + 切分字符串。
+        let node_id = document::attr(node, "id");
+        let node_class_attr = document::attr(node, "class").unwrap_or_default();
+        let node_classes: Vec<&str> = node_class_attr.split_whitespace().collect();
+
         // 1. 收集命中声明(规则 + 内联)。
         let mut candidates: Vec<Candidate> = Vec::new();
         for rule in &self.rules {
             if !rule.media.matches(&self.media) {
                 continue;
+            }
+            // 廉价否决:组内每个选择器的主体都不可能命中此节点时,整条规则跳过。
+            // 主体特征与 selectors 平行(构造时同源生成);长度不一致时保守回退到
+            // 完整匹配,不冒假否决的风险。
+            if rule.subjects.len() == rule.selectors.len() {
+                if !rule
+                    .subjects
+                    .iter()
+                    .any(|h| !h.rejects(&tag, node_id.as_deref(), &node_classes))
+                {
+                    continue;
+                }
             }
             let mut best: Option<(u16, u16, u16)> = None;
             for sel in &rule.selectors {
@@ -618,8 +638,13 @@ fn parse_block(css: &str, media: MediaExpr, out: &mut Vec<Rule>, order: &mut usi
         if decls.is_empty() {
             continue;
         }
+        let subjects = selectors
+            .iter()
+            .map(selector::SubjectHint::from_selector)
+            .collect();
         out.push(Rule {
             selectors,
+            subjects,
             decls,
             media: media.clone(),
             order: *order,

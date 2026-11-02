@@ -85,6 +85,58 @@ pub struct Selector {
     pub specificity: (u16, u16, u16),
 }
 
+/// 规则主体(选择器**最后一个** compound)的廉价拒绝特征。
+///
+/// `matches` 的第一件事就是 `match_compound(node, subject)`,而 `match_compound`
+/// 的前三项检查恰是 tag / id / class。把这三者抽成预计算特征后,`StyleEngine::
+/// computed` 可以在不进入 `match_compound`(借一次 attributes RefCell +
+/// `class.split_whitespace()` 重新分配 + 可能的祖先链回溯)的前提下否掉绝大
+/// 多数规则 —— 实测猎聘页 1.2 万条规则 × 每节点全量匹配,是布局/快照慢到
+/// 分钟级(大站截图 >11 min 未结束)的主因。
+///
+/// **语义约束:只能用于否定。** `rejects` 为 true 时 `match_compound` 必然失败
+/// (tag 不符 / id 不符 / class 不全含),故整条规则可安全跳过;为 false 时仍必须
+/// 走完整 `matches`(属性、伪类、组合符尚未检查)。因此本过滤**不会引入假否决**。
+#[derive(Debug, Default, Clone)]
+pub struct SubjectHint {
+    pub tag: Option<String>,
+    pub id: Option<String>,
+    pub classes: Vec<String>,
+}
+
+impl SubjectHint {
+    pub fn from_selector(sel: &Selector) -> Self {
+        let Some((_, compound)) = sel.parts.last() else {
+            return Self::default();
+        };
+        Self {
+            // match_compound 用 `to_ascii_lowercase()` 后的标签与 compound.tag
+            // 直接比较,故这里统一小写:最坏情况只是少否一层,不会误否。
+            tag: compound.tag.as_ref().map(|t| t.to_ascii_lowercase()),
+            id: compound.ids.first().cloned(),
+            classes: compound.classes.clone(),
+        }
+    }
+
+    /// true = 该主体**不可能**匹配此节点,含该主体的规则可整条跳过。
+    pub fn rejects(&self, tag: &str, id: Option<&str>, classes: &[&str]) -> bool {
+        if let Some(want) = &self.tag {
+            if want != tag {
+                return true;
+            }
+        }
+        if let Some(want) = &self.id {
+            if id != Some(want.as_str()) {
+                return true;
+            }
+        }
+        if !self.classes.is_empty() && self.classes.iter().any(|w| !classes.contains(&w.as_str())) {
+            return true;
+        }
+        false
+    }
+}
+
 /// 解析逗号分隔的选择器组;非法选择器被丢弃(不影响同组其它选择器)。
 pub fn parse_selector_list(input: &str) -> Vec<Selector> {
     split_top_level(input, ',')

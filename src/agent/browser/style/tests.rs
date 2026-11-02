@@ -715,3 +715,114 @@ fn 百分比top对未知包含块高按auto处理() {
     pos.top = Some(12.0);
     assert_eq!(pos.resolved_top(sentinel), Some(12.0));
 }
+
+/// 主体预过滤的**安全性**性质:被预过滤否决的规则,绝不可能是真正命中的规则。
+/// 换言之 `full_match ⇒ hint_pass` 必须恒成立 —— 预过滤只准「少否」,不准「误否」。
+#[test]
+fn 主体预过滤不误否任何会命中的规则() {
+    use crate::agent::browser::style::selector;
+    fn 节点特征(node: &kuchikiki::NodeRef) -> (String, Option<String>, Vec<String>) {
+        let tag = crate::agent::browser::document::tag_name(node).to_ascii_lowercase();
+        let id = crate::agent::browser::document::attr(node, "id");
+        let classes = crate::agent::browser::document::attr(node, "class")
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        (tag, id, classes)
+    }
+
+    fn 递归校验(
+        node: &kuchikiki::NodeRef,
+        engine: &StyleEngine,
+        bad: &mut Vec<String>,
+    ) {
+        if let Some(el) = node.as_element() {
+            let _ = el;
+            let (tag, id, classes) = 节点特征(node);
+            let class_refs: Vec<&str> = classes.iter().map(String::as_str).collect();
+            for (ri, rule) in engine.rules.iter().enumerate() {
+                let full = rule
+                    .selectors
+                    .iter()
+                    .any(|sel| selector::matches(sel, node));
+                let hint = rule
+                    .subjects
+                    .iter()
+                    .any(|h| !h.rejects(&tag, id.as_deref(), &class_refs));
+                if full && !hint {
+                    bad.push(format!(
+                        "规则 #{} 真实命中 <{tag} id={id:?} class={classes:?}> 却被预过滤否决",
+                        ri
+                    ));
+                }
+            }
+        }
+        for child in node.children() {
+            递归校验(&child, engine, bad);
+        }
+    }
+
+    let (doc, engine) = doc_engine(
+        "<head><style>
+            div { color: red; }
+            #main { color: blue; }
+            .a .b { color: green; }
+            div > span.x { color: navy; }
+            * { margin: 0; }
+            a[href] { color: teal; }
+            li:first-child { color: olive; }
+            ul li .c span { color: purple; }
+            .d { color: black; }
+            DIV.upper { color: gray; }
+         </style></head><body>
+            <div id='main' class='a'><span class='b x'>t</span></div>
+            <ul><li class='c'>1</li><li>2</li></ul>
+            <a href='x'>l</a><span class='d'>d</span>
+            <div class='upper'>U</div>
+         </body>",
+        1280.0,
+    );
+    let mut bad = Vec::new();
+    递归校验(&doc.root(), &engine, &mut bad);
+    assert!(bad.is_empty(), "预过滤误否:\n{}", bad.join("\n"));
+}
+
+/// 主体预过滤必须真的起作用(否则这条优化等于没做):在大样式表下,
+/// 单个节点的候选规则数应远小于规则总数。
+#[test]
+fn 主体预过滤确实减少候选规则() {
+    use crate::agent::browser::style::selector;
+    let mut css = String::new();
+    for i in 0..2000 {
+        css.push_str(&format!(".cls{i} .x{i} {{ color: rgb({i},0,0); }}\n"));
+        css.push_str(&format!("div.item{i} {{ margin: {i}px; }}\n"));
+        css.push_str(&format!("#id{i} {{ padding: {i}px; }}\n"));
+    }
+    // 唯一真正命中下面那个 <span class='hit'> 的规则
+    css.push_str("span.hit { color: rgb(1, 2, 3); }\n");
+    let html = format!(
+        "<head><style>{css}</style></head><body><div class='cls1 x1'><span class='hit'>t</span></div></body>"
+    );
+    let (doc, engine) = doc_engine(&html, 1280.0);
+    let node = doc.first("span").unwrap().unwrap();
+    let tag = crate::agent::browser::document::tag_name(&node).to_ascii_lowercase();
+    let id = crate::agent::browser::document::attr(&node, "id");
+    let classes = crate::agent::browser::document::attr(&node, "class").unwrap_or_default();
+    let class_refs: Vec<&str> = classes.split_whitespace().collect();
+    let total = engine.rules.len();
+    let candidates = engine
+        .rules
+        .iter()
+        .filter(|r| r.subjects.iter().any(|h| !h.rejects(&tag, id.as_deref(), &class_refs)))
+        .count();
+    assert!(
+        candidates * 20 < total,
+        "预过滤几乎没起作用:候选 {candidates} / 总 {total}"
+    );
+    // 且真实命中仍然保留
+    assert!(engine.rules.iter().any(|r| r
+        .selectors
+        .iter()
+        .any(|sel| selector::matches(sel, &node))));
+}
