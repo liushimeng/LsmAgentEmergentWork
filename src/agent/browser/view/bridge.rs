@@ -12,10 +12,24 @@ use std::sync::Arc;
 
 use super::super::{
     document, images, layout, page_bars, style, urlutil, LsmBrowserManager, TabState,
+    ViewFollow,
 };
 use super::ViewCommand;
 
 impl LsmBrowserManager {
+    /// 设置查看器跟随目标(动作落账/人工工具栏操作/加载首帧/显示收尾)。
+    /// 叶子锁:绝不与 `inner` 同时持有(心跳反序拿锁,防死锁)。
+    pub(crate) fn set_view_follow(&self, f: Option<ViewFollow>) {
+        if let Ok(mut g) = self.view_follow.lock() {
+            *g = f;
+        }
+    }
+
+    /// 读取查看器跟随目标(克隆返回,调用方不长期持锁)。
+    pub(crate) fn view_follow(&self) -> Option<ViewFollow> {
+        self.view_follow.lock().ok().and_then(|g| g.clone())
+    }
+
     /// 确保查看器子进程与命令通道存在;已关闭的句柄不阻止后续重建。
     fn ensure_view_process(&self, width: u32, height: u32, title: &str) {
         let mut guard = self.view.lock().unwrap();
@@ -47,6 +61,7 @@ impl LsmBrowserManager {
         self.ensure_view_process(tab.viewport.width, tab.viewport.height, &title);
         // 两条告知栏的 1Hz 心跳(全进程单实例,`page_bars.rs`)。
         self.ensure_bars_ticker();
+        // 推帧(push_frame)同步落跟随页。
         self.push_frame(tab);
     }
 
@@ -66,6 +81,12 @@ impl LsmBrowserManager {
                 sink.send_frame(&png);
                 sink.send_title(&format!("正在打开 — {url}"));
                 sink.send_urlbar(url, false, false);
+                // 加载帧已入查看器:置 PendingLoading 让 1Hz 心跳暂停推送,
+                // 否则旧跟随页的帧一秒后就把加载页盖掉(open/navigate 收尾的
+                // ensure_view 会落回 Page,心跳随之恢复)。
+                self.set_view_follow(Some(ViewFollow::PendingLoading {
+                    since_ms: page_bars::now_ms_public(),
+                }));
             }
         }
     }
@@ -117,6 +138,9 @@ impl LsmBrowserManager {
     ) {
         let page_id = self.foreground_page_id().await;
         let Some(page_id) = page_id else { return };
+        // 人工在查看器里操作(工具栏/地址栏):显式表达了「看这页」,
+        // 跟随页立刻切到前台页,Agent 后续动作再拉回工作页。
+        self.set_view_follow(Some(ViewFollow::Page(page_id.clone())));
         let timeout = 45_000u64;
         let _ = match cmd {
             ViewCommand::Navigate(url) => {
@@ -163,7 +187,12 @@ impl LsmBrowserManager {
     }
 
     /// 渲染当前布局为视口 PNG 并推给查看器(查看器不存在时 no-op)。
+    ///
+    /// 推帧即声明显示意图:跟随页在此同步落账(open/navigate 收尾、动作收尾、
+    /// api.rs 各交互补泵点都经此),引擎直调路径(api::control)无需依赖
+    /// 工具层落账也能让心跳跟上。
     pub(in crate::agent::browser) fn push_frame(&self, tab: &TabState) {
+        self.set_view_follow(Some(ViewFollow::Page(tab.id.clone())));
         let alive = self.view.lock().map(|g| g.is_some()).unwrap_or(false);
         if !alive {
             return;

@@ -457,27 +457,40 @@ impl LsmBrowserManager {
 
     /// 工具动作开始:把台账快照 + 动作标签落进目标标签页(`None` = 广播全部;
     /// ticker 在 Agent 任务树外,必须落账而不是渲染时实时读台账)。
+    /// 同时把查看器跟随页切到目标页(动作开始即显示,长动作期间人工全程可见)。
     pub(crate) async fn note_action_begin(&self, page_hint: Option<&str>, label: &str) {
         if !bars_enabled() {
             return;
         }
         let snap = web_activity::current_snapshot();
-        let mut inner = self.inner.lock().await;
-        for (id, tab) in inner.tabs.iter_mut() {
-            if let Some(hint) = page_hint {
-                if id != hint {
-                    continue;
+        let hit = {
+            let mut inner = self.inner.lock().await;
+            let mut hit = false;
+            for (id, tab) in inner.tabs.iter_mut() {
+                if let Some(hint) = page_hint {
+                    if id != hint {
+                        continue;
+                    }
+                    hit = true;
                 }
+                if let Some(s) = snap.as_ref() {
+                    tab.bars.apply_snapshot(s);
+                }
+                tab.bars.action = label.to_string();
             }
-            if let Some(s) = snap.as_ref() {
-                tab.bars.apply_snapshot(s);
-            }
-            tab.bars.action = label.to_string();
+            hit
+        };
+        // 跟随页在释放 inner 后落账(叶子锁序,防与心跳反序死锁)。
+        if hit {
+            self.set_view_follow(Some(super::ViewFollow::Page(
+                page_hint.unwrap_or_default().to_string(),
+            )));
         }
     }
 
     /// 工具动作结束:目标标签页事件时间线滚动追加(动作本身的收尾刷新走
-    /// refresh_view,1Hz 心跳兜底耗时行跳动)。
+    /// refresh_view,1Hz 心跳兜底耗时行跳动)。open 类动作的输出页
+    /// (新 page_id)在此把跟随页拉到新页。
     pub(crate) async fn note_action_end(
         &self,
         page_hint: Option<&str>,
@@ -494,14 +507,24 @@ impl LsmBrowserManager {
             ok,
             ms: elapsed_ms,
         };
-        let mut inner = self.inner.lock().await;
-        for (id, tab) in inner.tabs.iter_mut() {
-            if let Some(hint) = page_hint {
-                if id != hint {
-                    continue;
+        let hit = {
+            let mut inner = self.inner.lock().await;
+            let mut hit = false;
+            for (id, tab) in inner.tabs.iter_mut() {
+                if let Some(hint) = page_hint {
+                    if id != hint {
+                        continue;
+                    }
+                    hit = true;
                 }
+                tab.bars.push_event(ev.clone());
             }
-            tab.bars.push_event(ev.clone());
+            hit
+        };
+        if hit {
+            self.set_view_follow(Some(super::ViewFollow::Page(
+                page_hint.unwrap_or_default().to_string(),
+            )));
         }
     }
 
@@ -529,7 +552,12 @@ impl LsmBrowserManager {
         });
     }
 
-    /// 心跳一拍:查看器存活且有 headed 前台页时重推一帧(无查看器零渲染开销)。
+    /// 心跳一拍:按「跟随页」选页重推一帧(无查看器零渲染开销)。
+    ///
+    /// 2026-11-02 天猫一轮根因:此前恒推「前台页」(= 最近 open 的页),
+    /// Plan 侦察连开的骨架屏/错误页把查看器劫成白板,Agent 回工作页的帧
+    /// 每秒被前台帧盖回,人工在 HITL 时看「画面是白板」。选页决策收敛到
+    /// `pick_display_tab` 纯函数(单测覆盖三态回退)。
     async fn bars_tick(&self) {
         if !bars_enabled() {
             return;
@@ -538,20 +566,74 @@ impl LsmBrowserManager {
         if !alive {
             return;
         }
+        let follow = self.view_follow();
         let inner = self.inner.lock().await;
-        let tab = inner
+        let tabs: Vec<TabSummary> = inner
             .tabs
             .values()
-            .find(|t| t.foreground && t.mode.is_headed())
-            .or_else(|| inner.tabs.values().find(|t| t.mode.is_headed()));
-        if let Some(tab) = tab {
+            .map(|t| TabSummary {
+                id: t.id.clone(),
+                foreground: t.foreground,
+                headed: t.mode.is_headed(),
+            })
+            .collect();
+        let Some(id) = pick_display_tab(&tabs, follow.as_ref(), now_ms()) else {
+            return;
+        };
+        if let Some(tab) = inner.tabs.get(id) {
             self.push_frame(tab);
         }
     }
 }
 
+/// 心跳选页的标签页摘要(纯决策的输入;避免在决策层触碰完整 TabState)。
+pub(crate) struct TabSummary {
+    pub id: String,
+    pub foreground: bool,
+    pub headed: bool,
+}
+
+/// 加载首帧的孤儿 TTL:整脚本管线预算上限(240s)+ 宽限(60s)+ 余量(60s)。
+/// open/navigate 任务被取消时跟随页可能永远停在 PendingLoading,
+/// 超过 TTL 视为孤儿,心跳回退前台链恢复推送。
+pub(crate) const PENDING_LOADING_TTL_MS: u128 = 360_000;
+
+/// 心跳选页决策(纯函数):
+/// 1. `PendingLoading` 且未超 TTL → `None`(本轮不推,保住加载首帧);
+/// 2. 跟随页在场且 headed → 该页(Agent 工作页/人工操作页优先);
+/// 3. 回退链:前台 headed → 任一 headed → `None`。
+pub(crate) fn pick_display_tab<'a>(
+    tabs: &'a [TabSummary],
+    follow: Option<&super::ViewFollow>,
+    now: u128,
+) -> Option<&'a str> {
+    match follow {
+        Some(super::ViewFollow::PendingLoading { since_ms }) => {
+            if now.saturating_sub(*since_ms) < PENDING_LOADING_TTL_MS {
+                return None;
+            }
+        }
+        Some(super::ViewFollow::Page(id)) => {
+            if let Some(t) = tabs.iter().find(|t| t.id == *id && t.headed) {
+                return Some(&t.id);
+            }
+        }
+        None => {}
+    }
+    // 跟随页失效(被 close/无记录/PendingLoading 孤儿):前台链兜底。
+    tabs.iter()
+        .find(|t| t.foreground && t.headed)
+        .or_else(|| tabs.iter().find(|t| t.headed))
+        .map(|t| t.id.as_str())
+}
+
 fn now_ms() -> u128 {
     web_activity::now_ms()
+}
+
+/// 供 `view::bridge` 等兄弟模块使用的同一时钟(跟随页 TTL 与告知栏时间线一致)。
+pub(crate) fn now_ms_public() -> u128 {
+    now_ms()
 }
 
 #[cfg(test)]
@@ -756,5 +838,59 @@ mod tests {
             status2.iter().any(|r| r.text.contains("WebGL")),
             "有 WebGL 缺口时状态栏必须给出说明:{status2:?}"
         );
+    }
+
+    // ===================== 跟随页选页决策(2026-11-02 天猫白板根因) =====================
+
+    fn tab_s(id: &str, foreground: bool, headed: bool) -> TabSummary {
+        TabSummary { id: id.to_string(), foreground, headed }
+    }
+
+    #[test]
+    fn 跟随页优先于前台页() {
+        // 天猫一轮实况:前台被侦察页(p_4 错误页)占走,Agent 在 p_1 工作。
+        let tabs = vec![
+            tab_s("p_1", false, true),
+            tab_s("p_4", true, true),
+        ];
+        let follow = super::super::ViewFollow::Page("p_1".into());
+        assert_eq!(pick_display_tab(&tabs, Some(&follow), 1000), Some("p_1"));
+    }
+
+    #[test]
+    fn 跟随页被关闭则回退前台页() {
+        let tabs = vec![
+            tab_s("p_1", false, true),
+            tab_s("p_4", true, true),
+        ];
+        let follow = super::super::ViewFollow::Page("p_9".into());
+        assert_eq!(pick_display_tab(&tabs, Some(&follow), 1000), Some("p_4"));
+    }
+
+    #[test]
+    fn 加载首帧在位时心跳暂停推送() {
+        let tabs = vec![tab_s("p_1", true, true)];
+        let follow = super::super::ViewFollow::PendingLoading { since_ms: 1_000 };
+        // TTL 内:不推(保住加载首帧)。
+        assert_eq!(pick_display_tab(&tabs, Some(&follow), 2_000), None);
+        // 超过孤儿 TTL(取消的导航):回退前台链恢复推送。
+        assert_eq!(
+            pick_display_tab(&tabs, Some(&follow), 2_000 + PENDING_LOADING_TTL_MS),
+            Some("p_1")
+        );
+    }
+
+    #[test]
+    fn 无跟随记录走前台链兜底() {
+        let tabs = vec![
+            tab_s("p_1", false, true),
+            tab_s("p_2", true, true),
+        ];
+        assert_eq!(pick_display_tab(&tabs, None, 0), Some("p_2"));
+        // 前台页非 headed(极端窗口) → 任一 headed。
+        let tabs2 = vec![tab_s("p_1", true, false), tab_s("p_2", false, true)];
+        assert_eq!(pick_display_tab(&tabs2, None, 0), Some("p_2"));
+        // 全空 → 不推。
+        assert_eq!(pick_display_tab(&[], None, 0), None);
     }
 }

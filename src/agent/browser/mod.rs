@@ -479,6 +479,22 @@ impl EngineError {
 
 pub type EngineResult<T> = Result<T, EngineError>;
 
+/// 查看器「跟随页」显示语义的唯一真源(2026-11-02 天猫一轮:查看器白板根因)。
+///
+/// 旧语义:查看器恒显「前台页」(= 最近 open 的页)——Plan 侦察连开骨架屏/错误页
+/// 会把人工视口劫走,Agent 回工作页也被 1Hz 心跳用前台帧每秒盖回,人工看到的是
+/// 「白板」。新语义:显示跟随**最近一次有意义交互的页**——工具动作的目标页
+/// (`note_action_begin/end` 落账)、人工在查看器里的操作页(`handle_view_command`),
+/// 无记录时才回退前台页。设计见 `docs/MCP_Web_LsmAgentBrowser_Use/05-窗口交互与页面观察/38-查看器跟随页语义与天猫白板根因.md`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ViewFollow {
+    /// 跟随指定标签页(不在场/非 headed 时由心跳回退前台页)。
+    Page(String),
+    /// 加载首帧已推给查看器:心跳暂停推送,防旧页帧一秒后盖掉加载页;
+    /// 超过 TTL(整管线预算上限)视为孤儿导航,回退前台链。
+    PendingLoading { since_ms: u128 },
+}
+
 pub struct LsmBrowserManager {
     inner: Mutex<Inner>,
     http: net::HttpClient,
@@ -487,6 +503,8 @@ pub struct LsmBrowserManager {
     view: std::sync::Mutex<Option<view::ViewSink>>,
     /// 有头查看器的交互命令通道(查看器工具栏/地址栏 → 引擎)。
     view_cmd_tx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<view::ViewCommand>>>,
+    /// 查看器跟随页(显示语义见 `ViewFollow`;仅 1Hz 心跳消费)。
+    view_follow: std::sync::Mutex<Option<ViewFollow>>,
     /// 自身弱引用(查看器命令处理任务用它回到引擎;非 Arc 场景为空)。
     self_weak: std::sync::Mutex<std::sync::Weak<LsmBrowserManager>>,
     /// 两条告知栏 1Hz 心跳的单实例闸(`page_bars.rs::ensure_bars_ticker`)。
@@ -510,6 +528,7 @@ impl LsmBrowserManager {
             font: render::FontSet::load(),
             view: std::sync::Mutex::new(None),
             view_cmd_tx: std::sync::Mutex::new(None),
+            view_follow: std::sync::Mutex::new(None),
             self_weak: std::sync::Mutex::new(std::sync::Weak::new()),
             bars_ticker_started: std::sync::atomic::AtomicBool::new(false),
         }
@@ -1270,6 +1289,18 @@ impl LsmBrowserManager {
             layout::compute_full(&pre_doc, viewport_w as f64, &self.font, &pre_media, &pre_sizes)
                 .rect_map()
         };
+        // 有头:长导航先推加载首帧(2026-11-02 天猫一轮 R3:此前 navigate 路径
+        // 无加载视图,重导航期间查看器冻结旧帧,人工误判「页面已死」去点刷新,
+        // 雪上加霜)。`ensure_loading_view` 同步置 `PendingLoading`,1Hz 心跳暂停
+        // 推送;导航收尾 `ensure_view` 把跟随页落回 `Page(目标页)` 后恢复。
+        if inner
+            .tabs
+            .get(page_id)
+            .map(|t| t.mode.is_headed())
+            .unwrap_or(false)
+        {
+            self.ensure_loading_view(&resp.final_url, viewport_w, viewport_h);
+        }
         let pipeline = script::run_pipeline(
             inner,
             &self.http,
