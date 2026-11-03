@@ -233,15 +233,17 @@ async fn request_human(args: &Value, params: &Value) -> Result<String> {
     if !page_visible && !page_id.is_empty() {
         page_visible = mgr.revive_viewer().await;
     }
-    // 2026-11-01 天猫二轮:有头查看器也**没有页面键鼠通道**(ViewCommand 只有
-    // navigate/back/forward/reload/home/resize)——「请在浏览器窗口中扫码或
-    // 账号密码登录」在有头模式下同样不可兑现,人工只能观看/地址栏导航。
-    // 系统提示按真实能力生成,并给可执行替代:凭据走弹窗转述由 Agent 代填;
-    // 扫码登录无需页面输入,但要求二维码可见且登录轮询 JS 在跑。
+    // 2026-11-03(39 号设计文档):有头查看器已支持**页面内键鼠通道**
+    //(ViewCommand::Input → 宿主 human_input 管线;user 态放行)。人工介入
+    // 期间可直接在窗口里点击/输入;`input_forwarding` 如实回写,凭据转述
+    // 仍作为备选路径保留。
+    let input_forwarding =
+        page_visible && crate::agent::browser::human_input::enabled();
     let message = if page_visible {
         format!(
-            "{message}\n[系统提示] 本引擎查看器不支持页面内键鼠操作(人工可观看、可用地址栏导航);\
-             账号密码请在弹窗输入框中转述,由 Agent 通过 control(input_text) 代填;\
+            "{message}\n[系统提示] 本引擎查看器支持页面内键鼠操作(人工可观看、用地址栏导航、\
+             并在用户控制状态下直接在页面内点击/滚动/键盘输入);\
+             账号密码也可在弹窗输入框中转述,由 Agent 通过 control(input_text) 代填;\
              扫码登录无需页面输入,但需二维码在窗口中可见且登录检测在运行。"
         )
     } else {
@@ -300,9 +302,9 @@ async fn request_human(args: &Value, params: &Value) -> Result<String> {
                     "assist_channel": via.as_str(),
                     "origin": "llm",
                     "page_visible": page_visible,
-                    // 查看器无页面键鼠转发(2026-11-01 天猫二轮):人工不能在
-                    // 窗口里点/输;凭据转述由 Agent 代填,页面操作走 Agent 动作。
-                    "input_forwarding": false,
+                    // 有头查看器页面键鼠转发(39 号设计文档):人工可在窗口内
+                    // 直接操作页面;隐藏模式恒 false。
+                    "input_forwarding": input_forwarding,
                     "next_hint": next_hint,
                 }),
             )
@@ -315,9 +317,9 @@ async fn request_human(args: &Value, params: &Value) -> Result<String> {
                 "kind_label": crate::agent::human_assist::kind_label(&reason),
                 "assist_channel": via.as_str(),
                 "page_visible": page_visible,
-                "input_forwarding": false,
+                "input_forwarding": input_forwarding,
                 "hint": if page_visible {
-                    "可重试 request_human,或如实告知用户改在交互模式重试;本引擎查看器无页面键鼠通道,人工无法在窗口内输入,凭据请经弹窗转述由 Agent 代填;严禁伪造结果。"
+                    "可重试 request_human,或如实告知用户改在交互模式重试;本引擎查看器支持页面键鼠(用户控制状态下人工可直接在窗口内操作),凭据也可经弹窗转述由 Agent 代填;严禁伪造结果。"
                 } else {
                     "页面无可见窗口(隐藏模式),重试 request_human 前先以有头模式打开页面,否则人工永远无法在页面上操作;严禁伪造结果。"
                 },

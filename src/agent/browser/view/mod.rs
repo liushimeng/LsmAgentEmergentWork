@@ -12,11 +12,14 @@
 //!
 //! 命令通道(stdout,查看器 → 宿主,按行 JSON):
 //! `{"cmd":"navigate","url":"..."}` / `{"cmd":"back"}` / `{"cmd":"forward"}` /
-//! `{"cmd":"reload"}` / `{"cmd":"home"}` / `{"cmd":"resize","w":1920,"h":1080}`。
+//! `{"cmd":"reload"}` / `{"cmd":"home"}` / `{"cmd":"resize","w":1920,"h":1080}` /
+//! `{"cmd":"input","act":"move|down|up|wheel|key",...}`(人类键鼠,39 号设计文档)。
 //! 浏览器窗口的工具栏(后退/前进/刷新/首页)与地址栏都经这条通道驱动宿主引擎,
 //! 窗口因此是**可交互的真浏览器形态**,而不只是被动显示渲染帧。
 //! `resize` 是人工拖动窗口后查看器上报的新内容区尺寸(已扣工具栏),
 //! 宿主据此重排重渲染 → 新帧按 1:1 铺满内容区(见 `view::resize`)。
+//! `input` 是人工在页面区内的鼠标/键盘事件,宿主经 `human_input` 管线
+//! 转成真实页面交互(控制权 `user` 态放行,`agent` 态忽略)。
 
 #[cfg(target_os = "macos")]
 pub mod macos;
@@ -35,8 +38,8 @@ const KIND_CLOSE: u8 = b'c';
 /// 地址栏状态帧(URL + 前进/后退可用性)。
 const KIND_URLBAR: u8 = b'u';
 
-/// 查看器 → 宿主的交互命令(工具栏按钮 / 地址栏回车)。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 查看器 → 宿主的交互命令(工具栏按钮 / 地址栏回车 / 人类键鼠)。
+#[derive(Debug, Clone, PartialEq)]
 pub enum ViewCommand {
     /// 在地址栏输入的 URL(宿主负责补全协议并导航)。
     Navigate(String),
@@ -50,6 +53,8 @@ pub enum ViewCommand {
     Home,
     /// 人工拖动窗口后新的内容区尺寸(已扣工具栏;= 宿主侧的新视口尺寸)。
     Resize { width: u32, height: u32 },
+    /// 人工在页面区内的鼠标/键盘事件(39 号设计文档)。
+    Input(crate::agent::browser::human_input::HumanInput),
 }
 
 /// 解析查看器发来的一行 JSON 命令。非法行返回 None(忽略,不打断通道)。
@@ -79,6 +84,8 @@ pub fn parse_command(line: &str) -> Option<ViewCommand> {
                 height: h,
             })
         }
+        // 人工键鼠事件;解析规则见 `human_input::parse_event`(非法行忽略)。
+        "input" => crate::agent::browser::human_input::parse_event(&v).map(ViewCommand::Input),
         _ => None,
     }
 }

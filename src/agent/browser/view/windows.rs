@@ -17,20 +17,22 @@ use windows::core::w;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, InvalidateRect, StretchDIBits,
-    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HDC, PAINTSTRUCT, SRCCOPY,
+    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, InvalidateRect, ScreenToClient,
+    StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HDC, PAINTSTRUCT, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus, SetFocus};
+use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus, GetKeyState, SetFocus};
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetClientRect, GetMessageW, GetWindowTextW, LoadCursorW, MoveWindow, PostQuitMessage,
-    RegisterClassW, SetTimer, SetWindowTextW, ShowWindow, TranslateMessage, BS_PUSHBUTTON,
-    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, ES_AUTOHSCROLL, HMENU, IDC_ARROW, MSG, SW_SHOWNORMAL,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_KEYDOWN, WM_KILLFOCUS,
-    WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
-    WS_VISIBLE,
+    RegisterClassW, SetTimer, SetWindowTextW, ShowWindow, TranslateMessage,
+    BS_PUSHBUTTON, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, ES_AUTOHSCROLL, HMENU,
+    IDC_ARROW, MSG, SW_SHOWNORMAL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CHAR, WM_CLOSE, WM_COMMAND,
+    WM_DESTROY, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT,
+    WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSW,
+    WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
 };
 
 use super::read_frame;
@@ -63,6 +65,10 @@ static RELOAD_BTN: Mutex<Option<HwndCell>> = Mutex::new(None);
 static HOME_BTN: Mutex<Option<HwndCell>> = Mutex::new(None);
 /// 上一次已知的客户区尺寸(像素);变了才重排 + 上报宿主。
 static LAST_SIZE: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+/// 本查看器认知里的视口尺寸(键鼠坐标换算基线;初始来自 argv,随 resize 同步)。
+static VIEWPORT: Mutex<(i32, i32)> = Mutex::new((0, 0));
+/// 上次已上报的 move(节流:≥30ms 且位移 ≥1px 才再发)。
+static LAST_MOVE: Mutex<Option<(std::time::Instant, f64, f64)>> = Mutex::new(None);
 
 const TIMER_ID: usize = 1;
 const TIMER_MS: u32 = 100;
@@ -107,6 +113,213 @@ fn address_text(hwnd: HWND) -> String {
         }
         String::from_utf16_lossy(&buf[..n as usize])
     }
+}
+
+// ---------- 人类键鼠输入(39 号设计文档,与 macOS 侧同协议) ----------
+
+/// 输入上报是否被 `LAEW_HUMAN_INPUT=off` 关闭。
+fn input_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| {
+        matches!(
+            std::env::var("LAEW_HUMAN_INPUT")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "off" | "0" | "false" | "no"
+        )
+    })
+}
+
+/// 修饰键状态(GetKeyState 高位 = 按下)。
+unsafe fn mods_state() -> (bool, bool, bool, bool) {
+    let down = |vk: i32| GetKeyState(vk) as u16 & 0x8000 != 0;
+    (down(0x10), down(0x11), down(0x12), false) // shift/ctrl/alt;Windows 无 meta
+}
+
+/// 客户区坐标 → 视口坐标(画面 1:1 居中,与 paint 同一换算;越界返回 None)。
+fn client_to_page(hwnd: HWND, x: i32, y: i32) -> Option<(f64, f64)> {
+    let (cw, ch) = unsafe { client_size(hwnd) }?;
+    let view_h = ch - TOOLBAR_H;
+    if view_h <= 0 {
+        return None;
+    }
+    // 帧尺寸优先(当前真画面),缺帧时回落认知视口。
+    let (fw, fh) = {
+        let frame = FRAME.lock().unwrap();
+        match frame.as_ref() {
+            Some(f) => (f.width, f.height),
+            None => {
+                let (w, h) = *VIEWPORT.lock().unwrap();
+                if w <= 0 || h <= 0 {
+                    return None;
+                }
+                (w, h)
+            }
+        }
+    };
+    let dx = (cw - fw) / 2;
+    let dy = TOOLBAR_H + (view_h - fh) / 2;
+    let px = x - dx;
+    let py = y - dy;
+    if px < 0 || py < 0 || px >= fw || py >= fh {
+        return None;
+    }
+    Some((px as f64, py as f64))
+}
+
+fn move_allowed(x: f64, y: f64) -> bool {
+    let mut last = LAST_MOVE.lock().unwrap();
+    match *last {
+        Some((at, lx, ly)) => {
+            let due =
+                at.elapsed().as_millis() >= 30 && ((lx - x).abs() >= 1.0 || (ly - y).abs() >= 1.0);
+            if due {
+                *last = Some((std::time::Instant::now(), x, y));
+            }
+            due
+        }
+        None => {
+            *last = Some((std::time::Instant::now(), x, y));
+            true
+        }
+    }
+}
+
+/// 指针事件公共出口。
+fn forward_pointer(hwnd: HWND, x: i32, y: i32, act: &str, btn: Option<&str>, is_move: bool) {
+    if input_disabled() {
+        return;
+    }
+    let Some((px, py)) = client_to_page(hwnd, x, y) else {
+        return;
+    };
+    if is_move && !move_allowed(px, py) {
+        return;
+    }
+    let line = match btn {
+        Some(b) => {
+            format!("{{\"cmd\":\"input\",\"act\":\"{act}\",\"x\":{px:.0},\"y\":{py:.0},\"btn\":\"{b}\"}}")
+        }
+        None => format!("{{\"cmd\":\"input\",\"act\":\"{act}\",\"x\":{px:.0},\"y\":{py:.0}}}"),
+    };
+    send_cmd(&line);
+}
+
+/// lParam 的客户区坐标(带符号扩展,多显示器负坐标正确)。
+fn lparam_xy(lp: LPARAM) -> (i32, i32) {
+    let raw = lp.0 as u64;
+    let x = (raw & 0xFFFF) as u16 as i16 as i32;
+    let y = ((raw >> 16) & 0xFFFF) as u16 as i16 as i32;
+    (x, y)
+}
+
+/// 虚拟键码 → 浏览器键名(特殊键);可打印字符走 WM_CHAR。
+fn vk_special(vk: u32) -> Option<&'static str> {
+    Some(match vk {
+        0x0D => "Enter",
+        0x09 => "Tab",
+        0x1B => "Escape",
+        0x08 => "Backspace",
+        0x2E => "Delete",
+        0x25 => "ArrowLeft",
+        0x26 => "ArrowUp",
+        0x27 => "ArrowRight",
+        0x28 => "ArrowDown",
+        0x24 => "Home",
+        0x23 => "End",
+        0x21 => "PageUp",
+        0x22 => "PageDown",
+        0x20 => "Space",
+        _ => return None,
+    })
+}
+
+fn send_key_json(key: &str, mods: (bool, bool, bool, bool)) {
+    let line = format!(
+        "{{\"cmd\":\"input\",\"act\":\"key\",\"key\":\"{key}\",\"mods\":{{\"shift\":{},\"ctrl\":{},\"alt\":{},\"meta\":false}}}}",
+        mods.0, mods.1, mods.2
+    );
+    send_cmd(&line);
+}
+
+/// 键按下:浏览器级快捷键本地消化(Ctrl+R/F5 刷新);特殊键转发;可打印键
+/// 等 WM_CHAR(避免 KEYDOWN+CHAR 双发)。`sys` = Alt 组合(Alt+←/→ 前进后退)。
+unsafe fn forward_key(wp: WPARAM, sys: bool) {
+    if input_disabled() {
+        return;
+    }
+    let vk = (wp.0 & 0xFFFF) as u32;
+    let (shift, ctrl, alt, _) = mods_state();
+    if ctrl && vk == 0x52 || vk == 0x74 {
+        send_cmd("{\"cmd\":\"reload\"}");
+        return;
+    }
+    if sys {
+        if alt && vk == 0x25 {
+            send_cmd("{\"cmd\":\"back\"}");
+        } else if alt && vk == 0x27 {
+            send_cmd("{\"cmd\":\"forward\"}");
+        }
+        return;
+    }
+    if ctrl || alt {
+        return; // 其余组合键不产生页面文本(阶段二再接快捷键全集)
+    }
+    if let Some(k) = vk_special(vk) {
+        send_key_json(k, (shift, ctrl, alt, false));
+    }
+    // 可打印键:WM_CHAR 负责发送(WM_KEYDOWN 不发,防双发)。
+}
+
+/// WM_CHAR:可打印字符转发(跳过控制字符/代理对;组合键已在 KEYDOWN 过滤)。
+unsafe fn forward_char(wp: WPARAM) {
+    if input_disabled() {
+        return;
+    }
+    let unit = (wp.0 & 0xFFFF) as u32;
+    // 控制字符与 UTF-16 代理对(IME 组合输入属阶段二)不转发。
+    if unit < 0x20 || unit == 0x7F || (0xD800..=0xDFFF).contains(&unit) {
+        return;
+    }
+    let Some(c) = char::from_u32(unit) else { return };
+    let (shift, ctrl, alt, _) = mods_state();
+    if ctrl || alt {
+        return;
+    }
+    // 键内容只可能是简单 BMP 可打印字符,无需复杂转义;保守处理引号/反斜杠。
+    let escaped = match c {
+        '"' => "\\\"".to_string(),
+        '\\' => "\\\\".to_string(),
+        c => c.to_string(),
+    };
+    send_key_json(&escaped, (shift, ctrl, alt, false));
+}
+
+/// 滚轮:wParam 高 16 位 = 档位(±120/档);lParam 为**屏幕**坐标需转客户区。
+unsafe fn forward_wheel(hwnd: HWND, wp: WPARAM, lp: LPARAM, horizontal: bool) {
+    if input_disabled() {
+        return;
+    }
+    let delta = ((wp.0 >> 16) & 0xFFFF) as u16 as i16;
+    if delta == 0 {
+        return;
+    }
+    let (sx, sy) = lparam_xy(lp);
+    let mut pt = windows::Win32::Foundation::POINT { x: sx, y: sy };
+    if !ScreenToClient(hwnd, &mut pt).as_bool() {
+        return;
+    }
+    let Some((px, py)) = client_to_page(hwnd, pt.x, pt.y) else {
+        // 坐标越界仍允许滚动(滚轮作用整页;宿主按视口滚动兜底)。
+        return;
+    };
+    let (dx, dy) = if horizontal { (delta as f64 / 120.0, 0.0) } else { (0.0, delta as f64 / 120.0) };
+    let line = format!(
+        "{{\"cmd\":\"input\",\"act\":\"wheel\",\"x\":{px:.0},\"y\":{py:.0},\"dx\":{dx:.3},\"dy\":{dy:.3}}}"
+    );
+    send_cmd(&line);
 }
 
 /// 地址栏编辑框子类:回车 → 导航命令。
@@ -162,6 +375,77 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             } else if changed {
                 let _ = InvalidateRect(hwnd, None, false);
             }
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            let (x, y) = lparam_xy(lp);
+            forward_pointer(hwnd, x, y, "move", None, true);
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
+            let (x, y) = lparam_xy(lp);
+            forward_pointer(hwnd, x, y, "down", Some("left"), false);
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            let (x, y) = lparam_xy(lp);
+            forward_pointer(hwnd, x, y, "up", Some("left"), false);
+            LRESULT(0)
+        }
+        WM_RBUTTONDOWN | WM_RBUTTONDBLCLK => {
+            let (x, y) = lparam_xy(lp);
+            forward_pointer(hwnd, x, y, "down", Some("right"), false);
+            LRESULT(0)
+        }
+        WM_RBUTTONUP => {
+            let (x, y) = lparam_xy(lp);
+            forward_pointer(hwnd, x, y, "up", Some("right"), false);
+            LRESULT(0)
+        }
+        WM_MBUTTONDOWN => {
+            let (x, y) = lparam_xy(lp);
+            forward_pointer(hwnd, x, y, "down", Some("middle"), false);
+            LRESULT(0)
+        }
+        WM_MBUTTONUP => {
+            let (x, y) = lparam_xy(lp);
+            forward_pointer(hwnd, x, y, "up", Some("middle"), false);
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL => {
+            forward_wheel(hwnd, wp, lp, false);
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        WM_MOUSEHWHEEL => {
+            forward_wheel(hwnd, wp, lp, true);
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        WM_KEYDOWN => {
+            // 地址栏聚焦时不进页面(其子类自会处理编辑键)。
+            let focused = GetFocus();
+            let edit = ADDR_EDIT.lock().unwrap().map(|c| c.0);
+            if edit == Some(focused) {
+                return DefWindowProcW(hwnd, msg, wp, lp);
+            }
+            forward_key(wp, false);
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        WM_SYSKEYDOWN => {
+            let focused = GetFocus();
+            let edit = ADDR_EDIT.lock().unwrap().map(|c| c.0);
+            if edit == Some(focused) {
+                return DefWindowProcW(hwnd, msg, wp, lp);
+            }
+            forward_key(wp, true);
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        WM_CHAR => {
+            let focused = GetFocus();
+            let edit = ADDR_EDIT.lock().unwrap().map(|c| c.0);
+            if edit == Some(focused) {
+                return DefWindowProcW(hwnd, msg, wp, lp);
+            }
+            forward_char(wp);
             LRESULT(0)
         }
         WM_COMMAND => {
@@ -336,6 +620,8 @@ unsafe fn handle_resize(hwnd: HWND) {
     // 上报宿主:内容区宽 = 客户区宽;内容区高扣掉工具栏 = 视口高。
     let vw = cw.clamp(1, 7680) as u32;
     let vh = (ch - TOOLBAR_H).clamp(1, 4320) as u32;
+    // 记录本查看器认知里的视口尺寸(键鼠坐标换算基线)。
+    *VIEWPORT.lock().unwrap() = (vw as i32, vh as i32);
     send_cmd(&super::resize::resize_cmd_json(vw, vh));
 }
 
@@ -374,7 +660,9 @@ pub fn run(width: u32, height: u32, title: &str) -> i32 {
         let hinstance: HINSTANCE = hmodule.into();
         let class_name = w!("LsmBrowserViewWnd");
         let wc = WNDCLASSW {
-            style: CS_HREDRAW | CS_VREDRAW,
+            // CS_DBLCLKS:第二次同位点击产生 WM_LBUTTONDBLCLK(转发为按下,
+            // 宿主按两次抬起间隔合成 dblclick)。
+            style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
             lpfnWndProc: Some(wnd_proc),
             hInstance: hinstance,
             lpszClassName: class_name,
@@ -390,6 +678,8 @@ pub fn run(width: u32, height: u32, title: &str) -> i32 {
 
         let w = width.clamp(320, 3840) as i32;
         let h = height.clamp(240, 2160) as i32;
+        // 键鼠坐标换算基线:初始视口 = argv(后续随 resize 上报同步)。
+        *VIEWPORT.lock().unwrap() = (w, h);
         // 客户区尺寸 = 视口 + 工具栏;用 AdjustWindowRectEx 反算外框尺寸,
         // 保证客户区**正好**是 w × (h + TOOLBAR_H)(否则画面区比视口小,
         // 1:1 绘制会在右侧/底部露白边)。

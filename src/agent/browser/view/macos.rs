@@ -106,6 +106,14 @@ msg!(send_void_sel, (arg: Sel) -> ());
 // ABI 都按浮点寄存器返回,与 Rust `extern "C"` 的聚合体返回约定一致;
 // 已用探针实测取到正确尺寸。取不到合理值时上层按「读不到」处理。
 msg!(send_rect, () -> NSRect);
+// NSEvent 字段读取(39 号设计文档:人类键鼠输入)。
+// NSPoint(2×f64)按浮点寄存器传参/返回,与 send_rect 同一 ABI 依据。
+msg!(send_point, () -> NSPoint);
+msg!(send_point_point_id, (p: NSPoint, from: Id) -> NSPoint);
+msg!(send_u64, () -> u64);
+msg!(send_f64, () -> f64);
+// NSTrackingArea initWithRect:options:owner:userInfo:
+msg!(send_id_rect_u64_id_id, (rect: NSRect, opts: u64, owner: Id, info: Id) -> Id);
 
 fn cls(name: &'static [u8]) -> Id {
     unsafe { objc_getClass(name.as_ptr().cast()) }
@@ -293,6 +301,8 @@ unsafe fn sync_content_size() {
     // 上报宿主:内容区宽 = 视口宽;内容区高扣掉工具栏 = 视口高(四舍五入到整像素)。
     let vw = cw.round().clamp(1.0, 7680.0) as u32;
     let vh = (ch - TOOLBAR_H).round().clamp(1.0, 4320.0) as u32;
+    // 记录本查看器认知里的视口尺寸(键鼠坐标换算用;帧按此等比居中)。
+    *VIEWPORT.lock().unwrap() = (vw as f64, vh as f64);
     send_cmd(&super::resize::resize_cmd_json(vw, vh));
 }
 
@@ -422,6 +432,318 @@ extern "C" fn on_text_end(_self: Id, _cmd: Sel, _note: Id) {
             send_void_id(field, sel(b"setStringValue:\0"), ns_str(&url));
         }
     }
+}
+
+// ---------- 人类键鼠输入(39 号设计文档) ----------
+//
+// 页面视图(NSImageView 子类 `LsmBrowserPageView`)捕获原始鼠标/键盘事件,
+// 坐标换算成视口坐标后经 stdout 命令通道上报宿主;宿主 `human_input` 管线
+// 做控制权闸门 + 命中 + 复用 Agent 侧交互语义。`LAEW_HUMAN_INPUT=off` 时
+// 查看器停止上报(宿主侧同时拒绝,双保险)。
+
+/// 宿主侧当前视口尺寸(= 最近一次上报的 resize;初始来自 argv)。
+/// 帧画面按此尺寸与内容区做等比居中换算(稳态 1:1)。
+static VIEWPORT: once_cell::sync::Lazy<Mutex<(f64, f64)>> =
+    once_cell::sync::Lazy::new(|| Mutex::new((0.0, 0.0)));
+/// 上次已上报的 move(节流:≥30ms 且位移 ≥1px 才再发)。
+static LAST_MOVE: once_cell::sync::Lazy<Mutex<Option<(std::time::Instant, f64, f64)>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(None));
+/// 页面视图类(`NSImageView` 子类;`ensure_page_view_class` 注册)。
+static PAGE_VIEW_CLASS: once_cell::sync::Lazy<Mutex<IdCell>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(IdCell(std::ptr::null_mut())));
+
+/// 修饰键位(NSEvent modifierFlags)。
+const NSEVENT_SHIFT: u64 = 0x0002_0000;
+const NSEVENT_CONTROL: u64 = 0x0004_0000;
+const NSEVENT_OPTION: u64 = 0x0008_0000;
+const NSEVENT_COMMAND: u64 = 0x0010_0000;
+/// NSTrackingArea 选项:进入/离开 + 移动 + 始终活跃 + 自动跟随 visibleRect。
+const TRACKING_OPTS: u64 = 0x01 | 0x02 | 0x80 | 0x100;
+
+fn input_disabled() -> bool {
+    static OFF: once_cell::sync::Lazy<bool> = once_cell::sync::Lazy::new(|| {
+        matches!(
+            std::env::var("LAEW_HUMAN_INPUT")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "off" | "0" | "false" | "no"
+        )
+    });
+    *OFF
+}
+
+/// macOS 虚拟键码 → 浏览器键名(特殊键);可打印字符走
+/// `charactersIgnoringModifiers`(0x20..=0x7E,IME 组合输入属阶段二)。
+fn mac_special_key(code: u64) -> Option<&'static str> {
+    Some(match code {
+        36 | 76 => "Enter",
+        48 => "Tab",
+        53 => "Escape",
+        51 => "Backspace",
+        117 => "Delete",
+        123 => "ArrowLeft",
+        124 => "ArrowRight",
+        125 => "ArrowDown",
+        126 => "ArrowUp",
+        115 => "Home",
+        119 => "End",
+        116 => "PageUp",
+        121 => "PageDown",
+        _ => return None,
+    })
+}
+
+/// NSEvent → JSON 字符串的 key 字段转义(键名/单字符,无控制字符)。
+fn key_json_str(k: &str) -> String {
+    let mut out = String::new();
+    for c in k.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// 视图本地坐标(原点左下)→ 视口坐标(原点左上;帧等比居中换算)。
+/// 越出画面(拖到工具栏/边框)返回 None。
+unsafe fn page_point(view: Id, event: Id) -> Option<(f64, f64)> {
+    let loc = send_point(event, sel(b"locationInWindow\0"));
+    let local = send_point_point_id(view, sel(b"convertPoint:fromView:\0"), loc, std::ptr::null_mut());
+    let (cw, ch) = *CONTENT_SIZE.lock().unwrap();
+    let (vw, vh) = *VIEWPORT.lock().unwrap();
+    if vw <= 0.0 || vh <= 0.0 || cw <= 0.0 || ch <= 0.0 {
+        return None;
+    }
+    let view_h = (ch - TOOLBAR_H).max(1.0);
+    let s = (cw / vw).min(view_h / vh);
+    if s <= 0.0 {
+        return None;
+    }
+    let dx = (cw - vw * s) / 2.0;
+    let dy_bottom = (view_h - vh * s) / 2.0;
+    let top_edge = dy_bottom + vh * s;
+    let px = (local.x - dx) / s;
+    let py = (top_edge - local.y) / s;
+    if px < 0.0 || py < 0.0 || px >= vw || py >= vh {
+        return None;
+    }
+    Some((px, py))
+}
+
+/// 上报一条输入事件(命令通道)。
+fn send_input(line: &str) {
+    if input_disabled() {
+        return;
+    }
+    send_cmd(line);
+}
+
+fn move_allowed(x: f64, y: f64) -> bool {
+    let mut last = LAST_MOVE.lock().unwrap();
+    match *last {
+        Some((at, lx, ly)) => {
+            let due = at.elapsed().as_millis() >= 30
+                && ((lx - x).abs() >= 1.0 || (ly - y).abs() >= 1.0);
+            if due {
+                *last = Some((std::time::Instant::now(), x, y));
+            }
+            due
+        }
+        None => {
+            *last = Some((std::time::Instant::now(), x, y));
+            true
+        }
+    }
+}
+
+/// 指针事件公共出口:坐标换算 + 组 JSON。
+unsafe fn forward_pointer(view: Id, event: Id, act: &str, btn: Option<&str>, is_move: bool) {
+    let Some((x, y)) = page_point(view, event) else {
+        return;
+    };
+    if is_move && !move_allowed(x, y) {
+        return;
+    }
+    let line = match btn {
+        Some(b) => format!("{{\"cmd\":\"input\",\"act\":\"{act}\",\"x\":{x:.0},\"y\":{y:.0},\"btn\":\"{b}\"}}"),
+        None => format!("{{\"cmd\":\"input\",\"act\":\"{act}\",\"x\":{x:.0},\"y\":{y:.0}}}"),
+    };
+    send_input(&line);
+}
+
+macro_rules! pointer_action {
+    ($name:ident, $act:expr, $btn:expr, $is_move:expr) => {
+        extern "C" fn $name(_self: Id, _cmd: Sel, event: Id) {
+            if input_disabled() {
+                return;
+            }
+            unsafe { forward_pointer(_self, event, $act, $btn, $is_move) };
+        }
+    };
+}
+
+pointer_action!(on_pv_mouse_down, "down", Some("left"), false);
+pointer_action!(on_pv_mouse_up, "up", Some("left"), false);
+pointer_action!(on_pv_dragged, "move", None, true);
+pointer_action!(on_pv_moved, "move", None, true);
+pointer_action!(on_pv_right_down, "down", Some("right"), false);
+pointer_action!(on_pv_right_up, "up", Some("right"), false);
+pointer_action!(on_pv_other_up, "up", Some("middle"), false);
+
+/// 中键按下:仅 buttonNumber==2 视为中键(侧键忽略,阶段二)。
+extern "C" fn on_pv_other_down(_self: Id, _cmd: Sel, event: Id) {
+    if input_disabled() {
+        return;
+    }
+    unsafe {
+        let btn = send_u64(event, sel(b"buttonNumber\0"));
+        if btn == 2 {
+            forward_pointer(_self, event, "down", Some("middle"), false);
+        }
+    }
+}
+
+/// 滚轮:精确增量(触控板,像素)归一到 48px/档;离散滚轮每档 ±1。
+extern "C" fn on_pv_scroll(_self: Id, _cmd: Sel, event: Id) {
+    if input_disabled() {
+        return;
+    }
+    unsafe {
+        let Some((x, y)) = page_point(_self, event) else {
+            return;
+        };
+        let precise = send_i64(event, sel(b"hasPreciseDeltas\0")) != 0;
+        let raw_dx = send_f64(event, sel(b"deltaX\0"));
+        let raw_dy = send_f64(event, sel(b"deltaY\0"));
+        let norm = |d: f64| -> f64 {
+            let v = if precise { d / 48.0 } else { d };
+            v.clamp(-20.0, 20.0)
+        };
+        let (dx, dy) = (norm(raw_dx), norm(raw_dy));
+        if dx.abs() < f64::EPSILON && dy.abs() < f64::EPSILON {
+            return;
+        }
+        let line = format!(
+            "{{\"cmd\":\"input\",\"act\":\"wheel\",\"x\":{x:.0},\"y\":{y:.0},\"dx\":{dx:.3},\"dy\":{dy:.3}}}"
+        );
+        send_input(&line);
+    }
+}
+
+/// 键按下:浏览器级快捷键(⌘R/⌘[/⌘]/Ctrl+R/F5)本地消化,其余转发宿主。
+extern "C" fn on_pv_key_down(_self: Id, _cmd: Sel, event: Id) {
+    if input_disabled() {
+        return;
+    }
+    unsafe {
+        let flags = send_u64(event, sel(b"modifierFlags\0"));
+        let code = send_u64(event, sel(b"keyCode\0"));
+        let meta = flags & NSEVENT_COMMAND != 0;
+        let ctrl = flags & NSEVENT_CONTROL != 0;
+        // 浏览器级快捷键:刷新/后退/前进(转既有命令,不进页面)。
+        if (meta || ctrl) && code == 15 {
+            send_cmd("{\"cmd\":\"reload\"}");
+            return;
+        }
+        if meta && code == 33 {
+            send_cmd("{\"cmd\":\"back\"}");
+            return;
+        }
+        if meta && code == 30 {
+            send_cmd("{\"cmd\":\"forward\"}");
+            return;
+        }
+        if code == 96 {
+            send_cmd("{\"cmd\":\"reload\"}");
+            return;
+        }
+        let shift = flags & NSEVENT_SHIFT != 0;
+        let alt = flags & NSEVENT_OPTION != 0;
+        let key = match mac_special_key(code) {
+            Some(k) => k.to_string(),
+            None => {
+                if meta || ctrl {
+                    return; // 组合键不产生页面文本(阶段二再接浏览器快捷键全集)
+                }
+                let chars = send_id(event, sel(b"charactersIgnoringModifiers\0"));
+                if chars.is_null() {
+                    return;
+                }
+                let ptr = send_id_ptr(chars, sel(b"UTF8String\0"));
+                if ptr.is_null() {
+                    return;
+                }
+                let s = std::ffi::CStr::from_ptr(ptr).to_string_lossy().to_string();
+                // 仅 ASCII 可打印(P0 边界:IME 组合输入未接)。
+                let Some(c) = s.chars().next() else { return };
+                if !((0x20..=0x7e).contains(&(c as u32))) {
+                    return;
+                }
+                c.to_string()
+            }
+        };
+        let line = format!(
+            "{{\"cmd\":\"input\",\"act\":\"key\",\"key\":\"{}\",\"mods\":{{\"shift\":{shift},\"ctrl\":{ctrl},\"alt\":{alt},\"meta\":{meta}}}}}",
+            key_json_str(&key)
+        );
+        send_input(&line);
+    }
+}
+
+/// 页面视图可成为第一响应者(接收键盘事件;地址栏编辑时不抢)。
+extern "C" fn on_pv_accepts_first_responder(_self: Id, _cmd: Sel) -> i8 {
+    1
+}
+
+/// 注册页面视图类(NSImageView 子类:保留 setImage 绘制,叠加事件捕获)。
+unsafe fn ensure_page_view_class() -> Id {
+    {
+        let cached = PAGE_VIEW_CLASS.lock().unwrap().0;
+        if !cached.is_null() {
+            return cached;
+        }
+    }
+    let page_cls = objc_allocateClassPair(
+        cls(b"NSImageView\0"),
+        b"LsmBrowserPageView\0".as_ptr().cast(),
+        0,
+    );
+    if page_cls.is_null() {
+        // 兜底:子类化失败退回原生 NSImageView(无键鼠转发,窗口仍可用)。
+        return cls(b"NSImageView\0");
+    }
+    let add = |name: &'static [u8], imp: *const c_void, enc: &'static [u8]| {
+        class_addMethod(page_cls, sel(name), imp, enc.as_ptr().cast())
+    };
+    let mut ok = 1;
+    ok &= add(
+        b"acceptsFirstResponder\0",
+        on_pv_accepts_first_responder as extern "C" fn(Id, Sel) -> i8 as *const c_void,
+        b"B@:\0",
+    );
+    for (name, imp) in [
+        (b"mouseDown:\0".as_slice(), on_pv_mouse_down as extern "C" fn(Id, Sel, Id) as *const c_void),
+        (b"mouseUp:\0".as_slice(), on_pv_mouse_up as extern "C" fn(Id, Sel, Id) as *const c_void),
+        (b"mouseDragged:\0".as_slice(), on_pv_dragged as extern "C" fn(Id, Sel, Id) as *const c_void),
+        (b"mouseMoved:\0".as_slice(), on_pv_moved as extern "C" fn(Id, Sel, Id) as *const c_void),
+        (b"rightMouseDown:\0".as_slice(), on_pv_right_down as extern "C" fn(Id, Sel, Id) as *const c_void),
+        (b"rightMouseUp:\0".as_slice(), on_pv_right_up as extern "C" fn(Id, Sel, Id) as *const c_void),
+        (b"otherMouseDown:\0".as_slice(), on_pv_other_down as extern "C" fn(Id, Sel, Id) as *const c_void),
+        (b"otherMouseUp:\0".as_slice(), on_pv_other_up as extern "C" fn(Id, Sel, Id) as *const c_void),
+        (b"scrollWheel:\0".as_slice(), on_pv_scroll as extern "C" fn(Id, Sel, Id) as *const c_void),
+        (b"keyDown:\0".as_slice(), on_pv_key_down as extern "C" fn(Id, Sel, Id) as *const c_void),
+    ] {
+        ok &= add(name, imp, b"v@:@\0");
+    }
+    objc_registerClassPair(page_cls);
+    let final_cls = if ok == 0 { cls(b"NSImageView\0") } else { page_cls };
+    *PAGE_VIEW_CLASS.lock().unwrap() = IdCell(final_cls);
+    final_cls
 }
 
 unsafe fn ensure_frameworks() -> bool {
@@ -666,19 +988,34 @@ pub fn run(width: u32, height: u32, title: &str) -> i32 {
         send_void_id(window, sel(b"setTitle:\0"), ns_str(title));
         send_void_id(window, sel(b"setDelegate:\0"), ctrl);
         send_void_bool(window, sel(b"setReleasedWhenClosed:\0"), false);
-        // 初始第一响应者:画面视图(否则可编辑的地址栏会自动抢焦点,
-        // 误入的按键会写进地址栏,把宿主下发的 URL 顶掉)。
-        send_void_id(window, sel(b"setInitialFirstResponder:\0"), std::ptr::null_mut());
 
-        // 内容:NSImageView 铺满内容区下半部 + 等比缩放。
+        // 内容:页面视图(NSImageView 子类,叠加键鼠捕获)铺满内容区下半部
+        // + 等比缩放。初始第一响应者 = 页面视图:键盘事件进页面而非地址栏
+        //(地址栏被点选时自动接管第一响应者)。
         let content = send_id(window, sel(b"contentView\0"));
+        let pv_cls = ensure_page_view_class();
         let image_view = send_id_rect(
-            send_id(cls(b"NSImageView\0"), sel(b"alloc\0")),
+            send_id(pv_cls, sel(b"alloc\0")),
             sel(b"initWithFrame:\0"),
             ns_rect(0.0, 0.0, w, h),
         );
         send_void_i64(image_view, sel(b"setImageScaling:\0"), NS_IMAGE_SCALE_PROPORTIONALLY);
+        // 跟踪区:mouseMoved 需要(NSTrackingInVisibleRect 自动跟随窗口拖动)。
+        let tracking = send_id_rect_u64_id_id(
+            send_id(cls(b"NSTrackingArea\0"), sel(b"alloc\0")),
+            sel(b"initWithRect:options:owner:userInfo:\0"),
+            ns_rect(0.0, 0.0, w, h),
+            TRACKING_OPTS,
+            image_view,
+            std::ptr::null_mut(),
+        );
+        if !tracking.is_null() {
+            send_void_id(image_view, sel(b"addTrackingArea:\0"), tracking);
+        }
         send_void_id(content, sel(b"addSubview:\0"), image_view);
+        send_void_id(window, sel(b"setInitialFirstResponder:\0"), image_view);
+        // 键鼠坐标换算基线:初始视口 = argv(后续随 resize 上报同步)。
+        *VIEWPORT.lock().unwrap() = (w, h);
 
         // 工具栏:后退/前进/刷新/首页 + 地址栏。
         let btn_w = if w >= 640.0 { 46.0 } else { 30.0 };
@@ -844,5 +1181,34 @@ fn drain_stdin() {
         if n == 0 {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mac特殊键映射_核心键位() {
+        assert_eq!(mac_special_key(36), Some("Enter"));
+        assert_eq!(mac_special_key(76), Some("Enter"), "小键盘回车同语义");
+        assert_eq!(mac_special_key(48), Some("Tab"));
+        assert_eq!(mac_special_key(53), Some("Escape"));
+        assert_eq!(mac_special_key(51), Some("Backspace"));
+        assert_eq!(mac_special_key(117), Some("Delete"));
+        assert_eq!(mac_special_key(123), Some("ArrowLeft"));
+        assert_eq!(mac_special_key(126), Some("ArrowUp"));
+        assert_eq!(mac_special_key(115), Some("Home"));
+        assert_eq!(mac_special_key(121), Some("PageDown"));
+        // 可打印字符无特殊映射(走 charactersIgnoringModifiers)。
+        assert_eq!(mac_special_key(0), None);
+    }
+
+    #[test]
+    fn key字段转义_引号反斜杠与控制字符() {
+        assert_eq!(key_json_str("a"), "a");
+        assert_eq!(key_json_str("\""), "\\\"");
+        assert_eq!(key_json_str("\\"), "\\\\");
+        assert_eq!(key_json_str("A\r"), "A", "控制字符被剔除");
     }
 }

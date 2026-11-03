@@ -8,6 +8,7 @@
 pub mod api;
 pub mod cache;
 pub mod document;
+pub mod human_input;
 pub mod images;
 pub mod inspect;
 pub mod js;
@@ -509,6 +510,8 @@ pub struct LsmBrowserManager {
     self_weak: std::sync::Mutex<std::sync::Weak<LsmBrowserManager>>,
     /// 两条告知栏 1Hz 心跳的单实例闸(`page_bars.rs::ensure_bars_ticker`)。
     bars_ticker_started: std::sync::atomic::AtomicBool,
+    /// 人类输入会话态(查看器键鼠;按下/双击/hover 去重,`human_input/mod.rs`)。
+    human: std::sync::Mutex<human_input::HumanSession>,
 }
 
 /// 兼容旧调用点的类型名。
@@ -531,6 +534,7 @@ impl LsmBrowserManager {
             view_follow: std::sync::Mutex::new(None),
             self_weak: std::sync::Mutex::new(std::sync::Weak::new()),
             bars_ticker_started: std::sync::atomic::AtomicBool::new(false),
+            human: std::sync::Mutex::new(human_input::HumanSession::default()),
         }
     }
 

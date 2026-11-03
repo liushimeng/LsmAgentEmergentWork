@@ -131,11 +131,21 @@ impl LsmBrowserManager {
         pixmap.encode_png().ok()
     }
 
-    /// 处理查看器发来的交互命令(后退/前进/刷新/首页/地址栏导航/窗口尺寸变化)。
+    /// 处理查看器发来的交互命令(后退/前进/刷新/首页/地址栏导航/窗口尺寸变化/
+    /// 人类键鼠)。
     pub(in crate::agent::browser) async fn handle_view_command(
         self: &Arc<Self>,
         cmd: ViewCommand,
     ) {
+        // 人类键鼠:作用于查看器正在显示的页(跟随页,缺省前台页);
+        // 不改显示跟随(输入不换页),也不做导航收尾 refresh。
+        if let ViewCommand::Input(ev) = cmd {
+            let target = self.input_target_page().await;
+            if let Some(pid) = target {
+                self.handle_human_input(&pid, ev).await;
+            }
+            return;
+        }
         let page_id = self.foreground_page_id().await;
         let Some(page_id) = page_id else { return };
         // 人工在查看器里操作(工具栏/地址栏):显式表达了「看这页」,
@@ -156,8 +166,24 @@ impl LsmBrowserManager {
                 self.apply_view_resize(&page_id, width, height).await;
                 return;
             }
+            ViewCommand::Input(_) => unreachable!("Input 已在函数开头单独处理"),
         };
         self.refresh_view(&page_id).await;
+    }
+
+    /// 人类输入的目标页:查看器正在显示的页(跟随页)优先,回退前台页。
+    ///
+    /// 跟随页是「最近一次有意义交互」的落账(`push_frame`/工具动作/人工工具栏
+    /// 操作),人工的键鼠必然作用于他看到的那一页;侦察页在前台时也不会把
+    /// 输入误投给看不见的页。
+    pub(in crate::agent::browser) async fn input_target_page(&self) -> Option<String> {
+        if let Some(ViewFollow::Page(id)) = self.view_follow() {
+            let inner = self.inner.lock().await;
+            if inner.tabs.contains_key(&id) {
+                return Some(id);
+            }
+        }
+        self.foreground_page_id().await
     }
 
     /// 前台标签页 id(多标签时工具栏作用于前台页)。

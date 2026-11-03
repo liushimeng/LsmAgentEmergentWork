@@ -16,7 +16,7 @@ use crate::agent::browser::urlutil;
 /// 伪类状态维度。同一时刻**只有一个**元素持有某个维度的状态位
 /// (浏览器语义:一个指针、一个焦点)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PseudoDim {
+pub(crate) enum PseudoDim {
     Hover,
     Focus,
     Active,
@@ -30,7 +30,7 @@ enum PseudoDim {
 ///
 /// **状态只影响绘制,不影响占位**:控件固有尺寸不读任何状态标记,
 /// 状态切换不会让相邻元素抖动。
-fn set_pseudo_state(
+pub(crate) fn set_pseudo_state(
     tab: &mut super::TabState,
     stable: &str,
     dim: PseudoDim,
@@ -69,7 +69,7 @@ fn set_pseudo_state(
 ///
 /// CSS `:hover` 同时命中目标与全部祖先(`.parent:hover .child` 是菜单/下拉
 /// 组件的最常见写法)。DOM 句柄非 Send,必须在持锁块内先收敛成 selector。
-fn hover_chain_selectors(node: &kuchikiki::NodeRef) -> Vec<String> {
+pub(crate) fn hover_chain_selectors(node: &kuchikiki::NodeRef) -> Vec<String> {
     let mut chain = vec![Document::stable_selector(node)];
     let mut cur = node.parent();
     while let Some(p) = cur {
@@ -82,7 +82,7 @@ fn hover_chain_selectors(node: &kuchikiki::NodeRef) -> Vec<String> {
 }
 
 /// 悬停目标 + 祖先链;指针移动语义下旧 hover 与 active 一并释放。
-fn set_hover_chain(tab: &mut super::TabState, chain: &[String]) {
+pub(crate) fn set_hover_chain(tab: &mut super::TabState, chain: &[String]) {
     // 先按既有 Hover 维度清空旧指针态(on=false 不再写入目标),再逐祖先置位。
     set_pseudo_state(tab, "", PseudoDim::Hover, false);
     for stable in chain {
@@ -95,7 +95,7 @@ fn set_hover_chain(tab: &mut super::TabState, chain: &[String]) {
 }
 
 /// 释放按下态。内核动作是「点击已完成」语义,mouseup 后不应滞留 `:active`。
-fn release_active(tab: &mut super::TabState) {
+pub(crate) fn release_active(tab: &mut super::TabState) {
     for flags in tab.pseudo_states.values_mut() {
         flags.active = false;
     }
@@ -235,7 +235,7 @@ async fn reset_form_controls(mgr: &LsmBrowserManager, pid: &str, form_sel: &str)
 }
 
 /// 运行时控件状态变化后重算布局并推帧。
-async fn relayout_and_push(mgr: &LsmBrowserManager, pid: &str) {
+pub(crate) async fn relayout_and_push(mgr: &LsmBrowserManager, pid: &str) {
     let mut inner = mgr.inner.lock().await;
     let Some(tab) = inner.tabs.get_mut(pid) else {
         return;
@@ -321,7 +321,7 @@ async fn js_dispatch(
 }
 
 /// JS 事件分发(带上限):线程忙/无响应时返回 None，保底让原生默认动作继续。
-async fn js_dispatch_bounded(
+pub(crate) async fn js_dispatch_bounded(
     mgr: &LsmBrowserManager,
     pid: &str,
     selector: &str,
@@ -337,7 +337,7 @@ async fn js_dispatch_bounded(
 
 /// 应用 JS 回复:DOM 动作落到 `tab.html` 并重算布局;存储/Cookie/标题/滚动/台账合并。
 /// 返回导航类待执行动作(click/navigate/submit/new_tab/back/forward/reload)。
-async fn apply_js_reply(
+pub(crate) async fn apply_js_reply(
     mgr: &LsmBrowserManager,
     pid: &str,
     reply: &script::JsReply,
@@ -1172,7 +1172,7 @@ async fn act_click_kind(mgr: &LsmBrowserManager, pid: &str, params: &Value, kind
     click_inner(mgr, pid, params, kind).await
 }
 
-async fn click_inner(
+pub(crate) async fn click_inner(
     mgr: &LsmBrowserManager,
     pid: &str,
     params: &Value,
@@ -1606,6 +1606,17 @@ async fn click_inner(
         return Ok(out);
     }
 
+    // 39 号设计文档:人工 Cmd/Ctrl+点击 → 同窗导航改新标签(`force_target`)。
+    let plan = match plan {
+        Some(NavPlan::Same { url, method, body })
+            if p_str(params, "force_target").map(|t| t.eq_ignore_ascii_case("_blank"))
+                == Some(true) =>
+        {
+            let _ = (method, body);
+            Some(NavPlan::NewTab { url })
+        }
+        other => other,
+    };
     let navigated = plan.is_some();
     match plan {
         Some(NavPlan::NewTab { url }) => {
@@ -1974,7 +1985,7 @@ async fn act_toggle_dropdown(
     Ok(json!({"selector": stable, "open": open}))
 }
 
-async fn act_key_press(
+pub(crate) async fn act_key_press(
     mgr: &LsmBrowserManager,
     pid: &str,
     params: &Value,
