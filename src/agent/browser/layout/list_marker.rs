@@ -48,8 +48,11 @@ pub(crate) enum MarkerKind {
 /// 解析后的 marker 描述。
 pub(crate) struct Marker {
     pub kind: MarkerKind,
-    /// 序号类 marker 的序号(1 起)。
-    pub index: usize,
+    /// 序号类 marker 的序号。
+    ///
+    /// 第 49 轮:`ol reversed` 时首项取 `start`(缺省 = 列表项总数),
+    /// 其后逐项递减,故可为 0/负数(浏览器同样原样显示 `-1`)。
+    pub index: i64,
     /// `decimal-leading-zero` 时补零到两位。
     pub leading_zero: bool,
     /// marker 是否画在内容盒内。
@@ -140,24 +143,43 @@ fn list_style(style: &ComputedStyle, parent_tag: &str) -> (String, String) {
     (ty, pos)
 }
 
-/// `ol` 中当前 `li` 的序号(1 起,尊重 `start` 属性)。
-fn ol_index(node: &NodeRef, parent: &NodeRef) -> usize {
-    let mut idx = 1usize;
-    for sib in parent.children() {
-        if &sib == node {
-            break;
-        }
-        if document::tag_name(&sib).to_ascii_lowercase() == "li" {
-            idx += 1;
-        }
-    }
-    if let Some(start) = document::attr(parent, "start")
+/// `ol` 中当前 `li` 的序号(尊重 `start` / `reversed` 属性)。
+///
+/// 浏览器语义(实测 Chrome):
+/// - 普通:首项 = `start`(缺省 1),逐项递增;
+/// - `reversed`:首项 = `start`(缺省 = 列表项总数),逐项递减
+///   (可为 0/负数,原样显示)。
+fn ol_index(node: &NodeRef, parent: &NodeRef) -> i64 {
+    let lis: Vec<NodeRef> = parent
+        .children()
+        .filter(|s| document::tag_name(s).eq_ignore_ascii_case("li"))
+        .collect();
+    let total = lis.len().max(1) as i64;
+    let pos = lis
+        .iter()
+        .position(|s| s == node)
+        .map(|p| p as i64 + 1)
+        .unwrap_or(1);
+    let start = document::attr(parent, "start")
         .and_then(|v| v.trim().parse::<i64>().ok())
-    {
-        let start = start.max(1) as usize;
-        idx = start + idx - 1;
+        .filter(|v| *v > 0);
+    let reversed = document::attr(parent, "reversed").is_some();
+    // 普通列表首项缺省 1;`reversed` 且未给 `start` 时首项取列表项总数。
+    let first = match start {
+        Some(s) => s,
+        None => {
+            if reversed {
+                total
+            } else {
+                1
+            }
+        }
+    };
+    if reversed {
+        first - (pos - 1)
+    } else {
+        first + (pos - 1)
     }
-    idx
 }
 
 /// inside 模式下 `li` 内容需要让位的宽度(marker 宽 + 间隙);outside 返回 0。
@@ -186,16 +208,25 @@ fn marker_width(ctx: &LayoutCtx<'_>, marker: &Marker) -> f64 {
 fn marker_text(marker: &Marker) -> String {
     match marker.kind {
         MarkerKind::Decimal => {
-            if marker.leading_zero {
+            if marker.leading_zero && marker.index >= 0 {
                 format!("{:02}.", marker.index)
             } else {
                 format!("{}.", marker.index)
             }
         }
-        MarkerKind::LowerAlpha => format!("{}.", to_alpha(marker.index)),
-        MarkerKind::UpperAlpha => format!("{}.", to_alpha(marker.index).to_uppercase()),
-        MarkerKind::LowerRoman => format!("{}.", to_roman(marker.index)),
-        MarkerKind::UpperRoman => format!("{}.", to_roman(marker.index).to_uppercase()),
+        // 字母/罗马数字只对正序号有定义;`reversed` 递减到 0/负数时
+        // 回落十进制(浏览器对负值的字母/罗马无标准定义)。
+        MarkerKind::LowerAlpha if marker.index >= 1 => format!("{}.", to_alpha(marker.index as usize)),
+        MarkerKind::UpperAlpha if marker.index >= 1 => {
+            format!("{}.", to_alpha(marker.index as usize).to_uppercase())
+        }
+        MarkerKind::LowerRoman if marker.index >= 1 => format!("{}.", to_roman(marker.index as usize)),
+        MarkerKind::UpperRoman if marker.index >= 1 => {
+            format!("{}.", to_roman(marker.index as usize).to_uppercase())
+        }
+        MarkerKind::LowerAlpha | MarkerKind::UpperAlpha | MarkerKind::LowerRoman | MarkerKind::UpperRoman => {
+            format!("{}.", marker.index)
+        }
         _ => String::new(),
     }
 }

@@ -198,3 +198,91 @@ fn 边框折叠时相邻单元格不重复画右边框() {
         "折叠模式仍需绘制边框:边框指令数={row_borders}"
     );
 }
+
+#[test]
+fn border_spacing拉开单元格间距() {
+    let plain = Document::parse(
+        "<body><table><tr><td id='a'>A</td><td id='b'>B</td></tr><tr><td id='c'>C</td><td id='d'>D</td></tr></table></body>",
+        "https://a.test/",
+    );
+    let lay_plain = compute(&plain, 800.0, &font());
+    let spaced = Document::parse(
+        "<body><table style='border-spacing:10px 4px'><tr><td id='a'>A</td><td id='b'>B</td></tr><tr><td id='c'>C</td><td id='d'>D</td></tr></table></body>",
+        "https://a.test/",
+    );
+    let lay_spaced = compute(&spaced, 800.0, &font());
+    let a0 = box_by_selector(&lay_plain, "#a");
+    let b0 = box_by_selector(&lay_plain, "#b");
+    let c0 = box_by_selector(&lay_plain, "#c");
+    let a1 = box_by_selector(&lay_spaced, "#a");
+    let b1 = box_by_selector(&lay_spaced, "#b");
+    let c1 = box_by_selector(&lay_spaced, "#c");
+    // 外侧间距:首列整体右移 10px。
+    assert!(
+        (a1.x - a0.x - 10.0).abs() < 0.5,
+        "border-spacing 水平外侧间距应为 10px:plain={} spaced={}",
+        a0.x,
+        a1.x
+    );
+    // 单元格之间的水平间隙 = 10px。
+    let gap0 = b0.x - (a0.x + a0.w);
+    let gap1 = b1.x - (a1.x + a1.w);
+    assert!(
+        (gap1 - gap0 - 10.0).abs() < 0.5,
+        "border-spacing 水平间隙应为 10px:plain={gap0} spaced={gap1}"
+    );
+    // 单元格之间的垂直间隙 = 4px。
+    let vgap0 = c0.y - (a0.y + a0.h);
+    let vgap1 = c1.y - (a1.y + a1.h);
+    assert!(
+        (vgap1 - vgap0 - 4.0).abs() < 0.5,
+        "border-spacing 垂直间隙应为 4px:plain={vgap0} spaced={vgap1}"
+    );
+}
+
+#[test]
+fn border_spacing在折叠模式下被忽略() {
+    let doc = Document::parse(
+        "<body><table style='border-collapse:collapse;border-spacing:10px'><tr><td id='a'>A</td><td id='b'>B</td></tr></table></body>",
+        "https://a.test/",
+    );
+    let lay = compute(&doc, 800.0, &font());
+    let a = box_by_selector(&lay, "#a");
+    let b = box_by_selector(&lay, "#b");
+    let gap = b.x - (a.x + a.w);
+    assert!(
+        gap.abs() < 0.5,
+        "border-collapse:collapse 时 border-spacing 必须被忽略,实际间隙={gap}"
+    );
+}
+
+#[test]
+fn caption_side_bottom把标题放到表格下方() {
+    let html = |side: &str| {
+        format!(
+            "<body><table style='caption-side:{side}'><caption id='cap'>标题</caption><tr><td id='a'>A</td></tr></table></body>"
+        )
+    };
+    let lay_top = compute(
+        &Document::parse(&html("top"), "https://a.test/"),
+        800.0,
+        &font(),
+    );
+    let lay_bottom = compute(
+        &Document::parse(&html("bottom"), "https://a.test/"),
+        800.0,
+        &font(),
+    );
+    let cap_t = box_by_selector(&lay_top, "#cap");
+    let a_t = box_by_selector(&lay_top, "#a");
+    let cap_b = box_by_selector(&lay_bottom, "#cap");
+    let a_b = box_by_selector(&lay_bottom, "#a");
+    assert!(
+        cap_t.y < a_t.y,
+        "caption-side:top 时标题应在表格之上:{cap_t:?} {a_t:?}"
+    );
+    assert!(
+        cap_b.y > a_b.y,
+        "caption-side:bottom 时标题应在表格之下:{cap_b:?} {a_b:?}"
+    );
+}

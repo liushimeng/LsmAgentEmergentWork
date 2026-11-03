@@ -8,7 +8,7 @@ use kuchikiki::NodeRef;
 
 use super::super::document::{self, Document};
 use super::super::style::ComputedStyle;
-use super::{style_visible, translate, DeferredBox, ElementBox, LayoutCtx, PaintBox, PaintKind, UNKNOWN_CB_H};
+use super::{style_visible, translate, DeferredBox, ElementBox, LayoutCtx, UNKNOWN_CB_H};
 
 /// 布置一批延后处理的脱离流元素。
 pub(crate) fn layout_deferred(
@@ -211,23 +211,18 @@ fn layout_abs(
     // 这里补发 PaintBox + 显示项,与流内 img 路径保持一致。
     if document::tag_name(node).eq_ignore_ascii_case("img") {
         let (iw, ih, isrc) = ctx.replaced_size(node, style, avail_w, avail_h_known.then_some(avail_h));
-        if let Some(src) = isrc.filter(|s| ctx.image_loaded(s)) {
-            let paint = PaintBox {
-                src,
-                x: bx + pad_l,
-                y: by + pad_t,
-                w: (iw - pad_l - pad_r).max(0.0),
-                h: (ih - pad_t - pad_b).max(0.0),
-                fit: style.object_fit.clone(),
-                kind: PaintKind::Content,
-                visible: style_visible(style),
-                z_index: style.pos.z_index,
-                off_x: 0.0,
-                off_y: 0.0,
-            };
-            let tf = ctx.own_transform(style, bx, by, bw, bh);
-            ctx.emit_image(&paint, style.opacity, tf);
-            ctx.push_paint(paint);
+        let tf = ctx.own_transform(style, bx, by, bw, bh);
+        let img_x = bx + pad_l;
+        let img_y = by + pad_t;
+        let img_w = (iw - pad_l - pad_r).max(0.0);
+        let img_h = (ih - pad_t - pad_b).max(0.0);
+        match isrc {
+            Some(src) if ctx.image_loaded(&src) => {
+                let paint = ctx.content_image_paint(&src, style, img_x, img_y, img_w, img_h);
+                ctx.emit_image(&paint, style.opacity, tf);
+                ctx.push_paint(paint);
+            }
+            _ => ctx.emit_img_alt(node, style, img_x, img_y, img_w, img_h, tf),
         }
     }
     let mark = ctx.display_len();

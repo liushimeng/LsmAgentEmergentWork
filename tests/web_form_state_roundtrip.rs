@@ -314,3 +314,88 @@ async fn 交互态伪类与下拉浮层端到端一致() {
 
     exec(&tool, json!({"action":"close","page_id":page_id})).await;
 }
+
+/// 第 49 轮:label 点击转发到关联控件的端到端回归(mock 站点,无外网)。
+async fn start_label_site() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                loop {
+                    let Ok(n) = socket.read(&mut tmp).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let body = r##"<!doctype html><html><head><style>
+                html,body{margin:0;background:#fff}
+                </style></head><body>
+                <label id="l1" for="c1">勾选我</label>
+                <input id="c1" type="checkbox">
+                <label id="l2">嵌套输入<input id="c2" type="checkbox"></label>
+                </body></html>"##;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    format!("http://{}", addr)
+}
+
+#[tokio::test]
+async fn label点击转发到关联控件() {
+    std::env::set_var("LAEW_ALLOW_PRIVATE_ENDPOINT", "1");
+    let base = start_label_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+    let open = exec(
+        &tool,
+        json!({"action":"open","url":base,"mode":"hidden","reuse":false,"viewport":{"width":1280,"height":720}}),
+    )
+    .await;
+    assert_eq!(open["code"], 0, "{open}");
+    let page_id = open["data"]["page_id"].as_str().unwrap().to_string();
+
+    // label[for] → 关联 checkbox。
+    let clicked = exec(
+        &tool,
+        json!({"action":"control","page_id":page_id,"control_action":"click","params":{"selector":"#l1"}}),
+    )
+    .await;
+    assert_eq!(clicked["code"], 0, "{clicked}");
+    let c1 = element(&tool, &page_id, "#c1").await;
+    assert_eq!(
+        c1["value"], "true",
+        "点击 label[for] 应勾选关联 checkbox:{c1}"
+    );
+
+    // 嵌套 label → 首个可标注后代。
+    let clicked2 = exec(
+        &tool,
+        json!({"action":"control","page_id":page_id,"control_action":"click","params":{"selector":"#l2"}}),
+    )
+    .await;
+    assert_eq!(clicked2["code"], 0, "{clicked2}");
+    let c2 = element(&tool, &page_id, "#c2").await;
+    assert_eq!(
+        c2["value"], "true",
+        "点击嵌套 label 应勾选内部 checkbox:{c2}"
+    );
+
+    exec(&tool, json!({"action":"close","page_id":page_id})).await;
+}

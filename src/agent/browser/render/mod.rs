@@ -20,6 +20,7 @@ mod tests;
 mod widget_tests;
 
 pub use display::{BgFill, ClipRect, DisplayItem, DisplayKind};
+pub(crate) use raster::fit_rect;
 
 use std::collections::HashMap;
 use std::sync::Mutex;

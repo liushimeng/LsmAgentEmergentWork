@@ -199,3 +199,48 @@ fn progress与meter画轨道和比例填充() {
         .count();
     assert!(fills >= 4, "progress/meter 至少各画轨道与填充,实际背景项:{fills}");
 }
+
+#[test]
+fn fieldset禁用继承到子孙控件() {
+    let doc = Document::parse(
+        "<body><fieldset disabled><input id='a'></fieldset><fieldset><input id='b'></fieldset></body>",
+        "https://a.test/",
+    );
+    let a = doc.select("#a").unwrap().into_iter().next().unwrap();
+    let b = doc.select("#b").unwrap().into_iter().next().unwrap();
+    assert!(super::is_disabled(&a), "fieldset[disabled] 内控件应禁用");
+    assert!(!super::is_disabled(&b), "未禁用 fieldset 内控件不应禁用");
+}
+
+#[test]
+fn fieldset首个legend内控件不禁用() {
+    let doc = Document::parse(
+        "<body><fieldset disabled><legend><input id='a'></legend><input id='b'></fieldset></body>",
+        "https://a.test/",
+    );
+    let a = doc.select("#a").unwrap().into_iter().next().unwrap();
+    let b = doc.select("#b").unwrap().into_iter().next().unwrap();
+    assert!(
+        !super::is_disabled(&a),
+        "首个 legend 内控件不应被 fieldset 禁用"
+    );
+    assert!(super::is_disabled(&b), "legend 外控件应被禁用");
+}
+
+#[test]
+fn fieldset禁用继承进入绘制灰化() {
+    let doc = Document::parse(
+        "<body><fieldset disabled><input id='a' value='文本'></fieldset></body>",
+        "https://a.test/",
+    );
+    let lay = compute(&doc, 800.0, &font());
+    let has_gray = lay
+        .lines
+        .iter()
+        .any(|l| l.text.contains("文本") && l.color == [150, 150, 150]);
+    assert!(
+        has_gray,
+        "fieldset[disabled] 内控件文字应灰化(150,150,150):{:?}",
+        lay.lines
+    );
+}

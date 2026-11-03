@@ -94,9 +94,46 @@ pub(crate) fn select_list_rows(node: &NodeRef) -> usize {
     rows
 }
 
-/// 控件是否处于禁用态(`disabled` 属性;运行时状态不改写该属性)。
+/// 控件是否处于禁用态(自身 `disabled` 属性,或祖先 `fieldset[disabled]`)。
+///
+/// 第 49 轮:HTML 规范规定 `fieldset[disabled]` 禁用其**全部后代控件**,
+/// 首个 `legend` 子树例外。此前只看自身属性,fieldset 内的控件仍显示为可用。
 pub(crate) fn is_disabled(node: &NodeRef) -> bool {
-    document::attr(node, "disabled").is_some()
+    if document::attr(node, "disabled").is_some() {
+        return true;
+    }
+    let mut cur = node.parent();
+    while let Some(p) = cur {
+        if document::tag_name(&p).eq_ignore_ascii_case("fieldset")
+            && document::attr(&p, "disabled").is_some()
+            && !inside_first_legend(node, &p)
+        {
+            return true;
+        }
+        cur = p.parent();
+    }
+    false
+}
+
+/// `node` 是否位于 `fieldset` 的**首个 `legend`** 子树内(含自身)。
+fn inside_first_legend(node: &NodeRef, fieldset: &NodeRef) -> bool {
+    let legend = fieldset
+        .children()
+        .find(|c| document::tag_name(c).eq_ignore_ascii_case("legend"));
+    let Some(legend) = legend else {
+        return false;
+    };
+    if &legend == node {
+        return true;
+    }
+    let mut cur = node.parent();
+    while let Some(p) = cur {
+        if &p == &legend {
+            return true;
+        }
+        cur = p.parent();
+    }
+    false
 }
 
 /// 控件文字色:禁用态灰化(UA 皮肤),否则取元素文字色。

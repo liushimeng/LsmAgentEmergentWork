@@ -127,3 +127,89 @@ fn mark语义高亮产生背景显示项() {
         "mark 应产生高亮背景显示项"
     );
 }
+
+#[test]
+fn object_position左对齐偏移内容图() {
+    let html = "<html><body><img id='i' src='a.png' style='width:200px;height:100px;object-fit:contain;object-position:0% 0%'></body></html>";
+    let doc = Document::parse(html, "https://a.test/");
+    let mut sizes = crate::agent::browser::images::ImageSizes::default();
+    sizes
+        .sizes
+        .insert("https://a.test/a.png".to_string(), (100.0, 100.0));
+    let lay = super::compute_full(
+        &doc,
+        800.0,
+        &font(),
+        &crate::agent::browser::style::MediaCtx::new(800.0, 720.0),
+        &sizes,
+    );
+    let paint = lay
+        .paints
+        .iter()
+        .find(|p| p.src == "https://a.test/a.png")
+        .expect("应有图片绘制盒");
+    // contain:100×100 图在 200×100 盒内 → 绘制 100×100,居中偏移 (50,0)。
+    // object-position:0% 0% → 期望 (0,0),故 off = (0,0) - (50,0) = (-50,0)。
+    assert!(
+        (paint.off_x + 50.0).abs() < 0.5,
+        "object-position:0% 0% 应左对齐,off_x={}",
+        paint.off_x
+    );
+    assert!(paint.off_y.abs() < 0.5, "off_y={}", paint.off_y);
+}
+
+#[test]
+fn object_position缺省居中() {
+    let html = "<html><body><img id='i' src='a.png' style='width:200px;height:100px;object-fit:contain'></body></html>";
+    let doc = Document::parse(html, "https://a.test/");
+    let mut sizes = crate::agent::browser::images::ImageSizes::default();
+    sizes
+        .sizes
+        .insert("https://a.test/a.png".to_string(), (100.0, 100.0));
+    let lay = super::compute_full(
+        &doc,
+        800.0,
+        &font(),
+        &crate::agent::browser::style::MediaCtx::new(800.0, 720.0),
+        &sizes,
+    );
+    let paint = lay
+        .paints
+        .iter()
+        .find(|p| p.src == "https://a.test/a.png")
+        .expect("应有图片绘制盒");
+    assert!(
+        paint.off_x.abs() < 0.5 && paint.off_y.abs() < 0.5,
+        "缺省 object-position 必须居中,off=({}, {})",
+        paint.off_x,
+        paint.off_y
+    );
+}
+
+#[test]
+fn 未加载图片画alt文本占位() {
+    let html = "<html><body><img id='i' src='missing.png' alt='示例图片' style='width:120px;height:40px'></body></html>";
+    let doc = Document::parse(html, "https://a.test/");
+    let lay = compute(&doc, 800.0, &font());
+    assert!(
+        lay.display.iter().any(|it| matches!(
+            &it.kind,
+            super::super::render::display::DisplayKind::Text { text, .. } if text == "示例图片"
+        )),
+        "未加载图片应画 alt 文本占位"
+    );
+}
+
+#[test]
+fn 空alt不画占位() {
+    let html = "<html><body><img id='i' src='missing.png' alt='' style='width:120px;height:40px'></body></html>";
+    let doc = Document::parse(html, "https://a.test/");
+    let lay = compute(&doc, 800.0, &font());
+    assert!(
+        !lay.display.iter().any(|it| matches!(
+            &it.kind,
+            super::super::render::display::DisplayKind::Text { .. }
+        )),
+        "空 alt 不应画任何占位文本"
+    );
+}

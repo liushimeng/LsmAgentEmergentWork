@@ -58,8 +58,8 @@ LsmAgentBrowser 已有「HTML 解析 → CSS 计算 → 布局 → 显示列表 
 | 文件选择器 | act_upload 记录路径到 form_values | 按钮/文本框几何 | 🟡 | 不读真实文件系统、不显示文件列表 |
 | 滑块/颜色选择器 | min/max/step/value 属性保真 | 通用盒 | 🟡 | 无滑块轨道/拇指、颜色 swatch |
 | 输出框/output | DOM/文本 | inline 盒 | 🟡 | 无 for 关联即时计算 |
-| fieldset/legend | ✅（第 48 轮） | fieldset UA 边框+padding；legend 块级化；legend 嵌边为近似 |
-| label | 🟡 | 可寻址、参与 accessible name；点击不转发到关联控件 |
+| fieldset/legend | ✅（第 48 轮） | fieldset UA 边框+padding；legend 块级化；legend 嵌边为近似；**`fieldset[disabled]` 禁用继承（第 49 轮，首个 legend 例外）** |
+| label | ✅🆕（第 49 轮） | 可寻址、参与 accessible name；**点击转发到关联控件**（`for` / 嵌套首个可标注后代） |
 
 ### 2. 语义化展示控件
 
@@ -82,7 +82,8 @@ LsmAgentBrowser 已有「HTML 解析 → CSS 计算 → 布局 → 显示列表 
 | --- | --- | --- |
 | 图片 | ✅ | HTTP/data 预取解码、固有尺寸、object-fit、截图 |
 | 响应式图片 srcset/picture | ✅（第 45 轮） | 候选选择算法 + currentSrc 已落地 |
-| 图片 alt | 🟡 | 可访问名用 alt；加载失败不画可见 alt 文本 |
+| 图片 alt | ✅🆕（第 49 轮） | 可访问名用 alt；**加载失败于内容盒内画 alt 文本占位**（`alt` 非空且有尺寸时） |
+| 图片 object-position | ✅🆕（第 49 轮） | 复用 `background-position` 解析；`content_image_paint` 折算偏移 |
 | 画布 canvas | 🆕/✅ | HTML width/height/缺省 300×150 进布局；已有 RGBA 矩形/像素读写/PNG 回写 |
 | Canvas 高级 2D | ⛔ | 路径、文字、渐变、远程图片入 Canvas、WebGL 未实现 |
 | 矢量图形 svg | 🟡→✅（第 48 轮） | 固有几何 + MediaFrameNote 占位；仍不光栅化 path/text/gradient |
@@ -123,7 +124,10 @@ LsmAgentBrowser 已有「HTML 解析 → CSS 计算 → 布局 → 显示列表 
 
 **已支持**：行列对齐、自动列宽、受控 `colspan/rowspan`（非法值钳制；重叠 rowspan 退化为各自占行并告警）、单元格内块级/Flex/Grid 内容、td/th UA 边框与 padding。
 
-**非目标**：`border-collapse`、`caption`、`col/colgroup`、百分比列宽、`table-layout:fixed`、嵌套表格列宽联合求解、完整 CSS 表格规范。
+**非目标**：嵌套表格列宽联合求解、完整 CSS 表格规范。
+
+> 第 41 轮已补 `border-collapse`/`caption`/`col/colgroup`/百分比列宽/`table-layout:fixed`；
+> 第 49 轮补 `border-spacing` 与 `caption-side: top|bottom`。
 
 ## 四、显示异常排查映射
 
@@ -164,7 +168,8 @@ cargo test --no-fail-fast
 
 1. select 原生弹层/multiple、date/color/range 专用 UI。
 2. ~~`srcset/picture` 候选选择与 `currentSrc`~~（第 45 轮已完成）。
-3. `border-collapse`/caption/colgroup/百分比列宽的完整表格算法。
+3. ~~`border-collapse`/caption/colgroup/百分比列宽~~（第 41 轮已完成）；
+   ~~`border-spacing`/`caption-side`~~（第 49 轮已完成）。
 4. dialog top-layer/::backdrop/焦点圈禁。
 5. SVG 子集光栅化；video poster 静态显示与 iframe 子文档隔离（poster/占位第 48 轮已落地，子文档隔离仍非目标）。
 6. Shadow DOM 与动画帧同步；sticky 真吸附。

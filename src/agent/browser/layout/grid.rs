@@ -12,7 +12,7 @@ use super::super::document::{self, Document};
 use super::super::style::{ComputedStyle, GridFlow, GridLine, TrackSize};
 use super::flex::text_fragment;
 use super::{
-    append, constrain_height, style_visible, translate, ElementBox, Fragment, LayoutCtx, PaintBox, PaintKind,
+    append, constrain_height, style_visible, translate, ElementBox, Fragment, LayoutCtx,
     MAX_CONTENT_WIDTH,
 };
 
@@ -868,26 +868,22 @@ fn emit_item(
         ctx.emit_canvas_pixels(node, &cs, seq, x, y, used_w, used_h);
     }
     // 阶段三第三步:图片条目按最终尺寸绘制(object-fit 决定填充方式)。
-    if let Some(src) = item.image.clone().filter(|s| ctx.image_loaded(s)) {
-        let cw = (used_w - pl - item.style.padding_right).max(0.0);
-        let ch = (used_h - pt - pb).max(0.0);
-        let paint = PaintBox {
-            src,
-            x: x + pl,
-            y: y + pt,
-            w: cw,
-            h: ch,
-            fit: cs.object_fit.clone(),
-            kind: PaintKind::Content,
-            visible: style_visible(&cs),
-            z_index: cs.pos.z_index,
-            off_x: 0.0,
-            off_y: 0.0,
-        };
+    // 第 49 轮补 `object-position`,未加载时画 `alt` 占位。
+    let cw = (used_w - pl - item.style.padding_right).max(0.0);
+    let ch = (used_h - pt - pb).max(0.0);
+    let img_x = x + pl;
+    let img_y = y + pt;
+    let loaded = item.image.clone().filter(|s| ctx.image_loaded(s));
+    if let Some(src) = loaded {
+        let paint = ctx.content_image_paint(&src, &cs, img_x, img_y, cw, ch);
         let item_tf = ctx.own_transform(&cs, x, y, used_w, used_h);
         ctx.emit_image(&paint, cs.opacity, item_tf);
         ctx.push_paint(paint);
         return;
+    }
+    if let Some(node) = item.node.as_ref() {
+        let item_tf = ctx.own_transform(&cs, x, y, used_w, used_h);
+        ctx.emit_img_alt(node, &cs, img_x, img_y, cw, ch, item_tf);
     }
     let mark = ctx.display_len();
     let mut frag = item.frag.take().unwrap_or_default();

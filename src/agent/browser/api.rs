@@ -81,6 +81,51 @@ pub(crate) fn hover_chain_selectors(node: &kuchikiki::NodeRef) -> Vec<String> {
     chain
 }
 
+/// 可标注(labelable)元素标签。
+const LABELABLE_TAGS: &[&str] = &[
+    "input",
+    "select",
+    "textarea",
+    "button",
+    "meter",
+    "output",
+    "progress",
+];
+
+/// `label` 的关联控件(第 49 轮):`for` 属性 → 同文档 `id` 匹配的可标注元素;
+/// 无 `for` → label 内**第一个**可标注后代。非 `label` 返回 `None`。
+fn resolve_label_control(
+    node: &kuchikiki::NodeRef,
+    doc: &Document,
+) -> Option<kuchikiki::NodeRef> {
+    if !document::tag_name(node).eq_ignore_ascii_case("label") {
+        return None;
+    }
+    if let Some(for_id) = document::attr(node, "for").filter(|v| !v.trim().is_empty()) {
+        // 属性选择器避免 id 中的 CSS 元字符转义问题。
+        let escaped = for_id.replace('\\', "\\\\").replace('"', "\\\"");
+        let nodes = doc.select(&format!("[id=\"{escaped}\"]")).ok()?;
+        return nodes.into_iter().find(|n| {
+            LABELABLE_TAGS.contains(&document::tag_name(n).to_ascii_lowercase().as_str())
+        });
+    }
+    // 嵌套首个可标注后代(DFS,保持文档序)。
+    let mut stack: Vec<kuchikiki::NodeRef> = node.children().collect();
+    while let Some(n) = stack.pop() {
+        if n.as_element().is_none() {
+            continue;
+        }
+        let tag = document::tag_name(&n).to_ascii_lowercase();
+        if LABELABLE_TAGS.contains(&tag.as_str()) {
+            return Some(n);
+        }
+        let mut children: Vec<kuchikiki::NodeRef> = n.children().collect();
+        children.reverse();
+        stack.extend(children);
+    }
+    None
+}
+
 /// 悬停目标 + 祖先链;指针移动语义下旧 hover 与 active 一并释放。
 pub(crate) fn set_hover_chain(tab: &mut super::TabState, chain: &[String]) {
     // 先按既有 Hover 维度清空旧指针态(on=false 不再写入目标),再逐祖先置位。
@@ -1303,6 +1348,9 @@ pub(crate) async fn click_inner(
         let node = nodes.get(idx).ok_or_else(|| {
             EngineError::action_failed(format!("选择器未命中或索引越界:{selector}[{idx}]"))
         })?;
+        // 第 49 轮:点击 `label` 转发到其关联控件(浏览器语义)。
+        let resolved_label = resolve_label_control(node, &doc);
+        let node = resolved_label.as_ref().unwrap_or(node);
         let stable = Document::stable_selector(node);
         let rect_opt = tab.layout.rect_for(&stable);
         let rect = rect_opt.unwrap_or((0.0, 0.0, 0.0, 0.0));
@@ -1311,10 +1359,11 @@ pub(crate) async fn click_inner(
             .unwrap_or_default()
             .to_ascii_lowercase();
         let hover_chain = hover_chain_selectors(node);
+        // 第 49 轮:`fieldset[disabled]` 的子孙控件同样视为禁用。
         let disabled = matches!(
             tag.as_str(),
             "input" | "button" | "select" | "textarea" | "option"
-        ) && document::attr(node, "disabled").is_some();
+        ) && super::layout::is_disabled(node);
 
         // 当前展开的 select 面板:点击面板外任何元素都应收起(light dismiss 近似)。
         let open_selects: Vec<String> = doc

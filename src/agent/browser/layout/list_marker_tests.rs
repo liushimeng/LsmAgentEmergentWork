@@ -95,6 +95,42 @@ fn leading_zero补零序号() {
 }
 
 #[test]
+fn reversed倒序序号() {
+    let lay = layout(
+        "<body><ol reversed><li>甲</li><li>乙</li><li>丙</li></ol></body>",
+    );
+    let texts: Vec<&str> = lay.lines.iter().map(|l| l.text.as_str()).collect();
+    assert!(
+        texts.contains(&"3.") && texts.contains(&"2.") && texts.contains(&"1."),
+        "reversed 必须倒序 3./2./1.,实际:{texts:?}"
+    );
+}
+
+#[test]
+fn reversed配合start从start递减() {
+    let lay = layout(
+        "<body><ol reversed start='5'><li>甲</li><li>乙</li><li>丙</li></ol></body>",
+    );
+    let texts: Vec<&str> = lay.lines.iter().map(|l| l.text.as_str()).collect();
+    assert!(
+        texts.contains(&"5.") && texts.contains(&"4.") && texts.contains(&"3."),
+        "reversed+start=5 必须 5./4./3.,实际:{texts:?}"
+    );
+}
+
+#[test]
+fn reversed递减到零与负数原样显示() {
+    let lay = layout(
+        "<body><ol reversed start='1'><li>甲</li><li>乙</li><li>丙</li></ol></body>",
+    );
+    let texts: Vec<&str> = lay.lines.iter().map(|l| l.text.as_str()).collect();
+    assert!(
+        texts.contains(&"1.") && texts.contains(&"0.") && texts.contains(&"-1."),
+        "reversed+start=1 必须 1./0./-1.,实际:{texts:?}"
+    );
+}
+
+#[test]
 fn inside位置把marker画进内容盒() {
     let outside = layout(
         "<body><ul style='list-style-position:outside'><li>项目</li></ul></body>",

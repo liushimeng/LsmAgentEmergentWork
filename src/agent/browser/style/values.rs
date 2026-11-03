@@ -114,6 +114,17 @@ pub struct ComputedStyle {
     pub grid_item: GridItemStyle,
     /// `object-fit`(阶段三第三步):替换元素内容在盒内的填充方式。
     pub object_fit: String,
+    /// `object-position`(第 49 轮):替换元素内容在盒内的对齐位置。
+    ///
+    /// 与 `background-position` 同构(复用 `BackgroundPosition`);
+    /// `None` = `50% 50%`(浏览器初始值)。
+    pub object_position: Option<BackgroundPosition>,
+    /// `border-spacing`(第 49 轮):separated borders 模型的(水平, 垂直)间距。
+    ///
+    /// 仅 `border-collapse: separate` 生效;`collapse` 时忽略。
+    pub border_spacing: (f64, f64),
+    /// `caption-side`(第 49 轮):`"top"` | `"bottom"`。
+    pub caption_side: String,
     /// CSS `vertical-align`(第 44 轮):行内原子盒的垂直对齐方式(非继承)。
     ///
     /// 归一为关键字(`baseline`/`middle`/`top`/`bottom`/`sub`/`super`)或长度原值
@@ -486,6 +497,9 @@ impl Default for ComputedStyle {
             grid: GridContainerStyle::default(),
             grid_item: GridItemStyle::default(),
             object_fit: "fill".to_string(),
+            object_position: None,
+            border_spacing: (0.0, 0.0),
+            caption_side: "top".to_string(),
             vertical_align: "baseline".to_string(),
             accent_color: None,
             background_layers: Vec::new(),
@@ -699,6 +713,17 @@ impl ComputedStyle {
             self.grid_item.justify_self.clone(),
         );
         out.insert("object-fit".into(), self.object_fit.clone());
+        out.insert(
+            "object-position".into(),
+            self.object_position
+                .map(|p| p.text())
+                .unwrap_or_else(|| "50% 50%".to_string()),
+        );
+        out.insert(
+            "border-spacing".into(),
+            format!("{} {}", self.border_spacing.0, self.border_spacing.1),
+        );
+        out.insert("caption-side".into(), self.caption_side.clone());
         out.insert(
             "background-image".into(),
             if self.background_layers.is_empty() {
@@ -1543,6 +1568,24 @@ pub fn apply_declaration(
                 st.object_fit = v;
             }
         }
+        // 第 49 轮:`object-position` 与 `background-position` 同构
+        // (关键字/px/%,1-2 值)。缺省 `None` = `50% 50%`。
+        "object-position" => {
+            st.object_position = parse_background_position(value);
+        }
+        // 第 49 轮:表格 separated borders 间距。
+        "border-spacing" => {
+            if let Some((h, v)) = parse_border_spacing(value) {
+                st.border_spacing = (h, v);
+            }
+        }
+        // 第 49 轮:表格标题位置。
+        "caption-side" => {
+            let v = value.trim().to_ascii_lowercase();
+            if v == "top" || v == "bottom" {
+                st.caption_side = v;
+            }
+        }
         // 第 44 轮:行内原子盒的垂直对齐(此前落 `extra`,布局层完全不可见)。
         "vertical-align" => {
             let v = value.trim().to_ascii_lowercase();
@@ -1783,6 +1826,9 @@ fn apply_initial(st: &mut ComputedStyle, key: &str, root: &ComputedStyle) {
         },
         "background" | "background-color" => st.background = None,
         "object-fit" => st.object_fit = "fill".to_string(),
+        "object-position" => st.object_position = None,
+        "border-spacing" => st.border_spacing = (0.0, 0.0),
+        "caption-side" => st.caption_side = "top".to_string(),
         "background-image" => st.background_layers.clear(),
         "background-position" => st.background_position = None,
         "background-size" => st.background_size = "auto".to_string(),
@@ -1909,6 +1955,26 @@ pub fn parse_background_position(value: &str) -> Option<BackgroundPosition> {
                 })
             }
         }
+        _ => None,
+    }
+}
+
+/// 解析 `border-spacing`(第 49 轮):`<h> [<v>]`,长度单位 px。
+///
+/// 1 值 → 两轴同值;2 值 → 水平/垂直;其余(百分比/关键字/多余值)返回 `None`。
+fn parse_border_spacing(value: &str) -> Option<(f64, f64)> {
+    let tokens: Vec<&str> = value.split_whitespace().collect();
+    let parse_len = |t: &str| -> Option<f64> {
+        let low = t.to_ascii_lowercase();
+        if let Some(p) = low.strip_suffix("px") {
+            p.trim().parse::<f64>().ok().filter(|v| *v >= 0.0)
+        } else {
+            low.parse::<f64>().ok().filter(|v| *v >= 0.0)
+        }
+    };
+    match tokens.len() {
+        1 => parse_len(tokens[0]).map(|v| (v, v)),
+        2 => Some((parse_len(tokens[0])?, parse_len(tokens[1])?)),
         _ => None,
     }
 }

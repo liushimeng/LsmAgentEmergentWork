@@ -8,7 +8,10 @@
 //! - `border-collapse: collapse`:相邻单元格共享边框(单线,不双线)。
 //! - `table-layout: fixed`:列宽只由 `col`/首行单元格决定,不被内容撑开。
 //!
-//! 仍不实现:`border-spacing`、嵌套表联合求解、`caption-side: bottom`。
+//! 第 49 轮补齐:`border-spacing`(separated 模型的单元格间距)、
+//! `caption-side: top|bottom`。
+//!
+//! 仍不实现:嵌套表联合求解。
 
 use std::collections::HashMap;
 
@@ -102,14 +105,36 @@ pub(crate) fn layout_container(
     });
     let box_idx = ctx.boxes_len() - 1;
     // 第 41 轮:`caption` 排在表格内容之前,占表格总高的一段。
-    let caption_h = layout_caption(ctx, node, content_x, inner_w, style, depth);
-    let content_h =
-        layout_content(ctx, node, content_x, inner_w, style, depth + 1, cb) + caption_h;
+    // 第 49 轮:`caption-side: bottom` 时 caption 落到表格内容之后。
+    let caption_bottom = style.caption_side.eq_ignore_ascii_case("bottom");
+    let mut cursor_advanced = 0.0;
+    let top_caption_h = if caption_bottom {
+        0.0
+    } else {
+        let h = layout_caption(ctx, node, content_x, inner_w, style, depth);
+        cursor_advanced += h;
+        h
+    };
+    // `layout_content` 不推进全局游标(由容器入口统一推进)。
+    let table_h = layout_content(ctx, node, content_x, inner_w, style, depth + 1, cb);
+    let bottom_caption_h = if caption_bottom {
+        // caption 要落在内容之下:先推进内容高度,再让 caption 自己推进。
+        ctx.advance_y(table_h);
+        cursor_advanced += table_h;
+        let h = layout_caption(ctx, node, content_x, inner_w, style, depth);
+        cursor_advanced += h;
+        h
+    } else {
+        0.0
+    };
+    let content_h = table_h + top_caption_h + bottom_caption_h;
     let box_h = constrain_height(style, (content_h + style.padding_top + style.padding_bottom).max(1.0));
     ctx.set_box_height(box_idx, box_h);
     let tag = document::tag_name(node);
     ctx.finish_container(seq, dmark, node, style, &tag, bx, start_y, bw, box_h);
-    ctx.advance_y(content_h + style.padding_bottom + style.margin_bottom.max(2.0));
+    // 游标已推进的部分不再重复加,只补剩余高度与 padding/margin。
+    let remaining = (content_h - cursor_advanced).max(0.0);
+    ctx.advance_y(remaining + style.padding_bottom + style.margin_bottom.max(2.0));
 }
 
 /// `caption` 布局:表格上方的标题块(居中,浏览器默认 `caption-side: top`)。
@@ -177,6 +202,12 @@ pub(crate) fn layout_content(
         .get("table-layout")
         .map(|s| s.trim().eq_ignore_ascii_case("fixed"))
         .unwrap_or(false);
+    // 第 49 轮:separated borders 模型的单元格间距(`collapse` 时忽略)。
+    let (h_space, v_space) = if collapse {
+        (0.0, 0.0)
+    } else {
+        style.border_spacing
+    };
     let mut cells: Vec<Cell> = Vec::new();
     let mut occupied: HashMap<(usize, usize), bool> = HashMap::new();
     let mut n_cols = 0usize;
@@ -264,7 +295,9 @@ pub(crate) fn layout_content(
             fixed_col[i] = false;
         }
     }
-    normalize_columns(&mut col_w, content_w, &fixed_col);
+    // 第 49 轮:列宽预算扣除单元格间距(外侧也留间距)。
+    let col_avail = (content_w - (n_cols + 1) as f64 * h_space).max(0.0);
+    normalize_columns(&mut col_w, col_avail, &fixed_col);
 
     // 最终宽度下逐格测量,得到内容片段与外高。
     for cell in &mut cells {
@@ -297,13 +330,15 @@ pub(crate) fn layout_content(
         *h = h.max(1.0);
     }
 
+    // 第 49 轮:`border-spacing` 让首行之上、末行之下各留一段外间距。
     let top = ctx.cursor_y();
-    let total_w: f64 = col_w.iter().sum();
+    let cells_w: f64 = col_w.iter().sum();
+    let total_w: f64 = cells_w + (n_cols + 1) as f64 * h_space;
     let mut row_y = vec![0.0f64; rows.len()];
-    let mut acc = 0.0;
+    let mut acc = v_space;
     for (i, h) in row_h.iter().enumerate() {
         row_y[i] = top + acc;
-        acc += h;
+        acc += h + v_space;
     }
     // 行盒用于 inspect/点击寻址;自身无背景时只作几何锚点。
     for (r, row_node) in rows.iter().enumerate() {
@@ -325,7 +360,10 @@ pub(crate) fn layout_content(
 
     for cell in &mut cells {
         let endc = (cell.col + cell.col_span).min(n_cols);
-        let x = content_x + col_w[..cell.col].iter().sum::<f64>();
+        let x = content_x
+            + h_space
+            + col_w[..cell.col].iter().sum::<f64>()
+            + cell.col as f64 * h_space;
         let w: f64 = col_w[cell.col..endc].iter().sum();
         let endr = (cell.row + cell.row_span).min(rows.len());
         let y = row_y[cell.row];

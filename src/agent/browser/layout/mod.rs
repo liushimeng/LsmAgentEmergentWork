@@ -49,7 +49,7 @@ use std::collections::HashMap;
 
 use helpers::*;
 use inline::InlineBuf;
-pub(crate) use widgets::select_is_list;
+pub(crate) use widgets::{is_disabled, select_is_list};
 pub(crate) use measure::{append, translate, Fragment};
 
 use kuchikiki::NodeRef;
@@ -1331,6 +1331,118 @@ impl<'a> LayoutCtx<'a> {
         })
     }
 
+    /// 内容图(`<img>`)的绘制盒(第 49 轮):把 `object-position` 折算成
+    /// `off_x/off_y`。
+    ///
+    /// `fit_rect` 对 `contain/cover` 返回**居中**偏移;这里补上
+    /// 「期望位置 − 默认居中」的差值,使最终绘制点 = 内容盒 + 期望位置。
+    /// `fill`/`none`/`scale-down` 的默认偏移为 0,差值即期望位置本身。
+    pub(crate) fn content_image_paint(
+        &self,
+        src: &str,
+        style: &ComputedStyle,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+    ) -> PaintBox {
+        let (nw, nh) = self
+            .images
+            .natural(src)
+            .unwrap_or((w.max(1.0), h.max(1.0)));
+        let (default_ox, default_oy, dw, dh) =
+            super::render::fit_rect(&style.object_fit, nw, nh, w, h);
+        let (off_x, off_y) = match style.object_position {
+            Some(p) => (
+                p.x.resolve(w, dw) - default_ox,
+                p.y.resolve(h, dh) - default_oy,
+            ),
+            None => (0.0, 0.0),
+        };
+        PaintBox {
+            src: src.to_string(),
+            x,
+            y,
+            w: w.max(0.0),
+            h: h.max(0.0),
+            fit: style.object_fit.clone(),
+            kind: PaintKind::Content,
+            visible: style_visible(style),
+            z_index: style.pos.z_index,
+            off_x,
+            off_y,
+        }
+    }
+
+    /// `<img>` 加载失败时的 `alt` 文本占位(第 49 轮)。
+    ///
+    /// 浏览器在图片解码失败时于内容盒内画 `alt` 文本;内核此前直接留白,
+    /// 与「图片正常但未加载」无法区分。只在 `alt` 非空时绘制,单行截断。
+    pub(crate) fn emit_img_alt(
+        &mut self,
+        node: &NodeRef,
+        style: &ComputedStyle,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        tf: Option<Affine>,
+    ) {
+        if !document::tag_name(node).eq_ignore_ascii_case("img") {
+            return;
+        }
+        let alt = match document::attr(node, "alt") {
+            Some(a) if !a.trim().is_empty() => a,
+            _ => return,
+        };
+        if w <= 2.0 || h <= 2.0 {
+            return;
+        }
+        let size = style.font_size.max(10.0);
+        let pad = 2.0_f64;
+        let max_w = (w - pad * 2.0).max(1.0);
+        let text = self.truncate_to_width(&alt, max_w, size);
+        if text.is_empty() {
+            return;
+        }
+        let seq = self.next_seq();
+        self.display.push(DisplayItem {
+            kind: DisplayKind::Text {
+                text,
+                size,
+                color: [117, 117, 117],
+                bold: false,
+            },
+            x: x + pad,
+            y: y + pad,
+            w: 0.0,
+            h: 0.0,
+            radius: [CornerRadius::Px(0.0); 4],
+            z: 0,
+            seq,
+            opacity: 1.0,
+            clip: Some((x, y, w, h)),
+            transform: tf,
+            fixed: self.fixed_depth > 0,
+            out_of_flow: false,
+            layer: self.positioned_layer,
+        });
+    }
+
+    /// 按字体度量把文本截断到 `max_w` 内(逐字符累加,近似)。
+    fn truncate_to_width(&self, text: &str, max_w: f64, size: f64) -> String {
+        let mut out = String::new();
+        let mut w = 0.0;
+        for ch in text.chars() {
+            let cw = self.font.text_width(&ch.to_string(), size);
+            if w + cw > max_w {
+                break;
+            }
+            out.push(ch);
+            w += cw;
+        }
+        out
+    }
 
     fn layout_children(
         &mut self,
@@ -1515,23 +1627,22 @@ impl<'a> LayoutCtx<'a> {
                 let replaced_tag = document::tag_name(&child);
                 self.emit_element(seq, &style, &replaced_tag, bx + dx, by + dy, iw, ih);
                 self.emit_canvas_pixels(&child, &style, seq, bx + dx, by + dy, iw, ih);
-                if let Some(src) = isrc.filter(|s| self.image_loaded(s)) {
-                    let paint = PaintBox {
-                        src,
-                        x: bx + dx + style.padding_left,
-                        y: by + dy + style.padding_top,
-                        w: (iw - style.padding_left - style.padding_right).max(0.0),
-                        h: (ih - style.padding_top - style.padding_bottom).max(0.0),
-                        fit: style.object_fit.clone(),
-                        kind: PaintKind::Content,
-                        visible,
-                        z_index: style.pos.z_index,
-                        off_x: 0.0,
-                        off_y: 0.0,
-                    };
-                    let img_tf = self.own_transform(&style, bx + dx, by + dy, iw, ih);
-                    self.emit_image(&paint, style.opacity, img_tf);
-                    self.paints.push(paint);
+                // 第 49 轮:图片按 `object-position` 贴图;未加载时画 `alt` 占位。
+                let img_tf = self.own_transform(&style, bx + dx, by + dy, iw, ih);
+                let img_x = bx + dx + style.padding_left;
+                let img_y = by + dy + style.padding_top;
+                let img_w = (iw - style.padding_left - style.padding_right).max(0.0);
+                let img_h = (ih - style.padding_top - style.padding_bottom).max(0.0);
+                match isrc {
+                    Some(src) if self.image_loaded(&src) => {
+                        let paint =
+                            self.content_image_paint(&src, &style, img_x, img_y, img_w, img_h);
+                        self.emit_image(&paint, style.opacity, img_tf);
+                        self.paints.push(paint);
+                    }
+                    _ => {
+                        self.emit_img_alt(&child, &style, img_x, img_y, img_w, img_h, img_tf);
+                    }
                 }
                 self.y = by + ih;
                 self.pending_margin_bottom = style.margin_bottom.max(0.0);

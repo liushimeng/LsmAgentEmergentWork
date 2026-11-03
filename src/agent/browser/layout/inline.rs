@@ -842,25 +842,19 @@ impl<'a> LayoutCtx<'a> {
         self.emit_canvas_pixels(node, style, seq, x, y, w, h);
         match a.kind {
             AtomicKind::Replaced => {
-                // 替换元素的内容图:按固有尺寸与 `object-fit` 贴图。
-                if let Some(src) = self.image_display_src(node) {
-                    if self.image_loaded(&src) {
-                        let paint = PaintBox {
-                            src,
-                            x: x + style.padding_left,
-                            y: y + style.padding_top,
-                            w: (w - style.padding_left - style.padding_right).max(0.0),
-                            h: (h - style.padding_top - style.padding_bottom).max(0.0),
-                            fit: style.object_fit.clone(),
-                            kind: PaintKind::Content,
-                            visible: style_visible(style),
-                            z_index: style.pos.z_index,
-                            off_x: 0.0,
-                            off_y: 0.0,
-                        };
-                        self.emit_image(&paint, style.opacity, tf);
-                        self.paints.push(paint);
-                    }
+                // 替换元素的内容图:按固有尺寸与 `object-fit` 贴图;
+                // 第 49 轮补 `object-position`,未加载时画 `alt` 占位。
+                let img_x = x + style.padding_left;
+                let img_y = y + style.padding_top;
+                let img_w = (w - style.padding_left - style.padding_right).max(0.0);
+                let img_h = (h - style.padding_top - style.padding_bottom).max(0.0);
+                let src = self.image_display_src(node).filter(|s| self.image_loaded(s));
+                if let Some(src) = src {
+                    let paint = self.content_image_paint(&src, style, img_x, img_y, img_w, img_h);
+                    self.emit_image(&paint, style.opacity, tf);
+                    self.paints.push(paint);
+                } else {
+                    self.emit_img_alt(node, style, img_x, img_y, img_w, img_h, tf);
                 }
             }
             AtomicKind::Control => {

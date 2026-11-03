@@ -937,7 +937,7 @@ fn fill_glyph_mask(
 // ============ 图片(沿用双线性采样,接入 scissor 与透明度) ============
 
 /// 目标盒内的绘制矩形(偏移 + 尺寸),由 `object-fit` 决定。
-fn fit_rect(fit: &str, nw: f64, nh: f64, w: f64, h: f64) -> (f64, f64, f64, f64) {
+pub(crate) fn fit_rect(fit: &str, nw: f64, nh: f64, w: f64, h: f64) -> (f64, f64, f64, f64) {
     let contain = |w: f64, h: f64| -> (f64, f64, f64, f64) {
         let s = (w / nw).min(h / nh);
         let dw = nw * s;
