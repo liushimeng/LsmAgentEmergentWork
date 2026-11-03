@@ -50,6 +50,9 @@ pub const ATTR_SCROLL_TOP: &str = "data-lsm-scroll-top";
 pub const ATTR_CARET: &str = "data-lsm-caret";
 /// 39 号 P2a:选区锚点(char 索引;与光标不等即有选区),布局层画选区高亮。
 pub const ATTR_SEL: &str = "data-lsm-sel";
+/// 39 号 P2b:页面级自由选区的首元素区间(值为 `start,end`),
+/// 布局层据此画跨元素选区高亮(近似:只画首尾元素内区段)。
+pub const ATTR_PAGE_SEL: &str = "data-lsm-page-sel";
 
 /// inspect(elements) 与交互候选集的默认选择器唯一真源。
 ///
@@ -106,6 +109,164 @@ impl CaretState {
             (self.anchor, self.pos)
         }
     }
+}
+
+/// 页面级自由选区(39 号 P2b):跨元素拖选,**不属于任何单一控件**。
+///
+/// 与 [`CaretState`] 是**两本账**:`CaretState` 的字符索引空间是控件的
+/// `value`(单值字符串);自由选区跨元素,索引必须带**元素身份**(稳定选择器),
+/// 否则 DOM 一变就错位。`getSelection().toString()` 优先返回本选区的文本。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageSelection {
+    /// 锚点元素(P2b 拖选手势的起点)。
+    pub anchor_sel: String,
+    /// 锚点元素内的 char 索引(基于该元素**可见文本**)。
+    pub anchor_idx: usize,
+    /// 活动端元素(随指针移动)。
+    pub head_sel: String,
+    /// 活动端元素内的 char 索引。
+    pub head_idx: usize,
+}
+
+impl PageSelection {
+    /// 归一化:DOM 序靠前的端作 `start`。同元素时按索引升序。
+    /// 返回 `(start_sel, start_idx, end_sel, end_idx)`。
+    pub fn ordered(&self, doc: &Document) -> (String, usize, String, usize) {
+        let a = doc
+            .select(&self.anchor_sel)
+            .ok()
+            .and_then(|v| v.into_iter().next());
+        let h = doc
+            .select(&self.head_sel)
+            .ok()
+            .and_then(|v| v.into_iter().next());
+        let a_pos = a.as_ref().map(node_doc_order).unwrap_or(usize::MAX);
+        let h_pos = h.as_ref().map(node_doc_order).unwrap_or(usize::MAX);
+        if a_pos < h_pos {
+            (self.anchor_sel.clone(), self.anchor_idx, self.head_sel.clone(), self.head_idx)
+        } else if a_pos > h_pos {
+            (self.head_sel.clone(), self.head_idx, self.anchor_sel.clone(), self.anchor_idx)
+        } else if self.anchor_idx <= self.head_idx {
+            (self.anchor_sel.clone(), self.anchor_idx, self.head_sel.clone(), self.head_idx)
+        } else {
+            (self.head_sel.clone(), self.head_idx, self.anchor_sel.clone(), self.anchor_idx)
+        }
+    }
+
+    /// 选区是否为空(两端同元素同索引)。
+    pub fn is_empty(&self) -> bool {
+        self.anchor_sel == self.head_sel && self.anchor_idx == self.head_idx
+    }
+
+    /// 选区文本:按**元素可见文本**(`node_text`,与 `page_text_caret_at`
+    /// 的索引空间同源)拼接两端元素之间的内容后截取 `[start, end)`。
+    ///
+    /// **近似**(方案 §7.2):只取「无元素子代」的叶子元素(父元素文本已含子代,
+    /// 重复计数会让索引整体错位);跨元素整片高亮未建模,文本仍按两端之间的
+    /// 全部文本计算 —— 与渲染的首尾近似可能不完全重合,如实告知调用方。
+    pub fn text_in(&self, doc: &Document) -> String {
+        let (start_sel, start_idx, end_sel, end_idx) = self.ordered(doc);
+        // 逐元素收集(保序),并记录每段在拼接串里的起点偏移 ——
+        // start_idx/end_idx 是**元素内**索引,必须换算成拼接串的绝对偏移。
+        let mut parts: Vec<String> = Vec::new();
+        let mut in_range = false;
+        collect_page_sel_text(doc.root(), &start_sel, &end_sel, &mut in_range, &mut parts);
+        // 拼接并记录首/末段的起点偏移(元素内索引 → 拼接串绝对偏移)。
+        let mut offsets: Vec<usize> = Vec::with_capacity(parts.len());
+        let mut joined = String::new();
+        for (i, p) in parts.iter().enumerate() {
+            if i > 0 {
+                joined.push('\n');
+            }
+            // 记录**段起点**(分隔符之后),元素内索引才能正确换算。
+            offsets.push(joined.chars().count());
+            joined.push_str(p);
+        }
+        let chars: Vec<char> = joined.chars().collect();
+        let base_start = offsets.first().copied().unwrap_or(0);
+        let base_end = offsets.last().copied().unwrap_or(0);
+        let s = (base_start + start_idx).min(chars.len());
+        let e = (base_end + end_idx).min(chars.len());
+        if s >= e {
+            return String::new();
+        }
+        chars[s..e].iter().collect()
+    }
+}
+
+/// `text_in` 的收集器:先序遍历,收集 start..=end 之间**叶子元素**的文本。
+///
+/// 只取叶子(无元素子代)是必须的:父元素的 `node_text` 已含子代文本,
+/// 两者都收会重复计数,字符索引整体错位。
+///
+/// 返回 `true` = 已越过收尾元素,调用方应停止整棵树的遍历(剪枝)。
+fn collect_page_sel_text(
+    node: &NodeRef,
+    start_sel: &str,
+    end_sel: &str,
+    in_range: &mut bool,
+    parts: &mut Vec<String>,
+) -> bool {
+    if node.as_element().is_some() {
+        // 起点判定独立于 in_range:同一元素既是起点又是终点时(同元素选区)
+        // 两个分支都要走到。
+        if !*in_range && Document::stable_selector(node) == start_sel {
+            *in_range = true;
+        }
+        if *in_range {
+            let has_el_child = node.children().any(|c| c.as_element().is_some());
+            if !has_el_child {
+                let t = node_text(node);
+                if !t.is_empty() {
+                    parts.push(t);
+                }
+            }
+        }
+        // 收尾:收集完即剪枝(同元素时上面已收,这里直接返回)。
+        if *in_range && Document::stable_selector(node) == end_sel {
+            return true;
+        }
+    }
+    for c in node.children() {
+        if collect_page_sel_text(&c, start_sel, end_sel, in_range, parts) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 节点的文档序(先序遍历序号):`PageSelection::ordered` 的比较依据。
+/// 取不到时返回 `usize::MAX`(排到最后,不 panic)。
+fn node_doc_order(node: &NodeRef) -> usize {
+    let mut idx = 0usize;
+    let mut cur = node.clone();
+    // 先上溯到根,再自上而下数先序序号 —— 实现简单、对选区排序足够。
+    let mut depth = 0usize;
+    let mut p = cur.parent();
+    while let Some(parent) = p {
+        depth += 1;
+        if depth > 4096 {
+            return usize::MAX;
+        }
+        cur = parent.clone();
+        p = cur.parent();
+    }
+    // 自根先序遍历,命中即返回计数。
+    fn walk(n: &NodeRef, target: &NodeRef, counter: &mut usize) -> Option<usize> {
+        if n == target {
+            return Some(*counter);
+        }
+        if n.as_element().is_some() {
+            *counter += 1;
+        }
+        for c in n.children() {
+            if let Some(hit) = walk(&c, target, counter) {
+                return Some(hit);
+            }
+        }
+        None
+    }
+    walk(&cur, node, &mut idx).unwrap_or(usize::MAX)
 }
 
 /// 解析后的文档(局部值,不跨 await 保存)。
@@ -231,6 +392,41 @@ impl Document {
                 _ => {}
             }
         }
+    }
+
+    /// 39 号 P2b:页面级自由选区 → 临时解析树的首/尾元素 `data-lsm-page-sel`
+    /// 属性(值为 `start,end`)。布局层据此画跨元素选区高亮。
+    ///
+    /// **近似**:只标首尾两端元素(首元素画 `[start,len)`,尾元素画 `[0,end)`,
+    /// 中间整元素不画)——跨元素整片高亮留后续阶段(见方案 §7.2)。
+    pub fn apply_page_sel(&mut self, sel: &PageSelection) {
+        let (start_sel, start_idx, end_sel, end_idx) = sel.ordered(self);
+        let apply = |doc: &mut Document, selector: &str, range: (i64, i64)| {
+            let Ok(nodes) = doc.select(selector) else {
+                return;
+            };
+            let Some(node) = nodes.first() else { return };
+            let Some(el) = node.as_element() else {
+                return;
+            };
+            let mut attrs = el.attributes.borrow_mut();
+            // range.1 < 0 = 到文本末尾(首元素形态);range.0 < 0 或
+            // (两端都非负且 start >= end)才是空区间 → 撤标记。
+            let empty = range.0 < 0 || (range.1 >= 0 && range.1 <= range.0);
+            if empty {
+                attrs.remove(ATTR_PAGE_SEL);
+            } else {
+                attrs.insert(ATTR_PAGE_SEL, format!("{},{}", range.0, range.1));
+            }
+        };
+        if start_sel == end_sel {
+            apply(self, &start_sel, (start_idx as i64, end_idx as i64));
+            return;
+        }
+        // 首元素:从 start 到文本末尾(-1 = 到末尾,布局层按可见文本长度解释)。
+        apply(self, &start_sel, (start_idx as i64, -1));
+        // 尾元素:从文本开头到 end。
+        apply(self, &end_sel, (0, end_idx as i64));
     }
 
     /// 第 46 轮:元素级滚动偏移 → 临时解析树的 `data-lsm-scroll-top` 属性。
@@ -694,6 +890,14 @@ fn snapshot_walk(
             let idx = out.len();
             child_parent = idx;
             let selector = Document::stable_selector(node);
+            // 39 号 P2b:光标/选区 → 规范字段 `selStart/selEnd`(页面脚本读
+            // `el.selectionStart/End`)。属性由 `apply_caret_state` 落。
+            let sel_start = attr(node, ATTR_CARET).and_then(|v| v.trim().parse::<usize>().ok());
+            let sel_end = sel_start.map(|pos| {
+                attr(node, ATTR_SEL)
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(pos)
+            });
             out.push(SnapshotNode {
                 index: idx,
                 parent,
@@ -709,6 +913,8 @@ fn snapshot_walk(
                     .and_then(|h| urlutil::resolve(base_url, &h))
                     .unwrap_or_default(),
                 checked: attr(node, "checked").is_some(),
+                sel_start,
+                sel_end,
                 // 可见文本:`text_contents()` 会把 `<script>` 源码算进来,
                 // 导致 `body.innerText` 变成一整段 JS(实测百度地图即如此)。
                 text: if leaf {
@@ -764,6 +970,10 @@ pub struct SnapshotNode {
     /// 布局矩形 `(x, y, w, h)`:JS 桥的 clientWidth/offsetWidth 等几何属性数据源。
     /// 快照时无布局(如纯样式快照)则为 None。
     pub rect: Option<(f64, f64, f64, f64)>,
+    /// 文本控件的选区区间(升序 `(start, end)`,39 号 P2b)。
+    /// 仅带 `data-lsm-caret` 的控件有值;其余为 `None`。
+    pub sel_start: Option<usize>,
+    pub sel_end: Option<usize>,
 }
 
 impl SnapshotNode {
@@ -785,6 +995,9 @@ impl SnapshotNode {
             "attrs": self.attrs,
             "css": self.css,
             "rect": self.rect.map(|r| json!([r.0, r.1, r.2, r.3])),
+            // 规范选区字段(39 号 P2b):页面脚本读 `el.selectionStart/End`。
+            "selStart": self.sel_start,
+            "selEnd": self.sel_end,
         })
     }
 }

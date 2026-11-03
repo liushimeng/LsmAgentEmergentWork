@@ -29,6 +29,8 @@ pub struct ApplySummary {
     pub retired: usize,
     /// selector → value(set_value/set_checked 合并)。
     pub form_values: HashMap<String, String>,
+    /// 39 号 P2b:selector → (start, end) 文本控件选区(set_selection)。
+    pub form_selections: HashMap<String, (usize, usize)>,
     pub title: Option<String>,
     /// 原样 Set-Cookie 行。
     pub cookies: Vec<String>,
@@ -285,6 +287,41 @@ pub fn apply(doc: &Document, actions: &[JsAction], base_url: &str) -> ApplySumma
                 summary
                     .form_values
                     .insert(action.selector.clone(), action.value.clone());
+            }
+            // 39 号 P2b:页面脚本 `el.setSelectionRange(a,b)` / setter 回写。
+            // start 走 `key`、end 走 `value`(动作结构不新增字段,与
+            // set_attr 的 key/value 复用同风格);解析失败如实记 failed。
+            "set_selection" => {
+                let start = action.key.trim().parse::<usize>().ok();
+                let end = action.value.trim().parse::<usize>().ok();
+                match (start, end) {
+                    (Some(s), Some(e)) => {
+                        if let Some(node) = find(doc, &action.selector) {
+                            let mut attrs = node.as_element().unwrap().attributes.borrow_mut();
+                            attrs.insert(
+                                super::super::document::ATTR_CARET.to_string(),
+                                format!("{e}"),
+                            );
+                            if s == e {
+                                attrs.remove(super::super::document::ATTR_SEL);
+                            } else {
+                                attrs.insert(
+                                    super::super::document::ATTR_SEL.to_string(),
+                                    format!("{s}"),
+                                );
+                            }
+                            summary.applied += 1;
+                        }
+                        summary.form_selections.insert(action.selector.clone(), (s, e));
+                    }
+                    _ => {
+                        summary.failed += 1;
+                        summary.errors.push(format!(
+                            "set_selection 参数非法:{} start={:?} end={:?}",
+                            action.selector, action.key, action.value
+                        ));
+                    }
+                }
             }
             "set_title" => summary.title = Some(action.value.clone()),
             "set_cookie" => summary.cookies.push(action.value.clone()),

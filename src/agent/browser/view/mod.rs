@@ -37,6 +37,8 @@ const KIND_TITLE: u8 = b't';
 const KIND_CLOSE: u8 = b'c';
 /// 地址栏状态帧(URL + 前进/后退可用性)。
 const KIND_URLBAR: u8 = b'u';
+/// 聚焦地址栏请求(⌘/Ctrl+L;39 号 P2b)。
+const KIND_FOCUS_ADDRBAR: u8 = b'f';
 
 /// 查看器 → 宿主的交互命令(工具栏按钮 / 地址栏回车 / 人类键鼠)。
 #[derive(Debug, Clone, PartialEq)]
@@ -63,6 +65,8 @@ pub enum ViewCommand {
     NextTab,
     /// 控件级剪贴板(⌘/Ctrl+C/X/V 的右键菜单入口同路径)。
     Clip(crate::agent::browser::human_input::ClipOp),
+    /// ⌘/Ctrl+L:聚焦地址栏(39 号 P2b 顺带补齐)。
+    FocusAddrbar,
 }
 
 /// 解析查看器发来的一行 JSON 命令。非法行返回 None(忽略,不打断通道)。
@@ -108,6 +112,7 @@ pub fn parse_command(line: &str) -> Option<ViewCommand> {
             };
             Some(ViewCommand::Clip(op))
         }
+        "focus_addrbar" => Some(ViewCommand::FocusAddrbar),
         _ => None,
     }
 }
@@ -220,6 +225,12 @@ impl ViewSink {
     /// 请求查看器关闭。
     pub fn send_close(&self) {
         self.send(KIND_CLOSE, b"");
+    }
+
+    /// ⌘/Ctrl+L:请求查看器把焦点交给地址栏(39 号 P2b)。
+    /// 查看器侧收到后调平台原生 API(`makeFirstResponder:` / `SetFocus`)。
+    pub fn focus_addrbar(&self) {
+        self.send(KIND_FOCUS_ADDRBAR, b"");
     }
 }
 

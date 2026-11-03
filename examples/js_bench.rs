@@ -36,6 +36,10 @@ async fn main() {
         prefers_dark: false,
         csp: None,
         resources: Vec::new(),
+        carets: Default::default(),
+        page_sel_text: String::new(),
+        caret_text: Default::default(),
+        focused: String::new(),
     };
 
     let handle = JsHandle::spawn();

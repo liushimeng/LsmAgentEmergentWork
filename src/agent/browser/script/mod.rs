@@ -30,6 +30,8 @@ mod tests_jsonp;
 use std::collections::HashMap;
 use std::time::Duration;
 
+use serde_json::Value;
+
 pub use super::js::{JsAction, JsLog, JsOutcome};
 
 /// 页面环境(owned 版 `js::JsPageMeta`),随每次请求注入线程。
@@ -53,6 +55,14 @@ pub struct PageEnv {
     /// 的资源时序数据 —— 此前该 API 是空数组桩,Agent 探测「脚本是否加载」
     /// 被误导成 0 条(猎聘实测:jsCount=0 误判,实际 3.3MB bundle 已执行)。
     pub resources: Vec<super::NetworkRecord>,
+    /// 39 号 P2b:文本控件光标/选区(key = 稳定选择器,值 = `{start, end}`)。
+    pub carets: HashMap<String, Value>,
+    /// 39 号 P2b:页面级自由选区的文本(`getSelection().toString()`)。
+    pub page_sel_text: String,
+    /// 39 号 P2b:控件内选区的文本(key = 稳定选择器;无选区时为空)。
+    pub caret_text: HashMap<String, String>,
+    /// 39 号 P2b:当前聚焦元素的稳定选择器(`getSelection()` 回落查找用)。
+    pub focused: String,
 }
 
 /// 脚本来源:inline 文本或宿主预取的外链内容。
@@ -300,6 +310,8 @@ pub struct PipelineOut {
     pub network: Vec<super::NetworkRecord>,
     pub js: Option<JsHandle>,
     pub form_values: HashMap<String, String>,
+    /// 39 号 P2b:页面脚本回写的文本控件选区(selector → (start, end))。
+    pub form_selections: HashMap<String, (usize, usize)>,
     /// 已执行脚本指纹(内联内容/外链 URL)。交互后补齐懒加载脚本时作为种子,
     /// 避免把首屏脚本整批重跑一遍。
     pub executed: std::collections::HashSet<u64>,
@@ -831,6 +843,10 @@ pub(crate) fn build_env(
         ),
         csp: csp.cloned(),
         resources: Vec::new(),
+        carets: HashMap::new(),
+        page_sel_text: String::new(),
+        caret_text: HashMap::new(),
+        focused: String::new(),
     }
 }
 
@@ -883,6 +899,7 @@ pub(crate) fn append_reply(
         out.title = Some(title.clone());
     }
     out.form_values.extend(summary.form_values);
+    out.form_selections.extend(summary.form_selections);
     for rec in &reply.network {
         out.network.push(super::NetworkRecord {
             url: rec.url.clone(),

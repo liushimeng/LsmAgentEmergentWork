@@ -96,6 +96,17 @@ document.getElementById('d2').addEventListener('drop', function(){
 </body></html>"#
                 .to_string(),
         ),
+        // 39 号 P2b:页面自由选区 + 选区脚本化验证页。
+        "/sel" => (
+            "200 OK",
+            r#"<!doctype html><html><head><title>选区页</title></head><body>
+<p id="pa" style="font-size:16px">甲甲甲甲甲</p>
+<p id="pb" style="font-size:16px">乙乙乙乙乙</p>
+<input id="q" style="width:200px;height:30px" value="hello">
+<dialog id="dlg" open data-lsm-modal><p id="dcontent">弹窗内容</p></dialog>
+</body></html>"#
+                .to_string(),
+        ),
         "/next" => (
             "200 OK",
             "<html><head><title>下一页</title></head><body><h1>NEXT</h1></body></html>".to_string(),
@@ -761,3 +772,238 @@ async fn 选区剪贴板_双击词后剪切粘贴() {
     web_control::clear(Engine::Lsm, &pid);
     exec(&tool, json!({"action": "close", "page_id": &pid})).await;
 }
+
+// ---------- 39 号 P2b:页面自由选区与选区脚本化 ----------
+
+async fn open_sel(tool: &McpWebLsmBrowserUseTool, base: &str) -> String {
+    let open = exec(
+        tool,
+        json!({"action": "open", "url": format!("{base}/sel"), "mode": "hidden", "reuse": false}),
+    )
+    .await;
+    assert_eq!(open["code"], 0, "{open}");
+    let pid = open["data"]["page_id"].as_str().unwrap().to_string();
+    web_control::set_state(Engine::Lsm, &pid, ControlState::User, None, "test");
+    pid
+}
+
+/// eval_js 在 **user 控制态**下被 4004 拒(它是写操作)。人工输入用例需要
+/// 读回页面状态时,临时取回 agent 态执行 eval,随后还回 user 态。
+async fn eval_js(tool: &McpWebLsmBrowserUseTool, pid: &str, js: &str) -> Value {
+    web_control::set_state(Engine::Lsm, pid, ControlState::Agent, None, "test-eval");
+    let v = exec(
+        tool,
+        json!({"action": "control", "page_id": pid, "control_action": "eval_js",
+               "params": {"js": js}}),
+    )
+    .await;
+    web_control::set_state(Engine::Lsm, pid, ControlState::User, None, "test-eval-done");
+    assert_eq!(v["code"], 0, "{v}");
+    // `result` 是 JS 返回值的 JSON 序列化;字符串会带引号,这里解一层。
+    let r = v["data"]["result"].clone();
+    match r {
+        Value::String(s) => s.into(),
+        other => other,
+    }
+}
+
+/// 文本控件的 selectionStart/End 可被页面脚本读取(P2b-1)。
+#[tokio::test]
+async fn 页面脚本读文本控件选区_点击与双击后() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+    let pid = open_sel(&tool, &base).await;
+    let mgr = LsmBrowserManager::global();
+
+    let (rx, ry, rw, rh) = rect_of(&tool, &pid, "#q").await;
+    let y = ry + rh / 2.0;
+    human_click(&mgr, &pid, rx + 6.0, y).await;
+    // 键入 "XY" → 光标应在索引 2(初始 value 为 "hello",光标落 0 后插入)。
+    for ch in "XY".chars() {
+        key(&mgr, &pid, &ch.to_string()).await;
+    }
+    let v = eval_js(
+        &tool,
+        &pid,
+        "var q=document.getElementById('q'); q.value + '|' + q.selectionStart + '|' + q.selectionEnd",
+    )
+    .await;
+    let s = v.as_str().unwrap_or("");
+    assert!(s.contains("XYhello"), "值应为 XYhello:{s}");
+    assert!(s.ends_with("|2|2"), "光标应在索引 2:{s}");
+
+    // 双击选词 → selectionStart/End 应为选区两端。
+    for _ in 0..2 {
+        human_click(&mgr, &pid, rx + 6.0, y).await;
+    }
+    let v = eval_js(
+        &tool,
+        &pid,
+        "var q=document.getElementById('q'); q.selectionStart + ':' + q.selectionEnd",
+    )
+    .await;
+    let s = v.as_str().unwrap_or("");
+    assert!(s.contains(':'), "应读到选区:{s}");
+    assert_ne!(s, "0:0", "双击后应有非空选区:{s}");
+
+    web_control::clear(Engine::Lsm, &pid);
+    exec(&tool, json!({"action": "close", "page_id": &pid})).await;
+}
+
+/// setSelectionRange 回写宿主:渲染层的光标/选区随之移动(P2b-2)。
+#[tokio::test]
+async fn 页面脚本setSelectionRange_回写宿主选区() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+    let pid = open_sel(&tool, &base).await;
+    let mgr = LsmBrowserManager::global();
+
+    // 先聚焦输入框(否则 setSelectionRange 无焦点上下文)。
+    let (rx, ry, rw, rh) = rect_of(&tool, &pid, "#q").await;
+    human_click(&mgr, &pid, rx + 6.0, ry + rh / 2.0).await;
+
+    let v = eval_js(
+        &tool,
+        &pid,
+        "var q=document.getElementById('q'); q.setSelectionRange(1,3); q.selectionStart + ':' + q.selectionEnd",
+    )
+    .await;
+    assert_eq!(v.as_str().unwrap_or(""), "1:3", "{v}");
+
+    // 键入应替换 [1,3) 选区("hello" 的 "el")→ "hXlo"。
+    key(&mgr, &pid, "X").await;
+    let v = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": &pid, "info": "elements",
+               "params": {"selector": "#q"}}),
+    )
+    .await;
+    assert_eq!(v["data"]["value"], "hXlo", "键入应替换 setSelectionRange 的选区:{v}");
+
+    web_control::clear(Engine::Lsm, &pid);
+    exec(&tool, json!({"action": "close", "page_id": &pid})).await;
+}
+
+/// document.getSelection().toString() 覆盖控件内选区与页面自由选区(P2b-1/P2b-3)。
+#[tokio::test]
+async fn getSelection文本_控件选区与页面自由选区() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+    let pid = open_sel(&tool, &base).await;
+    let mgr = LsmBrowserManager::global();
+
+    // 控件内:三击全选 → getSelection().toString() 应为整值。
+    let (rx, ry, rw, rh) = rect_of(&tool, &pid, "#q").await;
+    let y = ry + rh / 2.0;
+    for _ in 0..3 {
+        human_click(&mgr, &pid, rx + 6.0, y).await;
+    }
+    let v = eval_js(&tool, &pid, "document.getSelection().toString()").await;
+    assert_eq!(v.as_str().unwrap_or(""), "hello", "{v}");
+
+    // 页面自由选区:点 #pa 拖到 #pa 右端。
+    let (ax, ay, aw, ah) = rect_of(&tool, &pid, "#pa").await;
+    mgr.handle_human_input(
+        &pid,
+        HumanInput::Down { x: ax + 6.0, y: ay + ah / 2.0, button: MouseButton::Left, mods: Mods::default() },
+    )
+    .await;
+    mgr.handle_human_input(&pid, HumanInput::Move { x: ax + aw - 4.0, y: ay + ah / 2.0 }).await;
+    let up = mgr.handle_human_input(
+        &pid,
+        HumanInput::Up { x: ax + aw - 4.0, y: ay + ah / 2.0, button: MouseButton::Left, mods: Mods::default() },
+    )
+    .await;
+    assert_eq!(up["page_selection"], true, "拖选应收官:{up}");
+    let v = eval_js(&tool, &pid, "document.getSelection().toString()").await;
+    let s = v.as_str().unwrap_or("");
+    assert!(!s.is_empty(), "页面自由选区文本应非空:{v}");
+    assert!(s.chars().all(|c| c == '甲'), "应只含甲:{s}");
+
+    web_control::clear(Engine::Lsm, &pid);
+    exec(&tool, json!({"action": "close", "page_id": &pid})).await;
+}
+
+/// 无控件焦点时 Ctrl+C 复制页面自由选区(P2b-4)。
+#[tokio::test]
+async fn 页面选区复制_无焦点时走页面选区() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+    let pid = open_sel(&tool, &base).await;
+    let mgr = LsmBrowserManager::global();
+
+    let (ax, ay, aw, ah) = rect_of(&tool, &pid, "#pb").await;
+    mgr.handle_human_input(
+        &pid,
+        HumanInput::Down { x: ax + 6.0, y: ay + ah / 2.0, button: MouseButton::Left, mods: Mods::default() },
+    )
+    .await;
+    mgr.handle_human_input(&pid, HumanInput::Move { x: ax + aw - 4.0, y: ay + ah / 2.0 }).await;
+    mgr.handle_human_input(
+        &pid,
+        HumanInput::Up { x: ax + aw - 4.0, y: ay + ah / 2.0, button: MouseButton::Left, mods: Mods::default() },
+    )
+    .await;
+    // 清空焦点(点空白处)→ Ctrl+C 应复制页面选区。
+    mgr.handle_human_input(
+        &pid,
+        HumanInput::Down { x: 5.0, y: 5.0, button: MouseButton::Left, mods: Mods::default() },
+    )
+    .await;
+    mgr.handle_human_input(
+        &pid,
+        HumanInput::Up { x: 5.0, y: 5.0, button: MouseButton::Left, mods: Mods::default() },
+    )
+    .await;
+    let meta = Mods { meta: true, ..Default::default() };
+    let out = key_mods(&mgr, &pid, "c", meta).await;
+    assert_eq!(out["ok"], true, "页面选区复制应成功:{out}");
+    assert_eq!(out["source"], "page_selection", "{out}");
+    match lsm_agent::agent::browser::human_input::clipboard::read_text() {
+        Ok(text) => assert!(text.chars().all(|c| c == '乙'), "剪贴板应只含乙:{text}"),
+        Err(e) => eprintln!("[skip] 本会话无剪贴板服务:{e}"),
+    }
+
+    web_control::clear(Engine::Lsm, &pid);
+    exec(&tool, json!({"action": "close", "page_id": &pid})).await;
+}
+
+/// 模态 dialog 遮罩点击关闭(P2b-4)。
+#[tokio::test]
+async fn 点击遮罩关闭模态弹窗() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+    let pid = open_sel(&tool, &base).await;
+    let mgr = LsmBrowserManager::global();
+
+    // 点 dialog 之外的区域(页面顶端空白)→ 应关闭。
+    let up = mgr.handle_human_input(
+        &pid,
+        HumanInput::Down { x: 700.0, y: 5.0, button: MouseButton::Left, mods: Mods::default() },
+    )
+    .await;
+    let up = mgr.handle_human_input(
+        &pid,
+        HumanInput::Up { x: 700.0, y: 5.0, button: MouseButton::Left, mods: Mods::default() },
+    )
+    .await;
+    assert_eq!(up["dialog_closed"], true, "点遮罩应关闭弹窗:{up}");
+    let v = eval_js(
+        &tool,
+        &pid,
+        "document.getElementById('dlg').hasAttribute('open')",
+    )
+    .await;
+    assert_eq!(v.as_str().unwrap_or(""), "false", "dialog 应已关闭:{v}");
+
+    web_control::clear(Engine::Lsm, &pid);
+    exec(&tool, json!({"action": "close", "page_id": &pid})).await;
+}
+
+
+

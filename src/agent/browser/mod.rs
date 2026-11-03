@@ -232,6 +232,9 @@ pub struct TabState {
     /// 与 `form_values` 同族的运行时覆盖层,`document_with_state` 落
     /// `data-lsm-caret`/`data-lsm-sel` 属性,布局层据此画光标条与选区高亮。
     pub form_caret: HashMap<String, document::CaretState>,
+    /// 39 号 P2b:页面级自由选区(跨元素拖选,与 `form_caret` 两本账)。
+    /// `document_with_state` 落首/尾元素 `data-lsm-page-sel` 属性。
+    pub page_sel: Option<document::PageSelection>,
     pub focused: Option<String>,
     pub mouse: Option<(f64, f64)>,
     pub layout: layout::Layout,
@@ -288,6 +291,9 @@ impl TabState {
         doc.apply_widget_state(&self.form_values, &self.widget_open, &self.pseudo_states);
         doc.apply_caret_state(&self.form_caret);
         doc.apply_scroll_state(&self.scroll_offsets);
+        if let Some(sel) = &self.page_sel {
+            doc.apply_page_sel(sel);
+        }
         doc
     }
 }
@@ -1085,6 +1091,7 @@ impl LsmBrowserManager {
             widget_open: HashMap::new(),
             pseudo_states: HashMap::new(),
             form_caret: HashMap::new(),
+            page_sel: None,
             focused: None,
             mouse: None,
             layout,

@@ -62,6 +62,27 @@ impl LsmBrowserManager {
         }
         let ctx = self.collect_text_ctx(pid).await;
         let Some(focused) = ctx.focused.clone() else {
+            // P2b:无控件焦点时,若存在**页面级自由选区** → 复制其文本
+            //(浏览器语义:Ctrl+C 复制页面选区,无需先点进输入框)。
+            if op == ClipOp::Copy {
+                let text = {
+                    let inner = self.inner.lock().await;
+                    inner
+                        .tabs
+                        .get(pid)
+                        .and_then(|t| t.page_sel.as_ref().map(|s| api::page_selection_text_pub(t, s)))
+                        .unwrap_or_default()
+                };
+                if !text.is_empty() {
+                    return match clipboard::write_text(&text) {
+                        Ok(()) => {
+                            self.note_human_event(pid, "人工复制(页面选区)");
+                            json!({"op": "copy", "ok": true, "source": "page_selection", "len": text.chars().count()})
+                        }
+                        Err(e) => json!({"op": "copy", "ok": false, "error": e}),
+                    };
+                }
+            }
             return json!({"op": op_name(op), "ignored": true, "reason": "no_focus"});
         };
         if !ctx.text_like {

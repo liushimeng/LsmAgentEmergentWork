@@ -628,3 +628,189 @@ async fn ctrl组合键_全选替换与撤销重做() {
     web_control::clear(Engine::Lsm, &pid);
     mgr.shutdown().await;
 }
+
+// ---------- 39 号 P2b:页面级自由选区与选区脚本化 ----------
+
+#[test]
+fn 页面选区归一化_同元素与跨元素() {
+    let doc = crate::agent::browser::document::Document::parse(
+        "<html><body><p id='a'>甲</p><p id='b'>乙</p><p id='c'>丙</p></body></html>",
+        "about:blank",
+    );
+    // 同元素:索引反向 → 升序。
+    let s = crate::agent::browser::document::PageSelection {
+        anchor_sel: "#a".to_string(),
+        anchor_idx: 3,
+        head_sel: "#a".to_string(),
+        head_idx: 1,
+    };
+    assert_eq!(s.ordered(&doc), ("#a".to_string(), 1, "#a".to_string(), 3));
+    // 跨元素:head 在 anchor 之前(DOM 序)→ 交换两端。
+    let s = crate::agent::browser::document::PageSelection {
+        anchor_sel: "#c".to_string(),
+        anchor_idx: 0,
+        head_sel: "#a".to_string(),
+        head_idx: 2,
+    };
+    assert_eq!(s.ordered(&doc), ("#a".to_string(), 2, "#c".to_string(), 0));
+    // 空选区判定。
+    let empty = crate::agent::browser::document::PageSelection {
+        anchor_sel: "#b".to_string(),
+        anchor_idx: 1,
+        head_sel: "#b".to_string(),
+        head_idx: 1,
+    };
+    assert!(empty.is_empty());
+}
+
+#[test]
+fn 页面选区文本_跨元素截取() {
+    let doc = crate::agent::browser::document::Document::parse(
+        "<html><body><p id='a'>甲甲甲</p><p id='b'>乙乙</p><p id='c'>丙丙丙</p></body></html>",
+        "about:blank",
+    );
+    // 文本 = "甲甲甲\n乙乙\n丙丙丙";取 [1, 7) → "甲甲\n乙乙\n丙"。
+    let s = crate::agent::browser::document::PageSelection {
+        anchor_sel: "#a".to_string(),
+        anchor_idx: 1,
+        head_sel: "#c".to_string(),
+        head_idx: 1,
+    };
+    assert_eq!(s.text_in(&doc), "甲甲\n乙乙\n丙");
+    // 单向:同元素截取。
+    let s = crate::agent::browser::document::PageSelection {
+        anchor_sel: "#b".to_string(),
+        anchor_idx: 0,
+        head_sel: "#b".to_string(),
+        head_idx: 1,
+    };
+    assert_eq!(s.text_in(&doc), "乙");
+    // 空选区 → 空串。
+    let s = crate::agent::browser::document::PageSelection {
+        anchor_sel: "#a".to_string(),
+        anchor_idx: 2,
+        head_sel: "#a".to_string(),
+        head_idx: 2,
+    };
+    assert_eq!(s.text_in(&doc), "");
+}
+
+#[test]
+fn 页面可选文本元素判定() {
+    assert!(is_page_selectable("p", ""));
+    assert!(is_page_selectable("span", ""));
+    assert!(is_page_selectable("td", ""));
+    assert!(!is_page_selectable("div", ""), "布局容器不参与(文本是子代之和)");
+    assert!(!is_page_selectable("input", "text"), "控件内选区归 text_drag");
+    assert!(!is_page_selectable("html", ""));
+    assert!(!is_page_selectable("body", ""));
+}
+
+#[test]
+fn 页面选区属性写入与解析() {
+    use crate::agent::browser::document::{Document, PageSelection, ATTR_PAGE_SEL};
+    let mut doc = Document::parse(
+        "<html><body><p id='a'>甲甲甲</p><p id='b'>乙乙</p></body></html>",
+        "about:blank",
+    );
+    doc.apply_page_sel(&PageSelection {
+        anchor_sel: "#a".to_string(),
+        anchor_idx: 1,
+        head_sel: "#a".to_string(),
+        head_idx: 2,
+    });
+    let a = doc.select("#a").unwrap().into_iter().next().unwrap();
+    assert_eq!(crate::agent::browser::document::attr(&a, ATTR_PAGE_SEL), Some("1,2".to_string()));
+    // 跨元素:首元素 [start,末尾)、尾元素 [0,end)。
+    let mut doc = Document::parse(
+        "<html><body><p id='a'>甲甲甲</p><p id='b'>乙乙</p></body></html>",
+        "about:blank",
+    );
+    doc.apply_page_sel(&PageSelection {
+        anchor_sel: "#a".to_string(),
+        anchor_idx: 1,
+        head_sel: "#b".to_string(),
+        head_idx: 1,
+    });
+    let a = doc.select("#a").unwrap().into_iter().next().unwrap();
+    let b = doc.select("#b").unwrap().into_iter().next().unwrap();
+    assert_eq!(crate::agent::browser::document::attr(&a, ATTR_PAGE_SEL), Some("1,-1".to_string()));
+    assert_eq!(crate::agent::browser::document::attr(&b, ATTR_PAGE_SEL), Some("0,1".to_string()));
+}
+
+#[tokio::test]
+async fn 页面自由选区拖选_提交与清空() {
+    let mgr = LsmBrowserManager::new();
+    let pid = open_hidden(
+        &mgr,
+        "<p id='a' style='font-size:16px'>甲甲甲甲甲</p><p id='b' style='font-size:16px'>乙乙乙乙乙</p>",
+    )
+    .await;
+    web_control::set_state(Engine::Lsm, &pid, ControlState::User, None, "test");
+    // 首个 p 的盒:y≈16..39(body margin 8 + p margin-top 8),中心 y≈27。
+    let (y, x0) = {
+        let hit = mgr.human_hit_test(&pid, 20.0, 27.0).await.expect("p 应命中");
+        assert_eq!(hit.tag, "p");
+        (hit.rect.1 + hit.rect.3 / 2.0, hit.rect.0 + 6.0)
+    };
+    // 按下 → 移动(越过 6px 阈值)→ 抬起:应提交 page_sel。
+    mgr.handle_human_input(
+        &pid,
+        HumanInput::Down { x: x0, y, button: MouseButton::Left, mods: Mods::default() },
+    )
+    .await;
+    mgr.handle_human_input(
+        &pid,
+        HumanInput::Move { x: x0 + 120.0, y },
+    )
+    .await;
+    let up = mgr.handle_human_input(
+        &pid,
+        HumanInput::Up { x: x0 + 120.0, y, button: MouseButton::Left, mods: Mods::default() },
+    )
+    .await;
+    assert_eq!(up["page_selection"], true, "拖选应收官:{up}");
+    let sel = {
+        let inner = mgr.inner.lock().await;
+        inner.tabs.get(&pid).and_then(|t| t.page_sel.clone())
+    };
+    assert!(sel.is_some(), "page_sel 应已提交");
+    web_control::clear(Engine::Lsm, &pid);
+    mgr.shutdown().await;
+}
+
+#[tokio::test]
+async fn disabled控件人工点击不分发不聚焦() {
+    let mgr = LsmBrowserManager::new();
+    let pid = open_hidden(
+        &mgr,
+        "<button id='d' disabled style='width:120px;height:40px'>禁用</button><span id='out'></span>",
+    )
+    .await;
+    web_control::set_state(Engine::Lsm, &pid, ControlState::User, None, "test");
+    let (x, y) = {
+        let hit = mgr.human_hit_test(&pid, 20.0, 20.0).await.expect("按钮应命中");
+        (hit.rect.0 + hit.rect.2 / 2.0, hit.rect.1 + hit.rect.3 / 2.0)
+    };
+    let down = mgr.handle_human_input(
+        &pid,
+        HumanInput::Down { x, y, button: MouseButton::Left, mods: Mods::default() },
+    )
+    .await;
+    assert_eq!(down["disabled"], true, "disabled 应被闸住:{down}");
+    let focused = {
+        let inner = mgr.inner.lock().await;
+        inner.tabs.get(&pid).and_then(|t| t.focused.clone())
+    };
+    assert!(focused.is_none(), "disabled 控件不应被聚焦");
+    web_control::clear(Engine::Lsm, &pid);
+    mgr.shutdown().await;
+}
+
+
+
+
+
+
+
+

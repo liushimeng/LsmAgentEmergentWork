@@ -148,6 +148,72 @@ fn tab_document(tab: &super::TabState) -> Document {
     tab.document_with_state()
 }
 
+/// 39 号 P2b:把宿主侧的光标/选区/页面自由选区文本注入 JS 环境。
+///
+/// - `carets`:selector → `{start, end}`(由 `form_caret` 归一化);
+/// - `caret_text`:selector → 该控件**当前选中的文本**(`getSelection()`
+///   在无页面自由选区时回落到它);
+/// - `page_sel_text`:页面自由选区的文本。
+///
+/// 文本在锁内一次性算好(避免 JS 侧二次遍历 DOM),算完即释放文档句柄。
+fn fill_selection_env(env: &mut script::PageEnv, tab: &super::TabState) {
+    let doc = tab.document_with_state();
+    let mut carets = std::collections::HashMap::new();
+    let mut caret_text = std::collections::HashMap::new();
+    for (sel, st) in &tab.form_caret {
+        let (start, end) = st.range();
+        carets.insert(
+            sel.clone(),
+            json!({"start": start, "end": end}),
+        );
+        if start >= end {
+            continue;
+        }
+        // 选中串:按控件「显示值」截取(与渲染/编辑同一数据源)。
+        let text = tab
+            .form_values
+            .get(sel)
+            .cloned()
+            .or_else(|| {
+                doc.select(sel)
+                    .ok()
+                    .and_then(|v| v.into_iter().next())
+                    .and_then(|n| document::attr(&n, "value"))
+            })
+            .unwrap_or_default();
+        let chars: Vec<char> = text.chars().collect();
+        if end <= chars.len() {
+            caret_text.insert(sel.clone(), chars[start..end].iter().collect::<String>());
+        }
+    }
+    env.carets = carets;
+    env.caret_text = caret_text;
+    env.focused = tab.focused.clone().unwrap_or_default();
+    env.page_sel_text = tab
+        .page_sel
+        .as_ref()
+        .map(|s| page_selection_text(&doc, s))
+        .unwrap_or_default();
+}
+
+/// `page_selection_text` 的公开包装(人工输入的页面复制复用同一实现)。
+pub(crate) fn page_selection_text_pub(
+    tab: &super::TabState,
+    sel: &document::PageSelection,
+) -> String {
+    let doc = tab.document_with_state();
+    page_selection_text(&doc, sel)
+}
+
+/// 页面自由选区的文本:按**元素可见文本**(每个元素一份,与
+/// `page_text_caret_at` 的索引空间同源)拼接后截取 `[start_idx, end_idx)`。
+///
+/// **近似**(方案 §7.2):跨元素整片高亮未建模,文本仍按「两端元素之间全部文本」
+/// 计算 —— 与渲染的首尾近似可能不完全一致,如实告知调用方。
+fn page_selection_text(doc: &Document, sel: &document::PageSelection) -> String {
+    sel.text_in(doc)
+}
+
 /// Esc 关闭最上层打开的 `<dialog>`(第 44 轮)。
 ///
 /// 浏览器语义:顶层浮层优先 —— 文档序**最后一个**带 `open` 的 dialog 即顶层。
@@ -291,6 +357,9 @@ pub(crate) async fn js_dispatch(
         env.scroll_y = tab.scroll_y;
         // 资源时序注入(第 174 轮):取最近 120 条,足够探测「脚本是否加载」。
         env.resources = tab.network.iter().rev().take(120).rev().cloned().collect();
+        // 39 号 P2b:光标/选区与选区文本注入(页面脚本读
+        // `el.selectionStart/End` 与 `getSelection().toString()`)。
+        fill_selection_env(&mut env, tab);
         let doc = tab_document(tab);
         let rects = tab.layout.rect_map();
         let nodes = doc.snapshot_nodes_with_rects((tab.viewport.width, tab.viewport.height), &rects);
@@ -406,8 +475,17 @@ pub(crate) async fn apply_js_reply(
     if let Some(title) = &summary.title {
         t.title = title.clone();
     }
-    let state_changed =
-        !summary.form_values.is_empty() || summary.focus.is_some() || summary.blur;
+    // 39 号 P2b:页面脚本 `setSelectionRange` 回写 → 光标/选区覆盖层。
+    // 落账后由调用方 relayout_and_push(选区高亮要重绘)。
+    let has_selections = !summary.form_selections.is_empty();
+    for (k, (s, e)) in summary.form_selections {
+        t.form_caret
+            .insert(k, super::document::CaretState { pos: e, anchor: s });
+    }
+    let state_changed = !summary.form_values.is_empty()
+        || has_selections
+        || summary.focus.is_some()
+        || summary.blur;
     for (k, v) in summary.form_values {
         t.form_values.insert(k, v);
     }
@@ -707,7 +785,7 @@ pub(crate) async fn run_pending_scripts(mgr: &LsmBrowserManager, pid: &str, budg
 ///
 /// DOM 句柄(`Rc` 树)不可跨 await 存活,故把"解析 → 应用 → 序列化"整体收在
 /// 同步函数内,调用方只拿纯数据(`String` + `ApplySummary`)。
-fn apply_dom_actions(
+pub(crate) fn apply_dom_actions(
     html: &str,
     base_url: &str,
     actions: &[script::JsAction],
@@ -790,6 +868,9 @@ async fn js_eval_thread_with_budget(
         env.scroll_y = tab.scroll_y;
         // 资源时序注入(第 174 轮):取最近 120 条,足够探测「脚本是否加载」。
         env.resources = tab.network.iter().rev().take(120).rev().cloned().collect();
+        // 39 号 P2b:光标/选区与选区文本注入(页面脚本读
+        // `el.selectionStart/End` 与 `getSelection().toString()`)。
+        fill_selection_env(&mut env, tab);
         let doc = tab_document(tab);
         let rects = tab.layout.rect_map();
         let nodes = doc.snapshot_nodes_with_rects((tab.viewport.width, tab.viewport.height), &rects);

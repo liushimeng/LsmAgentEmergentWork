@@ -926,6 +926,15 @@ fn build_meta_json(env: &PageEnv) -> String {
         "traceStmt": std::env::var("LAEW_JS_TRACE_STMT")
             .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
             .unwrap_or(false),
+        // 39 号 P2b:文本控件光标/选区(页面脚本读 `el.selectionStart/End`)。
+        // key = 稳定选择器,value = {start, end}(升序)。
+        "carets": env.carets,
+        // 39 号 P2b:页面级自由选区的文本(`getSelection().toString()`)与
+        // 控件内选区的文本(`caretText`,key = 稳定选择器)。
+        "pageSelText": env.page_sel_text,
+        "caretText": env.caret_text,
+        // 当前聚焦元素(`getSelection()` 无页面自由选区时回落到它的选区)。
+        "focused": env.focused,
     })
     .to_string()
 }
@@ -1382,6 +1391,10 @@ mod diag_probe {
             prefers_dark: false,
             csp: None,
             resources: Vec::new(),
+            carets: Default::default(),
+            page_sel_text: String::new(),
+            caret_text: Default::default(),
+            focused: String::new(),
         };
         let reply = rt.run_scripts(
             &[ScriptSource {

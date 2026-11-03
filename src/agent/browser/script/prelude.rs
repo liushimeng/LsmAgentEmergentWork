@@ -14,6 +14,13 @@ var __lsmValues = {};
 var __lsmChecked = {};
 var __lsmText = {};
 var __lsmHref = {};
+// 39 号 P2b:文本控件光标/选区(key = 稳定选择器)与页面级自由选区文本。
+// 宿主每次 refresh 注入;页面脚本读 `el.selectionStart/End` 与
+// `document.getSelection().toString()`。**规范属性是唯一推荐路径**,
+// 快照里的 `data-lsm-caret`/`data-lsm-sel` 私有属性仅供调试。
+var __lsmCarets = {};
+var __lsmPageSelStr = "";
+var __lsmCaretText = {};
 var __lsmLocal = {};
 var __lsmSession = {};
 var __lsmCookie = "";
@@ -380,6 +387,19 @@ function __lsmRefresh(nodes, meta) {
   window.scrollY = Number(__lsmMeta.scrollY) || 0;
   window.pageXOffset = window.scrollX;
   window.pageYOffset = window.scrollY;
+  // 39 号 P2b:光标/选区表(宿主注入)。每次 refresh 重建,与 __lsmValues 同口径。
+  __lsmCarets = {};
+  var __c = __lsmMeta.carets || {};
+  for (var kc in __c) if (Object.prototype.hasOwnProperty.call(__c, kc)) {
+    var cc = __c[kc];
+    __lsmCarets[kc] = { start: Number(cc && cc.start) || 0, end: Number(cc && cc.end) || 0 };
+  }
+  __lsmPageSelStr = String(__lsmMeta.pageSelText || "");
+  __lsmCaretText = {};
+  var __ct = __lsmMeta.caretText || {};
+  for (var kt in __ct) if (Object.prototype.hasOwnProperty.call(__ct, kt)) {
+    __lsmCaretText[kt] = String(__ct[kt]);
+  }
   __rebindDocNodes();
   __rebindLocation();
   __lsmApplyDiff(diff);
@@ -1159,6 +1179,97 @@ function __attrMap(ownerEl, attrsRef) {
     }
   });
 }
+// ---------- 39 号 P2b:文本控件选区(规范属性) ----------
+// 读路径唯一真源:宿主每轮注入的 __lsmCarets(由内核 form_caret 翻译)。
+// 非文本控件(input[checkbox/range/...] 与其余标签)一律返回 null —— 与
+// Chrome 一致(规范里只有文本类控件有这两个属性)。
+function __lsmIsTextSelEl(n) {
+  if (!n) return false;
+  var tag = String(n.tag || "").toLowerCase();
+  if (tag === "textarea") return true;
+  if (tag !== "input") return false;
+  var typ = String(n.typ || n.attrs && n.attrs.type || "").toLowerCase();
+  if (!typ) return true; // input 缺省 type=text
+  return ["checkbox", "radio", "range", "file", "button", "submit", "reset",
+          "image", "hidden", "color", "date", "time", "datetime-local",
+          "month", "week"].indexOf(typ) < 0;
+}
+// 取当前控件选区(升序)。非文本控件返回 null。
+function __lsmSelOf(n, key) {
+  if (!__lsmIsTextSelEl(n)) return null;
+  var rec = __lsmCarets[key];
+  if (rec && typeof rec.start === "number") return { start: rec.start, end: rec.end };
+  return { start: 0, end: 0 };
+}
+// 写选区:乐观更新本地表 + 回写宿主(与 set_value 同构)。
+function __lsmSetSel(n, key, start, end) {
+  if (!__lsmIsTextSelEl(n)) return;
+  var len = String(__lsmElemValue(n)).length;
+  var s = Math.max(0, Math.min(len, Number(start) || 0));
+  var e = Math.max(0, Math.min(len, Number(end) || 0));
+  __lsmCarets[key] = { start: s, end: e };
+  __lsmRec("attributes", null, { attributeName: "selectionStart", attributeOldValue: "" });
+  __push({ type: "set_selection", selector: n.sel, key: String(s), value: String(e) });
+}
+// el.value 的只读快照(不触发 setter;与 __lsmValues 的 JS 侧覆盖层合并)。
+function __lsmElemValue(n) {
+  var key = n.sel || ("#idx_" + n.i);
+  return Object.prototype.hasOwnProperty.call(__lsmValues, key) ? __lsmValues[key] : (n.value || "");
+}
+// 动态节点的选区:按 data-lsm-id 反查宿主表(挂载后才有意义)。
+function __lsmDynSel(el) {
+  var dk = __lsmDynKey(el);
+  if (!dk) return null;
+  var rec = __lsmCarets[dk];
+  if (rec && typeof rec.start === "number") return { start: rec.start, end: rec.end };
+  return { start: 0, end: 0 };
+}
+function __lsmDynSetSel(el, start, end) {
+  var dk = __lsmDynKey(el);
+  if (!dk) return;
+  var len = String(el.value || "").length;
+  var s = Math.max(0, Math.min(len, Number(start) || 0));
+  var e = Math.max(0, Math.min(len, Number(end) || 0));
+  __lsmCarets[dk] = { start: s, end: e };
+  __push({ type: "set_selection", selector: dk, key: String(s), value: String(e) });
+}
+// document.getSelection().toString():页面自由选区优先,回落聚焦控件的选区文本。
+// 聚焦元素的选择器由宿主持有(`__lsmMeta.focused`),这里按元素键查表。
+function __lsmPageSelText() {
+  if (__lsmPageSelStr) return __lsmPageSelStr;
+  var f = __lsmMeta && __lsmMeta.focused;
+  if (f && __lsmCaretText[f]) return __lsmCaretText[f];
+  return "";
+}
+// 39 号 P2b:规范方法 `setSelectionRange(start, end[, direction])`。
+// 内核不建模「方向」(forward/backward/none),参数接受但忽略 —— 光标/选区
+// 双向由 anchor/pos 表达,方向只影响后续编辑的默认折叠侧,当前无此语义。
+// 挂到**实例**上(内核的元素包装器每次 refresh 重建,无原型链可挂;
+// 动态节点走 __newEl 的同一份装配)。
+function __lsmInstallSetSelectionRange(el, n, key) {
+  if (!el || !n) return;
+  el.setSelectionRange = function (start, end, _direction) {
+    if (!__lsmIsTextSelEl(n)) return;
+    __lsmSetSel(n, key, Number(start) || 0, Number(end) || 0);
+  };
+  // select():全选(规范里等价 setSelectionRange(0, len))。
+  el.select = function () {
+    if (!__lsmIsTextSelEl(n)) return;
+    var len = String(__lsmElemValue(n)).length;
+    __lsmSetSel(n, key, 0, len);
+  };
+}
+// 动态节点版本(__newEl 装配尾调用)。
+function __lsmInstallDynSetSelectionRange(el) {
+  if (!el) return;
+  el.setSelectionRange = function (start, end, _direction) {
+    __lsmDynSetSel(el, Number(start) || 0, Number(end) || 0);
+  };
+  el.select = function () {
+    var len = String(el.value || "").length;
+    __lsmDynSetSel(el, 0, len);
+  };
+}
 function __mk(n) {
   var attrs = n.attrs || {};
   // 布局几何:快照 rect [x,y,w,h] → clientWidth/offsetWidth 等属性。
@@ -1518,6 +1629,20 @@ function __mk(n) {
     __lsmRec("attributes", el, { attributeName: "checked", attributeOldValue: n.checked ? "true" : "false" });
     __push({ type: "set_checked", selector: n.sel, value: v ? "true" : "false" });
   });
+  // 39 号 P2b:文本控件的 selectionStart/End(规范属性)。
+  // 读:宿主注入的 `__lsmCarets[sel]`(由 form_caret 每轮刷新);无记录时
+  //     回落「值末尾折叠」——与内核 `collect_text_ctx` 的缺省口径一致。
+  // 写:__push(set_selection) 回写宿主 + 乐观更新本地表(真实浏览器 setter
+  //     立即可读,不等宿主回写)。非文本控件返回 null(与 Chrome 一致)。
+  define("selectionStart", function () { return __lsmSelOf(n, key).start; }, function (v) {
+    var cur = __lsmSelOf(n, key);
+    __lsmSetSel(n, key, Number(v) || 0, cur.end);
+  });
+  define("selectionEnd", function () { return __lsmSelOf(n, key).end; }, function (v) {
+    var cur = __lsmSelOf(n, key);
+    __lsmSetSel(n, key, cur.start, Number(v) || 0);
+  });
+  __lsmInstallSetSelectionRange(el, n, key);
   // 第 41 轮:半选态(indeterminate)。内核以同名属性承载,布局层据此画横杠,
   // 样式引擎的 `:indeterminate` 也按该属性命中。
   define("indeterminate", function () {
@@ -2146,6 +2271,20 @@ function __newEl(tag) {
   };
   def("innerText", function () { return el.__text; }, function (v) { el.__text = String(v); el.__kids = []; });
   def("value", function () { return el.__attrs.value || ""; }, function (v) { el.__attrs.value = String(v); });
+  // 39 号 P2b:动态节点的文本控件选区(与快照元素同构)。未挂载时 sel 为空,
+  // setSelectionRange 静默 no-op(真实浏览器里 detached 元素同样不生效)。
+  def("selectionStart", function () {
+    var s = __lsmDynSel(el); return s ? s.start : null;
+  }, function (v) {
+    var s = __lsmDynSel(el) || { start: 0, end: 0 };
+    __lsmDynSetSel(el, Number(v) || 0, s.end);
+  });
+  def("selectionEnd", function () {
+    var s = __lsmDynSel(el); return s ? s.end : null;
+  }, function (v) {
+    var s = __lsmDynSel(el) || { start: 0, end: 0 };
+    __lsmDynSetSel(el, s.start, Number(v) || 0);
+  });
   // 静态与动态 Canvas 共用真实 RGBA8 像素实现(canvas_js.rs)。
   if (t === "canvas") __lsmAttachCanvas(el, null);
   // children 反射 __kids:createElement+appendChild 建出的子树立即被父节点可见
@@ -2164,6 +2303,8 @@ function __newEl(tag) {
     return all.length ? all[all.length - 1] : null;
   }, function (v) {});
   el.ownerDocument = document;
+  // 39 号 P2b:动态节点的文本控件选区方法(与快照元素同构)。
+  __lsmInstallDynSetSelectionRange(el);
   // 属性写拦截:挂载后的属性变更(百度地图瓦片淡入 opacity 0→1 等)
   // 必须回写宿主 DOM,否则宿主永远停在挂载时的属性值。
   el.__attrs = __mkDynAttrs(el);
@@ -2568,7 +2709,23 @@ var document = {
   },
   removeEventListener: function () {},
   dispatchEvent: function (e) { __fireDocument(String((e && e.type) || e)); return true; },
-  getSelection: function () { return { toString: function () { return ""; }, removeAllRanges: function () {} }; },
+  // 39 号 P2b:`toString()` 返回真实选区文本(页面自由选区优先,回落聚焦控件的
+  // 选区)。其余 Selection API(Range/addRange/collapse…)是空桩 —— 未建模,
+  // 与 `page_health` 能力缺口口径一致(见 inspect.rs)。
+  getSelection: function () {
+    return {
+      toString: function () { return __lsmPageSelText(); },
+      anchorNode: null, focusNode: null, rangeCount: 0,
+      isCollapsed: true, type: "None",
+      getRangeAt: function () { return null; },
+      addRange: function () {}, removeAllRanges: function () {},
+      collapse: function () {}, extend: function () {}, empty: function () {},
+      collapseToEnd: function () {}, collapseToStart: function () {},
+      containsNode: function () { return false; },
+      deleteFromDocument: function () {},
+      toStringNote: "内核仅实现 toString();Range/Selection 全 API 未建模",
+    };
+  },
   hasFocus: function () { return true; },
   queryCommandSupported: function () { return false; },
   // elementFromPoint:坐标命中测试。站点 APM/安全 SDK(patas 空白页采样、

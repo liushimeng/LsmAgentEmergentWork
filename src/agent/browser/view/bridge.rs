@@ -169,6 +169,16 @@ impl LsmBrowserManager {
                 }
                 return;
             }
+            ViewCommand::FocusAddrbar => {
+                // ⌘/Ctrl+L:查看器侧直接把焦点交给地址栏(命令由查看器本地拦截,
+                // 宿主只落「显示跟随」语义,无页面动作)。
+                if let Ok(guard) = self.view.lock() {
+                    if let Some(sink) = guard.as_ref() {
+                        sink.focus_addrbar();
+                    }
+                }
+                return;
+            }
             _ => {}
         }
         let page_id = self.foreground_page_id().await;
@@ -195,7 +205,8 @@ impl LsmBrowserManager {
             | ViewCommand::NewTab
             | ViewCommand::CloseTab
             | ViewCommand::NextTab
-            | ViewCommand::Clip(_) => unreachable!("已在函数开头单独处理"),
+            | ViewCommand::Clip(_)
+            | ViewCommand::FocusAddrbar => unreachable!("已在函数开头单独处理"),
         };
         self.refresh_view(&page_id).await;
     }

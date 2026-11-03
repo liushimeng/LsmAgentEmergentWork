@@ -11,6 +11,7 @@ mod inline;
 mod inline_atomic;
 mod list_marker;
 mod measure;
+mod page_sel;
 mod grid;
 mod helpers;
 mod position;
@@ -1831,6 +1832,17 @@ impl<'a> LayoutCtx<'a> {
                     bx + rdx + style.padding_left,
                     start_y + rdy,
                     box_h,
+                );
+                // 39 号 P2b:页面级自由选区高亮(只画首/尾元素内区段;近似)。
+                page_sel::emit_page_sel_overlay(
+                    self,
+                    &child,
+                    &style,
+                    bx + rdx + style.padding_left,
+                    start_y + rdy + style.padding_top,
+                    (bw - style.padding_left - style.padding_right).max(0.0),
+                    (box_h - style.padding_top - style.padding_bottom).max(0.0),
+                    None,
                 );
                 // 阶段七:浮动盒登记并恢复流式游标(非浮动为 no-op)。
                 float::finish(self, placement, &mut floats, &mut inline_row);

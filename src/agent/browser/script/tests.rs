@@ -21,6 +21,10 @@ pub(super) fn env(url: &str) -> PageEnv {
         prefers_dark: false,
         csp: None,
         resources: Vec::new(),
+        carets: HashMap::new(),
+        page_sel_text: String::new(),
+        caret_text: HashMap::new(),
+        focused: String::new(),
     }
 }
 

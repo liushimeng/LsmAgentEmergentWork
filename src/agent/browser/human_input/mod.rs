@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 
 use super::api;
 use super::document::{self, CaretState, Document};
+use super::script;
 use super::layout;
 use super::style::{MediaCtx, StyleEngine};
 use super::{page_bars, LsmBrowserManager, TabState};
@@ -136,8 +137,23 @@ struct PageInputState {
     text_drag: Option<TextDragState>,
     /// P2a:拖选已发生(位移超阈值)——收尾不合成 click(浏览器语义)。
     text_dragging: bool,
+    /// P2b:页面级自由选区的拖选会话(跨元素;与 `text_drag` 互斥)。
+    page_drag: Option<PageDragState>,
+    /// P2b:页面拖选已越阈值(收尾不合成 click)。
+    page_dragging: bool,
     /// P2a:单控件撤销/重做历史(key = stable selector)。
     edits: std::collections::HashMap<String, text_edit::EditHistory>,
+}
+
+/// P2b:页面级自由选区的拖选会话(锚点固定,头随指针)。
+#[derive(Debug, Clone)]
+struct PageDragState {
+    /// 锚点元素(稳定选择器)与锚点 char 索引。
+    anchor_sel: String,
+    anchor_idx: usize,
+    /// 起始视口坐标(阈值判定用)。
+    start_x: f64,
+    start_y: f64,
 }
 
 impl HumanSession {
@@ -474,6 +490,64 @@ impl LsmBrowserManager {
                 }
             }
         }
+        // P2b:页面级自由选区拖选(锚点固定、头随指针)。
+        //
+        // 索引映射是纯几何计算(不碰 DOM 重排),所以**每次移动都刷新头端**;
+        // 只有「头端元素变化」才需要重排(与 hover 去重同口径)。
+        let page_drag = {
+            let s = self.human.lock().unwrap_or_else(|p| p.into_inner());
+            s.pages.get(pid).and_then(|st| st.page_drag.clone())
+        };
+        if let Some(pd) = page_drag {
+            let pressed = {
+                let s = self.human.lock().unwrap_or_else(|p| p.into_inner());
+                s.pages.get(pid).map(|st| st.press.is_some()).unwrap_or(false)
+            };
+            let moved = (pd.start_x - x).hypot(pd.start_y - y) > CLICK_DIST;
+            if pressed && moved {
+                // 头端元素:命中可选文本元素时用命中者,否则沿用锚点元素
+                //(拖过容器间隙时选区仍连续,不因一次未命中而断)。
+                let head = hit.as_ref().filter(|h| is_page_selectable(&h.tag, &h.typ));
+                let head_sel = head
+                    .as_ref()
+                    .map(|h| h.selector.clone())
+                    .unwrap_or_else(|| pd.anchor_sel.clone());
+                let head_idx = match head {
+                    Some(h) => self.page_text_caret_at(pid, h, x, y).await.unwrap_or(pd.anchor_idx),
+                    None => pd.anchor_idx,
+                };
+                let mut relayout = false;
+                {
+                    let mut inner = self.inner.lock().await;
+                    if let Some(tab) = inner.tabs.get_mut(pid) {
+                        let need = match &tab.page_sel {
+                            Some(cur) => {
+                                cur.anchor_sel != pd.anchor_sel
+                                    || cur.head_sel != head_sel
+                                    || cur.head_idx != head_idx
+                            }
+                            None => true,
+                        };
+                        if need {
+                            tab.page_sel = Some(document::PageSelection {
+                                anchor_sel: pd.anchor_sel.clone(),
+                                anchor_idx: pd.anchor_idx,
+                                head_sel: head_sel.clone(),
+                                head_idx,
+                            });
+                            relayout = true;
+                        }
+                    }
+                }
+                if relayout {
+                    {
+                        let mut s = self.human.lock().unwrap_or_else(|p| p.into_inner());
+                        s.page(pid).page_dragging = true;
+                    }
+                    api::relayout_and_push(self, pid).await;
+                }
+            }
+        }
         // 拖拽中的滑块:按住移动持续设值(浏览器拖拽滑块语义)。
         let press_range = {
             let mut s = self.human.lock().unwrap_or_else(|p| p.into_inner());
@@ -577,14 +651,27 @@ impl LsmBrowserManager {
             });
             st.text_drag = None;
             st.text_dragging = false;
+            st.page_drag = None;
+            st.page_dragging = false;
         }
         let Some(hit) = hit else {
             return json!({"x": x, "y": y, "hit": false, "pressed": true});
         };
-        let focusable = is_focusable(&hit.tag, &hit.typ);
+        // disabled 控件:人工点击不分发事件也不聚焦(与 Agent 侧 `click_inner`
+        // 的 disabled 闸同语义;39 号 P2b 顺带补齐)。
+        let disabled = is_disabled_control(&hit.tag, &hit.typ)
+            && {
+                let inner = self.inner.lock().await;
+                inner
+                    .tabs
+                    .get(pid)
+                    .map(|t| control_disabled(t, &hit.selector))
+                    .unwrap_or(false)
+            };
+        let focusable = !disabled && is_focusable(&hit.tag, &hit.typ);
         // P2a:文本控件点击定位光标(Shift+点击沿用旧锚点扩选)。
         let mut caret_out = Value::Null;
-        if is_text_like(&hit.tag, &hit.typ) {
+        if !disabled && is_text_like(&hit.tag, &hit.typ) {
             if let Some(st) = self.place_text_caret(pid, &hit, x, y, mods.shift).await {
                 {
                     let mut s = self.human.lock().unwrap_or_else(|p| p.into_inner());
@@ -592,6 +679,51 @@ impl LsmBrowserManager {
                         Some(TextDragState { selector: hit.selector.clone(), anchor: st.anchor });
                 }
                 caret_out = json!({"pos": st.pos, "anchor": st.anchor});
+            }
+        }
+        // P2b:页面级自由选区锚点(非文本控件、有可见文本、非 user-select:none)。
+        let mut page_sel_anchor = Value::Null;
+        if !disabled && !is_text_like(&hit.tag, &hit.typ) && is_page_selectable(&hit.tag, &hit.typ)
+        {
+            let armed = {
+                let inner = self.inner.lock().await;
+                inner
+                    .tabs
+                    .get(pid)
+                    .map(|t| {
+                        let doc = t.document_with_state();
+                        doc.select(&hit.selector)
+                            .ok()
+                            .and_then(|v| v.into_iter().next())
+                            .map(|n| {
+                                !user_select_none(
+                                    &StyleEngine::from_document(
+                                        &doc,
+                                        MediaCtx::new(
+                                            t.viewport.width as f64,
+                                            t.viewport.height as f64,
+                                        ),
+                                    ),
+                                    &n,
+                                )
+                            })
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false)
+            };
+            if armed {
+                if let Some(idx) = self.page_text_caret_at(pid, &hit, x, y).await {
+                    {
+                        let mut s = self.human.lock().unwrap_or_else(|p| p.into_inner());
+                        s.page(pid).page_drag = Some(PageDragState {
+                            anchor_sel: hit.selector.clone(),
+                            anchor_idx: idx,
+                            start_x: x,
+                            start_y: y,
+                        });
+                    }
+                    page_sel_anchor = json!({"selector": hit.selector, "idx": idx});
+                }
             }
         }
         {
@@ -620,7 +752,7 @@ impl LsmBrowserManager {
             api::apply_js_reply(self, pid, &reply).await;
         }
         api::relayout_and_push(self, pid).await;
-        json!({"x": x, "y": y, "hit": true, "selector": sel, "tag": tag, "focused": focusable, "caret": caret_out})
+        json!({"x": x, "y": y, "hit": true, "selector": sel, "tag": tag, "focused": focusable, "disabled": disabled, "caret": caret_out, "page_sel_anchor": page_sel_anchor})
     }
 
     /// 抬起:同目标且位移小 → 完整点击语义(复用 `click_inner`);否则只发 mouseup。
@@ -633,7 +765,7 @@ impl LsmBrowserManager {
         mods: Mods,
         arrived: u128,
     ) -> Value {
-        let (press, drag_started, text_drag, text_dragging) = {
+        let (press, drag_started, text_drag, text_dragging, page_drag, page_dragging) = {
             let mut s = self.human.lock().unwrap_or_else(|p| p.into_inner());
             let st = s.page(pid);
             (
@@ -641,6 +773,8 @@ impl LsmBrowserManager {
                 std::mem::take(&mut st.drag_started),
                 st.text_drag.take(),
                 std::mem::take(&mut st.text_dragging),
+                st.page_drag.take(),
+                std::mem::take(&mut st.page_dragging),
             )
         };
         // 释放按下态(无论是否成点击)。
@@ -698,6 +832,24 @@ impl LsmBrowserManager {
             MouseButton::Left => {}
         }
 
+        // P2b:页面级自由选区收尾。拖过阈值 → 落 `page_sel` 并重排(高亮要重绘);
+        // 未过阈值 → 清掉拖选态,回落既有 click 语义(见下方)。
+        if let Some(pd) = page_drag {
+            let moved = (pd.start_x - x).hypot(pd.start_y - y) > CLICK_DIST;
+            if moved && page_dragging {
+                // `page_sel` 已在拖选途中由 `human_move` 实时提交,这里只收口。
+                api::relayout_and_push(self, pid).await;
+                self.note_human_event(pid, "人工拖选(页面选区)");
+                return json!({"x": x, "y": y, "clicked": false, "page_selection": true});
+            }
+            // 未越阈值:清掉拖选痕迹(半提交的 page_sel 一并清掉,回落 click 语义)。
+            let mut inner = self.inner.lock().await;
+            if let Some(tab) = inner.tabs.get_mut(pid) {
+                if tab.page_sel.is_some() {
+                    tab.page_sel = None;
+                }
+            }
+        }
         // P2a:文本拖选收尾 = 只落选区,不合成 click / HTML5 drag(浏览器语义:
         // 文本框里按住拖动是选区手势,松开不算点击)。
         if text_dragging {
@@ -718,6 +870,23 @@ impl LsmBrowserManager {
                 return json!({"x": x, "y": y, "clicked": false, "selection": true});
             }
         }
+        // 模态 dialog 遮罩点击关闭(39 号 P2b;浏览器语义:点 `::backdrop` 关窗)。
+        // 放在点击合成之前:点到 dialog 之外的任意元素(或**没有命中任何元素**,
+        // 即点在了遮罩上)都算「点遮罩」,与真实浏览器一致。
+        let backdrop_hit = match hit.as_ref() {
+            Some(h) => !in_open_dialog_hit(self, pid, &h.selector).await,
+            // 无命中:若存在模态 dialog,这点必然落在遮罩上。
+            None => self.has_modal_dialog(pid).await,
+        };
+        if backdrop_hit {
+            let closed = self.try_close_modal_backdrop(pid).await;
+            if closed {
+                api::relayout_and_push(self, pid).await;
+                self.note_human_event(pid, "人工点击遮罩关闭弹窗");
+                return json!({"x": x, "y": y, "clicked": false, "dialog_closed": true});
+            }
+        }
+
         // 左键:同目标且位移小 → 点击;否则视为拖拽收尾。
         let same_target = press.selector.is_some()
             && hit.as_ref().map(|h| h.selector.as_str()) == press.selector.as_deref();
@@ -1011,6 +1180,107 @@ impl LsmBrowserManager {
             let spans = self.font.char_spans(&display, size, (hit.rect.2 - 6.0).max(0.0));
             Some(text_edit::index_from_spans(&spans, x_rel))
         }
+    }
+
+    /// 模态 dialog 遮罩点击关闭:命中元素不在 dialog 子树内时关掉顶层模态框。
+    ///
+    /// 与 `api::act_key_press` 的 Esc 关闭同一条落点(移除 `open` +
+    /// `data-lsm-modal`),保证「点遮罩」与「按 Esc」语义一致。
+    /// 当前页是否存在**模态** dialog(`open` + `data-lsm-modal`;遮罩判定用)。
+    async fn has_modal_dialog(&self, pid: &str) -> bool {
+        let inner = self.inner.lock().await;
+        let Some(tab) = inner.tabs.get(pid) else {
+            return false;
+        };
+        let doc = tab.document_with_state();
+        dialog_selectors(&doc).into_iter().next().is_some()
+    }
+
+    async fn try_close_modal_backdrop(&self, pid: &str) -> bool {
+        // 顶层模态 dialog(文档序**最后一个** open 且带 `data-lsm-modal`;
+        // 与 `close_top_dialog` 同口径)。
+        let target = {
+            let inner = self.inner.lock().await;
+            let Some(tab) = inner.tabs.get(pid) else {
+                return false;
+            };
+            let doc = tab.document_with_state();
+            dialog_selectors(&doc).into_iter().next()
+        };
+        let Some(sel) = target else {
+            return false;
+        };
+        // 走与页面脚本 `dialog.close()` 相同的 DOM 动作路径。
+        let actions = vec![
+            script::JsAction {
+                kind: "remove_attr".to_string(),
+                selector: sel.clone(),
+                key: "open".to_string(),
+                value: String::new(),
+                url: String::new(),
+                event: String::new(),
+            },
+            script::JsAction {
+                kind: "remove_attr".to_string(),
+                selector: sel.clone(),
+                key: "data-lsm-modal".to_string(),
+                value: String::new(),
+                url: String::new(),
+                event: String::new(),
+            },
+        ];
+        let (html, url) = {
+            let inner = self.inner.lock().await;
+            match inner.tabs.get(pid) {
+                Some(t) => (t.html.clone(), t.url.clone()),
+                None => return false,
+            }
+        };
+        let (final_html, _) = api::apply_dom_actions(&html, &url, &actions);
+        {
+            let mut inner = self.inner.lock().await;
+            if let Some(tab) = inner.tabs.get_mut(pid) {
+                tab.set_html(final_html);
+            }
+        }
+        true
+    }
+
+    /// P2b:页面自由选区的**元素可见文本** char 索引映射(跨元素手势的索引空间)。
+    ///
+    /// 与 [`text_caret_at`] 的差异:那里的索引空间是控件的 `value`(单值字符串),
+    /// 这里是元素**可见文本**(去标签、折叠空白)——跨元素拼接时才不会错位。
+    /// 几何与控件内选区同源(`FontSet::char_spans`)。
+    async fn page_text_caret_at(&self, pid: &str, hit: &HitTarget, x: f64, y: f64) -> Option<usize> {
+        let (text, size, rect, fixed, scroll_x, scroll_y) = {
+            let inner = self.inner.lock().await;
+            let tab = inner.tabs.get(pid)?;
+            let doc = tab.document_with_state();
+            let node = doc.select(&hit.selector).ok().and_then(|v| v.into_iter().next())?;
+            let text = document::node_text(&node);
+            (
+                text,
+                node_font_size(
+                    &StyleEngine::from_document(
+                        &doc,
+                        MediaCtx::new(tab.viewport.width as f64, tab.viewport.height as f64),
+                    ),
+                    &node,
+                ),
+                hit.rect,
+                hit.fixed,
+                tab.scroll_x,
+                tab.scroll_y,
+            )
+        };
+        if text.is_empty() || size <= 0.0 {
+            return None;
+        }
+        let x_rel = (if fixed { x - rect.0 } else { x + scroll_x - rect.0 }) - 3.0;
+        // 页面文本按**单行**近似取最近字符边界(跨元素拖选不折行;多行块元素
+        // 的精确行定位留后续阶段,见方案 §7.2)。
+        let spans = self.font.char_spans(&text, size, f64::MAX);
+        Some(text_edit::index_from_spans(&spans, x_rel))
     }
 
     /// P2a:落点击光标(Shift+点击 = 沿用旧锚点扩选),返回新光标态。
@@ -1323,6 +1593,95 @@ fn in_open_dialog(doc: &Document, selector: &str) -> bool {
             }
             false
         })
+        .unwrap_or(false)
+}
+
+/// P2b:元素是否可参与**页面级自由选区**(跨元素拖选)。
+///
+/// 判据:有可见文本、非交互控件(控件内选区归 `text_drag` 管)、非 `user-select:none`。
+/// 标签白名单近似(块级文本容器 + 行内文本),避免把 `<html>`/`<body>`/`<div>` 布局容器
+/// 当成选区单元(它们的文本是子代之和,会导致索引空间与渲染错位)。
+fn is_page_selectable(tag: &str, typ: &str) -> bool {
+    let _ = typ;
+    matches!(
+        tag,
+        "p" | "span"
+            | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+            | "li" | "td" | "th" | "caption" | "label" | "a" | "b" | "i" | "em"
+            | "strong" | "small" | "code" | "pre" | "blockquote" | "dd" | "dt"
+            | "figcaption" | "legend" | "summary" | "option"
+    )
+}
+
+/// 元素链上是否显式 `user-select:none`(页面自由选区要跳过)。
+///
+/// 样式引擎**未建模** `user-select`(见 style/values.rs),这里只读**内联
+/// `style`** 与 `selectstart` 的常见站点写法 —— 保守口径:读不到就放行,
+/// 与既有命中近似的边界一致(宁可多选,别让拖选完全不可用)。
+fn user_select_none(engine: &StyleEngine, node: &kuchikiki::NodeRef) -> bool {
+    let _ = engine;
+    let mut cur = Some(node.clone());
+    let mut guard = 0;
+    while let Some(n) = cur {
+        guard += 1;
+        if guard > 64 {
+            return false;
+        }
+        if let Some(el) = n.as_element() {
+            let attrs = el.attributes.borrow();
+            for key in ["style", "unselectable"] {
+                if let Some(v) = attrs.get(key) {
+                    let v = v.to_ascii_lowercase();
+                    if v.contains("user-select") && v.contains("none")
+                        || v.eq_ignore_ascii_case("on")
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        cur = n.parent();
+    }
+    false
+}
+
+/// 页面上所有**模态** dialog 的稳定选择器(文档序;最后一个 = 顶层)。
+fn dialog_selectors(doc: &Document) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Ok(dialogs) = doc.select("dialog") {
+        for d in dialogs {
+            if document::attr(&d, "open").is_some()
+                && document::attr(&d, "data-lsm-modal").is_some()
+            {
+                out.push(Document::stable_selector(&d));
+            }
+        }
+    }
+    out
+}
+
+/// 命中元素是否位于**打开的** `<dialog>` 子树内(遮罩点击判定的辅助)。
+async fn in_open_dialog_hit(mgr: &LsmBrowserManager, pid: &str, selector: &str) -> bool {
+    let inner = mgr.inner.lock().await;
+    let Some(tab) = inner.tabs.get(pid) else {
+        return false;
+    };
+    let doc = tab.document_with_state();
+    in_open_dialog(&doc, selector)
+}
+
+/// 控件类标签(disabled 属性对其生效的集合;与 `click_inner` 的判定同口径)。
+fn is_disabled_control(tag: &str, _typ: &str) -> bool {
+    matches!(tag, "input" | "button" | "select" | "textarea" | "option")
+}
+
+/// 节点的 `disabled` 属性是否存在(锁内短临界区调用)。
+fn control_disabled(tab: &TabState, selector: &str) -> bool {
+    let doc = tab.document_with_state();
+    doc.select(selector)
+        .ok()
+        .and_then(|v| v.into_iter().next())
+        .map(|n| document::attr(&n, "disabled").is_some())
         .unwrap_or(false)
 }
 

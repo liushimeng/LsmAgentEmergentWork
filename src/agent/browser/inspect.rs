@@ -423,6 +423,11 @@ pub async fn inspect(
                 },
                 "script_budget_cut": tab.script_budget_cut,
                 "script_pending": tab.script_pending,
+                // 39 号 P2b 能力缺口(如实上报,免得 Agent 对着「选区没生效」
+                // 反复重试):跨元素整片高亮只画首尾元素内区段;Selection/Range
+                // 全 API 未建模(只有 getSelection().toString() 与文本控件的
+                // selectionStart/End/setSelectionRange)。
+                "selection_note": "页面自由选区:跨元素拖选可用,getSelection().toString() 可读;但 Selection/Range 全 API 未建模,且跨元素高亮只画首尾元素内区段(中间元素不画)",
                 "request_loop": request_loop,
                 "request_loop_note": if request_loop.is_some() {
                     "同路径请求大量重复(疑似验证码组件反复重置/轮询循环):结合 inspect(console) 的异常看组件是否在自愈循环;刷新通常无济于事,必要时改用 MCP_Web_Chrome_Use 或 request_human"

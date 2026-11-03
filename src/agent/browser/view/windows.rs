@@ -26,16 +26,18 @@ use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
     DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetClientRect, GetMessageW,
-    GetWindowTextW, LoadCursorW, MoveWindow, PostQuitMessage, RegisterClassW, SetTimer,
-    SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage, BS_PUSHBUTTON, CS_DBLCLKS,
-    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, ES_AUTOHSCROLL, HMENU, IDC_ARROW, MF_STRING, MSG,
-    SW_SHOWNORMAL, TPM_RIGHTBUTTON, TPM_RETURNCMD, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CHAR,
-    WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE,
-    WM_SYSKEYDOWN, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
-    WS_VISIBLE,
+    GetWindowTextW, LoadCursorW, MoveWindow, PostQuitMessage, RegisterClassW, SendMessageW,
+    SetTimer, SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage, BS_PUSHBUTTON,
+    CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, ES_AUTOHSCROLL, HMENU,
+    IDC_ARROW, MF_STRING, MSG, SW_SHOWNORMAL, TPM_RIGHTBUTTON, TPM_RETURNCMD, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_KEYDOWN, WM_KILLFOCUS,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CHILD,
+    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
 };
+// EM_SETSEL 定义在 Controls 模块(不在 WindowsAndMessaging;39 号 P2b)。
+use windows::Win32::UI::Controls::EM_SETSEL;
 
 use super::read_frame;
 
@@ -59,6 +61,8 @@ static CLOSE_FLAG: Mutex<bool> = Mutex::new(false);
 static TAKE_IMAGE: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 /// 地址栏状态(URL + 前进/后退可用性)。
 static PENDING_URL: Mutex<Option<(String, bool, bool)>> = Mutex::new(None);
+/// ⌘/Ctrl+L 聚焦地址栏请求(39 号 P2b)。
+static FOCUS_ADDRBAR_FLAG: Mutex<bool> = Mutex::new(false);
 static ADDR_EDIT: Mutex<Option<HwndCell>> = Mutex::new(None);
 static BACK_BTN: Mutex<Option<HwndCell>> = Mutex::new(None);
 static FWD_BTN: Mutex<Option<HwndCell>> = Mutex::new(None);
@@ -332,6 +336,11 @@ unsafe fn forward_key(wp: WPARAM, sys: bool) {
         send_cmd("{\"cmd\":\"next_tab\"}");
         return;
     }
+    // ⌘/Ctrl+L:聚焦地址栏(39 号 P2b;Windows 无 meta)。
+    if ctrl && vk == 0x4C {
+        send_cmd("{\"cmd\":\"focus_addrbar\"}");
+        return;
+    }
     if ctrl || alt {
         // 组合键只转发剪贴板三键(宿主侧按聚焦控件整值处理)。
         if ctrl && (vk == 0x43 || vk == 0x56 || vk == 0x58) {
@@ -434,6 +443,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             }
             if let Some((url, can_back, can_forward)) = PENDING_URL.lock().unwrap().take() {
                 apply_urlbar(&url, can_back, can_forward);
+            }
+            // ⌘/Ctrl+L:聚焦地址栏并全选(与 macOS 同语义)。
+            // EM_SETSEL 的 lParam = MAKELONG(0, -1):起点 0、终点 -1 = 全选。
+            if FOCUS_ADDRBAR_FLAG.lock().unwrap().take() {
+                if let Some(edit) = ADDR_EDIT.lock().unwrap().map(|c| c.0) {
+                    let _ = SetFocus(edit);
+                    let _ = SendMessageW(edit, EM_SETSEL, WPARAM(0), LPARAM(-1));
+                }
             }
             if let Some(png) = TAKE_IMAGE.lock().unwrap().take() {
                 if let Ok(img) = image::load_from_memory(&png) {
@@ -887,6 +904,10 @@ pub fn run(width: u32, height: u32, title: &str) -> i32 {
                             .and_then(|b| b.as_bool())
                             .unwrap_or(false);
                         *PENDING_URL.lock().unwrap() = Some((url, can_back, can_forward));
+                    }
+                    // ⌘/Ctrl+L:聚焦地址栏(39 号 P2b)。
+                    Some((b'f', _)) => {
+                        *FOCUS_ADDRBAR_FLAG.lock().unwrap() = true;
                     }
                     Some((b'c', _)) | None => {
                         *CLOSE_FLAG.lock().unwrap() = true;

@@ -710,6 +710,8 @@ mod tests {
             attrs: Default::default(),
             css: Default::default(),
             rect: None,
+            sel_start: None,
+            sel_end: None,
         }
     }
 

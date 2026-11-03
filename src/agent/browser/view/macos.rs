@@ -136,6 +136,8 @@ struct FrameSlot {
     title: Option<String>,
     /// 地址栏状态(URL + 前进/后退可用性)。
     urlbar: Option<(String, bool, bool)>,
+    /// ⌘/Ctrl+L 聚焦地址栏请求(39 号 P2b)。
+    focus_addrbar: bool,
     close: bool,
     seq: u64,
     shown_seq: u64,
@@ -146,6 +148,7 @@ static SLOT: once_cell::sync::Lazy<Mutex<FrameSlot>> =
         image: None,
         title: None,
         urlbar: None,
+        focus_addrbar: false,
         close: false,
         seq: 0,
         shown_seq: 0,
@@ -311,12 +314,13 @@ unsafe fn sync_content_size() {
 /// 定时器回调:取新帧 → NSImage initWithData → setImage;标题/地址栏/关闭同理。
 extern "C" fn on_tick(_self: Id, _cmd: Sel, _timer: Id) {
     unsafe {
-        let (img, title, urlbar, close, seq) = {
+        let (img, title, urlbar, focus_addrbar, close, seq) = {
             let mut s = SLOT.lock().unwrap();
             let img = s.image.take();
             let title = s.title.take();
             let urlbar = s.urlbar.take();
-            (img, title, urlbar, s.close, s.seq)
+            let focus_addrbar = std::mem::take(&mut s.focus_addrbar);
+            (img, title, urlbar, focus_addrbar, s.close, s.seq)
         };
         if close {
             let app = send_id(cls(b"NSApplication\0"), sel(b"sharedApplication\0"));
@@ -333,6 +337,18 @@ extern "C" fn on_tick(_self: Id, _cmd: Sel, _timer: Id) {
         }
         if let Some((url, can_back, can_forward)) = urlbar {
             apply_urlbar(&url, can_back, can_forward);
+        }
+        // ⌘/Ctrl+L:把窗口焦点交给地址栏并全选(浏览器语义)。
+        if focus_addrbar {
+            unsafe {
+                let win = WINDOW.lock().unwrap().0;
+                let field = ADDRESS_FIELD.lock().unwrap().0;
+                if !win.is_null() && !field.is_null() {
+                    send_void_id(win, sel(b"makeFirstResponder:\0"), field);
+                    // 全选当前 URL(真实浏览器 ⌘L 即全选,便于直接覆盖输入)。
+                    send_void_id(field, sel(b"selectAll:\0"), std::ptr::null_mut());
+                }
+            }
         }
         if let Some(png) = img {
             let iv = IMAGE_VIEW.lock().unwrap().0;
@@ -761,6 +777,11 @@ extern "C" fn on_pv_key_down(_self: Id, _cmd: Sel, event: Id) {
         }
         if ctrl && code == 48 {
             send_cmd("{\"cmd\":\"next_tab\"}");
+            return;
+        }
+        // ⌘/Ctrl+L:聚焦地址栏(39 号 P2b;浏览器级快捷键,不进页面)。
+        if (meta || ctrl) && code == 37 {
+            send_cmd("{\"cmd\":\"focus_addrbar\"}");
             return;
         }
         let shift = flags & NSEVENT_SHIFT != 0;
@@ -1250,6 +1271,12 @@ pub fn run(width: u32, height: u32, title: &str) -> i32 {
                             .unwrap_or(false);
                         if let Ok(mut s) = SLOT.lock() {
                             s.urlbar = Some((url, can_back, can_forward));
+                        }
+                    }
+                    // ⌘/Ctrl+L:聚焦地址栏(39 号 P2b)。
+                    Some((b'f', _)) => {
+                        if let Ok(mut s) = SLOT.lock() {
+                            s.focus_addrbar = true;
                         }
                     }
                     Some((b'c', _)) | None => {
