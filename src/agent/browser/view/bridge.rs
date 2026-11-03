@@ -146,6 +146,31 @@ impl LsmBrowserManager {
             }
             return;
         }
+        // 标签页快捷键与控件级剪贴板(39 号设计文档阶段二):作用于显示页。
+        match cmd {
+            ViewCommand::NewTab => {
+                self.viewer_new_tab().await;
+                return;
+            }
+            ViewCommand::CloseTab => {
+                let target = self.input_target_page().await;
+                self.viewer_close_tab(target.as_deref()).await;
+                return;
+            }
+            ViewCommand::NextTab => {
+                let target = self.input_target_page().await;
+                self.viewer_next_tab(target.as_deref()).await;
+                return;
+            }
+            ViewCommand::Clip(op) => {
+                let target = self.input_target_page().await;
+                if let Some(pid) = target {
+                    let _ = self.handle_human_clip(&pid, op).await;
+                }
+                return;
+            }
+            _ => {}
+        }
         let page_id = self.foreground_page_id().await;
         let Some(page_id) = page_id else { return };
         // 人工在查看器里操作(工具栏/地址栏):显式表达了「看这页」,
@@ -166,9 +191,92 @@ impl LsmBrowserManager {
                 self.apply_view_resize(&page_id, width, height).await;
                 return;
             }
-            ViewCommand::Input(_) => unreachable!("Input 已在函数开头单独处理"),
+            ViewCommand::Input(_)
+            | ViewCommand::NewTab
+            | ViewCommand::CloseTab
+            | ViewCommand::NextTab
+            | ViewCommand::Clip(_) => unreachable!("已在函数开头单独处理"),
         };
         self.refresh_view(&page_id).await;
+    }
+
+    // ---------- 标签页快捷键(⌘/Ctrl+T/W、Ctrl+Tab;39 号设计文档阶段二) ----------
+
+    /// ⌘/Ctrl+T:从前台页派生新标签(空白页)并显示。
+    async fn viewer_new_tab(self: &Arc<Self>) {
+        let Some(from) = self.foreground_page_id().await else {
+            return;
+        };
+        if let Ok(out) = self.new_tab(&from, "about:blank", 45_000).await {
+            self.refresh_view(&out.page_id).await;
+        }
+    }
+
+    /// ⌘/Ctrl+W:关显示页;**最后一个标签改为打开空白页**(查看器保活,
+    /// 与真浏览器「关最后一页不关窗口」一致)。
+    async fn viewer_close_tab(self: &Arc<Self>, pid: Option<&str>) {
+        let pid = match pid {
+            Some(p) => p.to_string(),
+            None => match self.foreground_page_id().await {
+                Some(p) => p,
+                None => return,
+            },
+        };
+        let (total, next) = {
+            let inner = self.inner.lock().await;
+            if inner.tabs.len() <= 1 {
+                (inner.tabs.len(), None)
+            } else {
+                // 同窗口的下一个标签优先,缺省任一存活页。
+                let win_next = inner
+                    .windows
+                    .iter()
+                    .find_map(|w| {
+                        let idx = w.tabs.iter().position(|t| t == &pid)?;
+                        if w.tabs.len() < 2 {
+                            return None;
+                        }
+                        Some(w.tabs[(idx + 1) % w.tabs.len()].clone())
+                    })
+                    .or_else(|| inner.tabs.keys().find(|k| *k != &pid).cloned());
+                (inner.tabs.len(), win_next)
+            }
+        };
+        if total <= 1 {
+            let _ = self.navigate(&pid, "about:blank", 45_000).await;
+            self.refresh_view(&pid).await;
+            return;
+        }
+        let _ = self.close_page(&pid).await;
+        if let Some(next) = next {
+            let _ = self.bring_to_front(&next).await;
+            self.refresh_view(&next).await;
+        }
+    }
+
+    /// Ctrl+Tab:切到同窗口的下一个标签(单标签 no-op)。
+    async fn viewer_next_tab(self: &Arc<Self>, pid: Option<&str>) {
+        let pid = match pid {
+            Some(p) => p.to_string(),
+            None => match self.foreground_page_id().await {
+                Some(p) => p,
+                None => return,
+            },
+        };
+        let next = {
+            let inner = self.inner.lock().await;
+            inner.windows.iter().find_map(|w| {
+                let idx = w.tabs.iter().position(|t| t == &pid)?;
+                if w.tabs.len() < 2 {
+                    return None;
+                }
+                Some(w.tabs[(idx + 1) % w.tabs.len()].clone())
+            })
+        };
+        if let Some(next) = next {
+            let _ = self.bring_to_front(&next).await;
+            self.refresh_view(&next).await;
+        }
     }
 
     /// 人类输入的目标页:查看器正在显示的页(跟随页)优先,回退前台页。

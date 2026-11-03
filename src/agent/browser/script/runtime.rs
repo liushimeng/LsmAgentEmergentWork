@@ -359,10 +359,11 @@ impl ThreadRuntime {
             JsRequest::Dispatch {
                 selector,
                 event,
+                payload,
                 env,
                 nodes,
                 ..
-            } => Some(self.dispatch(&selector, &event, &env, &nodes)),
+            } => Some(self.dispatch(&selector, &event, payload.as_ref(), &env, &nodes)),
             JsRequest::Shutdown => None,
         }
     }
@@ -755,15 +756,28 @@ impl ThreadRuntime {
         self.collect(Some(ov))
     }
 
-    fn dispatch(&mut self, selector: &str, event: &str, env: &PageEnv, nodes: &[SnapshotNode]) -> JsReply {
+    fn dispatch(
+        &mut self,
+        selector: &str,
+        event: &str,
+        payload: Option<&serde_json::Value>,
+        env: &PageEnv,
+        nodes: &[SnapshotNode],
+    ) -> JsReply {
         self.begin_request(env, 0);
         if let Err(e) = self.refresh(nodes, env) {
             return JsReply::error(e);
         }
+        // 载荷作为第三个参数传 JSON 字符串,PRELUDE 侧 JSON.parse 后浅合并进事件对象。
+        let detail = match payload {
+            Some(v) => serde_json::to_string(v).unwrap_or_else(|_| "null".into()),
+            None => String::new(),
+        };
         let src = format!(
-            "__lsmDispatch({}, {})",
+            "__lsmDispatch({}, {}, {})",
             serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into()),
-            serde_json::to_string(event).unwrap_or_else(|_| "\"\"".into())
+            serde_json::to_string(event).unwrap_or_else(|_| "\"\"".into()),
+            if detail.is_empty() { "null".to_string() } else { detail }
         );
         self.eval_quiet(&src);
         self.timer_budget = MAX_TIMER_CALLBACKS;

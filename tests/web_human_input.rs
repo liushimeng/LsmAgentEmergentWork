@@ -66,6 +66,8 @@ fn route(path: &str) -> (&'static str, String) {
             r#"<!doctype html><html><head><title>交互页</title></head><body>
 <button id="hit-btn" style="width:120px;height:40px">点我</button>
 <span id="out"></span>
+<span id="out2"></span>
+<span id="out3"></span>
 <a id="nav" href="/next" style="display:block;width:100px;height:30px">下一页</a>
 <form id="f" action="/search" method="get">
 <input id="q" name="q" style="width:200px;height:30px" value="">
@@ -73,11 +75,22 @@ fn route(path: &str) -> (&'static str, String) {
 <select id="dd"><option value="a">甲</option><option value="b">乙</option></select>
 <input id="rg" type="range" name="r" min="0" max="100" value="10" style="width:200px">
 </form>
+<div id="d1" draggable="true" style="width:80px;height:40px;background:#eee">拖我</div>
+<div id="d2" style="width:80px;height:40px;background:#ddd">放下</div>
 <a id="tab2" href="/next">T2</a><button id="tab3">T3</button>
 <div style="height:3000px"></div>
 <script>
 document.getElementById('hit-btn').addEventListener('click', function(){
   document.getElementById('out').textContent = 'HIT';
+});
+document.addEventListener('keydown', function(e){
+  document.getElementById('out2').textContent = 'K:' + e.key + ':' + e.keyCode;
+});
+document.getElementById('d1').addEventListener('dragstart', function(){
+  document.getElementById('out3').textContent = 'DS';
+});
+document.getElementById('d2').addEventListener('drop', function(){
+  document.getElementById('out3').textContent += '|DROP';
 });
 </script>
 </body></html>"#
@@ -361,5 +374,135 @@ async fn agent态人工输入被闸门忽略() {
     assert_eq!(out["ignored"], true, "agent 态输入应被忽略:{out}");
     assert_eq!(out["reason"], "agent_control");
 
+    exec(&tool, json!({"action": "close", "page_id": &pid})).await;
+}
+
+// ---------- 阶段二:事件载荷 / HTML5 drag / 控件级剪贴板 ----------
+
+#[tokio::test]
+async fn 键盘事件载荷可被页面读取() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+    let pid = open_hi(&tool, &base).await;
+    let mgr = LsmBrowserManager::global();
+
+    // 点击输入框聚焦,按 'a':document 级 keydown 监听应读到 e.key='a' e.keyCode=65。
+    let (x, y) = center_of(&tool, &pid, "#q").await;
+    human_click(&mgr, &pid, x, y).await;
+    key(&mgr, &pid, "a").await;
+    let v = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": &pid, "info": "elements",
+               "params": {"selector": "#out2"}}),
+    )
+    .await;
+    assert_eq!(v["data"]["text"], "K:a:65", "keydown 应携带 key/keyCode 载荷:{v}");
+
+    // ArrowLeft(命名键):e.key='ArrowLeft' keyCode=37。不用 Enter —— 它会
+    // 触发表单提交换页,页面元素随导航消失(提交语义另有用例覆盖)。
+    key(&mgr, &pid, "ArrowLeft").await;
+    let v = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": &pid, "info": "elements",
+               "params": {"selector": "#out2"}}),
+    )
+    .await;
+    assert_eq!(v["data"]["text"], "K:ArrowLeft:37", "命名键载荷应与 DOM 一致:{v}");
+
+    web_control::clear(Engine::Lsm, &pid);
+    exec(&tool, json!({"action": "close", "page_id": &pid})).await;
+}
+
+#[tokio::test]
+async fn 拖拽事件序列_dragstart_drop_dragend() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+    let pid = open_hi(&tool, &base).await;
+    let mgr = LsmBrowserManager::global();
+
+    let (x1, y1) = center_of(&tool, &pid, "#d1").await;
+    let (x2, y2) = center_of(&tool, &pid, "#d2").await;
+    // 按下 #d1 → 移到 #d2(超阈值触发 dragstart + dragover)→ 在 #d2 抬起(drop)。
+    mgr.handle_human_input(
+        &pid,
+        HumanInput::Down { x: x1, y: y1, button: MouseButton::Left, mods: Mods::default() },
+    )
+    .await;
+    mgr.handle_human_input(&pid, HumanInput::Move { x: x2, y: y2 }).await;
+    let out = mgr
+        .handle_human_input(
+            &pid,
+            HumanInput::Up { x: x2, y: y2, button: MouseButton::Left, mods: Mods::default() },
+        )
+        .await;
+    assert_eq!(out["drag"], true, "{out}");
+    let v = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": &pid, "info": "elements",
+               "params": {"selector": "#out3"}}),
+    )
+    .await;
+    assert_eq!(
+        v["data"]["text"], "DS|DROP",
+        "dragstart 与 drop 监听都应收到事件:{v}"
+    );
+
+    web_control::clear(Engine::Lsm, &pid);
+    exec(&tool, json!({"action": "close", "page_id": &pid})).await;
+}
+
+#[tokio::test]
+async fn 控件级复制粘贴_整值近似() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+    let pid = open_hi(&tool, &base).await;
+    let mgr = LsmBrowserManager::global();
+
+    // 聚焦 #q 并键入 abc → ⌘C 复制 → 清空(⌘X)→ ⌘V 粘贴回来。
+    let (x, y) = center_of(&tool, &pid, "#q").await;
+    human_click(&mgr, &pid, x, y).await;
+    for ch in ["a", "b", "c"] {
+        key(&mgr, &pid, ch).await;
+    }
+    let copied = mgr
+        .handle_human_input(
+            &pid,
+            HumanInput::Key { key: "c".to_string(), mods: Mods { meta: true, ..Default::default() } },
+        )
+        .await;
+    assert_eq!(copied["ok"], true, "复制应成功:{copied}");
+    // 剪贴板内容校验(无剪贴板服务的会话软跳过)。
+    match lsm_agent::agent::browser::human_input::clipboard::read_text() {
+        Ok(text) => assert!(text.contains("abc"), "剪贴板应含整值:{text}"),
+        Err(e) => eprintln!("[skip] 本会话无剪贴板服务:{e}"),
+    }
+    // ⌘X 剪切清空。
+    let cut = mgr
+        .handle_human_input(
+            &pid,
+            HumanInput::Key { key: "x".to_string(), mods: Mods { meta: true, ..Default::default() } },
+        )
+        .await;
+    assert_eq!(cut["ok"], true, "{cut}");
+    let v = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": &pid, "info": "elements",
+               "params": {"selector": "#q"}}),
+    )
+    .await;
+    assert_eq!(v["data"]["value"], "", "剪切后应为空:{v}");
+    // ⌘V 粘贴回来。
+    let paste = mgr
+        .handle_human_input(
+            &pid,
+            HumanInput::Key { key: "v".to_string(), mods: Mods { meta: true, ..Default::default() } },
+        )
+        .await;
+    assert_eq!(paste["value_len"], 3, "{paste}");
+
+    web_control::clear(Engine::Lsm, &pid);
     exec(&tool, json!({"action": "close", "page_id": &pid})).await;
 }

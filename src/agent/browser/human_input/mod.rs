@@ -27,6 +27,8 @@ use super::style::{MediaCtx, StyleEngine};
 use super::{page_bars, LsmBrowserManager, TabState};
 use crate::agent::web_control::{self, Engine};
 
+pub mod clipboard;
+
 #[cfg(test)]
 mod tests;
 
@@ -124,6 +126,8 @@ struct PageInputState {
     hover: Option<String>,
     /// 最近一次 JS mousemove 派发时刻(毫秒;100ms 节流)。
     last_js_move_ms: u128,
+    /// HTML5 drag 近似:按下后位移超阈值时已派发 dragstart。
+    drag_started: bool,
 }
 
 impl HumanSession {
@@ -343,10 +347,65 @@ impl LsmBrowserManager {
         }
     }
 
-    /// 指针移动:hover 链更新(目标变化才重排)+ JS mousemove 节流派发。
+    /// 指针移动:hover 链更新(目标变化才重排)+ HTML5 drag 近似 +
+    /// JS mousemove 节流派发(带坐标载荷)。
     async fn human_move(&self, pid: &str, x: f64, y: f64) -> Value {
         let hit = self.human_hit_test(pid, x, y).await;
         let hit_sel = hit.as_ref().map(|h| h.selector.clone());
+        // HTML5 drag 近似:按下中且位移超阈值 → dragstart 一次,后续 dragover。
+        // 无 dataTransfer 模型(页面拿不到拖拽数据),只保证事件序列与坐标。
+        let drag_evt: Option<(String, String, bool)> = {
+            let mut s = self.human.lock().unwrap_or_else(|p| p.into_inner());
+            let st = s.page(pid);
+            match (&st.press, &hit) {
+                (Some(p), Some(h))
+                    if p.selector.is_some()
+                        && (p.x - x).hypot(p.y - y) > CLICK_DIST =>
+                {
+                    let src = p.selector.clone().unwrap_or_default();
+                    if !st.drag_started {
+                        st.drag_started = true;
+                        Some(("dragstart".to_string(), src, true))
+                    } else {
+                        Some(("dragover".to_string(), h.selector.clone(), false))
+                    }
+                }
+                _ => None,
+            }
+        };
+        if let Some((ev, sel, immediate)) = drag_evt {
+            let dispatch = if immediate {
+                api::js_dispatch_bounded_with(
+                    self, pid, &sel, &ev,
+                    Some(mouse_payload(x, y, MouseButton::Left, true, 0)),
+                )
+                .await
+            } else {
+                let due = {
+                    let mut s = self.human.lock().unwrap_or_else(|p| p.into_inner());
+                    let st = s.page(pid);
+                    let now = now_ms();
+                    if now.saturating_sub(st.last_js_move_ms) >= JS_MOVE_THROTTLE_MS {
+                        st.last_js_move_ms = now;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if due {
+                    api::js_dispatch_bounded_with(
+                        self, pid, &sel, &ev,
+                        Some(mouse_payload(x, y, MouseButton::Left, true, 0)),
+                    )
+                    .await
+                } else {
+                    None
+                }
+            };
+            if let Some(reply) = dispatch {
+                api::apply_js_reply(self, pid, &reply).await;
+            }
+        }
         // 拖拽中的滑块:按住移动持续设值(浏览器拖拽滑块语义)。
         let press_range = {
             let mut s = self.human.lock().unwrap_or_else(|p| p.into_inner());
@@ -377,13 +436,17 @@ impl LsmBrowserManager {
             changed
         };
         if changed {
-            let mut inner = self.inner.lock().await;
-            if let Some(tab) = inner.tabs.get_mut(pid) {
-                tab.mouse = Some((x, y));
-                focused = tab.focused.clone();
-                match &hit {
-                    Some(h) => api::set_hover_chain(tab, &h.hover_chain),
-                    None => api::set_pseudo_state(tab, "", api::PseudoDim::Hover, false),
+            // 锁块收窄:relayout_and_push 内部会再锁 inner(tokio Mutex 非重入,
+            // 持锁调用会自死锁 —— 拖拽测试首轮即命中,修复于阶段二)。
+            {
+                let mut inner = self.inner.lock().await;
+                if let Some(tab) = inner.tabs.get_mut(pid) {
+                    tab.mouse = Some((x, y));
+                    focused = tab.focused.clone();
+                    match &hit {
+                        Some(h) => api::set_hover_chain(tab, &h.hover_chain),
+                        None => api::set_pseudo_state(tab, "", api::PseudoDim::Hover, false),
+                    }
                 }
             }
             api::relayout_and_push(self, pid).await;
@@ -395,6 +458,10 @@ impl LsmBrowserManager {
                 focused = tab.focused.clone();
             }
         }
+        let pressed = {
+            let s = self.human.lock().unwrap_or_else(|p| p.into_inner());
+            s.pages.get(pid).map(|st| st.press.is_some()).unwrap_or(false)
+        };
         let due = {
             let mut s = self.human.lock().unwrap_or_else(|p| p.into_inner());
             let st = s.page(pid);
@@ -408,7 +475,15 @@ impl LsmBrowserManager {
         };
         if due {
             if let Some(sel) = hit_sel.as_deref().or(focused.as_deref()) {
-                if let Some(reply) = api::js_dispatch_bounded(self, pid, sel, "mousemove").await {
+                if let Some(reply) = api::js_dispatch_bounded_with(
+                    self,
+                    pid,
+                    sel,
+                    "mousemove",
+                    Some(mouse_payload(x, y, MouseButton::Left, pressed, 0)),
+                )
+                .await
+                {
                     api::apply_js_reply(self, pid, &reply).await;
                 }
             }
@@ -449,7 +524,15 @@ impl LsmBrowserManager {
         }
         let sel = hit.selector.clone();
         let tag = hit.tag.clone();
-        if let Some(reply) = api::js_dispatch_bounded(self, pid, &sel, "mousedown").await {
+        if let Some(reply) = api::js_dispatch_bounded_with(
+            self,
+            pid,
+            &sel,
+            "mousedown",
+            Some(mouse_payload(x, y, MouseButton::Left, true, 1)),
+        )
+        .await
+        {
             api::apply_js_reply(self, pid, &reply).await;
         }
         api::relayout_and_push(self, pid).await;
@@ -458,9 +541,10 @@ impl LsmBrowserManager {
 
     /// 抬起:同目标且位移小 → 完整点击语义(复用 `click_inner`);否则只发 mouseup。
     async fn human_up(&self, pid: &str, x: f64, y: f64, button: MouseButton, mods: Mods) -> Value {
-        let press = {
+        let (press, drag_started) = {
             let mut s = self.human.lock().unwrap_or_else(|p| p.into_inner());
-            s.page(pid).press.take()
+            let st = s.page(pid);
+            (st.press.take(), std::mem::take(&mut st.drag_started))
         };
         // 释放按下态(无论是否成点击)。
         {
@@ -480,7 +564,15 @@ impl LsmBrowserManager {
             MouseButton::Right => {
                 if let Some(h) = hit.as_ref() {
                     let sel = h.selector.clone();
-                    if let Some(reply) = api::js_dispatch_bounded(self, pid, &sel, "contextmenu").await {
+                    if let Some(reply) = api::js_dispatch_bounded_with(
+                        self,
+                        pid,
+                        &sel,
+                        "contextmenu",
+                        Some(mouse_payload(x, y, MouseButton::Right, false, 0)),
+                    )
+                    .await
+                    {
                         api::apply_js_reply(self, pid, &reply).await;
                     }
                     self.note_human_event(pid, &format!("人工右键 ·{}", h.tag));
@@ -513,8 +605,50 @@ impl LsmBrowserManager {
         let same_target = press.selector.is_some()
             && hit.as_ref().map(|h| h.selector.as_str()) == press.selector.as_deref();
         if !same_target || dist > CLICK_DIST {
+            // HTML5 drag 近似:dragstart 已派发 → drop(命中他者)+ dragend(源)。
+            if drag_started {
+                if let Some(src) = press.selector.clone() {
+                    if let Some(h) = hit.as_ref() {
+                        if h.selector != src {
+                            let drop_sel = h.selector.clone();
+                            if let Some(reply) = api::js_dispatch_bounded_with(
+                                self,
+                                pid,
+                                &drop_sel,
+                                "drop",
+                                Some(mouse_payload(x, y, MouseButton::Left, false, 0)),
+                            )
+                            .await
+                            {
+                                api::apply_js_reply(self, pid, &reply).await;
+                            }
+                        }
+                    }
+                    if let Some(reply) = api::js_dispatch_bounded_with(
+                        self,
+                        pid,
+                        &src,
+                        "dragend",
+                        Some(mouse_payload(x, y, MouseButton::Left, false, 0)),
+                    )
+                    .await
+                    {
+                        api::apply_js_reply(self, pid, &reply).await;
+                    }
+                    self.note_human_event(pid, "人工拖拽(dragstart→drop/dragend)");
+                    return json!({"x": x, "y": y, "clicked": false, "drag": true});
+                }
+            }
             if let Some(sel) = press.selector.clone().or(hit.as_ref().map(|h| h.selector.clone())) {
-                if let Some(reply) = api::js_dispatch_bounded(self, pid, &sel, "mouseup").await {
+                if let Some(reply) = api::js_dispatch_bounded_with(
+                    self,
+                    pid,
+                    &sel,
+                    "mouseup",
+                    Some(mouse_payload(x, y, MouseButton::Left, false, 1)),
+                )
+                .await
+                {
                     api::apply_js_reply(self, pid, &reply).await;
                 }
                 api::relayout_and_push(self, pid).await;
@@ -566,14 +700,22 @@ impl LsmBrowserManager {
             self.set_range_by_x(pid, &sel, target.rect, x).await;
         }
 
-        let mut params = json!({"selector": sel});
+        let mut params = json!({"selector": sel, "client_x": x, "client_y": y});
         if mods.ctrl || mods.meta {
             // Cmd/Ctrl+点击 = 新标签打开(点击语义保留,导航目标改 _blank)。
             params["force_target"] = json!("_blank");
         }
         let clicked = api::click_inner(self, pid, &params, "human").await;
         if dbl {
-            if let Some(reply) = api::js_dispatch_bounded(self, pid, &sel, "dblclick").await {
+            if let Some(reply) = api::js_dispatch_bounded_with(
+                self,
+                pid,
+                &sel,
+                "dblclick",
+                Some(mouse_payload(x, y, MouseButton::Left, false, 2)),
+            )
+            .await
+            {
                 api::apply_js_reply(self, pid, &reply).await;
             }
         }
@@ -634,13 +776,132 @@ impl LsmBrowserManager {
         json!({"mode": "viewport_scroll", "scrollX": sx, "scrollY": sy})
     }
 
-    /// 键盘:先派 JS keydown(无载荷),再按原生语义路由(39 号设计文档 §3)。
+    /// 控件级剪贴板(⌘/Ctrl+C/X/V 与查看器右键菜单共用)。
+    ///
+    /// 无文本选区模型,语义按「聚焦文本控件整值」近似:复制 = 整值入剪贴板;
+    /// 剪切 = 复制 + 清空;粘贴 = 追加(与光标在末尾的键入模型一致)。
+    pub async fn handle_human_clip(&self, pid: &str, op: ClipOp) -> Value {
+        if !enabled() {
+            return json!({"ignored": true, "reason": "LAEW_HUMAN_INPUT=off"});
+        }
+        if web_control::enabled() && !web_control::is_user_control(Engine::Lsm, pid) {
+            return json!({"ignored": true, "reason": "agent_control"});
+        }
+        // 聚焦控件的文本态(锁内收敛)。
+        let ctx = {
+            let inner = self.inner.lock().await;
+            let Some(tab) = inner.tabs.get(pid) else {
+                return json!({"ignored": true, "reason": "page_gone"});
+            };
+            let doc = tab.document_with_state();
+            let focused = tab.focused.clone();
+            let mut text_like = false;
+            let mut editable = false;
+            if let Some(sel) = &focused {
+                if let Some(node) = doc.select(sel).ok().and_then(|v| v.into_iter().next()) {
+                    let tag = document::tag_name(&node);
+                    let typ = document::attr(&node, "type").unwrap_or_default().to_ascii_lowercase();
+                    let disabled = document::attr(&node, "disabled").is_some();
+                    let readonly = document::attr(&node, "readonly").is_some();
+                    text_like = matches!(tag.as_str(), "input" | "textarea")
+                        && (tag == "textarea"
+                            || !matches!(
+                                typ.as_str(),
+                                "checkbox" | "radio" | "range" | "file" | "button" | "submit"
+                                    | "reset" | "image" | "hidden" | "color" | "date" | "time"
+                                    | "datetime-local" | "month" | "week"
+                            ));
+                    editable = text_like && !disabled && !readonly;
+                }
+            }
+            (focused, text_like, editable)
+        };
+        let Some(focused) = ctx.0 else {
+            return json!({"op": op_name(op), "ignored": true, "reason": "no_focus"});
+        };
+        if !ctx.1 {
+            return json!({"op": op_name(op), "ignored": true, "reason": "no_text_focus"});
+        }
+        match op {
+            ClipOp::Copy => match clipboard::write_text(&self.current_value(pid, &focused).await) {
+                Ok(()) => {
+                    self.note_human_event(pid, "人工复制(整值)");
+                    json!({"op": "copy", "ok": true, "selector": focused})
+                }
+                Err(e) => json!({"op": "copy", "ok": false, "error": e}),
+            },
+            ClipOp::Cut => {
+                if !ctx.2 {
+                    return json!({"op": "cut", "ignored": true, "reason": "readonly_or_disabled"});
+                }
+                let value = self.current_value(pid, &focused).await;
+                match clipboard::write_text(&value) {
+                    Ok(()) => {
+                        self.set_runtime_value(pid, &focused, "").await;
+                        if let Some(reply) =
+                            api::js_dispatch_bounded(self, pid, &focused, "input").await
+                        {
+                            api::apply_js_reply(self, pid, &reply).await;
+                        }
+                        api::relayout_and_push(self, pid).await;
+                        self.note_human_event(pid, "人工剪切");
+                        json!({"op": "cut", "ok": true, "selector": focused})
+                    }
+                    Err(e) => json!({"op": "cut", "ok": false, "error": e}),
+                }
+            }
+            ClipOp::Paste => {
+                if !ctx.2 {
+                    return json!({"op": "paste", "ignored": true, "reason": "readonly_or_disabled"});
+                }
+                match clipboard::read_text() {
+                    Ok(text) if !text.is_empty() => {
+                        self.note_human_event(pid, "人工粘贴");
+                        self.append_text(pid, &focused, &text, "paste").await
+                    }
+                    Ok(_) => json!({"op": "paste", "ok": false, "error": "剪贴板为空"}),
+                    Err(e) => json!({"op": "paste", "ok": false, "error": e}),
+                }
+            }
+        }
+    }
+
+    /// 键盘:组合键(⌘/Ctrl+C/X/V)→ 控件级剪贴板;其余先派 JS keydown
+    /// (带 e.key/e.keyCode 载荷),再按原生语义路由,收尾尽力补发 keyup。
     async fn human_key(&self, pid: &str, key: &str, mods: &Mods) -> Value {
-        // 组合键(非纯 Shift)不产生页面文本/导航语义;查看器层已拦截
-        // Cmd/Ctrl+R 等浏览器级快捷键,能到这里的组合键直接忽略。
+        // 39 号设计文档阶段二:剪贴板组合键在宿主侧消化(查看器层已拦截
+        // Cmd/Ctrl+R 等浏览器级快捷键)。
+        if let Some(op) = clip_op_for(key, mods) {
+            return self.handle_human_clip(pid, op).await;
+        }
+        // 其余组合键(非纯 Shift)不产生页面文本/导航语义。
         if mods.combo() {
             return json!({"key": key, "ignored": true, "reason": "combo"});
         }
+        let out = Box::pin(self.human_key_inner(pid, key, mods)).await;
+        // keyup 尽力派发(Enter 提交等路径可能已换页,自然 no-op)。
+        let focused = {
+            let inner = self.inner.lock().await;
+            inner.tabs.get(pid).and_then(|t| t.focused.clone())
+        };
+        if let Some(sel) = focused {
+            if let Some(reply) = api::js_dispatch_bounded_with(
+                self,
+                pid,
+                &sel,
+                "keyup",
+                Some(key_payload(key, mods)),
+            )
+            .await
+            {
+                api::apply_js_reply(self, pid, &reply).await;
+            }
+        }
+        out
+    }
+
+    /// 键盘原生语义路由(keydown 已派发后的默认行为)。
+    async fn human_key_inner(&self, pid: &str, key: &str, mods: &Mods) -> Value {
         // 聚焦上下文(锁内收敛;文档对象不跨 await 存活)。
         let ctx = {
             let inner = self.inner.lock().await;
@@ -677,9 +938,17 @@ impl LsmBrowserManager {
                 focusables: focusable_selectors(tab, &doc),
             }
         };
-        // JS keydown(无载荷;Dispatch 协议暂不带 key 字段,阶段二补)。
+        // JS keydown(阶段二起带 e.key/e.keyCode/修饰键载荷)。
         if let Some(sel) = ctx.focused.clone() {
-            if let Some(reply) = api::js_dispatch_bounded(self, pid, &sel, "keydown").await {
+            if let Some(reply) = api::js_dispatch_bounded_with(
+                self,
+                pid,
+                &sel,
+                "keydown",
+                Some(key_payload(key, mods)),
+            )
+            .await
+            {
                 api::apply_js_reply(self, pid, &reply).await;
             }
         }
@@ -1313,5 +1582,115 @@ fn format_num(v: f64) -> String {
         format!("{}", v.round() as i64)
     } else {
         format!("{v:.3}")
+    }
+}
+
+// ---------- 事件载荷(39 号设计文档阶段二) ----------
+
+/// 鼠标键 → DOM `button` 值(0=左 1=中 2=右)。
+fn dom_button(b: MouseButton) -> i64 {
+    match b {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    }
+}
+
+/// 鼠标事件载荷(clientX/Y 视口坐标、pageX/Y 页坐标、button/buttons/detail)。
+fn mouse_payload(x: f64, y: f64, button: MouseButton, pressed: bool, detail: i64) -> Value {
+    json!({
+        "clientX": x.round(), "clientY": y.round(),
+        "screenX": x.round(), "screenY": y.round(),
+        "button": dom_button(button),
+        "buttons": if pressed { 1 } else { 0 },
+        "detail": detail,
+    })
+}
+
+/// DOM `KeyboardEvent.key`(命名键与 DOM 规范一致;可打印字符为产出的字符)。
+fn js_key_name(key: &str, mods: &Mods) -> String {
+    if key == "Space" {
+        return " ".to_string();
+    }
+    if key.chars().count() == 1 && mods.shift {
+        return shift_char(key.chars().next().unwrap()).to_string();
+    }
+    key.to_string()
+}
+
+/// 遗留 `keyCode` 近似(命名键查表;字母取大写 ASCII;数字 48-57)。
+pub(crate) fn legacy_key_code(key: &str) -> i64 {
+    match key {
+        "Enter" => 13,
+        "Tab" => 9,
+        "Escape" => 27,
+        "Backspace" => 8,
+        "Delete" => 46,
+        "ArrowLeft" => 37,
+        "ArrowUp" => 38,
+        "ArrowRight" => 39,
+        "ArrowDown" => 40,
+        "Home" => 36,
+        "End" => 35,
+        "PageUp" => 33,
+        "PageDown" => 34,
+        "Space" | " " => 32,
+        _ => {
+            let c = key.chars().next().unwrap_or('\0');
+            if c.is_ascii_alphabetic() {
+                c.to_ascii_uppercase() as i64
+            } else if c.is_ascii_digit() {
+                c as i64
+            } else {
+                0
+            }
+        }
+    }
+}
+
+/// 键盘事件载荷(e.key/keyCode/which/charCode + 修饰键布尔)。
+fn key_payload(key: &str, mods: &Mods) -> Value {
+    let name = js_key_name(key, mods);
+    let code = legacy_key_code(key);
+    let printable = name.chars().count() == 1;
+    json!({
+        "key": name,
+        "keyCode": code,
+        "which": code,
+        "charCode": if printable { code } else { 0 },
+        "shiftKey": mods.shift,
+        "ctrlKey": mods.ctrl,
+        "altKey": mods.alt,
+        "metaKey": mods.meta,
+        "repeat": false,
+    })
+}
+
+/// 剪贴板操作(⌘/Ctrl+C/V/X;查看器右键菜单同路径)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipOp {
+    Copy,
+    Cut,
+    Paste,
+}
+
+/// 由按键+修饰键判定剪贴板操作(ctrl/meta + c/v/x)。
+pub fn clip_op_for(key: &str, mods: &Mods) -> Option<ClipOp> {
+    if !(mods.ctrl || mods.meta) {
+        return None;
+    }
+    match key.to_ascii_lowercase().as_str() {
+        "c" => Some(ClipOp::Copy),
+        "x" => Some(ClipOp::Cut),
+        "v" => Some(ClipOp::Paste),
+        _ => None,
+    }
+}
+
+fn op_name(op: ClipOp) -> &'static str {
+    match op {
+        ClipOp::Copy => "copy",
+        ClipOp::Cut => "cut",
+        ClipOp::Paste => "paste",
     }
 }

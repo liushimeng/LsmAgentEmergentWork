@@ -259,11 +259,13 @@ pub(crate) async fn relayout_and_push(mgr: &LsmBrowserManager, pid: &str) {
 // ============ 阶段二:页面 JS 线程交互 ============
 
 /// 若页面有 JS 线程,把事件分发到页面 listener。无线程/失败返回 None(并清理失效句柄)。
-async fn js_dispatch(
+/// `payload` = 事件载荷(39 号设计文档阶段二,e.key/e.clientX 等),None = 无载荷。
+pub(crate) async fn js_dispatch(
     mgr: &LsmBrowserManager,
     pid: &str,
     selector: &str,
     event: &str,
+    payload: Option<Value>,
 ) -> Option<script::JsReply> {
     let (handle, env, nodes) = {
         let mut inner = mgr.inner.lock().await;
@@ -302,6 +304,7 @@ async fn js_dispatch(
             event: evt,
             env,
             nodes,
+            payload,
             reply: tx,
         })
     })
@@ -327,9 +330,20 @@ pub(crate) async fn js_dispatch_bounded(
     selector: &str,
     event: &str,
 ) -> Option<script::JsReply> {
+    js_dispatch_bounded_with(mgr, pid, selector, event, None).await
+}
+
+/// 带载荷版本(39 号设计文档阶段二):人类输入的鼠标/键盘事件带坐标与键值。
+pub(crate) async fn js_dispatch_bounded_with(
+    mgr: &LsmBrowserManager,
+    pid: &str,
+    selector: &str,
+    event: &str,
+    payload: Option<Value>,
+) -> Option<script::JsReply> {
     tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        js_dispatch(mgr, pid, selector, event),
+        js_dispatch(mgr, pid, selector, event, payload),
     )
     .await
     .unwrap_or(None)
@@ -1397,9 +1411,31 @@ pub(crate) async fn click_inner(
     // listener 未拦截时继续默认行为(handler 与默认导航并存,贴近真实浏览器)。
     if !matches!(kind, "right" | "double" | "js") {
         // JS 先行但不能无限等:页面线程忙/无响应时按未拦截处理,保底推进默认动作。
+        // 39 号设计文档(阶段二):人工点击带坐标载荷(e.clientX/clientY/pageX/pageY)。
+        let click_payload = match (
+            p_f64(params, "client_x"),
+            p_f64(params, "client_y"),
+        ) {
+            (Some(cx), Some(cy)) => {
+                let (px, py) = {
+                    let inner = mgr.inner.lock().await;
+                    inner
+                        .tabs
+                        .get(pid)
+                        .map(|t| (cx + t.scroll_x, cy + t.scroll_y))
+                        .unwrap_or((cx, cy))
+                };
+                Some(json!({
+                    "clientX": cx.round(), "clientY": cy.round(),
+                    "pageX": px.round(), "pageY": py.round(),
+                    "button": 0, "buttons": 1, "detail": 1,
+                }))
+            }
+            _ => None,
+        };
         let dispatch = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            js_dispatch(mgr, pid, &stable, "click"),
+            js_dispatch(mgr, pid, &stable, "click", click_payload),
         )
         .await
         .unwrap_or(None);
@@ -2009,7 +2045,7 @@ pub(crate) async fn act_key_press(
         if let Some((url, method, body)) = resolve_submit(mgr, pid, selector).await? {
             // 阶段二:submit 事件先分发,preventDefault 可拦截提交(冒泡命中 form listener)。
             if let Some(dispatch_sel) = selector {
-                if let Some(reply) = js_dispatch(mgr, pid, dispatch_sel, "submit").await {
+                if let Some(reply) = js_dispatch(mgr, pid, dispatch_sel, "submit", None).await {
                     apply_js_reply(mgr, pid, &reply).await;
                     if reply.default_prevented {
                         return Ok(json!({
@@ -2048,7 +2084,7 @@ async fn act_press_sequence(
         if key.eq_ignore_ascii_case("enter") {
             if let Some((url, method, body)) = resolve_submit(mgr, pid, selector).await? {
                 if let Some(dispatch_sel) = selector {
-                    if let Some(reply) = js_dispatch(mgr, pid, dispatch_sel, "submit").await {
+                    if let Some(reply) = js_dispatch(mgr, pid, dispatch_sel, "submit", None).await {
                         apply_js_reply(mgr, pid, &reply).await;
                         if reply.default_prevented {
                             return Ok(json!({
@@ -2270,7 +2306,7 @@ async fn act_dispatch_event(
     }
     if ev == "submit" {
         if let Some((url, method, body)) = resolve_submit(mgr, pid, Some(selector)).await? {
-            if let Some(reply) = js_dispatch(mgr, pid, selector, "submit").await {
+            if let Some(reply) = js_dispatch(mgr, pid, selector, "submit", None).await {
                 apply_js_reply(mgr, pid, &reply).await;
                 if reply.default_prevented {
                     return Ok(json!({"selector": selector, "event": event, "dispatched": true, "default_prevented": true}));
@@ -2283,7 +2319,7 @@ async fn act_dispatch_event(
         }
     }
     // 其余事件类型:优先分发到页面 listener(阶段二),无 listener 时保持记录语义。
-    if let Some(reply) = js_dispatch(mgr, pid, selector, &ev).await {
+    if let Some(reply) = js_dispatch(mgr, pid, selector, &ev, None).await {
         apply_js_reply(mgr, pid, &reply).await;
         return Ok(json!({
             "selector": selector, "event": event, "dispatched": true,

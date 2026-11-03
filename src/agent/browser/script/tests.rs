@@ -344,11 +344,50 @@ fn click_listener_阻止默认行为() {
             event: "click".to_string(),
             env: e,
             nodes,
+            payload: None,
             reply: tx,
         })
         .expect("dispatch 失败");
     assert!(dispatch.handled);
     assert!(dispatch.default_prevented);
+}
+
+#[test]
+fn 事件载荷_浅合并进监听器事件对象() {
+    let handle = JsHandle::spawn();
+    let reply = run_scripts(
+        &handle,
+        vec![
+            "window.__seen = '';",
+            "document.getElementById('go').addEventListener('keydown', function(e){\
+             \n window.__seen = e.key + ':' + e.keyCode + ':' + e.shiftKey;\
+             \n});",
+        ],
+        PAGE,
+        "https://a.test/",
+    );
+    assert!(reply.outcome.ok, "{reply:?}");
+    let nodes = Document::parse(PAGE, "https://a.test/").snapshot_nodes();
+    let e = env("https://a.test/");
+    let dispatch = handle
+        .request(|tx| JsRequest::Dispatch {
+            selector: "#go".to_string(),
+            event: "keydown".to_string(),
+            env: e,
+            nodes,
+            payload: Some(serde_json::json!({
+                "key": "A", "keyCode": 65, "shiftKey": true,
+            })),
+            reply: tx,
+        })
+        .expect("dispatch 失败");
+    assert!(dispatch.handled, "{dispatch:?}");
+    let probe = eval_on(&handle, "window.__seen", PAGE, "https://a.test/");
+    assert_eq!(
+        probe.outcome.value, "A:65:true",
+        "载荷字段应浅合并进事件对象:{probe:?}"
+    );
+    handle.shutdown();
 }
 
 #[test]
@@ -1458,6 +1497,7 @@ fn 动态元素事件监听可触发() {
             event: "click".to_string(),
             env: e,
             nodes,
+            payload: None,
             reply: tx,
         })
         .expect("JS 线程请求失败");

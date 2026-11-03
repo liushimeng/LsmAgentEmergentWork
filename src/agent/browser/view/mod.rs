@@ -55,6 +55,14 @@ pub enum ViewCommand {
     Resize { width: u32, height: u32 },
     /// 人工在页面区内的鼠标/键盘事件(39 号设计文档)。
     Input(crate::agent::browser::human_input::HumanInput),
+    /// 标签页快捷键:新标签(⌘/Ctrl+T)。
+    NewTab,
+    /// 标签页快捷键:关闭当前标签(⌘/Ctrl+W;最后一个标签改为打开空白页)。
+    CloseTab,
+    /// 标签页快捷键:切换到同窗口下一个标签(Ctrl+Tab)。
+    NextTab,
+    /// 控件级剪贴板(⌘/Ctrl+C/X/V 的右键菜单入口同路径)。
+    Clip(crate::agent::browser::human_input::ClipOp),
 }
 
 /// 解析查看器发来的一行 JSON 命令。非法行返回 None(忽略,不打断通道)。
@@ -86,6 +94,20 @@ pub fn parse_command(line: &str) -> Option<ViewCommand> {
         }
         // 人工键鼠事件;解析规则见 `human_input::parse_event`(非法行忽略)。
         "input" => crate::agent::browser::human_input::parse_event(&v).map(ViewCommand::Input),
+        // 标签页快捷键与控件级剪贴板(39 号设计文档阶段二)。
+        "new_tab" => Some(ViewCommand::NewTab),
+        "close_tab" => Some(ViewCommand::CloseTab),
+        "next_tab" => Some(ViewCommand::NextTab),
+        "clip" => {
+            let act = v.get("act")?.as_str()?.trim().to_ascii_lowercase();
+            let op = match act.as_str() {
+                "copy" => crate::agent::browser::human_input::ClipOp::Copy,
+                "cut" => crate::agent::browser::human_input::ClipOp::Cut,
+                "paste" => crate::agent::browser::human_input::ClipOp::Paste,
+                _ => return None,
+            };
+            Some(ViewCommand::Clip(op))
+        }
         _ => None,
     }
 }
@@ -254,6 +276,7 @@ pub fn run_viewer_main(width: u32, height: u32, title: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::browser::human_input;
 
     #[test]
     fn 解析命令_覆盖全部动作() {
@@ -284,6 +307,34 @@ mod tests {
         assert_eq!(parse_command("not json"), None);
         assert_eq!(parse_command(r#"{"cmd":"unknown"}"#), None);
         assert_eq!(parse_command(r#"{"cmd":"navigate"}"#), None);
+    }
+
+    #[test]
+    fn 解析命令_输入事件与标签页剪贴板命令() {
+        // 键鼠事件(阶段一)。
+        assert_eq!(
+            parse_command(r#"{"cmd":"input","act":"move","x":10,"y":20}"#),
+            Some(ViewCommand::Input(human_input::HumanInput::Move { x: 10.0, y: 20.0 }))
+        );
+        // 标签页快捷键与剪贴板(阶段二)。
+        assert_eq!(parse_command(r#"{"cmd":"new_tab"}"#), Some(ViewCommand::NewTab));
+        assert_eq!(parse_command(r#"{"cmd":"close_tab"}"#), Some(ViewCommand::CloseTab));
+        assert_eq!(parse_command(r#"{"cmd":"next_tab"}"#), Some(ViewCommand::NextTab));
+        assert_eq!(
+            parse_command(r#"{"cmd":"clip","act":"copy"}"#),
+            Some(ViewCommand::Clip(human_input::ClipOp::Copy))
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"clip","act":"cut"}"#),
+            Some(ViewCommand::Clip(human_input::ClipOp::Cut))
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"clip","act":"paste"}"#),
+            Some(ViewCommand::Clip(human_input::ClipOp::Paste))
+        );
+        // 非法 clip 动作忽略。
+        assert_eq!(parse_command(r#"{"cmd":"clip"}"#), None);
+        assert_eq!(parse_command(r#"{"cmd":"clip","act":"fly"}"#), None);
     }
 
     #[test]

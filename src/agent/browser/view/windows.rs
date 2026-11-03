@@ -24,15 +24,17 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus, GetKeyState, SetFocus};
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetClientRect, GetMessageW, GetWindowTextW, LoadCursorW, MoveWindow, PostQuitMessage,
-    RegisterClassW, SetTimer, SetWindowTextW, ShowWindow, TranslateMessage,
-    BS_PUSHBUTTON, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, ES_AUTOHSCROLL, HMENU,
-    IDC_ARROW, MSG, SW_SHOWNORMAL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CHAR, WM_CLOSE, WM_COMMAND,
-    WM_DESTROY, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT,
-    WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSW,
-    WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+    AdjustWindowRectEx, AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+    DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetClientRect, GetMessageW,
+    GetWindowTextW, LoadCursorW, MoveWindow, PostQuitMessage, RegisterClassW, SetTimer,
+    SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage, BS_PUSHBUTTON, CS_DBLCLKS,
+    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, ES_AUTOHSCROLL, HMENU, IDC_ARROW, MF_STRING, MSG,
+    SW_SHOWNORMAL, TPM_RIGHTBUTTON, TPM_RETURNCMD, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CHAR,
+    WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE,
+    WM_SYSKEYDOWN, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
+    WS_VISIBLE,
 };
 
 use super::read_frame;
@@ -69,6 +71,58 @@ static LAST_SIZE: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 static VIEWPORT: Mutex<(i32, i32)> = Mutex::new((0, 0));
 /// 上次已上报的 move(节流:≥30ms 且位移 ≥1px 才再发)。
 static LAST_MOVE: Mutex<Option<(std::time::Instant, f64, f64)>> = Mutex::new(None);
+/// 右键原生菜单是否关闭(`LAEW_HUMAN_RMENU=off` → 回退 contextmenu 事件路径)。
+static RMENU_OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+/// 右键菜单是否接管(接管期间 up 不再上报 contextmenu)。
+static RMENU_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn rmenu_disabled() -> bool {
+    *RMENU_OFF.get_or_init(|| {
+        matches!(
+            std::env::var("LAEW_HUMAN_RMENU")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "off" | "0" | "false" | "no"
+        )
+    })
+}
+
+/// 右键原生菜单(后退/前进/刷新/首页/复制/粘贴),选择经命令通道驱动引擎。
+unsafe fn show_context_menu(hwnd: HWND) {
+    let Ok(menu) = CreatePopupMenu() else {
+        return;
+    };
+    // (id, 标题, 命令)
+    let items: [(usize, &str, &str); 6] = [
+        (101, "后退", "{\"cmd\":\"back\"}"),
+        (102, "前进", "{\"cmd\":\"forward\"}"),
+        (103, "刷新", "{\"cmd\":\"reload\"}"),
+        (104, "首页", "{\"cmd\":\"home\"}"),
+        (105, "复制", "{\"cmd\":\"clip\",\"act\":\"copy\"}"),
+        (106, "粘贴", "{\"cmd\":\"clip\",\"act\":\"paste\"}"),
+    ];
+    for (id, title, _) in items {
+        let _ = AppendMenuW(menu, MF_STRING, id, PCWSTR(to_wide(title).as_ptr()));
+    }
+    let mut pt = windows::Win32::Foundation::POINT::default();
+    if GetCursorPos(&mut pt).is_ok() {
+        let picked = TrackPopupMenu(
+            menu,
+            TPM_RIGHTBUTTON | TPM_RETURNCMD,
+            pt.x,
+            pt.y,
+            0,
+            hwnd,
+            None,
+        );
+        if let Some((_, _, cmd)) = items.iter().find(|(id, _, _)| *id == picked.0 as usize) {
+            send_cmd(cmd);
+        }
+    }
+    let _ = DestroyMenu(menu);
+}
 
 const TIMER_ID: usize = 1;
 const TIMER_MS: u32 = 100;
@@ -244,8 +298,9 @@ fn send_key_json(key: &str, mods: (bool, bool, bool, bool)) {
     send_cmd(&line);
 }
 
-/// 键按下:浏览器级快捷键本地消化(Ctrl+R/F5 刷新);特殊键转发;可打印键
-/// 等 WM_CHAR(避免 KEYDOWN+CHAR 双发)。`sys` = Alt 组合(Alt+←/→ 前进后退)。
+/// 键按下:浏览器级快捷键本地消化(Ctrl+R/F5 刷新、标签页三键、剪贴板三键
+/// 转发);特殊键转发;可打印键等 WM_CHAR(避免 KEYDOWN+CHAR 双发)。
+/// `sys` = Alt 组合(Alt+←/→ 前进后退)。
 unsafe fn forward_key(wp: WPARAM, sys: bool) {
     if input_disabled() {
         return;
@@ -264,8 +319,30 @@ unsafe fn forward_key(wp: WPARAM, sys: bool) {
         }
         return;
     }
+    // 标签页快捷键(39 号设计文档阶段二)。
+    if ctrl && vk == 0x54 {
+        send_cmd("{\"cmd\":\"new_tab\"}");
+        return;
+    }
+    if ctrl && vk == 0x57 {
+        send_cmd("{\"cmd\":\"close_tab\"}");
+        return;
+    }
+    if ctrl && vk == 0x09 {
+        send_cmd("{\"cmd\":\"next_tab\"}");
+        return;
+    }
     if ctrl || alt {
-        return; // 其余组合键不产生页面文本(阶段二再接快捷键全集)
+        // 组合键只转发剪贴板三键(宿主侧按聚焦控件整值处理)。
+        if ctrl && (vk == 0x43 || vk == 0x56 || vk == 0x58) {
+            let k = match vk {
+                0x43 => "c",
+                0x56 => "v",
+                _ => "x",
+            };
+            send_key_json(k, (shift, ctrl, alt, false));
+        }
+        return; // 其余组合键不产生页面文本
     }
     if let Some(k) = vk_special(vk) {
         send_key_json(k, (shift, ctrl, alt, false));
@@ -393,11 +470,21 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             LRESULT(0)
         }
         WM_RBUTTONDOWN | WM_RBUTTONDBLCLK => {
-            let (x, y) = lparam_xy(lp);
-            forward_pointer(hwnd, x, y, "down", Some("right"), false);
+            if input_disabled() || rmenu_disabled() {
+                RMENU_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+                let (x, y) = lparam_xy(lp);
+                forward_pointer(hwnd, x, y, "down", Some("right"), false);
+            } else {
+                // 原生菜单接管(阻塞至选择/点空白),down/up 都不再走事件路径。
+                show_context_menu(hwnd);
+                RMENU_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             LRESULT(0)
         }
         WM_RBUTTONUP => {
+            if RMENU_ACTIVE.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                return LRESULT(0);
+            }
             let (x, y) = lparam_xy(lp);
             forward_pointer(hwnd, x, y, "up", Some("right"), false);
             LRESULT(0)

@@ -131,6 +131,9 @@ pub enum JsRequest {
         event: String,
         env: PageEnv,
         nodes: Vec<super::document::SnapshotNode>,
+        /// 事件载荷(39 号设计文档阶段二:e.key/e.keyCode/e.clientX 等);
+        /// `None` = 无载荷(与旧行为一致)。
+        payload: Option<serde_json::Value>,
         reply: std::sync::mpsc::Sender<JsReply>,
     },
     /// 语句级错误定位(调试用):在持久 Context 上对给定源码做前缀重放二分。

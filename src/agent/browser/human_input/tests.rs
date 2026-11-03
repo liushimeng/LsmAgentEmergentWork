@@ -108,6 +108,78 @@ fn 数值格式化_整数与浮点() {
     assert_eq!(format_num(49.5), "49.500");
 }
 
+// ---------- 阶段二:事件载荷与剪贴板 ----------
+
+#[test]
+fn 遗留键码映射() {
+    assert_eq!(legacy_key_code("Enter"), 13);
+    assert_eq!(legacy_key_code("Tab"), 9);
+    assert_eq!(legacy_key_code("Escape"), 27);
+    assert_eq!(legacy_key_code("Backspace"), 8);
+    assert_eq!(legacy_key_code("ArrowLeft"), 37);
+    assert_eq!(legacy_key_code("PageDown"), 34);
+    assert_eq!(legacy_key_code("Space"), 32);
+    // 字母取大写 ASCII、数字原值。
+    assert_eq!(legacy_key_code("a"), 65);
+    assert_eq!(legacy_key_code("A"), 65);
+    assert_eq!(legacy_key_code("5"), 53);
+    assert_eq!(legacy_key_code("什么"), 0, "未知键位归 0");
+}
+
+#[test]
+fn js键名_空格与shift大小写() {
+    assert_eq!(js_key_name("Space", &Mods::default()), " ");
+    assert_eq!(js_key_name("a", &Mods { shift: true, ..Default::default() }), "A");
+    assert_eq!(js_key_name("a", &Mods::default()), "a");
+    assert_eq!(js_key_name("Enter", &Mods::default()), "Enter");
+}
+
+#[test]
+fn 键盘载荷_字段齐全() {
+    let p = key_payload("a", &Mods { shift: true, ..Default::default() });
+    assert_eq!(p["key"], "A");
+    assert_eq!(p["keyCode"], 65);
+    assert_eq!(p["which"], 65);
+    assert_eq!(p["shiftKey"], true);
+    assert_eq!(p["repeat"], false);
+    let p = key_payload("Enter", &Mods::default());
+    assert_eq!(p["key"], "Enter");
+    assert_eq!(p["charCode"], 0, "非可打印键 charCode=0");
+}
+
+#[test]
+fn 鼠标载荷_坐标与按键位() {
+    let p = mouse_payload(10.4, 20.6, MouseButton::Left, true, 1);
+    assert_eq!(p["clientX"].as_f64(), Some(10.0));
+    assert_eq!(p["clientY"].as_f64(), Some(21.0));
+    assert_eq!(p["button"].as_i64(), Some(0));
+    assert_eq!(p["buttons"].as_i64(), Some(1));
+    assert_eq!(p["detail"].as_i64(), Some(1));
+    assert_eq!(
+        mouse_payload(0.0, 0.0, MouseButton::Right, false, 0)["button"].as_i64(),
+        Some(2)
+    );
+    assert_eq!(
+        mouse_payload(0.0, 0.0, MouseButton::Middle, false, 0)["button"].as_i64(),
+        Some(1)
+    );
+}
+
+#[test]
+fn 剪贴板操作判定() {
+    let ctrl = Mods { ctrl: true, ..Default::default() };
+    let meta = Mods { meta: true, ..Default::default() };
+    let plain = Mods::default();
+    let alt = Mods { alt: true, ..Default::default() };
+    assert_eq!(clip_op_for("c", &ctrl), Some(ClipOp::Copy));
+    assert_eq!(clip_op_for("C", &meta), Some(ClipOp::Copy));
+    assert_eq!(clip_op_for("v", &ctrl), Some(ClipOp::Paste));
+    assert_eq!(clip_op_for("x", &meta), Some(ClipOp::Cut));
+    assert_eq!(clip_op_for("c", &plain), None, "无修饰键是普通字符");
+    assert_eq!(clip_op_for("c", &alt), None, "纯 Alt 不触发剪贴板");
+    assert_eq!(clip_op_for("r", &ctrl), None, "Ctrl+R 在查看器层拦截");
+}
+
 // ---------- 焦点循环 ----------
 
 #[test]

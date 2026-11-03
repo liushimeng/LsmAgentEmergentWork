@@ -114,6 +114,8 @@ msg!(send_u64, () -> u64);
 msg!(send_f64, () -> f64);
 // NSTrackingArea initWithRect:options:owner:userInfo:
 msg!(send_id_rect_u64_id_id, (rect: NSRect, opts: u64, owner: Id, info: Id) -> Id);
+// NSMenu popUpMenuPositioningItem:atLocation:inView:(右键原生菜单,阶段二)。
+msg!(send_i8_id_point_id, (item: Id, loc: NSPoint, view: Id) -> i8);
 
 fn cls(name: &'static [u8]) -> Id {
     unsafe { objc_getClass(name.as_ptr().cast()) }
@@ -397,6 +399,9 @@ button_action!(on_back, "{\"cmd\":\"back\"}");
 button_action!(on_forward, "{\"cmd\":\"forward\"}");
 button_action!(on_reload, "{\"cmd\":\"reload\"}");
 button_action!(on_home, "{\"cmd\":\"home\"}");
+// 右键菜单的剪贴板项(39 号设计文档阶段二;宿主侧按聚焦控件整值近似)。
+button_action!(on_clip_copy, "{\"cmd\":\"clip\",\"act\":\"copy\"}");
+button_action!(on_clip_paste, "{\"cmd\":\"clip\",\"act\":\"paste\"}");
 
 /// 地址栏回车:`control:textView:doCommandBySelector:` 收到 `insertNewline:`。
 extern "C" fn on_text_command(
@@ -451,6 +456,17 @@ static LAST_MOVE: once_cell::sync::Lazy<Mutex<Option<(std::time::Instant, f64, f
 /// 页面视图类(`NSImageView` 子类;`ensure_page_view_class` 注册)。
 static PAGE_VIEW_CLASS: once_cell::sync::Lazy<Mutex<IdCell>> =
     once_cell::sync::Lazy::new(|| Mutex::new(IdCell(std::ptr::null_mut())));
+/// 右键原生菜单是否关闭(`LAEW_HUMAN_RMENU=off` → 回退 contextmenu 事件路径)。
+static RMENU_OFF: once_cell::sync::Lazy<bool> = once_cell::sync::Lazy::new(|| {
+    matches!(
+        std::env::var("LAEW_HUMAN_RMENU")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "off" | "0" | "false" | "no"
+    )
+});
 
 /// 修饰键位(NSEvent modifierFlags)。
 const NSEVENT_SHIFT: u64 = 0x0002_0000;
@@ -591,9 +607,80 @@ pointer_action!(on_pv_mouse_down, "down", Some("left"), false);
 pointer_action!(on_pv_mouse_up, "up", Some("left"), false);
 pointer_action!(on_pv_dragged, "move", None, true);
 pointer_action!(on_pv_moved, "move", None, true);
-pointer_action!(on_pv_right_down, "down", Some("right"), false);
-pointer_action!(on_pv_right_up, "up", Some("right"), false);
 pointer_action!(on_pv_other_up, "up", Some("middle"), false);
+
+/// 右键菜单是否接管(接管期间 down/up 都不再走 contextmenu 事件路径)。
+static RMENU_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// 控制器实例(右键菜单的 target;`run()` 创建后登记)。
+static CTRL: once_cell::sync::Lazy<Mutex<IdCell>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(IdCell(std::ptr::null_mut())));
+
+/// 右键按下:默认弹**原生菜单**(后退/前进/刷新/首页/复制/粘贴);
+/// `LAEW_HUMAN_RMENU=off` 回退阶段一的 contextmenu 事件路径。
+extern "C" fn on_pv_right_down(_self: Id, _cmd: Sel, event: Id) {
+    if input_disabled() || *RMENU_OFF {
+        RMENU_ACTIVE.store(false, Ordering::Relaxed);
+        unsafe { forward_pointer(_self, event, "down", Some("right"), false) };
+        return;
+    }
+    unsafe {
+        // 弹菜单(阻塞至人工选择/点空白关闭);选择经命令通道驱动引擎。
+        show_context_menu(_self, event);
+        RMENU_ACTIVE.store(true, Ordering::Relaxed);
+    }
+}
+
+/// 右键抬起:菜单已接管时不重复上报(contextmenu 由菜单项表达意图)。
+extern "C" fn on_pv_right_up(_self: Id, _cmd: Sel, event: Id) {
+    if RMENU_ACTIVE.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    if input_disabled() {
+        return;
+    }
+    unsafe { forward_pointer(_self, event, "up", Some("right"), false) };
+}
+
+/// 构建并弹出右键菜单(NSMenu + NSMenuItem,action 挂到控制器)。
+unsafe fn show_context_menu(view: Id, event: Id) {
+    let menu = send_id_id(
+        send_id(cls(b"NSMenu\0"), sel(b"alloc\0")),
+        sel(b"initWithTitle:\0"),
+        ns_str("LAEW"),
+    );
+    if menu.is_null() {
+        return;
+    }
+    // (标题, 动作选择器, 命令) —— 动作直接走 send_cmd,与工具栏按钮同构。
+    let items: [(&str, &'static [u8], &str); 6] = [
+        ("后退", b"on_back:\0", "{\"cmd\":\"back\"}"),
+        ("前进", b"on_forward:\0", "{\"cmd\":\"forward\"}"),
+        ("刷新", b"on_reload:\0", "{\"cmd\":\"reload\"}"),
+        ("首页", b"on_home:\0", "{\"cmd\":\"home\"}"),
+        ("复制", b"on_clip_copy:\0", "{\"cmd\":\"clip\",\"act\":\"copy\"}"),
+        ("粘贴", b"on_clip_paste:\0", "{\"cmd\":\"clip\",\"act\":\"paste\"}"),
+    ];
+    let ctrl = CTRL.lock().unwrap().0;
+    for (title, action, _) in items {
+        let item = send_id_id_id_id(
+            send_id(cls(b"NSMenuItem\0"), sel(b"alloc\0")),
+            sel(b"initWithTitle:action:keyEquivalent:\0"),
+            ns_str(title),
+            sel(action).cast_mut(),
+            ns_str(""),
+        );
+        if item.is_null() {
+            continue;
+        }
+        if !ctrl.is_null() {
+            send_void_id(item, sel(b"setTarget:\0"), ctrl);
+        }
+        send_void_id(menu, sel(b"addItem:\0"), item);
+    }
+    let loc = send_point(event, sel(b"locationInWindow\0"));
+    let local = send_point_point_id(view, sel(b"convertPoint:fromView:\0"), loc, std::ptr::null_mut());
+    send_i8_id_point_id(menu, sel(b"popUpMenuPositioningItem:atLocation:inView:\0"), std::ptr::null_mut(), local, view);
+}
 
 /// 中键按下:仅 buttonNumber==2 视为中键(侧键忽略,阶段二)。
 extern "C" fn on_pv_other_down(_self: Id, _cmd: Sel, event: Id) {
@@ -662,14 +749,25 @@ extern "C" fn on_pv_key_down(_self: Id, _cmd: Sel, event: Id) {
             send_cmd("{\"cmd\":\"reload\"}");
             return;
         }
+        // 标签页快捷键(39 号设计文档阶段二):⌘/Ctrl+T 新标签、⌘/Ctrl+W 关标签
+        //、Ctrl+Tab 切换(⌘+Tab 是系统级切换器,不占用)。
+        if (meta || ctrl) && code == 17 {
+            send_cmd("{\"cmd\":\"new_tab\"}");
+            return;
+        }
+        if (meta || ctrl) && code == 13 {
+            send_cmd("{\"cmd\":\"close_tab\"}");
+            return;
+        }
+        if ctrl && code == 48 {
+            send_cmd("{\"cmd\":\"next_tab\"}");
+            return;
+        }
         let shift = flags & NSEVENT_SHIFT != 0;
         let alt = flags & NSEVENT_OPTION != 0;
         let key = match mac_special_key(code) {
             Some(k) => k.to_string(),
             None => {
-                if meta || ctrl {
-                    return; // 组合键不产生页面文本(阶段二再接浏览器快捷键全集)
-                }
                 let chars = send_id(event, sel(b"charactersIgnoringModifiers\0"));
                 if chars.is_null() {
                     return;
@@ -683,6 +781,13 @@ extern "C" fn on_pv_key_down(_self: Id, _cmd: Sel, event: Id) {
                 let Some(c) = s.chars().next() else { return };
                 if !((0x20..=0x7e).contains(&(c as u32))) {
                     return;
+                }
+                if meta || ctrl {
+                    // 组合键只转发剪贴板三键(宿主侧按聚焦控件整值处理),
+                    // 其余组合键不产生页面文本。
+                    if !matches!(c.to_ascii_lowercase(), 'c' | 'v' | 'x') {
+                        return;
+                    }
                 }
                 c.to_string()
             }
@@ -929,6 +1034,18 @@ pub fn run(width: u32, height: u32, title: &str) -> i32 {
             on_home as extern "C" fn(Id, Sel, Id) as *const c_void,
             b"v@:@\0".as_ptr().cast(),
         );
+        let ok_clip_copy = class_addMethod(
+            ctrl_cls,
+            sel(b"on_clip_copy:\0"),
+            on_clip_copy as extern "C" fn(Id, Sel, Id) as *const c_void,
+            b"v@:@\0".as_ptr().cast(),
+        );
+        let ok_clip_paste = class_addMethod(
+            ctrl_cls,
+            sel(b"on_clip_paste:\0"),
+            on_clip_paste as extern "C" fn(Id, Sel, Id) as *const c_void,
+            b"v@:@\0".as_ptr().cast(),
+        );
         let ok_text_cmd = class_addMethod(
             ctrl_cls,
             sel(b"control:textView:doCommandBySelector:\0"),
@@ -954,6 +1071,8 @@ pub fn run(width: u32, height: u32, title: &str) -> i32 {
             || ok_fwd == 0
             || ok_reload == 0
             || ok_home == 0
+            || ok_clip_copy == 0
+            || ok_clip_paste == 0
             || ok_text_cmd == 0
             || ok_text_begin == 0
             || ok_text_end == 0
@@ -965,6 +1084,7 @@ pub fn run(width: u32, height: u32, title: &str) -> i32 {
             return 1;
         }
         let ctrl = send_id(send_id(ctrl_cls, sel(b"alloc\0")), sel(b"init\0"));
+        *CTRL.lock().unwrap() = IdCell(ctrl);
 
         // 窗口:内容区 = 视口 + 工具栏(单一真源,不回读)。
         let w = width.clamp(320, 3840) as f64;

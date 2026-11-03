@@ -3651,14 +3651,21 @@ function __lsmExportGlobals() {
 __lsmExportGlobals();
 
 // ---------- 事件系统 ----------
-function __mkEvent(type) {
-  return {
+// 39 号设计文档(阶段二):`detail` 为宿主注入的事件载荷(键值/坐标),
+// 浅合并进事件对象 —— keydown 能读到 e.key/e.keyCode,鼠标事件能读到
+// e.clientX/e.clientY。detail 缺省时行为与旧版完全一致。
+function __mkEvent(type, detail) {
+  var ev = {
     type: String(type), target: null, currentTarget: null, timeStamp: __lsmNow,
     defaultPrevented: false, propagationStopped: false,
     preventDefault: function () { this.defaultPrevented = true; },
     stopPropagation: function () { this.propagationStopped = true; },
     stopImmediatePropagation: function () { this.propagationStopped = true; }
   };
+  if (detail && typeof detail === "object") {
+    for (var dk in detail) { ev[dk] = detail[dk]; }
+  }
+  return ev;
 }
 // 动态子树冒泡链:目标快照节点若被动态对象收养,把它的动态父链一并纳入,
 // 这样「注册在动态节点上的监听」在宿主点击命中其子树时也能跑到。
@@ -3673,7 +3680,7 @@ function __dynChainOf(node) {
   }
   return out;
 }
-function __fire(sel, type) {
+function __fire(sel, type, detail) {
   var node = __lsmFindBySel(sel);
   if (!node) return { handled: false, defaultPrevented: false };
   var chain = __ancestorChain(node.i);
@@ -3697,7 +3704,7 @@ function __fire(sel, type) {
       }
     }
     if (targetIdx === -1) continue;
-    var ev = __mkEvent(type);
+    var ev = __mkEvent(type, detail);
     ev.target = __mk(node);
     ev.currentTarget = targetIdx === -2 ? document
       : (targetIdx === -3 ? L.node : __mk(__lsmNodes[targetIdx]));
@@ -4591,8 +4598,15 @@ function __lsmEvalUser(src) {
   }
   return JSON.stringify({ ok: __err === null, value: __val, type: typeof __r, error: __err });
 }
-function __lsmDispatch(sel, type) {
-  var res = __fire(String(sel), String(type));
+function __lsmDispatch(sel, type, detail) {
+  // 宿主侧可能传对象字面量(Rust 直接内联 JSON)或字符串(手工调用 stringify)。
+  var d = null;
+  if (detail) {
+    try {
+      d = (typeof detail === "string") ? JSON.parse(detail) : detail;
+    } catch (e) { d = null; }
+  }
+  var res = __fire(String(sel), String(type), d);
   __lsmDispatchResult = res;
   return JSON.stringify(res);
 }
