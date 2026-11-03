@@ -1018,6 +1018,12 @@ fn draw_image(
     for py in bounds.y0.max(0)..bounds.y1.min(height) {
         for pxi in bounds.x0.max(0)..bounds.x1.min(width) {
             let (lx, ly) = mapper.local(pxi, py);
+            // 只绘制实际图像矩形:`sample_bilinear` 对越界坐标做钳制,
+            // 不跳过的话 `object-fit:contain/cover` 的留白区会被**边缘像素
+            // 拉伸**满整盒(letterbox 失效,红图铺满 120×60)。
+            if lx < dx || lx >= dx + dw || ly < dy || ly >= dy + dh {
+                continue;
+            }
             let u = (lx - dx) / dw;
             let v = (ly - dy) / dh;
             let c = sample_bilinear(img, u * nw - 0.5, v * nh - 0.5);

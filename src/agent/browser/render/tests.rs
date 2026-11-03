@@ -146,6 +146,57 @@ fn 渲染绘制图片() {
 }
 
 #[test]
+fn object_fit留白区不被边缘像素拉伸() {
+    let font = FontSet::fallback();
+    // 4×4 红图,20×10 盒,`object-fit:contain` → 绘制 10×10,居中偏移 (5,0)。
+    // 左右各 5px 是 letterbox 留白,必须保持背景色。
+    let l = layout::Layout {
+        paints: vec![layout::PaintBox {
+            src: "u".to_string(),
+            x: 10.0,
+            y: 10.0,
+            w: 20.0,
+            h: 10.0,
+            fit: "contain".to_string(),
+            kind: layout::PaintKind::Content,
+            visible: true,
+            z_index: 0,
+            off_x: 0.0,
+            off_y: 0.0,
+        }],
+        width: 100.0,
+        height: 100.0,
+        ..Default::default()
+    };
+    let mut store = ImageStore::new();
+    store.insert(
+        "u".to_string(),
+        std::sync::Arc::new(DecodedImage {
+            width: 4,
+            height: 4,
+            rgba: (0..16).flat_map(|_| [255u8, 0, 0, 255]).collect(),
+        }),
+    );
+    let png = font.render(&l, 100, 100, 0.0, 0.0, false, &store);
+    let decoded = image::load_from_memory(&png).unwrap().to_rgba8();
+    assert_eq!(
+        &decoded.get_pixel(20, 15).0[..3],
+        &[255, 0, 0],
+        "图像区(15..25)应为红色"
+    );
+    assert_eq!(
+        &decoded.get_pixel(12, 15).0[..3],
+        &[255, 255, 255],
+        "左侧 letterbox 留白不得被边缘红像素拉伸"
+    );
+    assert_eq!(
+        &decoded.get_pixel(28, 15).0[..3],
+        &[255, 255, 255],
+        "右侧 letterbox 留白不得被边缘红像素拉伸"
+    );
+}
+
+#[test]
 fn 字体度量回退可用() {
     let f = FontSet::fallback();
     assert!(f.char_width('中', 16.0) >= 16.0);

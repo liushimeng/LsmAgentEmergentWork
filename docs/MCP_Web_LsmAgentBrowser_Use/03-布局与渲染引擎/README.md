@@ -24,4 +24,4 @@
 | [46-元素级滚动容器与滚动条方案.md](46-元素级滚动容器与滚动条方案.md) | `overflow:auto|scroll` 归一为可滚动容器:运行时滚动偏移(临时解析树 `data-lsm-scroll-top`)→ 内容上移 + 越界裁剪 + 滚动条 + `Layout::scroll_max`;`control(scroll, selector=…, delta_y=…)` 元素内滚动 |
 | [47-行内块独立格式化上下文与行内片段盒方案.md](47-行内块独立格式化上下文与行内片段盒方案.md) | 行内排版第二层:`inline-block`/`inline-flex` 独立格式化上下文(子代进独立缓冲按盒宽换行、盒高由内容决定、shrink-to-fit 子树累加宽)、**行内片段盒**(普通行内元素背景/边框按行盒片段绘制,位置跟随文本、高度含上下内边距)、窄容器换行(断行后清零待入段宽 + 词界回退)、`<br>` 块容器直接子级换行 |
 | [48-媒体嵌入几何语义装饰与静态位置修复方案.md](48-媒体嵌入几何语义装饰与静态位置修复方案.md) | video/audio/object/embed 替换式几何 + poster/data/src 预取 + MediaFrameNote 空盒占位;del/ins/u/abbr/mark 语义装饰;hr/fieldset/legend UA 缺省;absolute 无 inset 取静态位置 |
-| [49-显示渲染补全方案.md](49-显示渲染补全方案.md) | `<img>` 的 `object-position` 与加载失败 `alt` 占位;表格 `border-spacing` 与 `caption-side`(顺带修 caption 高重复计数);`ol reversed` 倒序(含 0/负数);`fieldset[disabled]` 控件禁用继承(首个 legend 例外);`label` 点击转发到关联控件 |
+| [49-显示渲染补全方案.md](49-显示渲染补全方案.md) | `<img>` 的 `object-position` 与加载失败 `alt` 占位;**修 `object-fit` letterbox 留白被边缘像素拉伸**;表格 `border-spacing` 与 `caption-side`(顺带修 caption 高重复计数);`ol reversed` 倒序(含 0/负数);`fieldset[disabled]` 控件禁用继承(首个 legend 例外);`label` 点击转发到关联控件 |
