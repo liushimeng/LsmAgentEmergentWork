@@ -46,6 +46,10 @@ pub const ATTR_PSEUDO_ACTIVE: &str = "data-lsm-active";
 pub const ATTR_SELECT_OPEN: &str = "data-lsm-select-open";
 /// 第 46 轮:元素级滚动偏移的内核私有标记(落到临时解析树,不入页面 HTML)。
 pub const ATTR_SCROLL_TOP: &str = "data-lsm-scroll-top";
+/// 39 号 P2a:文本光标位置(char 索引)的内核私有标记,布局层据此画光标条。
+pub const ATTR_CARET: &str = "data-lsm-caret";
+/// 39 号 P2a:选区锚点(char 索引;与光标不等即有选区),布局层画选区高亮。
+pub const ATTR_SEL: &str = "data-lsm-sel";
 
 /// inspect(elements) 与交互候选集的默认选择器唯一真源。
 ///
@@ -70,6 +74,37 @@ impl PseudoFlags {
     /// 是否带任何状态位。
     pub fn any(&self) -> bool {
         self.hover || self.focus || self.focus_visible || self.active
+    }
+}
+
+/// 文本控件的运行时光标 + 选区锚点(39 号 P2a,与 `PseudoFlags` 同族的
+/// 运行时覆盖层)。索引为 **char 索引**(0..=len,中文/emoji 不裂)。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CaretState {
+    /// 光标(选区头)位置。
+    pub pos: usize,
+    /// 选区锚点(Shift 点击/扩选的固定端);与 `pos` 相等 = 无选区。
+    pub anchor: usize,
+}
+
+impl CaretState {
+    /// 折叠光标(无选区)。
+    pub fn collapsed(pos: usize) -> Self {
+        Self { pos, anchor: pos }
+    }
+
+    /// 是否无选区。
+    pub fn is_empty(&self) -> bool {
+        self.pos == self.anchor
+    }
+
+    /// 选区区间(升序 `(start, end)`)。
+    pub fn range(&self) -> (usize, usize) {
+        if self.pos <= self.anchor {
+            (self.pos, self.anchor)
+        } else {
+            (self.anchor, self.pos)
+        }
     }
 }
 
@@ -215,6 +250,30 @@ impl Document {
             };
             let mut attrs = el.attributes.borrow_mut();
             attrs.insert(ATTR_SCROLL_TOP, format!("{top}"));
+        }
+    }
+
+    /// 39 号 P2a:文本光标/选区态 → 临时解析树的 `data-lsm-caret` /
+    /// `data-lsm-sel` 属性。布局层(`layout/widgets.rs`)据此在控件内画
+    /// 光标条与选区高亮;无选区时撤掉选区标记。
+    pub fn apply_caret_state(&mut self, carets: &HashMap<String, CaretState>) {
+        for (sel, st) in carets {
+            let Ok(nodes) = self.select(sel) else {
+                continue;
+            };
+            let Some(node) = nodes.first() else {
+                continue;
+            };
+            let Some(el) = node.as_element() else {
+                continue;
+            };
+            let mut attrs = el.attributes.borrow_mut();
+            attrs.insert(ATTR_CARET, format!("{}", st.pos));
+            if st.is_empty() {
+                attrs.remove(ATTR_SEL);
+            } else {
+                attrs.insert(ATTR_SEL, format!("{}", st.anchor));
+            }
         }
     }
 

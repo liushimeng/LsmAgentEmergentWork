@@ -176,6 +176,29 @@ async fn key(mgr: &LsmBrowserManager, pid: &str, k: &str) -> Value {
     .await
 }
 
+/// 人工按组合键。
+async fn key_mods(mgr: &LsmBrowserManager, pid: &str, k: &str, mods: Mods) -> Value {
+    mgr.handle_human_input(pid, HumanInput::Key { key: k.to_string(), mods }).await
+}
+
+/// 元素盒(inspect elements 的 rect 为页坐标)。
+async fn rect_of(tool: &McpWebLsmBrowserUseTool, pid: &str, selector: &str) -> (f64, f64, f64, f64) {
+    let v = exec(
+        tool,
+        json!({"action": "inspect", "page_id": pid, "info": "elements",
+               "params": {"selector": selector, "nth": 0}}),
+    )
+    .await;
+    assert_eq!(v["code"], 0, "{v}");
+    let r = &v["data"]["rect"];
+    (
+        r["x"].as_f64().unwrap(),
+        r["y"].as_f64().unwrap(),
+        r["width"].as_f64().unwrap(),
+        r["height"].as_f64().unwrap(),
+    )
+}
+
 // ---------- 用例 ----------
 
 #[tokio::test]
@@ -502,6 +525,238 @@ async fn 控件级复制粘贴_整值近似() {
         )
         .await;
     assert_eq!(paste["value_len"], 3, "{paste}");
+
+    web_control::clear(Engine::Lsm, &pid);
+    exec(&tool, json!({"action": "close", "page_id": &pid})).await;
+}
+
+// ---------- P2a:文本光标 / 选区 / 编辑语义 ----------
+
+#[tokio::test]
+async fn 点击定位光标_中间插入与拖选替换() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+    let pid = open_hi(&tool, &base).await;
+    let mgr = LsmBrowserManager::global();
+
+    let (rx, ry, rw, rh) = rect_of(&tool, &pid, "#q").await;
+    let (x, y) = (rx + rw / 2.0, ry + rh / 2.0);
+    human_click(&mgr, &pid, x, y).await;
+    for ch in ["a", "b", "c", "d"] {
+        key(&mgr, &pid, ch).await;
+    }
+    // 点击文本起排附近(盒左 + 4px):光标落 0/1(按 Down 回执的 pos 自适应断言,
+    // 不依赖具体字体度量)。
+    let down = mgr
+        .handle_human_input(
+            &pid,
+            HumanInput::Down {
+                x: rx + 4.0,
+                y,
+                button: MouseButton::Left,
+                mods: Mods::default(),
+            },
+        )
+        .await;
+    let pos = down["caret"]["pos"].as_i64().unwrap_or(-1);
+    assert!((0..4).contains(&pos), "点击文本起排附近应落前部光标:{down}");
+    mgr.handle_human_input(
+        &pid,
+        HumanInput::Up {
+            x: rx + 4.0,
+            y,
+            button: MouseButton::Left,
+            mods: Mods::default(),
+        },
+    )
+    .await;
+    key(&mgr, &pid, "X").await;
+    let v = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": &pid, "info": "elements",
+               "params": {"selector": "#q"}}),
+    )
+    .await;
+    let orig = "abcd";
+    let pos = pos.clamp(0, 4) as usize;
+    let expect = format!("{}X{}", &orig[..pos], &orig[pos..]);
+    assert_eq!(v["data"]["value"], expect, "键入应插入光标处:{v}");
+
+    // 拖选:从按下点拖到最右(选区 = pos..4),键入整体替换选区。
+    mgr.handle_human_input(
+        &pid,
+        HumanInput::Down {
+            x: rx + 4.0,
+            y,
+            button: MouseButton::Left,
+            mods: Mods::default(),
+        },
+    )
+    .await;
+    mgr.handle_human_input(&pid, HumanInput::Move { x: rx + rw - 1.0, y }).await;
+    mgr.handle_human_input(&pid, HumanInput::Move { x: rx + rw - 1.0, y }).await;
+    let up = mgr
+        .handle_human_input(
+            &pid,
+            HumanInput::Up {
+                x: rx + rw - 1.0,
+                y,
+                button: MouseButton::Left,
+                mods: Mods::default(),
+            },
+        )
+        .await;
+    assert_eq!(up["selection"], true, "拖选收尾不应合成点击:{up}");
+    key(&mgr, &pid, "Z").await;
+    let v = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": &pid, "info": "elements",
+               "params": {"selector": "#q"}}),
+    )
+    .await;
+    assert_eq!(
+        v["data"]["value"],
+        format!("{}Z", &expect[..pos]),
+        "拖选段应被键入替换:{v}"
+    );
+
+    web_control::clear(Engine::Lsm, &pid);
+    exec(&tool, json!({"action": "close", "page_id": &pid})).await;
+}
+
+#[tokio::test]
+async fn 双击选词_三击全选_后键入替换() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+    let pid = open_hi(&tool, &base).await;
+    let mgr = LsmBrowserManager::global();
+
+    let (rx, ry, rw, rh) = rect_of(&tool, &pid, "#q").await;
+    let (x, y) = (rx + rw / 2.0, ry + rh / 2.0);
+    human_click(&mgr, &pid, x, y).await;
+    for ch in "hello world".chars() {
+        key(&mgr, &pid, &ch.to_string()).await;
+    }
+    // 双击首词内任意位置(文本起排附近)→ 选中 "hello" → 键入替换。
+    let x2 = rx + 4.0;
+    for _ in 0..2 {
+        human_click(&mgr, &pid, x2, y).await;
+    }
+    key(&mgr, &pid, "X").await;
+    let v = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": &pid, "info": "elements",
+               "params": {"selector": "#q"}}),
+    )
+    .await;
+    assert_eq!(v["data"]["value"], "X world", "双击词应被替换:{v}");
+
+    // 三击 → 全选 → 键入整体替换。
+    for _ in 0..3 {
+        human_click(&mgr, &pid, x2, y).await;
+    }
+    key(&mgr, &pid, "Y").await;
+    let v = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": &pid, "info": "elements",
+               "params": {"selector": "#q"}}),
+    )
+    .await;
+    assert_eq!(v["data"]["value"], "Y", "三击全选应被替换:{v}");
+
+    web_control::clear(Engine::Lsm, &pid);
+    exec(&tool, json!({"action": "close", "page_id": &pid})).await;
+}
+
+#[tokio::test]
+async fn ctrl全选替换与撤销重做() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+    let pid = open_hi(&tool, &base).await;
+    let mgr = LsmBrowserManager::global();
+
+    let (x, y) = center_of(&tool, &pid, "#q").await;
+    human_click(&mgr, &pid, x, y).await;
+    for ch in ["a", "b"] {
+        key(&mgr, &pid, ch).await;
+    }
+    let ctrl = Mods { ctrl: true, ..Default::default() };
+    key_mods(&mgr, &pid, "a", ctrl).await;
+    key(&mgr, &pid, "Z").await;
+    let v = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": &pid, "info": "elements",
+               "params": {"selector": "#q"}}),
+    )
+    .await;
+    assert_eq!(v["data"]["value"], "Z", "Ctrl+A 全选后键入应整体替换:{v}");
+    key_mods(&mgr, &pid, "z", ctrl).await;
+    let v = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": &pid, "info": "elements",
+               "params": {"selector": "#q"}}),
+    )
+    .await;
+    assert_eq!(v["data"]["value"], "ab", "Ctrl+Z 撤销应回旧值:{v}");
+    key_mods(&mgr, &pid, "y", ctrl).await;
+    let v = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": &pid, "info": "elements",
+               "params": {"selector": "#q"}}),
+    )
+    .await;
+    assert_eq!(v["data"]["value"], "Z", "Ctrl+Y 重做应回新值:{v}");
+
+    web_control::clear(Engine::Lsm, &pid);
+    exec(&tool, json!({"action": "close", "page_id": &pid})).await;
+}
+
+#[tokio::test]
+async fn 选区剪贴板_双击词后剪切粘贴() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+    let pid = open_hi(&tool, &base).await;
+    let mgr = LsmBrowserManager::global();
+
+    let (rx, ry, rw, rh) = rect_of(&tool, &pid, "#q").await;
+    let (x, y) = (rx + rw / 2.0, ry + rh / 2.0);
+    human_click(&mgr, &pid, x, y).await;
+    for ch in "hello world".chars() {
+        key(&mgr, &pid, &ch.to_string()).await;
+    }
+    // 双击选中 "hello" → ⌘X 剪切选区(非整值清空)。
+    for _ in 0..2 {
+        human_click(&mgr, &pid, rx + 4.0, y).await;
+    }
+    let meta = Mods { meta: true, ..Default::default() };
+    let cut = key_mods(&mgr, &pid, "x", meta).await;
+    assert_eq!(cut["ok"], true, "{cut}");
+    let v = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": &pid, "info": "elements",
+               "params": {"selector": "#q"}}),
+    )
+    .await;
+    assert_eq!(v["data"]["value"], " world", "⌘X 应只剪掉选区:{v}");
+    // 剪贴板内容校验(无剪贴板服务的会话软跳过)。
+    match lsm_agent::agent::browser::human_input::clipboard::read_text() {
+        Ok(text) => assert_eq!(text, "hello", "剪贴板应是选区串:{text}"),
+        Err(e) => eprintln!("[skip] 本会话无剪贴板服务:{e}"),
+    }
+    // ⌘V 在光标处(选区删后 = 0)粘贴回来。
+    let paste = key_mods(&mgr, &pid, "v", meta).await;
+    assert_eq!(paste["ok"], true, "{paste}");
+    let v = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": &pid, "info": "elements",
+               "params": {"selector": "#q"}}),
+    )
+    .await;
+    assert_eq!(v["data"]["value"], "hello world", "粘贴应回到完整值:{v}");
 
     web_control::clear(Engine::Lsm, &pid);
     exec(&tool, json!({"action": "close", "page_id": &pid})).await;

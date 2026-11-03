@@ -228,6 +228,10 @@ pub struct TabState {
     /// key = stable selector，value = 状态位。落到临时解析树的 `data-lsm-*`
     /// 属性后由样式引擎的 `:hover`/`:focus`/`:focus-visible`/`:active` 命中。
     pub pseudo_states: HashMap<String, document::PseudoFlags>,
+    /// 39 号 P2a:文本控件运行时光标/选区（key = stable selector）。
+    /// 与 `form_values` 同族的运行时覆盖层,`document_with_state` 落
+    /// `data-lsm-caret`/`data-lsm-sel` 属性,布局层据此画光标条与选区高亮。
+    pub form_caret: HashMap<String, document::CaretState>,
     pub focused: Option<String>,
     pub mouse: Option<(f64, f64)>,
     pub layout: layout::Layout,
@@ -282,6 +286,7 @@ impl TabState {
     pub fn document_with_state(&self) -> document::Document {
         let mut doc = document::Document::parse(&self.html, &self.url);
         doc.apply_widget_state(&self.form_values, &self.widget_open, &self.pseudo_states);
+        doc.apply_caret_state(&self.form_caret);
         doc.apply_scroll_state(&self.scroll_offsets);
         doc
     }
@@ -520,11 +525,22 @@ pub type BrowserManager = LsmBrowserManager;
 static GLOBAL: Lazy<Arc<LsmBrowserManager>> =
     Lazy::new(|| LsmBrowserManager::new_arc());
 
+/// 页面序号分段源(每管理器 `0x100000` 页额度,见 [`LsmBrowserManager::new`])。
+static MANAGER_SEQ_SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl LsmBrowserManager {
     pub fn new() -> Self {
+        // 页面序号按管理器分段(<<20):多管理器并行(单元/集成测试)不得共用
+        // page_id —— web_control 等进程级全局注册表按 (引擎, page_id) 键控,
+        // 同名页面会互相覆盖/清除控制权态(并行单测曾偶发 agent_control 误拦)。
+        // 生产进程只有单管理器(种子 0),页 id 与旧格式完全一致。
+        let seq_base = MANAGER_SEQ_SEED
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            << 20;
         Self {
             inner: Mutex::new(Inner {
                 started_ms: now_ms(),
+                seq: seq_base,
                 ..Default::default()
             }),
             http: net::HttpClient::new(DEFAULT_UA),
@@ -1068,6 +1084,7 @@ impl LsmBrowserManager {
             form_values: pipeline.form_values.clone(),
             widget_open: HashMap::new(),
             pseudo_states: HashMap::new(),
+            form_caret: HashMap::new(),
             focused: None,
             mouse: None,
             layout,

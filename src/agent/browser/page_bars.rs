@@ -796,6 +796,7 @@ mod tests {
             form_values: Default::default(),
             widget_open: Default::default(),
             pseudo_states: Default::default(),
+            form_caret: Default::default(),
             focused: None,
             mouse: None,
             layout: Default::default(),

@@ -2,6 +2,9 @@
 //! 以及 data: 页面上的坐标命中(含 fixed/常规流双假设与顶层浮层优先)。
 
 use super::*;
+use super::text_edit;
+use crate::agent::browser::document::CaretState;
+use crate::agent::browser::render::FontSet;
 use crate::agent::browser::{BrowserMode, LsmBrowserManager, NavHints};
 use crate::agent::web_control::{self, ControlState, Engine};
 
@@ -335,6 +338,293 @@ async fn 键入文本进入聚焦控件() {
     .await;
     let value = mgr.current_value(&pid, &hit.selector).await;
     assert_eq!(value, "abc", "应为 ab + c(追加)+ D(shift 大写)- D(回删)");
+    web_control::clear(Engine::Lsm, &pid);
+    mgr.shutdown().await;
+}
+
+// ---------- P2a:文本光标 / 选区 / 编辑语义(text_edit 纯逻辑) ----------
+
+#[test]
+fn 光标映射_单行点击取最近字符边界() {
+    let font = FontSet::fallback();
+    let spans = font.char_spans("abc", 16.0, 1000.0);
+    assert_eq!(spans.len(), 3);
+    assert_eq!(text_edit::index_from_spans(&spans, -5.0), 0);
+    assert_eq!(text_edit::index_from_spans(&spans, spans[0].0), 0);
+    assert_eq!(text_edit::index_from_spans(&spans, spans[0].1), 1, "第一字右缘 = 字符间边界");
+    assert_eq!(text_edit::index_from_spans(&spans, spans[1].0 + 0.01), 1);
+    assert_eq!(text_edit::index_from_spans(&spans, 999.0), 3, "超出文本宽夹到末尾");
+}
+
+#[test]
+fn 光标映射_textarea行列与中文索引() {
+    let font = FontSet::fallback();
+    let rows = font.wrap_text_rows("你好\n世界", 16.0, 1000.0, 10);
+    assert_eq!(rows, vec![("你好".to_string(), 0), ("世界".to_string(), 3)]);
+    let line_h = 16.0 * 1.35;
+    // 点第 2 行第 1 字中点 → 索引 4(行首 3 + 列 1)。
+    let idx = text_edit::index_from_rows(&font, &rows, 16.0, 8.0, line_h + 2.0, line_h);
+    assert_eq!(idx, 4);
+    // 点第 1 行空白右侧之外 → 第 1 行行尾。
+    let idx = text_edit::index_from_rows(&font, &rows, 16.0, 999.0, 1.0, line_h);
+    assert_eq!(idx, 2);
+}
+
+#[test]
+fn 换行行集_折行与行首索引对齐() {
+    let font = FontSet::fallback();
+    // 16px 回退字宽 8.8:行宽 20 只容 2 字符 → "abcd" 折两行。
+    let rows = font.wrap_text_rows("abcd", 16.0, 20.0, 10);
+    assert_eq!(rows, vec![("ab".to_string(), 0), ("cd".to_string(), 2)]);
+    // 尾随 \n 产生空尾行(编辑语义:回车后的空行可落光标)。
+    let rows = font.wrap_text_rows("a\n", 16.0, 100.0, 10);
+    assert_eq!(rows, vec![("a".to_string(), 0), ("".to_string(), 2)]);
+    // 行数封顶。
+    let rows = font.wrap_text_rows("a\nb\nc", 16.0, 100.0, 2);
+    assert_eq!(rows.len(), 2);
+}
+
+#[test]
+fn 词界_双击选词与词跳() {
+    let chars: Vec<char> = "hello world 你好".chars().collect();
+    assert_eq!(text_edit::word_bounds(&chars, 1), (0, 5));
+    assert_eq!(text_edit::word_bounds(&chars, 4), (0, 5), "词尾点选同词");
+    assert_eq!(text_edit::word_bounds(&chars, 7), (6, 11));
+    assert_eq!(text_edit::word_bounds(&chars, 5), (6, 11), "双击空白向右选相邻词");
+    assert_eq!(text_edit::word_bounds(&chars, 12), (12, 14), "CJK 词按字类连跑");
+    // 双击空白:向右优先选相邻词。
+    assert_eq!(text_edit::word_bounds(&chars, 11), (12, 14));
+    // 词跳:向左跳到词首,向右到下一词首。
+    assert_eq!(text_edit::word_jump(&chars, 5, -1), 0);
+    assert_eq!(text_edit::word_jump(&chars, 5, 1), 6);
+    assert_eq!(text_edit::word_jump(&chars, 11, 1), 12);
+}
+
+#[test]
+fn 编辑运算_插入替换选区与前后删除() {
+    let c = CaretState { pos: 4, anchor: 1 }; // "hello" 选中 "ell"
+    let (nv, nc) = text_edit::edit_insert("hello", c, "X");
+    assert_eq!(nv, "hXo");
+    assert_eq!(nc, CaretState::collapsed(2));
+    assert_eq!(text_edit::edit_backspace("abc", CaretState::collapsed(2)).0, "ac");
+    assert_eq!(text_edit::edit_delete("abc", CaretState::collapsed(1)).0, "ac");
+    assert_eq!(text_edit::edit_backspace("abc", CaretState::collapsed(0)).0, "abc", "0 处 no-op");
+    assert_eq!(text_edit::edit_delete("abc", CaretState::collapsed(3)).0, "abc", "尾部 no-op");
+    // 有选区:Backspace/Delete 均删选区。
+    let c = CaretState { pos: 1, anchor: 3 };
+    assert_eq!(text_edit::edit_backspace("abcd", c).0, "ad");
+    assert_eq!(text_edit::edit_delete("abcd", c).0, "ad");
+    // 中文按 char 切,不裂。
+    assert_eq!(text_edit::edit_backspace("你好", CaretState::collapsed(2)).0, "你");
+    // Ctrl+Backspace 删词。
+    assert_eq!(
+        text_edit::edit_delete_word_back("hello world", CaretState::collapsed(11)).0,
+        "hello "
+    );
+    assert_eq!(
+        text_edit::edit_delete_word_back("hello world", CaretState::collapsed(5)).0,
+        " world"
+    );
+}
+
+#[test]
+fn 光标移动_折叠扩选与词跳() {
+    let v = "hello world";
+    let c = CaretState { pos: 4, anchor: 1 }; // 选区 1..4
+    assert_eq!(text_edit::caret_move(v, c, -1, false, false), CaretState::collapsed(1));
+    assert_eq!(text_edit::caret_move(v, c, 1, false, false), CaretState::collapsed(4));
+    let m = text_edit::caret_move(v, c, 1, false, true);
+    assert_eq!((m.pos, m.anchor), (5, 1), "Shift 扩选锚点不动");
+    assert_eq!(text_edit::caret_move(v, CaretState::collapsed(5), -1, true, false).pos, 0);
+    assert_eq!(text_edit::caret_move(v, CaretState::collapsed(0), 1, true, false).pos, 6);
+}
+
+#[test]
+fn 光标移动_上下按行与行首行尾() {
+    let font = FontSet::fallback();
+    let v = "abc\nde";
+    let rows = font.wrap_text_rows(v, 16.0, 1000.0, 10);
+    assert_eq!(rows, vec![("abc".to_string(), 0), ("de".to_string(), 4)]);
+    // 第 0 行 col 2 → 第 1 行 col 2(超出行尾夹到行尾)。
+    let c = text_edit::caret_move_vert(v, CaretState::collapsed(2), &rows, 1, false);
+    assert_eq!(c.pos, 6, "第 1 行行尾");
+    // 首行向上 no-op。
+    assert_eq!(
+        text_edit::caret_move_vert(v, CaretState::collapsed(2), &rows, -1, false),
+        CaretState::collapsed(2)
+    );
+    // 行首/行尾(非 doc)。
+    assert_eq!(text_edit::caret_to_edge(v, CaretState::collapsed(5), &rows, false, false, false).pos, 4);
+    assert_eq!(text_edit::caret_to_edge(v, CaretState::collapsed(5), &rows, true, false, false).pos, 6);
+    // doc 边缘与扩选。
+    assert_eq!(text_edit::caret_to_edge(v, CaretState::collapsed(5), &rows, false, true, false).pos, 0);
+    assert_eq!(
+        text_edit::caret_to_edge(v, CaretState::collapsed(2), &rows, true, true, true),
+        CaretState { pos: 6, anchor: 2 }
+    );
+}
+
+#[test]
+fn 选区构造_双击选词全选与取串() {
+    assert_eq!(text_edit::select_word("hello world", 7), CaretState { pos: 11, anchor: 6 });
+    assert_eq!(text_edit::select_all("你好"), CaretState { pos: 2, anchor: 0 });
+    assert_eq!(text_edit::selected_text("hello", CaretState { pos: 4, anchor: 1 }).as_deref(), Some("ell"));
+    assert_eq!(text_edit::selected_text("hello", CaretState::collapsed(2)), None);
+}
+
+#[test]
+fn 撤销重做_双栈往返与断链() {
+    let mut h = text_edit::EditHistory::default();
+    h.push("ab".to_string(), CaretState::collapsed(2));
+    h.push("abc".to_string(), CaretState::collapsed(3));
+    assert_eq!(h.depth(), (2, 0));
+    let (v1, _) = h.undo("abcd".to_string(), CaretState::collapsed(4)).unwrap();
+    assert_eq!(v1, "abc");
+    assert_eq!(h.depth(), (1, 1));
+    let (v2, _) = h.undo("abc".to_string(), CaretState::collapsed(3)).unwrap();
+    assert_eq!(v2, "ab");
+    assert!(h.undo("ab".to_string(), CaretState::collapsed(2)).is_none(), "栈空撤销 no-op");
+    let (v3, _) = h.redo("ab".to_string(), CaretState::collapsed(2)).unwrap();
+    assert_eq!(v3, "abc");
+    // 新编辑断开 redo 链。
+    h.push("abx".to_string(), CaretState::collapsed(3));
+    assert_eq!(h.depth().1, 0);
+}
+
+#[test]
+fn 编辑组合键判定() {
+    let ctrl = Mods { ctrl: true, ..Default::default() };
+    let shift = Mods { shift: true, ..Default::default() };
+    let cs = Mods { ctrl: true, shift: true, ..Default::default() };
+    assert_eq!(edit_op_for("a", &ctrl), Some(EditOp::SelectAll));
+    assert_eq!(edit_op_for("A", &ctrl), Some(EditOp::SelectAll));
+    assert_eq!(edit_op_for("z", &ctrl), Some(EditOp::Undo));
+    assert_eq!(edit_op_for("z", &cs), Some(EditOp::Redo));
+    assert_eq!(edit_op_for("y", &ctrl), Some(EditOp::Redo));
+    assert_eq!(edit_op_for("a", &shift), None, "纯 Shift 是普通字符");
+    assert_eq!(edit_op_for("a", &Mods::default()), None);
+}
+
+#[tokio::test]
+async fn 点击定位光标_键入插入中间() {
+    let mgr = LsmBrowserManager::new();
+    let pid = open_hidden(
+        &mgr,
+        "<input id='q' style='width:200px;height:30px' value='abcd'>",
+    )
+    .await;
+    web_control::set_state(Engine::Lsm, &pid, ControlState::User, None, "test");
+    let hit = mgr.human_hit_test(&pid, 100.0, 15.0).await.expect("输入框应命中");
+    assert!(is_text_like(&hit.tag, &hit.typ), "输入框应判为文本控件");
+    // 文本起排 = 盒左 + 3;点在第 1 字符右缘稍右 → 光标落索引 1。
+    let x = hit.rect.0 + 3.0 + mgr.font().char_width('a', hit.font_size) + 0.5;
+    mgr.handle_human_input(
+        &pid,
+        HumanInput::Down { x, y: 15.0, button: MouseButton::Left, mods: Mods::default() },
+    )
+    .await;
+    mgr.handle_human_input(
+        &pid,
+        HumanInput::Up { x, y: 15.0, button: MouseButton::Left, mods: Mods::default() },
+    )
+    .await;
+    mgr.handle_human_input(&pid, HumanInput::Key { key: "X".to_string(), mods: Mods::default() })
+        .await;
+    let value = mgr.current_value(&pid, &hit.selector).await;
+    assert_eq!(value, "aXbcd", "键入应插入光标处而非尾部");
+    web_control::clear(Engine::Lsm, &pid);
+    mgr.shutdown().await;
+}
+
+#[tokio::test]
+async fn 拖选与双击选词_后键入替换() {
+    let mgr = LsmBrowserManager::new();
+    let pid = open_hidden(
+        &mgr,
+        "<input id='q' style='width:200px;height:30px' value='hello world'>",
+    )
+    .await;
+    web_control::set_state(Engine::Lsm, &pid, ControlState::User, None, "test");
+    let hit = mgr.human_hit_test(&pid, 100.0, 15.0).await.expect("输入框应命中");
+    let size = hit.font_size;
+    let x0 = hit.rect.0 + 3.0;
+    let x_of = |s: &str, i: usize| -> f64 {
+        let w: f64 = s.chars().take(i).map(|c| mgr.font().char_width(c, size)).sum();
+        x0 + w + 0.5
+    };
+    // 拖选 'e'..'l'(索引 1..3 → 覆盖 "el")。
+    mgr.handle_human_input(
+        &pid,
+        HumanInput::Down { x: x_of("hello world", 1), y: 15.0, button: MouseButton::Left, mods: Mods::default() },
+    )
+    .await;
+    mgr.handle_human_input(
+        &pid,
+        HumanInput::Move { x: x_of("hello world", 3), y: 15.0 },
+    )
+    .await;
+    mgr.handle_human_input(
+        &pid,
+        HumanInput::Up { x: x_of("hello world", 3), y: 15.0, button: MouseButton::Left, mods: Mods::default() },
+    )
+    .await;
+    mgr.handle_human_input(&pid, HumanInput::Key { key: "Z".to_string(), mods: Mods::default() })
+        .await;
+    let value = mgr.current_value(&pid, &hit.selector).await;
+    assert_eq!(value, "hZlo world", "拖选段应被键入替换");
+    // 双击选词 'world' 并替换。
+    for _ in 0..2 {
+        mgr.handle_human_input(
+            &pid,
+            HumanInput::Down { x: x_of("hZlo world", 8), y: 15.0, button: MouseButton::Left, mods: Mods::default() },
+        )
+        .await;
+        mgr.handle_human_input(
+            &pid,
+            HumanInput::Up { x: x_of("hZlo world", 8), y: 15.0, button: MouseButton::Left, mods: Mods::default() },
+        )
+        .await;
+    }
+    mgr.handle_human_input(&pid, HumanInput::Key { key: "Y".to_string(), mods: Mods::default() })
+        .await;
+    let value = mgr.current_value(&pid, &hit.selector).await;
+    assert_eq!(value, "hZlo Y", "双击词应被替换");
+    web_control::clear(Engine::Lsm, &pid);
+    mgr.shutdown().await;
+}
+
+#[tokio::test]
+async fn ctrl组合键_全选替换与撤销重做() {
+    let mgr = LsmBrowserManager::new();
+    let pid = open_hidden(
+        &mgr,
+        "<input id='q' style='width:200px;height:30px' value='abc'>",
+    )
+    .await;
+    web_control::set_state(Engine::Lsm, &pid, ControlState::User, None, "test");
+    let hit = mgr.human_hit_test(&pid, 100.0, 15.0).await.expect("输入框应命中");
+    let x = hit.rect.0 + 3.0 + 1.0;
+    mgr.handle_human_input(
+        &pid,
+        HumanInput::Down { x, y: 15.0, button: MouseButton::Left, mods: Mods::default() },
+    )
+    .await;
+    mgr.handle_human_input(
+        &pid,
+        HumanInput::Up { x, y: 15.0, button: MouseButton::Left, mods: Mods::default() },
+    )
+    .await;
+    // Ctrl+A 全选 → 键入替换。
+    let ctrl = Mods { ctrl: true, ..Default::default() };
+    mgr.handle_human_input(&pid, HumanInput::Key { key: "a".to_string(), mods: ctrl }).await;
+    mgr.handle_human_input(&pid, HumanInput::Key { key: "X".to_string(), mods: Mods::default() })
+        .await;
+    assert_eq!(mgr.current_value(&pid, &hit.selector).await, "X");
+    // Ctrl+Z 撤销回 abc,Ctrl+Y 重做回 X。
+    mgr.handle_human_input(&pid, HumanInput::Key { key: "z".to_string(), mods: ctrl }).await;
+    assert_eq!(mgr.current_value(&pid, &hit.selector).await, "abc", "撤销应恢复旧值");
+    mgr.handle_human_input(&pid, HumanInput::Key { key: "y".to_string(), mods: ctrl }).await;
+    assert_eq!(mgr.current_value(&pid, &hit.selector).await, "X", "重做应恢复新值");
     web_control::clear(Engine::Lsm, &pid);
     mgr.shutdown().await;
 }

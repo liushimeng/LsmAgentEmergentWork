@@ -145,6 +145,71 @@ impl FontSet {
         text.chars().map(|c| self.char_width(c, size)).sum()
     }
 
+    /// 单行可见字符的 x 跨度序列((起点, 终点),行内相对坐标):
+    /// 逐字宽累加,超过 `max_w` 的字符截断不入列——与 `layout/widgets.rs::
+    /// emit_singleline_text` 的裁剪规则同源。文本光标映射(点击→char 索引)与
+    /// 控件内选区高亮都以本表为唯一几何依据(39 号 P2a)。
+    pub fn char_spans(&self, text: &str, size: f64, max_w: f64) -> Vec<(f64, f64)> {
+        let mut spans = Vec::with_capacity(text.chars().count());
+        let mut used = 0.0;
+        for ch in text.chars() {
+            let cw = self.char_width(ch, size);
+            if used + cw > max_w {
+                break;
+            }
+            spans.push((used, used + cw));
+            used += cw;
+        }
+        spans
+    }
+
+    /// 多行文本折行(行内逐字宽折行的**唯一真源**):`\r\n` 归一为 `\n` 后按
+    /// `\n` 断行,行内超过 `max_w` 折行,行数封顶 `max_rows`。返回
+    /// `(行文本, 行首 char 索引)`——索引相对归一化后的字符串,供文本光标
+    /// 行列映射(39 号 P2a)与 `layout/widgets.rs::emit_multiline_text` 绘制共用。
+    /// 尾随空行保留(编辑语义上 `\n` 结尾是真实空行;绘制空行无像素)。
+    pub fn wrap_text_rows(
+        &self,
+        text: &str,
+        size: f64,
+        max_w: f64,
+        max_rows: usize,
+    ) -> Vec<(String, usize)> {
+        let norm = text.replace("\r\n", "\n");
+        let mut out: Vec<(String, usize)> = Vec::new();
+        if max_rows == 0 {
+            return out;
+        }
+        let mut base = 0usize; // 当前段(\n 之间)起始 char 索引
+        for raw in norm.split('\n') {
+            let mut cur = String::new();
+            let mut row_start = base;
+            let mut used = 0.0;
+            for (i, ch) in raw.chars().enumerate() {
+                let cw = self.char_width(ch, size);
+                if !cur.is_empty() && used + cw > max_w {
+                    out.push((std::mem::take(&mut cur), row_start));
+                    row_start = base + i;
+                    used = 0.0;
+                    if out.len() >= max_rows {
+                        break;
+                    }
+                }
+                cur.push(ch);
+                used += cw;
+            }
+            if out.len() >= max_rows {
+                break;
+            }
+            out.push((cur, row_start));
+            if out.len() >= max_rows {
+                break;
+            }
+            base += raw.chars().count() + 1; // +1 = 段间 \n
+        }
+        out
+    }
+
     /// 单字形栅格化(光栅化器用):回退链选字 + 栅格缓存;
     /// 全链无覆盖返回 None(调用方跳过绘制,不再画 tofu 框)。
     pub(crate) fn rasterize_glyph(&self, ch: char, size: f32) -> Option<(fontdue::Metrics, Vec<u8>)> {

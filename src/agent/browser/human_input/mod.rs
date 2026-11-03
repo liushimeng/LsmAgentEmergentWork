@@ -10,24 +10,28 @@
 //! * 本模块做**控制权闸门**(agent 态忽略)+ **坐标命中**(`human_hit_test`) +
 //!   **复用既有 Agent 侧交互管线**(`api::click_inner` / JS 事件派发 /
 //!   控件原生语义 / 导航),不另造第二套事件系统;
-//! * 键盘语义(可打印字符追加 / Enter / Tab 焦点循环 / Esc / Backspace /
-//!   Space / 方向键 / PageUp·Down / Home·End)在无光标模型的边界内近似:
-//!   文本"尾部追加/删除"。
+//! * 键盘/剪贴板语义在 [`keyboard`] 子模块(P2a 起为光标/选区/编辑模型:
+//!   光标处插入删除、选区替换、Ctrl 词跳、Ctrl+A/Z/Y 等),编辑纯逻辑在
+//!   [`text_edit`] 子模块。
 //!
 //! 设计与阶段边界:`docs/MCP_Web_LsmAgentBrowser_Use/05-窗口交互与页面观察/
-//! 39-人类鼠标键盘交互与真浏览器输入链路设计.md`(IME/文本选区/原生右键
-//! 菜单等属阶段二)。
+//! 39-人类鼠标键盘交互与真浏览器输入链路设计.md`(IME/页面级自由选区/浏览器
+//! 级缩放属后续阶段)。
 
 use serde_json::{json, Value};
 
 use super::api;
-use super::document::{self, Document};
+use super::document::{self, CaretState, Document};
 use super::layout;
 use super::style::{MediaCtx, StyleEngine};
 use super::{page_bars, LsmBrowserManager, TabState};
 use crate::agent::web_control::{self, Engine};
 
 pub mod clipboard;
+pub mod text_edit;
+
+mod keyboard;
+pub use keyboard::{edit_op_for, EditOp};
 
 #[cfg(test)]
 mod tests;
@@ -120,7 +124,7 @@ pub struct HumanSession {
 struct PageInputState {
     /// 当前按下(mousedown 已发、mouseup 未到)。
     press: Option<PressState>,
-    /// 最近一次有效单击(双击判定窗口 500ms/6px)。
+    /// 最近一次有效单击(双击判定窗口 500ms/6px;`count` 供双击/三击语义)。
     last_click: Option<ClickMark>,
     /// 当前 hover 目标(selector;同元素不重排)。
     hover: Option<String>,
@@ -128,6 +132,12 @@ struct PageInputState {
     last_js_move_ms: u128,
     /// HTML5 drag 近似:按下后位移超阈值时已派发 dragstart。
     drag_started: bool,
+    /// P2a:文本控件内的按下(= 选区拖选会话;文本拖动不触发 HTML5 drag)。
+    text_drag: Option<TextDragState>,
+    /// P2a:拖选已发生(位移超阈值)——收尾不合成 click(浏览器语义)。
+    text_dragging: bool,
+    /// P2a:单控件撤销/重做历史(key = stable selector)。
+    edits: std::collections::HashMap<String, text_edit::EditHistory>,
 }
 
 impl HumanSession {
@@ -147,6 +157,16 @@ struct PressState {
 struct ClickMark {
     selector: String,
     at_ms: u128,
+    /// 连击计数(1=单击,2=双击,3+=三击全选)。
+    count: u32,
+}
+
+/// P2a:文本控件内按下后的选区拖选会话。
+#[derive(Debug, Clone)]
+struct TextDragState {
+    selector: String,
+    /// 选区锚点(按下点;Shift+点击沿用旧锚点)。
+    anchor: usize,
 }
 
 /// 命中结果(锁内收敛成 owned 数据,锁外零 DOM 句柄)。
@@ -161,6 +181,10 @@ struct HitTarget {
     hover_chain: Vec<String>,
     /// `label[for]` 转发目标 id(点 label 等价于点关联控件)。
     label_for: Option<String>,
+    /// 自身或祖先 `position:fixed`(fixed 子树坐标以视口为原点)。
+    fixed: bool,
+    /// 控件字号(文本光标映射用;非文本控件为 0)。
+    font_size: f64,
 }
 
 /// 焦点上下文(锁内收敛)。
@@ -174,7 +198,12 @@ struct FocusCtx {
 }
 
 /// 双击判定窗口(毫秒)与位移容差(px)。
-const DBLCLICK_MS: u128 = 500;
+///
+/// 窗口按**事件到达时刻**计(见 `handle_human_input`);值取 1500 而非浏览器
+/// 常见的 500:点击处理链(命中 + 重排 + JS 派发)在重站上可达数百毫秒,
+/// 串行投递(自动化用例)与人工事件积压都可能把相邻点击的到达间隔拉长,
+/// 500ms 会把正常双击/三击判成单击。
+const DBLCLICK_MS: u128 = 1500;
 const DBLCLICK_DIST: f64 = 6.0;
 /// 单击合成容差:down/up 位移超过此值视为拖拽而非点击。
 const CLICK_DIST: f64 = 6.0;
@@ -299,6 +328,9 @@ impl LsmBrowserManager {
     ///
     /// 返回小结 JSON(测试断言与日志用;查看器不消费回执)。
     pub async fn handle_human_input(&self, page_id: &str, ev: HumanInput) -> Value {
+        // 事件到达时刻:连击窗口按到达时刻计,不被命中/重排等处理延迟吃掉
+        //(人工连点与自动化用例同受益)。
+        let arrived = now_ms();
         if !enabled() {
             return json!({"ignored": true, "reason": "LAEW_HUMAN_INPUT=off"});
         }
@@ -337,7 +369,7 @@ impl LsmBrowserManager {
                 self.human_down(page_id, x, y, button, mods).await
             }
             HumanInput::Up { x, y, button, mods } => {
-                self.human_up(page_id, x, y, button, mods).await
+                self.human_up(page_id, x, y, button, mods, arrived).await
             }
             HumanInput::Wheel { x, y, dx, dy } => self.human_wheel(page_id, x, y, dx, dy).await,
             HumanInput::Key { key, mods } => {
@@ -358,8 +390,10 @@ impl LsmBrowserManager {
             let mut s = self.human.lock().unwrap_or_else(|p| p.into_inner());
             let st = s.page(pid);
             match (&st.press, &hit) {
+                // P2a:文本控件内拖动是选区拖选,不触发 HTML5 drag。
                 (Some(p), Some(h))
                     if p.selector.is_some()
+                        && st.text_drag.is_none()
                         && (p.x - x).hypot(p.y - y) > CLICK_DIST =>
                 {
                     let src = p.selector.clone().unwrap_or_default();
@@ -404,6 +438,40 @@ impl LsmBrowserManager {
             };
             if let Some(reply) = dispatch {
                 api::apply_js_reply(self, pid, &reply).await;
+            }
+        }
+        // P2a:文本控件内拖动 = 选区拖选(锚点固定、头随指针;浏览器语义)。
+        let text_drag = {
+            let s = self.human.lock().unwrap_or_else(|p| p.into_inner());
+            s.pages.get(pid).and_then(|st| st.text_drag.clone())
+        };
+        if let Some(td) = text_drag {
+            let pressed = {
+                let s = self.human.lock().unwrap_or_else(|p| p.into_inner());
+                s.pages.get(pid).map(|st| st.press.is_some()).unwrap_or(false)
+            };
+            if pressed {
+                if let Some(h) = hit.as_ref().filter(|h| h.selector == td.selector) {
+                    if let Some(idx) = self.text_caret_at(pid, h, x, y).await {
+                        let changed = {
+                            let mut inner = self.inner.lock().await;
+                            match inner.tabs.get_mut(pid).and_then(|t| t.form_caret.get_mut(&td.selector)) {
+                                Some(st) if st.pos != idx => {
+                                    st.pos = idx;
+                                    true
+                                }
+                                _ => false,
+                            }
+                        };
+                        if changed {
+                            {
+                                let mut s = self.human.lock().unwrap_or_else(|p| p.into_inner());
+                                s.page(pid).text_dragging = true;
+                            }
+                            api::relayout_and_push(self, pid).await;
+                        }
+                    }
+                }
             }
         }
         // 拖拽中的滑块:按住移动持续设值(浏览器拖拽滑块语义)。
@@ -491,8 +559,9 @@ impl LsmBrowserManager {
         json!({"x": x, "y": y, "hover": hit_sel, "restyled": changed})
     }
 
-    /// 按下:hover 链 + `:active` + 可聚焦元素聚焦 + JS mousedown。
-    async fn human_down(&self, pid: &str, x: f64, y: f64, button: MouseButton, _mods: Mods) -> Value {
+    /// 按下:hover 链 + `:active` + 可聚焦元素聚焦 + JS mousedown;
+    /// P2a:文本控件内按下 = 定位光标(Shift+点击 = 扩选)并武装选区拖选。
+    async fn human_down(&self, pid: &str, x: f64, y: f64, button: MouseButton, mods: Mods) -> Value {
         if button != MouseButton::Left {
             // 右键/中键在抬起时处理(contextmenu/新标签),按下不产生页面语义。
             return json!({"x": x, "y": y, "button": "non-left", "pressed": false});
@@ -500,16 +569,31 @@ impl LsmBrowserManager {
         let hit = self.human_hit_test(pid, x, y).await;
         {
             let mut s = self.human.lock().unwrap_or_else(|p| p.into_inner());
-            s.page(pid).press = Some(PressState {
+            let st = s.page(pid);
+            st.press = Some(PressState {
                 selector: hit.as_ref().map(|h| h.selector.clone()),
                 x,
                 y,
             });
+            st.text_drag = None;
+            st.text_dragging = false;
         }
         let Some(hit) = hit else {
             return json!({"x": x, "y": y, "hit": false, "pressed": true});
         };
         let focusable = is_focusable(&hit.tag, &hit.typ);
+        // P2a:文本控件点击定位光标(Shift+点击沿用旧锚点扩选)。
+        let mut caret_out = Value::Null;
+        if is_text_like(&hit.tag, &hit.typ) {
+            if let Some(st) = self.place_text_caret(pid, &hit, x, y, mods.shift).await {
+                {
+                    let mut s = self.human.lock().unwrap_or_else(|p| p.into_inner());
+                    s.page(pid).text_drag =
+                        Some(TextDragState { selector: hit.selector.clone(), anchor: st.anchor });
+                }
+                caret_out = json!({"pos": st.pos, "anchor": st.anchor});
+            }
+        }
         {
             let mut inner = self.inner.lock().await;
             if let Some(tab) = inner.tabs.get_mut(pid) {
@@ -536,15 +620,28 @@ impl LsmBrowserManager {
             api::apply_js_reply(self, pid, &reply).await;
         }
         api::relayout_and_push(self, pid).await;
-        json!({"x": x, "y": y, "hit": true, "selector": sel, "tag": tag, "focused": focusable})
+        json!({"x": x, "y": y, "hit": true, "selector": sel, "tag": tag, "focused": focusable, "caret": caret_out})
     }
 
     /// 抬起:同目标且位移小 → 完整点击语义(复用 `click_inner`);否则只发 mouseup。
-    async fn human_up(&self, pid: &str, x: f64, y: f64, button: MouseButton, mods: Mods) -> Value {
-        let (press, drag_started) = {
+    async fn human_up(
+        &self,
+        pid: &str,
+        x: f64,
+        y: f64,
+        button: MouseButton,
+        mods: Mods,
+        arrived: u128,
+    ) -> Value {
+        let (press, drag_started, text_drag, text_dragging) = {
             let mut s = self.human.lock().unwrap_or_else(|p| p.into_inner());
             let st = s.page(pid);
-            (st.press.take(), std::mem::take(&mut st.drag_started))
+            (
+                st.press.take(),
+                std::mem::take(&mut st.drag_started),
+                st.text_drag.take(),
+                std::mem::take(&mut st.text_dragging),
+            )
         };
         // 释放按下态(无论是否成点击)。
         {
@@ -601,6 +698,26 @@ impl LsmBrowserManager {
             MouseButton::Left => {}
         }
 
+        // P2a:文本拖选收尾 = 只落选区,不合成 click / HTML5 drag(浏览器语义:
+        // 文本框里按住拖动是选区手势,松开不算点击)。
+        if text_dragging {
+            if let Some(td) = &text_drag {
+                if let Some(h) = hit.as_ref().filter(|h| h.selector == td.selector) {
+                    if let Some(idx) = self.text_caret_at(pid, h, x, y).await {
+                        let mut inner = self.inner.lock().await;
+                        if let Some(tab) = inner.tabs.get_mut(pid) {
+                            tab.form_caret.insert(
+                                td.selector.clone(),
+                                CaretState { pos: idx, anchor: td.anchor },
+                            );
+                        }
+                    }
+                }
+                api::relayout_and_push(self, pid).await;
+                self.note_human_event(pid, "人工拖选(文本选区)");
+                return json!({"x": x, "y": y, "clicked": false, "selection": true});
+            }
+        }
         // 左键:同目标且位移小 → 点击;否则视为拖拽收尾。
         let same_target = press.selector.is_some()
             && hit.as_ref().map(|h| h.selector.as_str()) == press.selector.as_deref();
@@ -669,12 +786,13 @@ impl LsmBrowserManager {
         let sel = target.selector.clone();
         let tag = target.tag.clone();
 
-        // 双击判定(同目标、500ms/6px 内):点击后补发 dblclick 事件。
-        let now = now_ms();
-        let dbl = {
+        // 连击判定(同目标、500ms/6px 窗口):2 = 双击(选词 + JS dblclick),
+        // 3+ = 三击(全选);窗口外重新计数。时刻用事件到达时刻(`arrived`)。
+        let now = arrived;
+        let count = {
             let mut s = self.human.lock().unwrap_or_else(|p| p.into_inner());
             let st = s.page(pid);
-            let dbl = st
+            let within = st
                 .last_click
                 .as_ref()
                 .map(|m| {
@@ -683,16 +801,22 @@ impl LsmBrowserManager {
                         && dist <= DBLCLICK_DIST
                 })
                 .unwrap_or(false);
-            if dbl {
-                st.last_click = None;
+            if within {
+                let m = st.last_click.as_mut().unwrap();
+                m.count = (m.count + 1).min(3);
+                m.at_ms = now;
+                m.count
             } else {
                 st.last_click = Some(ClickMark {
                     selector: sel.clone(),
                     at_ms: now,
+                    count: 1,
                 });
+                1
             }
-            dbl
         };
+        let dbl = count == 2;
+        let triple = count >= 3;
 
         // input[type=range]:点击轨道 = 按 x 比例设值(先设值再走点击,
         // 页面 click 监听可读到新值)。
@@ -719,11 +843,41 @@ impl LsmBrowserManager {
                 api::apply_js_reply(self, pid, &reply).await;
             }
         }
-        let label = if dbl { "人工双击" } else { "人工单击" };
+        // P2a:双击选词 / 三击全选(仅文本控件;单击已在 down 落光标)。
+        if (dbl || triple) && text_drag.is_some() {
+            let value = self.current_value(pid, &sel).await;
+            let pos = {
+                let inner = self.inner.lock().await;
+                inner
+                    .tabs
+                    .get(pid)
+                    .and_then(|t| t.form_caret.get(&sel).map(|c| c.pos))
+                    .unwrap_or_else(|| value.chars().count())
+            };
+            let caret = if triple {
+                text_edit::select_all(&value)
+            } else {
+                text_edit::select_word(&value, pos)
+            };
+            {
+                let mut inner = self.inner.lock().await;
+                if let Some(tab) = inner.tabs.get_mut(pid) {
+                    tab.form_caret.insert(sel.clone(), caret);
+                }
+            }
+            api::relayout_and_push(self, pid).await;
+        }
+        let label = if triple {
+            "人工三击"
+        } else if dbl {
+            "人工双击"
+        } else {
+            "人工单击"
+        };
         self.note_human_event(pid, &format!("{label} ·{tag}"));
         match clicked {
-            Ok(out) => json!({"x": x, "y": y, "clicked": true, "selector": sel, "double": dbl, "outcome": out}),
-            Err(e) => json!({"x": x, "y": y, "clicked": false, "selector": sel, "error": e.message}),
+            Ok(out) => json!({"x": x, "y": y, "clicked": true, "selector": sel, "double": dbl, "count": count, "outcome": out}),
+            Err(e) => json!({"x": x, "y": y, "clicked": false, "selector": sel, "count": count, "error": e.message}),
         }
     }
 
@@ -776,347 +930,7 @@ impl LsmBrowserManager {
         json!({"mode": "viewport_scroll", "scrollX": sx, "scrollY": sy})
     }
 
-    /// 控件级剪贴板(⌘/Ctrl+C/X/V 与查看器右键菜单共用)。
-    ///
-    /// 无文本选区模型,语义按「聚焦文本控件整值」近似:复制 = 整值入剪贴板;
-    /// 剪切 = 复制 + 清空;粘贴 = 追加(与光标在末尾的键入模型一致)。
-    pub async fn handle_human_clip(&self, pid: &str, op: ClipOp) -> Value {
-        if !enabled() {
-            return json!({"ignored": true, "reason": "LAEW_HUMAN_INPUT=off"});
-        }
-        if web_control::enabled() && !web_control::is_user_control(Engine::Lsm, pid) {
-            return json!({"ignored": true, "reason": "agent_control"});
-        }
-        // 聚焦控件的文本态(锁内收敛)。
-        let ctx = {
-            let inner = self.inner.lock().await;
-            let Some(tab) = inner.tabs.get(pid) else {
-                return json!({"ignored": true, "reason": "page_gone"});
-            };
-            let doc = tab.document_with_state();
-            let focused = tab.focused.clone();
-            let mut text_like = false;
-            let mut editable = false;
-            if let Some(sel) = &focused {
-                if let Some(node) = doc.select(sel).ok().and_then(|v| v.into_iter().next()) {
-                    let tag = document::tag_name(&node);
-                    let typ = document::attr(&node, "type").unwrap_or_default().to_ascii_lowercase();
-                    let disabled = document::attr(&node, "disabled").is_some();
-                    let readonly = document::attr(&node, "readonly").is_some();
-                    text_like = matches!(tag.as_str(), "input" | "textarea")
-                        && (tag == "textarea"
-                            || !matches!(
-                                typ.as_str(),
-                                "checkbox" | "radio" | "range" | "file" | "button" | "submit"
-                                    | "reset" | "image" | "hidden" | "color" | "date" | "time"
-                                    | "datetime-local" | "month" | "week"
-                            ));
-                    editable = text_like && !disabled && !readonly;
-                }
-            }
-            (focused, text_like, editable)
-        };
-        let Some(focused) = ctx.0 else {
-            return json!({"op": op_name(op), "ignored": true, "reason": "no_focus"});
-        };
-        if !ctx.1 {
-            return json!({"op": op_name(op), "ignored": true, "reason": "no_text_focus"});
-        }
-        match op {
-            ClipOp::Copy => match clipboard::write_text(&self.current_value(pid, &focused).await) {
-                Ok(()) => {
-                    self.note_human_event(pid, "人工复制(整值)");
-                    json!({"op": "copy", "ok": true, "selector": focused})
-                }
-                Err(e) => json!({"op": "copy", "ok": false, "error": e}),
-            },
-            ClipOp::Cut => {
-                if !ctx.2 {
-                    return json!({"op": "cut", "ignored": true, "reason": "readonly_or_disabled"});
-                }
-                let value = self.current_value(pid, &focused).await;
-                match clipboard::write_text(&value) {
-                    Ok(()) => {
-                        self.set_runtime_value(pid, &focused, "").await;
-                        if let Some(reply) =
-                            api::js_dispatch_bounded(self, pid, &focused, "input").await
-                        {
-                            api::apply_js_reply(self, pid, &reply).await;
-                        }
-                        api::relayout_and_push(self, pid).await;
-                        self.note_human_event(pid, "人工剪切");
-                        json!({"op": "cut", "ok": true, "selector": focused})
-                    }
-                    Err(e) => json!({"op": "cut", "ok": false, "error": e}),
-                }
-            }
-            ClipOp::Paste => {
-                if !ctx.2 {
-                    return json!({"op": "paste", "ignored": true, "reason": "readonly_or_disabled"});
-                }
-                match clipboard::read_text() {
-                    Ok(text) if !text.is_empty() => {
-                        self.note_human_event(pid, "人工粘贴");
-                        self.append_text(pid, &focused, &text, "paste").await
-                    }
-                    Ok(_) => json!({"op": "paste", "ok": false, "error": "剪贴板为空"}),
-                    Err(e) => json!({"op": "paste", "ok": false, "error": e}),
-                }
-            }
-        }
-    }
-
-    /// 键盘:组合键(⌘/Ctrl+C/X/V)→ 控件级剪贴板;其余先派 JS keydown
-    /// (带 e.key/e.keyCode 载荷),再按原生语义路由,收尾尽力补发 keyup。
-    async fn human_key(&self, pid: &str, key: &str, mods: &Mods) -> Value {
-        // 39 号设计文档阶段二:剪贴板组合键在宿主侧消化(查看器层已拦截
-        // Cmd/Ctrl+R 等浏览器级快捷键)。
-        if let Some(op) = clip_op_for(key, mods) {
-            return self.handle_human_clip(pid, op).await;
-        }
-        // 其余组合键(非纯 Shift)不产生页面文本/导航语义。
-        if mods.combo() {
-            return json!({"key": key, "ignored": true, "reason": "combo"});
-        }
-        let out = Box::pin(self.human_key_inner(pid, key, mods)).await;
-        // keyup 尽力派发(Enter 提交等路径可能已换页,自然 no-op)。
-        let focused = {
-            let inner = self.inner.lock().await;
-            inner.tabs.get(pid).and_then(|t| t.focused.clone())
-        };
-        if let Some(sel) = focused {
-            if let Some(reply) = api::js_dispatch_bounded_with(
-                self,
-                pid,
-                &sel,
-                "keyup",
-                Some(key_payload(key, mods)),
-            )
-            .await
-            {
-                api::apply_js_reply(self, pid, &reply).await;
-            }
-        }
-        out
-    }
-
-    /// 键盘原生语义路由(keydown 已派发后的默认行为)。
-    async fn human_key_inner(&self, pid: &str, key: &str, mods: &Mods) -> Value {
-        // 聚焦上下文(锁内收敛;文档对象不跨 await 存活)。
-        let ctx = {
-            let inner = self.inner.lock().await;
-            let Some(tab) = inner.tabs.get(pid) else {
-                return json!({"ignored": true});
-            };
-            let doc = tab.document_with_state();
-            let focused = tab.focused.clone();
-            let (mut ftag, mut ftyp) = (String::new(), String::new());
-            let (mut text_like, mut editable) = (false, false);
-            if let Some(sel) = &focused {
-                if let Some(node) = doc.select(sel).ok().and_then(|v| v.into_iter().next()) {
-                    ftag = document::tag_name(&node);
-                    ftyp = document::attr(&node, "type").unwrap_or_default().to_ascii_lowercase();
-                    let disabled = document::attr(&node, "disabled").is_some();
-                    let readonly = document::attr(&node, "readonly").is_some();
-                    text_like = matches!(ftag.as_str(), "input" | "textarea")
-                        && (ftag == "textarea"
-                            || !matches!(
-                                ftyp.as_str(),
-                                "checkbox" | "radio" | "range" | "file" | "button" | "submit"
-                                    | "reset" | "image" | "hidden" | "color" | "date" | "time"
-                                    | "datetime-local" | "month" | "week"
-                            ));
-                    editable = text_like && !disabled && !readonly;
-                }
-            }
-            FocusCtx {
-                focused,
-                ftag,
-                ftyp,
-                text_like,
-                editable,
-                focusables: focusable_selectors(tab, &doc),
-            }
-        };
-        // JS keydown(阶段二起带 e.key/e.keyCode/修饰键载荷)。
-        if let Some(sel) = ctx.focused.clone() {
-            if let Some(reply) = api::js_dispatch_bounded_with(
-                self,
-                pid,
-                &sel,
-                "keydown",
-                Some(key_payload(key, mods)),
-            )
-            .await
-            {
-                api::apply_js_reply(self, pid, &reply).await;
-            }
-        }
-        match key {
-            "Enter" if ctx.text_like && ctx.ftag == "textarea" && ctx.editable => {
-                let sel = ctx.focused.clone().unwrap();
-                return self.append_text(pid, &sel, "\n", "Enter").await;
-            }
-            "Enter"
-                if ctx.ftag == "button"
-                    || (ctx.ftag == "input"
-                        && matches!(ctx.ftyp.as_str(), "button" | "submit" | "reset")) =>
-            {
-                let sel = ctx.focused.clone().unwrap();
-                let out = api::click_inner(self, pid, &json!({"selector": sel}), "human").await;
-                self.note_human_event(pid, "人工 Enter 触发按钮");
-                return json!({"key": key, "activated": true, "outcome": out.ok()});
-            }
-            // 表单默认提交路径(submit 事件可被 preventDefault 拦截)。
-            "Enter" => {
-                let params = match &ctx.focused {
-                    Some(sel) => json!({"key": "Enter", "selector": sel}),
-                    None => json!({"key": "Enter"}),
-                };
-                let out = api::act_key_press(self, pid, &params, &json!({})).await;
-                return json!({"key": key, "outcome": out.ok()});
-            }
-            "Escape" => {
-                // 收起展开的 select 面板(light dismiss)→ 关闭顶层 dialog。
-                let panels = {
-                    let mut inner = self.inner.lock().await;
-                    let Some(tab) = inner.tabs.get_mut(pid) else {
-                        return json!({"key": key, "ignored": true});
-                    };
-                    let n = tab.widget_open.len();
-                    tab.widget_open.clear();
-                    n
-                };
-                let dialog = api::act_key_press(self, pid, &json!({"key": "Escape"}), &json!({})).await;
-                api::relayout_and_push(self, pid).await;
-                return json!({"key": key, "panels_closed": panels, "dialog": dialog.ok()});
-            }
-            "Tab" => {
-                let next = next_focusable(&ctx.focusables, ctx.focused.as_deref(), !mods.shift);
-                let Some(next) = next else {
-                    return json!({"key": key, "moved": false});
-                };
-                {
-                    let mut inner = self.inner.lock().await;
-                    if let Some(tab) = inner.tabs.get_mut(pid) {
-                        if let Some(old) = tab.focused.take() {
-                            api::set_pseudo_state(tab, &old, api::PseudoDim::Focus, false);
-                        }
-                        tab.focused = Some(next.clone());
-                        api::set_pseudo_state(tab, &next, api::PseudoDim::Focus, true);
-                    }
-                }
-                api::relayout_and_push(self, pid).await;
-                return json!({"key": key, "moved": true, "focused": next, "backward": mods.shift});
-            }
-            "Backspace" if ctx.editable => {
-                let sel = ctx.focused.clone().unwrap();
-                return self.pop_text(pid, &sel).await;
-            }
-            "Space" if ctx.editable => {
-                let sel = ctx.focused.clone().unwrap();
-                return self.append_text(pid, &sel, " ", "Space").await;
-            }
-            "Space"
-                if ctx.ftag == "button"
-                    || (ctx.ftag == "input"
-                        && matches!(
-                            ctx.ftyp.as_str(),
-                            "button" | "submit" | "reset" | "checkbox" | "radio"
-                        )) =>
-            {
-                let sel = ctx.focused.clone().unwrap();
-                let out = api::click_inner(self, pid, &json!({"selector": sel}), "human").await;
-                self.note_human_event(pid, "人工 Space 激活控件");
-                return json!({"key": key, "activated": true, "outcome": out.ok()});
-            }
-            "Space" => {
-                return self.scroll_viewport_by(pid, 0.0, -PAGE_RATIO).await;
-            }
-            "ArrowUp" | "ArrowDown" => {
-                let dir = if key == "ArrowUp" { -1 } else { 1 };
-                if ctx.ftag == "select" {
-                    return self.step_select(pid, ctx.focused.as_deref().unwrap_or(""), dir).await;
-                }
-                if ctx.ftag == "input" && ctx.ftyp == "range" {
-                    return self.step_range(pid, ctx.focused.as_deref().unwrap_or(""), dir).await;
-                }
-                if ctx.focused.is_none() {
-                    return self.scroll_viewport_by(pid, 0.0, -(dir as f64)).await;
-                }
-                return json!({"key": key, "ignored": true});
-            }
-            "ArrowLeft" | "ArrowRight" => {
-                let dir = if key == "ArrowRight" { 1 } else { -1 };
-                if ctx.ftag == "input" && ctx.ftyp == "range" {
-                    return self.step_range(pid, ctx.focused.as_deref().unwrap_or(""), dir).await;
-                }
-                if ctx.focused.is_none() {
-                    return self.scroll_viewport_by(pid, dir as f64, 0.0).await;
-                }
-                return json!({"key": key, "ignored": true});
-            }
-            "PageUp" | "PageDown" => {
-                let dy = if key == "PageDown" { -PAGE_RATIO } else { PAGE_RATIO };
-                return self.scroll_viewport_by(pid, 0.0, dy).await;
-            }
-            "Home" => {
-                return self.scroll_viewport_to(pid, 0.0, 0.0).await;
-            }
-            "End" => {
-                let page_h = {
-                    let inner = self.inner.lock().await;
-                    inner
-                        .tabs
-                        .get(pid)
-                        .map(|t| t.layout.page_height() - t.viewport.height as f64)
-                        .unwrap_or(0.0)
-                };
-                return self.scroll_viewport_to(pid, 0.0, page_h.max(0.0)).await;
-            }
-            "Delete" => {
-                return json!({"key": key, "ignored": true, "reason": "no_caret_model"});
-            }
-            _ => {}
-        }
-        // 可打印单字符:追加进聚焦文本控件(无光标模型 → 尾部追加)。
-        if key.chars().count() == 1 {
-            if ctx.editable {
-                let sel = ctx.focused.clone().unwrap();
-                let ch = key.chars().next().unwrap();
-                let piece = if mods.shift { shift_char(ch).to_string() } else { ch.to_string() };
-                return self.append_text(pid, &sel, &piece, "char").await;
-            }
-            return json!({"key": key, "ignored": true, "reason": "no_text_focus"});
-        }
-        json!({"key": key, "ignored": true})
-    }
-
-    // ---------- 键盘/拖拽的底层小动作 ----------
-
-    /// 追加文本到聚焦控件的运行时值并派发 input 事件。
-    async fn append_text(&self, pid: &str, selector: &str, piece: &str, via: &str) -> Value {
-        let current = self.current_value(pid, selector).await;
-        let next = format!("{current}{piece}");
-        self.set_runtime_value(pid, selector, &next).await;
-        if let Some(reply) = api::js_dispatch_bounded(self, pid, selector, "input").await {
-            api::apply_js_reply(self, pid, &reply).await;
-        }
-        api::relayout_and_push(self, pid).await;
-        json!({"via": via, "selector": selector, "value_len": next.chars().count()})
-    }
-
-    /// 删除聚焦文本控件值的最后一个字符(尾部近似,无光标模型)。
-    async fn pop_text(&self, pid: &str, selector: &str) -> Value {
-        let current = self.current_value(pid, selector).await;
-        let next: String = current.chars().take(current.chars().count().saturating_sub(1)).collect();
-        self.set_runtime_value(pid, selector, &next).await;
-        if let Some(reply) = api::js_dispatch_bounded(self, pid, selector, "input").await {
-            api::apply_js_reply(self, pid, &reply).await;
-        }
-        api::relayout_and_push(self, pid).await;
-        json!({"via": "Backspace", "selector": selector, "value_len": next.chars().count()})
-    }
+    // ---------- 运行时值 / 光标映射 / 视口滚动(鼠标与键盘共用) ----------
 
     /// 写运行时表单值(form_values)。
     async fn set_runtime_value(&self, pid: &str, selector: &str, value: &str) {
@@ -1141,6 +955,86 @@ impl LsmBrowserManager {
             .and_then(|v| v.into_iter().next())
             .and_then(|n| document::attr(&n, "value"))
             .unwrap_or_default()
+    }
+
+    /// P2a:点击 → 文本控件内 char 索引(与控件文本绘制同源的字体度量;
+    /// fixed 子树免补滚动;password 按等宽子弹串映射,索引与值 1:1)。
+    async fn text_caret_at(&self, pid: &str, hit: &HitTarget, x: f64, y: f64) -> Option<usize> {
+        let inner = self.inner.lock().await;
+        let tab = inner.tabs.get(pid)?;
+        if hit.font_size <= 0.0 {
+            return None;
+        }
+        let doc = tab.document_with_state();
+        let mut value = tab
+            .form_values
+            .get(&hit.selector)
+            .cloned()
+            .or_else(|| {
+                doc.select(&hit.selector)
+                    .ok()
+                    .and_then(|v| v.into_iter().next())
+                    .and_then(|n| {
+                        if hit.tag == "textarea" {
+                            Some(
+                                document::attr(&n, "value")
+                                    .unwrap_or_else(|| n.text_contents()),
+                            )
+                        } else {
+                            document::attr(&n, "value")
+                        }
+                    })
+            })
+            .unwrap_or_default();
+        if hit.tag == "textarea" {
+            value = value.replace("\r\n", "\n");
+        }
+        let display = if hit.typ == "password" {
+            "•".repeat(value.chars().count())
+        } else {
+            value
+        };
+        let size = hit.font_size;
+        let x_rel = (if hit.fixed { x - hit.rect.0 } else { x + tab.scroll_x - hit.rect.0 }) - 3.0;
+        if hit.tag == "textarea" {
+            let y_rel = (if hit.fixed { y - hit.rect.1 } else { y + tab.scroll_y - hit.rect.1 }) - 2.0;
+            let rows = self.font.wrap_text_rows(&display, size, (hit.rect.2 - 6.0).max(1.0), usize::MAX);
+            Some(text_edit::index_from_rows(
+                &self.font,
+                &rows,
+                size,
+                x_rel,
+                y_rel,
+                size * 1.35,
+            ))
+        } else {
+            let spans = self.font.char_spans(&display, size, (hit.rect.2 - 6.0).max(0.0));
+            Some(text_edit::index_from_spans(&spans, x_rel))
+        }
+    }
+
+    /// P2a:落点击光标(Shift+点击 = 沿用旧锚点扩选),返回新光标态。
+    async fn place_text_caret(
+        &self,
+        pid: &str,
+        hit: &HitTarget,
+        x: f64,
+        y: f64,
+        extend: bool,
+    ) -> Option<CaretState> {
+        let idx = self.text_caret_at(pid, hit, x, y).await?;
+        let mut inner = self.inner.lock().await;
+        let tab = inner.tabs.get_mut(pid)?;
+        let st = if extend {
+            CaretState {
+                pos: idx,
+                anchor: tab.form_caret.get(&hit.selector).map(|c| c.anchor).unwrap_or(idx),
+            }
+        } else {
+            CaretState::collapsed(idx)
+        };
+        tab.form_caret.insert(hit.selector.clone(), st);
+        Some(st)
     }
 
     /// 视口滚动(offset 为增量 px;dy 正 = 向上)。
@@ -1168,95 +1062,6 @@ impl LsmBrowserManager {
         drop(inner);
         self.push_frame_if_headed(pid).await;
         json!({"scrollX": x, "scrollY": y})
-    }
-
-    /// select 上下键换项(文档序 ±1,派发 change)。
-    async fn step_select(&self, pid: &str, selector: &str, dir: i32) -> Value {
-        let picked = {
-            let inner = self.inner.lock().await;
-            let Some(tab) = inner.tabs.get(pid) else {
-                return json!({"ignored": true});
-            };
-            let doc = tab.document_with_state();
-            let Some(node) = doc.select(selector).ok().and_then(|v| v.into_iter().next()) else {
-                return json!({"ignored": true});
-            };
-            // 只取该 select 直接的 option(文档序)。
-            let options: Vec<(String, String)> = node
-                .select("option")
-                .ok()
-                .map(|os| {
-                    os.into_iter()
-                        .map(|o| {
-                            let o = o.as_node();
-                            let label = document::collapse_ws(&o.text_contents());
-                            let value =
-                                document::attr(o, "value").unwrap_or_else(|| label.clone());
-                            (value, label)
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            if options.is_empty() {
-                return json!({"key": "select", "ignored": true});
-            }
-            let cur_value = tab
-                .form_values
-                .get(selector)
-                .cloned()
-                .or_else(|| {
-                    node.select("option")
-                        .ok()
-                        .and_then(|os| {
-                            os.into_iter()
-                                .find(|o| document::attr(o.as_node(), "selected").is_some())
-                        })
-                        .and_then(|o| document::attr(o.as_node(), "value"))
-                })
-                .unwrap_or_else(|| options[0].0.clone());
-            let cur_idx = options
-                .iter()
-                .position(|(v, _)| *v == cur_value)
-                .unwrap_or(0) as i64;
-            let next = (cur_idx + dir as i64).clamp(0, options.len() as i64 - 1) as usize;
-            options[next].clone()
-        };
-        self.set_runtime_value(pid, selector, &picked.0).await;
-        if let Some(reply) = api::js_dispatch_bounded(self, pid, selector, "change").await {
-            api::apply_js_reply(self, pid, &reply).await;
-        }
-        api::relayout_and_push(self, pid).await;
-        json!({"selector": selector, "value": picked.0, "label": picked.1})
-    }
-
-    /// range 步进(ArrowLeft/Right)。
-    async fn step_range(&self, pid: &str, selector: &str, dir: i32) -> Value {
-        let next_val = {
-            let inner = self.inner.lock().await;
-            let Some(tab) = inner.tabs.get(pid) else {
-                return json!({"ignored": true});
-            };
-            let doc = tab.document_with_state();
-            let Some(node) = doc.select(selector).ok().and_then(|v| v.into_iter().next()) else {
-                return json!({"ignored": true});
-            };
-            let (min, max, step) = range_params(&node);
-            let cur = tab
-                .form_values
-                .get(selector)
-                .cloned()
-                .or_else(|| document::attr(&node, "value"))
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(min + (max - min) / 2.0);
-            let next = (cur + dir as f64 * step).clamp(min.min(max), max.max(min));
-            format_num(next)
-        };
-        self.set_runtime_value(pid, selector, &next_val).await;
-        if let Some(reply) = api::js_dispatch_bounded(self, pid, selector, "input").await {
-            api::apply_js_reply(self, pid, &reply).await;
-        }
-        api::relayout_and_push(self, pid).await;
-        json!({"selector": selector, "value": next_val})
     }
 
     /// input[type=range] 点击/拖拽:按视口 x 在轨道矩形内的比例设值(吸附 step)。
@@ -1420,6 +1225,11 @@ impl LsmBrowserManager {
             } else {
                 None
             };
+            let font_size = if is_text_like(&tag, &typ) {
+                node_font_size(&engine, &node)
+            } else {
+                0.0
+            };
             resolved.push(HitTarget {
                 selector: b.selector.clone(),
                 tag,
@@ -1427,6 +1237,8 @@ impl LsmBrowserManager {
                 rect: (b.x, b.y, b.w, b.h),
                 hover_chain: api::hover_chain_selectors(&node),
                 label_for,
+                fixed,
+                font_size,
             });
             if resolved.len() >= 6 {
                 break;
@@ -1522,6 +1334,36 @@ fn is_focusable(tag: &str, typ: &str) -> bool {
         "select" | "textarea" | "button" | "summary" => true,
         _ => false,
     }
+}
+
+/// 文本类控件判定(input 文本系 / textarea;光标/选区/编辑语义的适用面,
+/// 与 `keyboard::collect_text_ctx` 同口径)。
+pub(crate) fn is_text_like(tag: &str, typ: &str) -> bool {
+    matches!(tag, "input" | "textarea")
+        && (tag == "textarea"
+            || !matches!(
+                typ,
+                "checkbox" | "radio" | "range" | "file" | "button" | "submit" | "reset"
+                    | "image" | "hidden" | "color" | "date" | "time" | "datetime-local"
+                    | "month" | "week"
+            ))
+}
+
+/// 节点计算字号(从根下推继承链;文本光标映射与键路由折行共用)。
+fn node_font_size(engine: &StyleEngine, node: &kuchikiki::NodeRef) -> f64 {
+    let mut chain: Vec<kuchikiki::NodeRef> = Vec::new();
+    let mut cur = Some(node.clone());
+    while let Some(n) = cur {
+        if n.as_element().is_some() {
+            chain.push(n.clone());
+        }
+        cur = n.parent();
+    }
+    let mut st = engine.initial_style();
+    for n in chain.iter().rev() {
+        st = engine.computed(n, &st);
+    }
+    st.font_size.max(8.0)
 }
 
 /// 文档序可聚焦选择器列表(有布局盒才算;tabindex 排序未建模,按文档序近似)。

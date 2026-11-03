@@ -421,6 +421,7 @@ pub(crate) fn emit_form_control_text(
                         text = "•".repeat(text.chars().count());
                     }
                     emit_singleline_text(ctx, &text, color, style, bx, by, w, h, tf);
+                    emit_edit_overlay(ctx, node, style, bx, by, w, h, tf, false);
                 }
                 // 第 41 轮:数字输入框 = 文本 + 右端微调箭头。
                 "number" => {
@@ -429,7 +430,7 @@ pub(crate) fn emit_form_control_text(
                         text = "•".repeat(text.chars().count());
                     }
                     let arrow_w = 13.0_f64.min(w * 0.3);
-                    emit_singleline_text(ctx, 
+                    emit_singleline_text(ctx,
                         &text,
                         color,
                         style,
@@ -439,6 +440,7 @@ pub(crate) fn emit_form_control_text(
                         h,
                         tf,
                     );
+                    emit_edit_overlay(ctx, node, style, bx, by, (w - arrow_w).max(1.0), h, tf, false);
                     emit_number_spinner(ctx, style, color, bx, by, w, h, tf);
                 }
                 // 第 41 轮:滑块 —— 轨道 + 拇指(内置 UI 独立计算几何)。
@@ -554,6 +556,7 @@ pub(crate) fn emit_form_control_text(
                 (text, style.color)
             };
             emit_multiline_text(ctx, &text, color, style, bx, by, w, h, tf);
+            emit_edit_overlay(ctx, node, style, bx, by, w, h, tf, true);
         }
         "progress" => emit_meter_like(ctx, node, style, bx, by, w, h, tf, false),
         "meter" => emit_meter_like(ctx, node, style, bx, by, w, h, tf, true),
@@ -838,6 +841,139 @@ pub(crate) fn emit_multiline_text(
 };
         ctx.emit_text(&line, tf, &[]);
         ctx.lines.push(line);
+    }
+}
+
+/// 39 号 P2a:文本控件的编辑覆盖层——光标条 + 选区高亮。
+///
+/// 仅带 `data-lsm-caret`(人工点击/聚焦过)的控件绘制;几何与
+/// [`emit_singleline_text`] / [`emit_multiline_text`] 同源(文本起排 `bx+3`、
+/// 可用宽 `w-6`、字号 `font_size.max(8)`、行高 `1.35×`),宽度按**显示串**
+/// 测量(password = 等宽子弹串,索引与值 1:1)。选区先画(半透明蓝底,
+/// Background rank 天然压在文字下),光标条叠加其上;仅聚焦时画光标。
+/// 近似边界:单行超宽文本无横向滚动可见性,越界光标/选区段夹到可视右缘。
+#[allow(clippy::too_many_arguments)]
+fn emit_edit_overlay(
+    ctx: &mut LayoutCtx<'_>,
+    node: &NodeRef,
+    style: &ComputedStyle,
+    bx: f64,
+    by: f64,
+    w: f64,
+    h: f64,
+    tf: Option<Affine>,
+    multiline: bool,
+) {
+    let Some(pos) = document::attr(node, document::ATTR_CARET)
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    else {
+        return;
+    };
+    let anchor = document::attr(node, document::ATTR_SEL)
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(pos);
+    let focused = document::attr(node, document::ATTR_PSEUDO_FOCUS).is_some();
+    let size = style.font_size.max(8.0);
+    let line_height = size * 1.35;
+
+    let value = if document::tag_name(node) == "textarea" {
+        document::attr(node, "value").unwrap_or_else(|| node.text_contents())
+    } else {
+        document::attr(node, "value").unwrap_or_default()
+    };
+    let value = value.replace("\r\n", "\n");
+    let typ = document::attr(node, "type").unwrap_or_default().to_ascii_lowercase();
+    let display = if typ == "password" {
+        "•".repeat(value.chars().count())
+    } else {
+        value
+    };
+    let len = display.chars().count();
+    let pos = pos.min(len);
+    let anchor = anchor.min(len);
+    let (sel_a, sel_b) = if pos <= anchor { (pos, anchor) } else { (anchor, pos) };
+    let has_sel = sel_a < sel_b;
+    let x0 = bx + 3.0;
+    let max_w = (w - 6.0).max(0.0);
+    // 选区高亮(系统选区蓝近似,半透明)与光标条(文字色)。
+    let sel_color: [u8; 3] = [60, 130, 235];
+    let sel_alpha: u8 = 110;
+    let caret_w = 1.5_f64.max(size * 0.08);
+    let caret_h = size * 1.2;
+
+    if multiline {
+        let wrap_w = (w - 6.0).max(1.0);
+        let max_rows = (((h - 4.0) / line_height).floor() as usize).max(1);
+        let rows = ctx.font().wrap_text_rows(&display, size, wrap_w, max_rows);
+        for (i, (row, start)) in rows.iter().enumerate() {
+            let y = by + 2.0 + i as f64 * line_height;
+            let n = row.chars().count();
+            let spans = ctx.font().char_spans(row, size, max_w);
+            if has_sel {
+                let s = sel_a.max(*start);
+                let e = sel_b.min(*start + n);
+                if s < e {
+                    let sc = (s - *start).min(spans.len());
+                    let ec = (e - *start).min(spans.len());
+                    if sc < ec {
+                        let x = x0 + spans[sc].0;
+                        let ww = (spans[ec - 1].1 - spans[sc].0).max(1.0);
+                        ctx.push_widget_fill(style, sel_color, sel_alpha, x, y, ww, line_height, tf);
+                    }
+                }
+            }
+            if focused && pos >= *start && pos <= *start + n {
+                let col = pos - *start;
+                let x = if col == 0 {
+                    0.0
+                } else if col <= spans.len() {
+                    spans[col - 1].1
+                } else {
+                    spans.last().map(|s| s.1).unwrap_or(0.0)
+                };
+                ctx.push_widget_fill(
+                    style,
+                    style.color,
+                    255,
+                    x0 + x,
+                    y + ((line_height - caret_h) / 2.0).max(0.0),
+                    caret_w,
+                    caret_h,
+                    tf,
+                );
+            }
+        }
+    } else {
+        let y = by + ((h - line_height) / 2.0).max(1.0);
+        let spans = ctx.font().char_spans(&display, size, max_w);
+        if has_sel {
+            let sc = sel_a.min(spans.len());
+            let ec = sel_b.min(spans.len());
+            if sc < ec {
+                let x = x0 + spans[sc].0;
+                let ww = (spans[ec - 1].1 - spans[sc].0).max(1.0);
+                ctx.push_widget_fill(style, sel_color, sel_alpha, x, y, ww, line_height, tf);
+            }
+        }
+        if focused {
+            let x = if pos == 0 {
+                0.0
+            } else if pos <= spans.len() {
+                spans[pos - 1].1
+            } else {
+                spans.last().map(|s| s.1).unwrap_or(0.0)
+            };
+            ctx.push_widget_fill(
+                style,
+                style.color,
+                255,
+                x0 + x,
+                y + ((line_height - caret_h) / 2.0).max(0.0),
+                caret_w,
+                caret_h,
+                tf,
+            );
+        }
     }
 }
 
