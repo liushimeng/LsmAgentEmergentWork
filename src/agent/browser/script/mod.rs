@@ -376,8 +376,11 @@ const MAX_DRAIN_ROUNDS: u32 = 6;
 // 含 195KB 反爬脚本的站点不够:实测在脚本链中途被截断,地图内核不启动。
 // 120s 又对京东不够:pc-tk.js(50KB 混淆加密,签名 SDK)单脚本在 Boa 下
 // 实测 191s,首屏全链 222s;120s 会在 pc-tk 中途掐断,后续搜索请求无签名
-// (2026-10-30 京东实测)。快站脚本跑完即收工,不受该上限影响。
-const PIPELINE_BUDGET_MS: u64 = 240_000;
+// (2026-10-30 京东实测)。240s 对猎聘 SEO 首页又不够:hero 是空挂载点、
+// 全靠定时器水合,240s 在水合中途掐断 → 首页 hero 整幅背景色空块
+// (2026-11-04 真机实测 pending=0 但动作流仍在)。提到 360s。快站脚本跑完
+// 即收工,不受该上限影响。
+const PIPELINE_BUDGET_MS: u64 = 360_000;
 
 /// 预算顺延单次时长与次数上限(到点仍有待取回脚本时使用)。
 pub(crate) const PIPELINE_EXTENSION_MS: u64 = 60_000;
@@ -457,6 +460,10 @@ pub(crate) async fn run_pipeline(
     // 预算顺延次数:到点时若仍有**待取回脚本**(不是空转的定时器),说明
     // 页面 UI chunk 还没装完,直接截断会让首页楼层整片缺失。每次顺延 60s,
     // 最多两次(总上限 budget + 120s),只给「有脚本待办」的情况。
+    // (2026-11-04 猎聘首页实测:水合中页面靠**基线预算**放大轮等待窗口覆盖
+    // ——轮等待=剩余墙钟,基线 360s 时水合轮有 120s+;「有动作就顺延」的
+    // 广播判据分不清「卡死脚本的部分动作」与「水合推进」,会破坏京东
+    // 超时截断+补泵语义,故不做。)
     let mut budget_extensions: u32 = 0;
     // 实际执行轮次记账(进 `out.rounds` → open 响应 timings;真机排障用)。
     let mut rounds_done: u32 = 0;
@@ -773,6 +780,7 @@ pub(crate) async fn run_pipeline(
         } else {
             idle_rounds = 0;
         }
+
         // 页面静默标志:事件循环跑完仍无待执行定时器。
         page_idle = reply.outcome.pending_timers == 0;
         // 外链执行记账(含执行抛错的:真实浏览器里抛错的 script 同样不会重跑)。

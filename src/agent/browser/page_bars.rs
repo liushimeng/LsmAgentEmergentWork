@@ -369,6 +369,76 @@ fn draw_control_veil(pixmap: &mut Pixmap, font: &FontSet, vw: f32, vh: f32) {
     );
 }
 
+/// 遮罩软化后的透明度:白色遮罩按此系数与底层内容混合(0.25 白纱 ≈ 底层
+/// 内容亮度保留 75%),登录表单的深色文字仍可辨认。
+pub(crate) const OVERLAY_SOFTEN_OPACITY: f64 = 0.25;
+
+/// 站点加载/风控遮罩软化(仅查看器帧):把 `inspect::is_loading_overlay_item`
+/// 命中的「整幅不透明遮罩」透明度降到 [`OVERLAY_SOFTEN_OPACITY`]。
+///
+/// 用户控制态(`request_human` 交还人工)下,站点自身的全屏 loading 遮罩
+/// (实测猎聘 `/zhaopin/` 的 `.searchjobs-spin-loading-box` 白底 z=9999:
+/// 搜索 API 400 → React loading 永真 → 遮罩永驻)会让人工完全看不见遮罩下的
+/// 登录表单/验证码 —— 人工只能对着白屏空点「我已完成」,HITL 流程死锁。
+/// 软化后人工看得见即可操作:点击命中按面积升序,小表单元素天然优先于
+/// 全屏遮罩,不受遮罩影响。**只在查看器帧调用**,取证截图路径
+/// (`screenshot_locked`)不经过本函数,证据图保持站点原貌。
+///
+/// 返回软化的项数(0=无遮罩,调用方据此决定是否叠提示胶囊)。
+pub(crate) fn soften_loading_overlays(
+    display: &mut [super::render::display::DisplayItem],
+    vp_w: f64,
+    vp_h: f64,
+) -> usize {
+    let Some(content_max_z) = super::inspect::loading_overlay_content_max_z(display) else {
+        return 0;
+    };
+    let mut softened = 0usize;
+    for it in display.iter_mut() {
+        if super::inspect::is_loading_overlay_item(it, vp_w, vp_h, content_max_z) {
+            it.opacity = OVERLAY_SOFTEN_OPACITY;
+            softened += 1;
+        }
+    }
+    softened
+}
+
+/// 遮罩软化提示胶囊:告知人工「白屏是站点加载遮罩,已临时半透明」,
+/// 避免人工把半透明底误当成页面真实外观。画在页面顶部居中
+/// (右上状态栏/左下进度栏均不占位)。
+pub(crate) fn draw_overlay_note(pixmap: &mut Pixmap, font: &FontSet) {
+    let vw = pixmap.width() as f32;
+    let vh = pixmap.height() as f32;
+    if vw < 320.0 || vh < 240.0 {
+        return;
+    }
+    let label = "站点加载遮罩 · 已临时半透明以便人工操作";
+    let size = 14.0f32;
+    let text_w = font.text_width(label, size as f64) as f32;
+    let pad_x = 14.0f32;
+    let pad_y = 8.0f32;
+    let w = (text_w + pad_x * 2.0).min(vw - 24.0);
+    let h = size * 1.7 + pad_y;
+    let x0 = ((vw - w) / 2.0).max(12.0);
+    let y0 = MARGIN;
+    if let Some(rect) = tiny_skia::Rect::from_xywh(x0, y0, w, h) {
+        let mut bg = tiny_skia::Paint::default();
+        // 琥珀底 + 白字:与 Agent 控制蒙层的蓝调区分,一眼看出是提示。
+        bg.set_color_rgba8(146, 64, 14, 232);
+        pixmap.fill_rect(rect, &bg, tiny_skia::Transform::identity(), None);
+    }
+    font.draw_overlay_text(
+        pixmap,
+        x0 + pad_x,
+        y0 + pad_y,
+        label,
+        size,
+        [0xff, 0xf7, 0xed],
+        true,
+        w - pad_x * 2.0,
+    );
+}
+
 /// 量算一条栏的 `(宽, 高)`(按最长行宽收敛,带上限防撑破视口)。
 fn layout_bar(font: &FontSet, rows: &[BarRow], vw: f32, with_fill: bool) -> (f32, f32) {
     let cap = (vw * 0.48).min(560.0) - PAD_X * 2.0;
@@ -894,5 +964,113 @@ mod tests {
         assert_eq!(pick_display_tab(&tabs2, None, 0), Some("p_2"));
         // 全空 → 不推。
         assert_eq!(pick_display_tab(&[], None, 0), None);
+    }
+
+    // ===================== 站点加载遮罩软化(猎聘 zhaopin 白屏 HITL) =====================
+
+    use crate::agent::browser::render::display::{BgFill, DisplayItem, DisplayKind};
+    use crate::agent::browser::style::CornerRadius;
+
+    fn item_bg(z: i64, w: f64, h: f64, alpha: u8, opacity: f64) -> DisplayItem {
+        DisplayItem {
+            kind: DisplayKind::Background { fill: BgFill::Solid([255, 255, 255], alpha) },
+            x: 0.0,
+            y: 0.0,
+            w,
+            h,
+            radius: [CornerRadius::Px(0.0); 4],
+            z,
+            seq: 0,
+            opacity,
+            clip: None,
+            transform: None,
+            fixed: false,
+            out_of_flow: false,
+            layer: 1,
+        }
+    }
+
+    fn item_text(z: i64) -> DisplayItem {
+        DisplayItem {
+            kind: DisplayKind::Text { text: "登录/注册".into(), size: 16.0, color: [0, 0, 0], bold: false },
+            x: 1168.0,
+            y: 248.0,
+            w: 384.0,
+            h: 20.0,
+            radius: [CornerRadius::Px(0.0); 4],
+            z,
+            seq: 1,
+            opacity: 1.0,
+            clip: None,
+            transform: None,
+            fixed: false,
+            out_of_flow: false,
+            layer: 1,
+        }
+    }
+
+    #[test]
+    fn 遮罩软化_整幅不透明顶层背景降透明度() {
+        // 猎聘 zhaopin 实测形态:内容(含登录表单文字)之上盖一层
+        // 1920×1080 不透明白底 z=9999。
+        let mut items = vec![item_text(0), item_bg(9999, 1920.0, 1080.0, 255, 1.0)];
+        let n = soften_loading_overlays(&mut items, 1920.0, 1080.0);
+        assert_eq!(n, 1, "应恰好软化一层遮罩");
+        assert!((items[1].opacity - OVERLAY_SOFTEN_OPACITY).abs() < 1e-9, "遮罩透明度应被降低");
+        assert_eq!(items[0].opacity, 1.0, "内容项不受影响");
+    }
+
+    #[test]
+    fn 遮罩软化_根背景与半透明层不误伤() {
+        // 根画布背景(内容之下)与半透明遮罩(alpha=100)都不算遮罩。
+        let mut items = vec![
+            item_bg(i64::MIN, 1920.0, 1080.0, 255, 1.0),
+            item_text(5),
+            item_bg(10, 1920.0, 1080.0, 100, 1.0),
+        ];
+        assert_eq!(soften_loading_overlays(&mut items, 1920.0, 1080.0), 0);
+        assert!(items.iter().all(|it| it.opacity == 1.0));
+    }
+
+    #[test]
+    fn 遮罩软化_堆叠双层遮罩全部软化() {
+        // 防站点堆叠两层全屏遮罩:只软化最高层时底下那层仍挡视线。
+        let mut items = vec![
+            item_text(0),
+            item_bg(9998, 1920.0, 1080.0, 255, 1.0),
+            item_bg(9999, 1920.0, 1080.0, 255, 1.0),
+        ];
+        let n = soften_loading_overlays(&mut items, 1920.0, 1080.0);
+        assert_eq!(n, 2, "两层全屏遮罩都应软化");
+        assert!(items[1..].iter().all(|it| it.opacity == OVERLAY_SOFTEN_OPACITY));
+    }
+
+    #[test]
+    fn 遮罩软化_小于95视口不误伤() {
+        // 95% 视口以下的整页 hero 背景不是遮罩。
+        let mut items = vec![item_text(0), item_bg(9999, 1800.0, 1000.0, 255, 1.0)];
+        assert_eq!(soften_loading_overlays(&mut items, 1920.0, 1080.0), 0);
+    }
+
+    #[test]
+    fn 遮罩软化_无内容项时不软化() {
+        // 只有背景没有内容项:content_max_z 为 None,防御性返回 0
+        // (与 detect_loading_overlay 的保守语义一致)。
+        let mut items = vec![item_bg(9999, 1920.0, 1080.0, 255, 1.0)];
+        assert_eq!(soften_loading_overlays(&mut items, 1920.0, 1080.0), 0);
+    }
+
+    #[test]
+    fn 遮罩提示胶囊_绘制不panic且着色() {
+        // 冒烟:胶囊绘制改变像素且不 panic(无字体回退路径同样安全)。
+        let font = FontSet::fallback();
+        let mut pixmap = Pixmap::new(800, 600).unwrap();
+        draw_overlay_note(&mut pixmap, &font);
+        let changed = pixmap
+            .pixels()
+            .iter()
+            .filter(|p| p.red() > 100 && p.red() < 200 && p.green() < 100 && p.blue() < 60)
+            .count();
+        assert!(changed > 0, "琥珀底胶囊应已绘制(顶部居中)");
     }
 }

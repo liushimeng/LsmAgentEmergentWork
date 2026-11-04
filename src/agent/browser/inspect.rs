@@ -333,7 +333,10 @@ pub async fn inspect(
             let webgl_gap = tab.webgl_asked > 0;
             // 第 174 轮:脚本管线截断也是一等健康信号 —— 截断意味着懒加载组件
             // (登录弹层/搜索面板)可能还没挂载,先补齐脚本再判断页面状态。
-            let script_cut = tab.script_budget_cut && tab.script_pending > 0;
+            // 2026-11-04 猎聘首页:预算掐断时 `script_pending` 可以为 0(脚本全
+            // 部取完、定时器仍在水合 DOM,管线在等待期被墙钟截断)——只看
+            // pending>0 会漏报,hero 空挂载点(整幅藏青空块)就是这么漏掉的。
+            let script_cut = tab.script_budget_cut;
             // 同路径请求循环探测:验证码组件反复重置 / 轮询打转会在网络台账留下
             // 「同 method+路径(忽略 query)大量重复」的形态(实测 zhipin 安全验证页
             // GeeTest reset.php 连打 19 次直到脚本预算截断,页面只显示「配置错误」)。
@@ -372,8 +375,8 @@ pub async fn inspect(
                 )
             } else if script_cut {
                 (
-                    "页面脚本管线被墙钟预算截断,仍有模块未装载,动态组件可能尚未挂载",
-                    "这是加载中状态而非页面故障:先 control(wait) 1-3 秒或再次执行一次轻量 eval_js 触发补齐,脚本会从上次断点继续;若持续截断可提高 LAEW_WEB_SCRIPT_INTERACT_MS",
+                    "页面脚本管线被墙钟预算截断,动态组件可能尚未挂载(实测形态:首页 hero 整幅背景色空块、挂载点容器高度≈0)",
+                    "这是加载中状态而非页面故障:script_pending>0 时先 control(wait) 1-3 秒或轻量 eval_js 触发补泵,脚本从断点继续;pending=0 说明定时器水合被掐,重开页面或以 LAEW_WEB_SCRIPT_PIPELINE_MS 调大预算(默认 360s)重试;持续截断说明站点脚本超出 Boa 性能边界,可改用 MCP_Web_Chrome_Use",
                 )
             } else if !errors.is_empty() {
                 if blank {
@@ -888,29 +891,50 @@ fn inspect_blockers(tab: &super::TabState, doc: &Document) -> Value {
 /// 站点自身的 loading 包裹层(antd Spin 的 `.ant-spin-nested-loading` 加站点
 /// 自定义白底)与风控挑战层都是这个形态。命中说明页面**看起来全白**是站点状态
 /// 而非内核渲染故障,应如实上报而不是让 Agent 反复截图重试。
-fn detect_loading_overlay(
+///
+/// 供两处消费:`inspect(page_health)` 如实上报;`page_bars` 在用户控制态把
+/// 命中项临时半透明化(仅查看器帧,HITL 人工可见性,不进截图取证路径)。
+pub(in crate::agent::browser) fn detect_loading_overlay(
     display: &[super::render::display::DisplayItem],
     vp_w: f64,
     vp_h: f64,
 ) -> Option<&super::render::display::DisplayItem> {
-    // 内容(文字/图片/边框等非背景项)的最高 z:遮罩必须**严格高于**全部内容,
-    // 否则「整页 hero 背景」「根画布背景」都会被判成遮罩(根画布背景恒铺满
-    // 视口且不透明,是最典型的假阳性源)。
-    let content_max_z = display
+    let content_max_z = loading_overlay_content_max_z(display)?;
+    display
+        .iter()
+        .filter(|it| is_loading_overlay_item(it, vp_w, vp_h, content_max_z))
+        .max_by_key(|it| it.z)
+}
+
+/// 遮罩判定的内容基准:非背景项(文字/图片/边框等)的最高 z。
+///
+/// 遮罩必须**严格高于**这个值,否则「整页 hero 背景」「根画布背景」都会被判成
+/// 遮罩(根画布背景恒铺满视口且不透明,是最典型的假阳性源)。
+pub(in crate::agent::browser) fn loading_overlay_content_max_z(
+    display: &[super::render::display::DisplayItem],
+) -> Option<i64> {
+    display
         .iter()
         .filter(|it| !matches!(it.kind, DisplayKind::Background { .. }))
         .map(|it| it.z)
-        .max()?;
-    display
-        .iter()
-        .filter(|it| {
-            it.opacity > 0.95
-                && it.w >= vp_w * 0.95
-                && it.h >= vp_h * 0.95
-                && it.z > content_max_z
-                && matches!(it.kind, DisplayKind::Background { fill: BgFill::Solid(_, a) } if a > 250)
-        })
-        .max_by_key(|it| it.z)
+        .max()
+}
+
+/// 单项遮罩判定:不透明背景 + 铺满视口(≥95%) + 严格高于全部内容 z。
+///
+/// 与 `detect_loading_overlay` 同一判据;`page_bars::soften_loading_overlays`
+/// 复用本函数软化**全部**命中项(不止最高 z 一层,防站点堆叠双层遮罩)。
+pub(in crate::agent::browser) fn is_loading_overlay_item(
+    it: &super::render::display::DisplayItem,
+    vp_w: f64,
+    vp_h: f64,
+    content_max_z: i64,
+) -> bool {
+    it.opacity > 0.95
+        && it.w >= vp_w * 0.95
+        && it.h >= vp_h * 0.95
+        && it.z > content_max_z
+        && matches!(it.kind, DisplayKind::Background { fill: BgFill::Solid(_, a) } if a > 250)
 }
 
 #[cfg(test)]

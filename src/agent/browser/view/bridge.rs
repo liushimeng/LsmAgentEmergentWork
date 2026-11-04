@@ -342,19 +342,49 @@ impl LsmBrowserManager {
         if !alive {
             return;
         }
-        let Some(mut pixmap) = self.font.render_pixmap(
-            &tab.layout,
-            tab.viewport.width,
-            tab.viewport.height,
-            tab.scroll_x,
-            tab.scroll_y,
-            false,
-            &tab.images,
-        ) else {
+        // 用户控制态 × 站点加载/风控遮罩:查看器帧把整幅不透明遮罩临时半透明化,
+        // 让人工看得见遮罩下的登录表单/验证码(实测猎聘 `/zhaopin/` 搜索 API 400
+        // 后遮罩永驻,人工对着白屏无法完成登录,HITL 死锁)。仅查看器帧渲染路径,
+        // 取证截图(`screenshot_locked`)不经此处,证据图保持站点原貌。
+        let user_control =
+            crate::agent::web_control::state_of(crate::agent::web_control::Engine::Lsm, &tab.id)
+                == crate::agent::web_control::ControlState::User;
+        let mut overlay_softened = 0usize;
+        let rendered = if user_control {
+            let mut layout = tab.layout.clone();
+            overlay_softened = page_bars::soften_loading_overlays(
+                &mut layout.display,
+                tab.viewport.width as f64,
+                tab.viewport.height as f64,
+            );
+            self.font.render_pixmap(
+                &layout,
+                tab.viewport.width,
+                tab.viewport.height,
+                tab.scroll_x,
+                tab.scroll_y,
+                false,
+                &tab.images,
+            )
+        } else {
+            self.font.render_pixmap(
+                &tab.layout,
+                tab.viewport.width,
+                tab.viewport.height,
+                tab.scroll_x,
+                tab.scroll_y,
+                false,
+                &tab.images,
+            )
+        };
+        let Some(mut pixmap) = rendered else {
             return;
         };
         // 屏蔽页面状态栏/进度栏:查看器帧合成层叠加(不进截图取证路径)。
         page_bars::draw(&mut pixmap, &self.font, tab);
+        if overlay_softened > 0 {
+            page_bars::draw_overlay_note(&mut pixmap, &self.font);
+        }
         let png = pixmap.encode_png().unwrap_or_default();
         if png.is_empty() {
             return;
