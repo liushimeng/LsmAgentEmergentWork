@@ -31,16 +31,40 @@ impl LsmBrowserManager {
     }
 
     /// 确保查看器子进程与命令通道存在;已关闭的句柄不阻止后续重建。
+    ///
+    /// 自动重生限次:首启免费,此后每次(重)启动计数,第 4 次起拒绝并 WARN
+    /// ——防「一启动就崩」的查看器把任务拖进无限重生循环;`close_view` 收口时
+    /// 清零预算(2026-11-04 查看器崩溃事故的自愈策略)。
     fn ensure_view_process(&self, width: u32, height: u32, title: &str) {
         let mut guard = self.view.lock().unwrap();
         let needs_start = guard.as_ref().map(|s| !s.is_alive()).unwrap_or(true);
         if !needs_start {
             return;
         }
+        let starts = self
+            .view_respawns
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if starts >= 3 {
+            *guard = None;
+            tracing::warn!(
+                "查看器子进程反复死亡,自动重生已达上限(3 次),回退纯无头;崩溃现场见工作目录 CrashReport/"
+            );
+            return;
+        }
+        if starts > 0 {
+            tracing::warn!(
+                "查看器子进程已死亡,自动重生(第 {starts} 次);若反复出现请查工作目录 CrashReport/"
+            );
+        }
         *guard = None;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ViewCommand>();
         *self.view_cmd_tx.lock().unwrap() = Some(tx.clone());
         *guard = super::ViewSink::start(width, height, title, tx);
+        if guard.is_some() {
+            // 窗口已重新在位:清「人工关窗」旗标(新一轮显示意图)。
+            self.view_user_closed
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
         // 命令处理任务:查看器工具栏/地址栏/尺寸变化 → 引擎。
         // 需要 `Arc<Self>`(弱引用升级);非 Arc 场景(单测直接 new())无命令处理,
         // 查看器仍可正常显示帧。
@@ -146,6 +170,13 @@ impl LsmBrowserManager {
             }
             return;
         }
+        // 人工关窗:置旗标,`push_frame` 不再自动重生窗口(不与用户抢窗口);
+        // 进程意外死亡(崩溃,无此信号)才走自愈重生。
+        if let ViewCommand::ViewerClosed = cmd {
+            self.view_user_closed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
         // 标签页快捷键与控件级剪贴板(39 号设计文档阶段二):作用于显示页。
         match cmd {
             ViewCommand::NewTab => {
@@ -202,6 +233,7 @@ impl LsmBrowserManager {
                 return;
             }
             ViewCommand::Input(_)
+            | ViewCommand::ViewerClosed
             | ViewCommand::NewTab
             | ViewCommand::CloseTab
             | ViewCommand::NextTab
@@ -338,9 +370,33 @@ impl LsmBrowserManager {
     /// 工具层落账也能让心跳跟上。
     pub(in crate::agent::browser) fn push_frame(&self, tab: &TabState) {
         self.set_view_follow(Some(ViewFollow::Page(tab.id.clone())));
-        let alive = self.view.lock().map(|g| g.is_some()).unwrap_or(false);
+        let alive = self
+            .view
+            .lock()
+            .map(|g| g.as_ref().map(|s| s.is_alive()).unwrap_or(false))
+            .unwrap_or(false);
         if !alive {
-            return;
+            // 查看器死亡处置:人工关窗(`viewer_closed` 信号)不重生(不与用户抢
+            // 窗口);意外死亡(崩溃)自动重生(限次见 `ensure_view_process`)并
+            // 照常补推当前帧——此前死后窗口永不再现,任务只剩纯无头
+            // (2026-11-04 查看器崩溃事故)。无头页不启查看器。
+            if !tab.mode.is_headed()
+                || self
+                    .view_user_closed
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return;
+            }
+            let title = format!("🌐 {} · {} — {}", tab.id, tab.title, tab.url);
+            self.ensure_view_process(tab.viewport.width, tab.viewport.height, &title);
+            let alive = self
+                .view
+                .lock()
+                .map(|g| g.as_ref().map(|s| s.is_alive()).unwrap_or(false))
+                .unwrap_or(false);
+            if !alive {
+                return;
+            }
         }
         // 用户控制态 × 站点加载/风控遮罩:查看器帧把整幅不透明遮罩临时半透明化,
         // 让人工看得见遮罩下的登录表单/验证码(实测猎聘 `/zhaopin/` 搜索 API 400
@@ -402,6 +458,11 @@ impl LsmBrowserManager {
 
     /// 关闭查看器(所有页面关闭后)。
     pub(in crate::agent::browser) fn close_view(&self) {
+        // 收口清理:自动重生预算清零、人工关窗旗标复位,供后续全新任务重新计数。
+        self.view_respawns
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.view_user_closed
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut guard) = self.view.lock() {
             if let Some(sink) = guard.take() {
                 sink.send_close();

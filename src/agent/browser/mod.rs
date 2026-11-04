@@ -523,6 +523,13 @@ pub struct LsmBrowserManager {
     bars_ticker_started: std::sync::atomic::AtomicBool,
     /// 人类输入会话态(查看器键鼠;按下/双击/hover 去重,`human_input/mod.rs`)。
     human: std::sync::Mutex<human_input::HumanSession>,
+    /// 查看器窗口被人工关闭(`viewer_closed` 信号 / `close_view`)。
+    /// 置位期间 `push_frame` 不自动重生窗口(不与用户抢窗口);
+    /// 工具动作路径(`ensure_view`/`revive_viewer`)仍可按设计复活。
+    view_user_closed: std::sync::atomic::AtomicBool,
+    /// 查看器子进程启动次数(首启不计;意外死亡自动重生上限 3 次/会话,
+    /// 防崩溃循环;超限回退纯无头并打 WARN,见 `view::bridge::push_frame`)。
+    view_respawns: std::sync::atomic::AtomicUsize,
 }
 
 /// 兼容旧调用点的类型名。
@@ -557,6 +564,8 @@ impl LsmBrowserManager {
             self_weak: std::sync::Mutex::new(std::sync::Weak::new()),
             bars_ticker_started: std::sync::atomic::AtomicBool::new(false),
             human: std::sync::Mutex::new(human_input::HumanSession::default()),
+            view_user_closed: std::sync::atomic::AtomicBool::new(false),
+            view_respawns: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 

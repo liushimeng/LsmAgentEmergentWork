@@ -339,7 +339,15 @@ impl Controls {
 
 // ---------- 窗口过程 ----------
 
+/// 主弹窗过程(panic 防火墙外壳:extern "system" 同为 nounwind 边界,
+/// 见 `crate::ffi_guard`;逻辑在 `_inner`)。
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    crate::ffi_guard::guard_ret("hitl::wnd_proc", LRESULT(0), || unsafe {
+        wnd_proc_inner(hwnd, msg, wparam, lparam)
+    })
+}
+
+unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_SIZE => {
             relayout();
@@ -488,7 +496,19 @@ fn pad_relay_at(lparam: LPARAM, kind: &str) {
     super::dialog_main::emit_line_or_exit(&super::dialog_main::relay_line(id, kind, nx, ny, ""));
 }
 
+/// 选项面板过程(panic 防火墙外壳,逻辑在 `_inner`)。
 unsafe extern "system" fn pad_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    crate::ffi_guard::guard_ret("hitl::pad_wnd_proc", LRESULT(0), || unsafe {
+        pad_wnd_proc_inner(hwnd, msg, wparam, lparam)
+    })
+}
+
+unsafe fn pad_wnd_proc_inner(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,

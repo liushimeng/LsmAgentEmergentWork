@@ -409,7 +409,23 @@ unsafe fn forward_wheel(hwnd: HWND, wp: WPARAM, lp: LPARAM, horizontal: bool) {
 }
 
 /// 地址栏编辑框子类:回车 → 导航命令。
+///
+/// 外壳只做 FFI 回调 panic 防火墙(`extern "system"` 同为 nounwind 边界,
+/// panic 展开会 abort 整个查看器,见 `crate::ffi_guard`);逻辑在 `_inner`。
 unsafe extern "system" fn edit_subclass(
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+    _id: usize,
+    _ref: usize,
+) -> LRESULT {
+    crate::ffi_guard::guard_ret("view::edit_subclass", LRESULT(0), || unsafe {
+        edit_subclass_inner(hwnd, msg, wp, lp, _id, _ref)
+    })
+}
+
+unsafe fn edit_subclass_inner(
     hwnd: HWND,
     msg: u32,
     wp: WPARAM,
@@ -434,7 +450,14 @@ unsafe extern "system" fn edit_subclass(
     DefSubclassProc(hwnd, msg, wp, lp)
 }
 
+/// 主窗口过程(panic 防火墙外壳,逻辑在 `_inner`)。
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    crate::ffi_guard::guard_ret("view::wnd_proc", LRESULT(0), || unsafe {
+        wnd_proc_inner(hwnd, msg, wp, lp)
+    })
+}
+
+unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_TIMER => {
             let mut changed = false;

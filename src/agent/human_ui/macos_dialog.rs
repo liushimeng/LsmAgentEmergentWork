@@ -361,23 +361,29 @@ fn state() -> std::sync::MutexGuard<'static, Option<MacState>> {
 // ---------- 控制器类(IMP) ----------
 
 extern "C" fn on_submit(_self: Id, _cmd: Sel, sender: Id) {
+    crate::ffi_guard::guard("hitl::on_submit", || {
     let tag = if sender.is_null() {
         -1
     } else {
         unsafe { send_i64(sender, sel(b"tag\0")) }
     };
     finish("answer", tag);
+    });
 }
 
 extern "C" fn on_cancel(_self: Id, _cmd: Sel, _sender: Id) {
+    crate::ffi_guard::guard("hitl::on_cancel", || {
     finish("cancel", -1);
+    });
 }
 
 /// 2026-10-13:多选模式选项复选框的 action —— NSSwitchButton 点击时 AppKit 已自动
 /// 翻转 state,这里**只观察不收口**(多选的收口动作是「继续」按钮收集勾选);
 /// 单选模式的选项仍是 push button,走 `submit:` 立即应答,不经过本 IMP。
 extern "C" fn on_opt_toggle(_self: Id, _cmd: Sel, _sender: Id) {
+    crate::ffi_guard::guard("hitl::on_opt_toggle", || {
     // 观察 no-op:保留 target/action 接线是为了点击有标准键盘焦点行为。
+    });
 }
 
 /// 第 145 轮:「⏱ +2分钟」延长等待 —— 本地 `timeout_ms += EXTEND_STEP_MS`
@@ -387,6 +393,7 @@ extern "C" fn on_opt_toggle(_self: Id, _cmd: Sel, _sender: Id) {
 /// 根治实测:人工在浏览器完成整条登录链超过 120s 分档超时 → 弹窗自灭 →
 /// QC 单元重试 → 二次弹窗(浪费 36s 且验证码已刷新)。
 extern "C" fn on_extend(_self: Id, _cmd: Sel, _sender: Id) {
+    crate::ffi_guard::guard("hitl::on_extend", || {
     let (line, title, extend_btn, t1, timeline) = {
         let mut guard = state();
         let Some(st) = guard.as_mut() else { return };
@@ -430,6 +437,7 @@ extern "C" fn on_extend(_self: Id, _cmd: Sel, _sender: Id) {
             send_void_id(t1, sel(b"setStringValue:\0"), ns_str(&timeline));
         }
     }
+    });
 }
 
 /// 2026-10-13:「解除屏蔽/恢复屏蔽」互切 —— 人工在弹窗直接掌控页面管控,
@@ -438,6 +446,7 @@ extern "C" fn on_extend(_self: Id, _cmd: Sel, _sender: Id) {
 /// 并接线 `HumanAssistHub::guard_toggle_from_ui` → 对关联 page_id 应用整页 open /
 /// 恢复解锁前快照),按钮标题同步切换。
 extern "C" fn on_guard_toggle(_self: Id, _cmd: Sel, _sender: Id) {
+    crate::ffi_guard::guard("hitl::on_guard_toggle", || {
     let (line, title, btn) = {
         let mut guard = state();
         let Some(st) = guard.as_mut() else { return };
@@ -462,9 +471,11 @@ extern "C" fn on_guard_toggle(_self: Id, _cmd: Sel, _sender: Id) {
             send_void_id(btn, sel(b"setTitle:\0"), ns_str(title));
         }
     }
+    });
 }
 
 extern "C" fn on_tick(_self: Id, _cmd: Sel, _sender: Id) {
+    crate::ffi_guard::guard("hitl::on_tick", || {
     // 单次锁定取出所需;**必须先解锁再 finish**(finish 会再次锁定 STATE)。
     let (label, text, timed_out, rollback_copy) = {
         let mut guard = state();
@@ -504,6 +515,7 @@ extern "C" fn on_tick(_self: Id, _cmd: Sel, _sender: Id) {
     if timed_out {
         finish("timeout", -1);
     }
+    });
 }
 
 /// 第 139 轮:「📋 复制」—— 把说明 + 页面 URL + 页面 ID 一次性写入系统剪贴板。
@@ -526,6 +538,7 @@ unsafe fn copy_to_pasteboard(text: &str) -> bool {
 }
 
 extern "C" fn on_copy(_self: Id, _cmd: Sel, _sender: Id) {
+    crate::ffi_guard::guard("hitl::on_copy", || {
     let (payload, btn) = {
         let mut guard = state();
         let Some(st) = guard.as_mut() else { return };
@@ -542,9 +555,11 @@ extern "C" fn on_copy(_self: Id, _cmd: Sel, _sender: Id) {
             send_void_id(btn, sel(b"setTitle:\0"), ns_str(title));
         }
     }
+    });
 }
 
 extern "C" fn on_focus_once(_self: Id, _cmd: Sel, _sender: Id) {
+    crate::ffi_guard::guard("hitl::on_focus_once", || {
     // 0.05s 二次断言 first responder(第 132 轮「看着有焦点打不进字」教训)。
     let pair = {
         let guard = state();
@@ -555,13 +570,16 @@ extern "C" fn on_focus_once(_self: Id, _cmd: Sel, _sender: Id) {
             send_bool_id(window, sel(b"makeFirstResponder:\0"), input);
         }
     }
+    });
 }
 
 extern "C" fn on_window_will_close(_self: Id, _cmd: Sel, _sender: Id) {
+    crate::ffi_guard::guard("hitl::on_window_will_close", || {
     // 窗口消失 ≠ 人工明确取消:无头/自动化环境下窗口可能被系统回收,
     // 报「取消」会让编排器把整个任务判死(实测猎聘任务 52s 后被误取消)。
     // 真实取消只由「取消任务」按钮(on_cancel)产生。
     finish("closed", -1);
+    });
 }
 
 /// 注册控制器类(进程内一次)。
@@ -624,17 +642,24 @@ fn pad_relay(event: Id, kind: &str) {
 }
 
 extern "C" fn on_pad_down(_self: Id, _cmd: Sel, event: Id) {
+    crate::ffi_guard::guard("hitl::on_pad_down", || {
     pad_relay(event, "down");
+    });
 }
 extern "C" fn on_pad_drag(_self: Id, _cmd: Sel, event: Id) {
+    crate::ffi_guard::guard("hitl::on_pad_drag", || {
     pad_relay(event, "move");
+    });
 }
 extern "C" fn on_pad_up(_self: Id, _cmd: Sel, event: Id) {
+    crate::ffi_guard::guard("hitl::on_pad_up", || {
     pad_relay(event, "up");
+    });
 }
 
 /// 触控板按键 → relay key 行(AppKit keyCode → 语义名;回车/空格可直接提交挑战)。
 extern "C" fn on_pad_key(_self: Id, _cmd: Sel, event: Id) {
+    crate::ffi_guard::guard("hitl::on_pad_key", || {
     let code = unsafe { send_i64(event, sel(b"keyCode\0")) };
     let name = match code {
         36 | 76 => "enter",
@@ -657,6 +682,7 @@ extern "C" fn on_pad_key(_self: Id, _cmd: Sel, event: Id) {
         }
     };
     super::dialog_main::emit_line_or_exit(&super::dialog_main::relay_line(id, "key", 0.0, 0.0, name));
+    });
 }
 
 /// 触控板必须能成为第一响应者才能收到 keyDown:(YES = 1 的 BOOL)。
@@ -757,6 +783,7 @@ unsafe fn make_relay_pad() -> Id {
 /// 打 `session_start` 中间行(父进程放行页面 + 解析映射区 + 置前窗口);退出时
 /// 还原布局并打 `session_end`。
 extern "C" fn on_relay_toggle(_self: Id, _cmd: Sel, _sender: Id) {
+    crate::ffi_guard::guard("hitl::on_relay_toggle", || {
     let (line, title, pad, msg_scroll, opts, input, btn, snap, frames, geo, now_on, pad_rect) = {
         let mut guard = state();
         let Some(st) = guard.as_mut() else { return };
@@ -819,6 +846,7 @@ extern "C" fn on_relay_toggle(_self: Id, _cmd: Sel, _sender: Id) {
             send_void_id(btn, sel(b"setTitle:\0"), ns_str(title));
         }
     }
+    });
 }
 
 // ---------- 收口 ----------

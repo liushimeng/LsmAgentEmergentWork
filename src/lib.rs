@@ -20,6 +20,7 @@ pub mod config;
 pub mod crash;
 pub mod database;
 pub mod error;
+pub mod ffi_guard;
 pub mod frontmatter;
 pub mod llm;
 pub mod logging;

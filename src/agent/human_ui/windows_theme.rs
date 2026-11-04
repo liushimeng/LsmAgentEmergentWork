@@ -453,13 +453,15 @@ pub(super) fn apply_window_chrome(hwnd: HWND) {
 
 /// EnumWindows 回调:命中本进程的顶层窗口 → 补挂 chrome(幂等)。
 unsafe extern "system" fn sweep_enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let target_process_id = lparam.0 as u32;
-    let mut process_id: u32 = 0;
-    let _ = GetWindowThreadProcessId(hwnd, Some(&mut process_id));
-    if process_id != 0 && process_id == target_process_id {
-        apply_window_chrome(hwnd);
-    }
-    BOOL(1)
+    crate::ffi_guard::guard_ret("hitl::sweep_enum_proc", BOOL(1), || {
+        let target_process_id = lparam.0 as u32;
+        let mut process_id: u32 = 0;
+        let _ = GetWindowThreadProcessId(hwnd, Some(&mut process_id));
+        if process_id != 0 && process_id == target_process_id {
+            apply_window_chrome(hwnd);
+        }
+        BOOL(1)
+    })
 }
 
 /// **本进程全部顶层窗口自遍历补挂 chrome**(「所有弹出的 UI 窗口都要美化」的机械化

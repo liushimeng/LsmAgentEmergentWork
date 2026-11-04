@@ -112,6 +112,8 @@ msg!(send_point, () -> NSPoint);
 msg!(send_point_point_id, (p: NSPoint, from: Id) -> NSPoint);
 msg!(send_u64, () -> u64);
 msg!(send_f64, () -> f64);
+// `respondsToSelector:` / `instancesRespondToSelector:`(选择器存在性守卫)。
+msg!(send_i64_sel, (arg: Sel) -> i64);
 // NSTrackingArea initWithRect:options:owner:userInfo:
 msg!(send_id_rect_u64_id_id, (rect: NSRect, opts: u64, owner: Id, info: Id) -> Id);
 // NSMenu popUpMenuPositioningItem:atLocation:inView:(右键原生菜单,阶段二)。
@@ -119,6 +121,16 @@ msg!(send_i8_id_point_id, (item: Id, loc: NSPoint, view: Id) -> i8);
 
 fn cls(name: &'static [u8]) -> Id {
     unsafe { objc_getClass(name.as_ptr().cast()) }
+}
+
+/// 选择器存在性守卫(实例):发送前先 `respondsToSelector:`。
+///
+/// 发不存在的选择器会抛 NSException(foreign exception)——它**不是** Rust panic,
+/// `catch_unwind` 拦不住,展开穿越 nounwind 回调直接 abort 整个查看器
+/// (2026-11-04 `hasPreciseDeltas` 误拼事故,详见 `crate::ffi_guard`)。
+/// 事件子类型相关的选择器(滚轮/中键等)一律先验后发,缺失时优雅降级。
+unsafe fn respond(obj: Id, name: &'static [u8]) -> bool {
+    !obj.is_null() && send_i64_sel(obj, sel(b"respondsToSelector:\0"), sel(name)) != 0
 }
 
 fn sel(name: &'static [u8]) -> Sel {
@@ -313,7 +325,7 @@ unsafe fn sync_content_size() {
 
 /// 定时器回调:取新帧 → NSImage initWithData → setImage;标题/地址栏/关闭同理。
 extern "C" fn on_tick(_self: Id, _cmd: Sel, _timer: Id) {
-    unsafe {
+    crate::ffi_guard::guard("on_tick", || unsafe {
         let (img, title, urlbar, focus_addrbar, close, seq) = {
             let mut s = SLOT.lock().unwrap();
             let img = s.image.take();
@@ -369,7 +381,7 @@ extern "C" fn on_tick(_self: Id, _cmd: Sel, _timer: Id) {
                 s.shown_seq = seq;
             }
         }
-    }
+    });
 }
 
 /// 地址栏同步:用户不在编辑态才覆盖文本;按钮按可用性置灰。
@@ -394,19 +406,23 @@ unsafe fn apply_urlbar(url: &str, can_back: bool, can_forward: bool) {
     }
 }
 
-/// 窗口关闭 → 退出查看器(读线程随进程一起结束)。
+/// 窗口关闭 → 先告知宿主(人工关闭,宿主勿自动重生窗口),再退出查看器
+/// (读线程随进程一起结束)。
 extern "C" fn on_window_close(_self: Id, _cmd: Sel, _note: Id) {
-    unsafe {
-        let app = send_id(cls(b"NSApplication\0"), sel(b"sharedApplication\0"));
-        send_void_id(app, sel(b"terminate:\0"), std::ptr::null_mut());
-    }
+    crate::ffi_guard::guard("on_window_close", || {
+        send_cmd("{\"cmd\":\"viewer_closed\"}");
+        unsafe {
+            let app = send_id(cls(b"NSApplication\0"), sel(b"sharedApplication\0"));
+            send_void_id(app, sel(b"terminate:\0"), std::ptr::null_mut());
+        }
+    });
 }
 
 /// 工具栏按钮动作。
 macro_rules! button_action {
     ($name:ident, $cmd:expr) => {
         extern "C" fn $name(_self: Id, _cmd: Sel, _sender: Id) {
-            send_cmd($cmd);
+            crate::ffi_guard::guard(stringify!($name), || send_cmd($cmd));
         }
     };
 }
@@ -427,32 +443,39 @@ extern "C" fn on_text_command(
     _text_view: Id,
     command: Sel,
 ) -> i64 {
-    if command == sel(b"insertNewline:\0") {
-        let text = unsafe { address_text() };
-        let text = text.trim();
-        if !text.is_empty() {
-            send_cmd(&cmd_json("navigate", Some(text)));
+    let handled = std::cell::Cell::new(0i64);
+    crate::ffi_guard::guard("on_text_command", || {
+        if command == sel(b"insertNewline:\0") {
+            let text = unsafe { address_text() };
+            let text = text.trim();
+            if !text.is_empty() {
+                send_cmd(&cmd_json("navigate", Some(text)));
+            }
+            handled.set(1);
         }
-        return 1;
-    }
-    0
+    });
+    handled.get()
 }
 
 /// 地址栏开始编辑(此后宿主不同步覆盖文本)。
 extern "C" fn on_text_begin(_self: Id, _cmd: Sel, _note: Id) {
-    EDITING.store(true, Ordering::Relaxed);
+    crate::ffi_guard::guard("on_text_begin", || {
+        EDITING.store(true, Ordering::Relaxed);
+    });
 }
 
 /// 地址栏结束编辑:回填宿主下发的 URL(清掉误入的外来输入)。
 extern "C" fn on_text_end(_self: Id, _cmd: Sel, _note: Id) {
-    EDITING.store(false, Ordering::Relaxed);
-    unsafe {
-        let field = ADDRESS_FIELD.lock().unwrap().0;
-        let url = LAST_URL.lock().map(|s| s.clone()).unwrap_or_default();
-        if !field.is_null() {
-            send_void_id(field, sel(b"setStringValue:\0"), ns_str(&url));
+    crate::ffi_guard::guard("on_text_end", || {
+        EDITING.store(false, Ordering::Relaxed);
+        unsafe {
+            let field = ADDRESS_FIELD.lock().unwrap().0;
+            let url = LAST_URL.lock().map(|s| s.clone()).unwrap_or_default();
+            if !field.is_null() {
+                send_void_id(field, sel(b"setStringValue:\0"), ns_str(&url));
+            }
         }
-    }
+    });
 }
 
 // ---------- 人类键鼠输入(39 号设计文档) ----------
@@ -611,10 +634,12 @@ unsafe fn forward_pointer(view: Id, event: Id, act: &str, btn: Option<&str>, is_
 macro_rules! pointer_action {
     ($name:ident, $act:expr, $btn:expr, $is_move:expr) => {
         extern "C" fn $name(_self: Id, _cmd: Sel, event: Id) {
-            if input_disabled() {
-                return;
-            }
-            unsafe { forward_pointer(_self, event, $act, $btn, $is_move) };
+            crate::ffi_guard::guard(stringify!($name), || {
+                if input_disabled() {
+                    return;
+                }
+                unsafe { forward_pointer(_self, event, $act, $btn, $is_move) };
+            });
         }
     };
 }
@@ -634,27 +659,31 @@ static CTRL: once_cell::sync::Lazy<Mutex<IdCell>> =
 /// 右键按下:默认弹**原生菜单**(后退/前进/刷新/首页/复制/粘贴);
 /// `LAEW_HUMAN_RMENU=off` 回退阶段一的 contextmenu 事件路径。
 extern "C" fn on_pv_right_down(_self: Id, _cmd: Sel, event: Id) {
-    if input_disabled() || *RMENU_OFF {
-        RMENU_ACTIVE.store(false, Ordering::Relaxed);
-        unsafe { forward_pointer(_self, event, "down", Some("right"), false) };
-        return;
-    }
-    unsafe {
-        // 弹菜单(阻塞至人工选择/点空白关闭);选择经命令通道驱动引擎。
-        show_context_menu(_self, event);
-        RMENU_ACTIVE.store(true, Ordering::Relaxed);
-    }
+    crate::ffi_guard::guard("on_pv_right_down", || {
+        if input_disabled() || *RMENU_OFF {
+            RMENU_ACTIVE.store(false, Ordering::Relaxed);
+            unsafe { forward_pointer(_self, event, "down", Some("right"), false) };
+            return;
+        }
+        unsafe {
+            // 弹菜单(阻塞至人工选择/点空白关闭);选择经命令通道驱动引擎。
+            show_context_menu(_self, event);
+            RMENU_ACTIVE.store(true, Ordering::Relaxed);
+        }
+    });
 }
 
 /// 右键抬起:菜单已接管时不重复上报(contextmenu 由菜单项表达意图)。
 extern "C" fn on_pv_right_up(_self: Id, _cmd: Sel, event: Id) {
-    if RMENU_ACTIVE.swap(false, Ordering::Relaxed) {
-        return;
-    }
-    if input_disabled() {
-        return;
-    }
-    unsafe { forward_pointer(_self, event, "up", Some("right"), false) };
+    crate::ffi_guard::guard("on_pv_right_up", || {
+        if RMENU_ACTIVE.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        if input_disabled() {
+            return;
+        }
+        unsafe { forward_pointer(_self, event, "up", Some("right"), false) };
+    });
 }
 
 /// 构建并弹出右键菜单(NSMenu + NSMenuItem,action 挂到控制器)。
@@ -699,51 +728,76 @@ unsafe fn show_context_menu(view: Id, event: Id) {
 }
 
 /// 中键按下:仅 buttonNumber==2 视为中键(侧键忽略,阶段二)。
+/// `buttonNumber` 先经 `respond` 守卫(事件子类型相关选择器,防 unrecognized
+/// selector),缺失时按非中键处理。
 extern "C" fn on_pv_other_down(_self: Id, _cmd: Sel, event: Id) {
-    if input_disabled() {
-        return;
-    }
-    unsafe {
-        let btn = send_u64(event, sel(b"buttonNumber\0"));
-        if btn == 2 {
-            forward_pointer(_self, event, "down", Some("middle"), false);
+    crate::ffi_guard::guard("on_pv_other_down", || {
+        if input_disabled() {
+            return;
         }
-    }
+        unsafe {
+            let btn = if respond(event, b"buttonNumber\0") {
+                send_u64(event, sel(b"buttonNumber\0"))
+            } else {
+                0
+            };
+            if btn == 2 {
+                forward_pointer(_self, event, "down", Some("middle"), false);
+            }
+        }
+    });
 }
 
 /// 滚轮:精确增量(触控板,像素)归一到 48px/档;离散滚轮每档 ±1。
+///
+/// 事件子类型相关的选择器(`hasPreciseScrollingDeltas`/`deltaX`/`deltaY`)一律
+/// 先经 `respond` 守卫再发:选择器不存在时优雅降级(按离散滚轮/零增量处理),
+/// 绝不触发 unrecognized selector(2026-11-04 崩溃根因:误拼 `hasPreciseDeltas`,
+/// NSException 穿越 nounwind 回调 abort 查看器)。
 extern "C" fn on_pv_scroll(_self: Id, _cmd: Sel, event: Id) {
-    if input_disabled() {
-        return;
-    }
-    unsafe {
-        let Some((x, y)) = page_point(_self, event) else {
-            return;
-        };
-        let precise = send_i64(event, sel(b"hasPreciseDeltas\0")) != 0;
-        let raw_dx = send_f64(event, sel(b"deltaX\0"));
-        let raw_dy = send_f64(event, sel(b"deltaY\0"));
-        let norm = |d: f64| -> f64 {
-            let v = if precise { d / 48.0 } else { d };
-            v.clamp(-20.0, 20.0)
-        };
-        let (dx, dy) = (norm(raw_dx), norm(raw_dy));
-        if dx.abs() < f64::EPSILON && dy.abs() < f64::EPSILON {
+    crate::ffi_guard::guard("on_pv_scroll", || {
+        if input_disabled() {
             return;
         }
-        let line = format!(
-            "{{\"cmd\":\"input\",\"act\":\"wheel\",\"x\":{x:.0},\"y\":{y:.0},\"dx\":{dx:.3},\"dy\":{dy:.3}}}"
-        );
-        send_input(&line);
-    }
+        unsafe {
+            let Some((x, y)) = page_point(_self, event) else {
+                return;
+            };
+            let precise = respond(event, b"hasPreciseScrollingDeltas\0")
+                && send_i64(event, sel(b"hasPreciseScrollingDeltas\0")) != 0;
+            let raw_dx = if respond(event, b"deltaX\0") {
+                send_f64(event, sel(b"deltaX\0"))
+            } else {
+                0.0
+            };
+            let raw_dy = if respond(event, b"deltaY\0") {
+                send_f64(event, sel(b"deltaY\0"))
+            } else {
+                0.0
+            };
+            let norm = |d: f64| -> f64 {
+                let v = if precise { d / 48.0 } else { d };
+                v.clamp(-20.0, 20.0)
+            };
+            let (dx, dy) = (norm(raw_dx), norm(raw_dy));
+            if dx.abs() < f64::EPSILON && dy.abs() < f64::EPSILON {
+                return;
+            }
+            let line = format!(
+                "{{\"cmd\":\"input\",\"act\":\"wheel\",\"x\":{x:.0},\"y\":{y:.0},\"dx\":{dx:.3},\"dy\":{dy:.3}}}"
+            );
+            send_input(&line);
+        }
+    });
 }
 
 /// 键按下:浏览器级快捷键(⌘R/⌘[/⌘]/Ctrl+R/F5)本地消化,其余转发宿主。
 extern "C" fn on_pv_key_down(_self: Id, _cmd: Sel, event: Id) {
-    if input_disabled() {
-        return;
-    }
-    unsafe {
+    crate::ffi_guard::guard("on_pv_key_down", || {
+        if input_disabled() {
+            return;
+        }
+        unsafe {
         let flags = send_u64(event, sel(b"modifierFlags\0"));
         let code = send_u64(event, sel(b"keyCode\0"));
         let meta = flags & NSEVENT_COMMAND != 0;
@@ -818,7 +872,8 @@ extern "C" fn on_pv_key_down(_self: Id, _cmd: Sel, event: Id) {
             key_json_str(&key)
         );
         send_input(&line);
-    }
+        }
+    });
 }
 
 /// 页面视图可成为第一响应者(接收键盘事件;地址栏编辑时不抢)。
@@ -1357,5 +1412,76 @@ mod tests {
         assert_eq!(key_json_str("\""), "\\\"");
         assert_eq!(key_json_str("\\"), "\\\\");
         assert_eq!(key_json_str("A\r"), "A", "控制字符被剔除");
+    }
+
+    /// 事件处理链发送的全部实例选择器必须真实存在(与 SDK 对照)。
+    ///
+    /// 发不存在的选择器 = unrecognized selector → NSException(foreign exception)
+    /// 穿越 nounwind 回调 → 整个查看器 abort(2026-11-04 `hasPreciseDeltas`
+    /// 误拼事故的回归防线——该测试在事故前就应当存在)。用
+    /// `+NSObject instancesRespondToSelector:` 查询,无需 GUI/NSApp,cargo test 可跑。
+    #[test]
+    fn 事件处理链选择器全部真实存在() {
+        unsafe {
+            assert!(ensure_frameworks(), "装载 Foundation/AppKit 失败");
+            let nsevent = cls(b"NSEvent\0");
+            assert!(!nsevent.is_null(), "拿不到 NSEvent 类");
+            for name in [
+                &b"locationInWindow\0"[..],
+                &b"hasPreciseScrollingDeltas\0"[..],
+                &b"deltaX\0"[..],
+                &b"deltaY\0"[..],
+                &b"buttonNumber\0"[..],
+                &b"modifierFlags\0"[..],
+                &b"keyCode\0"[..],
+                &b"charactersIgnoringModifiers\0"[..],
+            ] {
+                let ok = send_i64_sel(
+                    nsevent,
+                    sel(b"instancesRespondToSelector:\0"),
+                    sel(name),
+                );
+                assert!(
+                    ok != 0,
+                    "NSEvent 不响应选择器 {:?} —— 发出去就是 unrecognized selector 崩溃",
+                    String::from_utf8_lossy(name)
+                );
+            }
+            let nsview = cls(b"NSView\0");
+            assert!(!nsview.is_null(), "拿不到 NSView 类");
+            for name in [
+                &b"convertPoint:fromView:\0"[..],
+                &b"setFrame:\0"[..],
+                &b"addTrackingArea:\0"[..],
+            ] {
+                let ok = send_i64_sel(
+                    nsview,
+                    sel(b"instancesRespondToSelector:\0"),
+                    sel(name),
+                );
+                assert!(
+                    ok != 0,
+                    "NSView 不响应选择器 {:?}",
+                    String::from_utf8_lossy(name)
+                );
+            }
+        }
+    }
+
+    /// `respond` 守卫本身:实例上存在的选择器返回 true,瞎拼/不存在的返回
+    /// false(而不是发出去崩掉),空对象安全。
+    #[test]
+    fn 选择器守卫_存在与否() {
+        unsafe {
+            assert!(ensure_frameworks(), "装载 Foundation/AppKit 失败");
+            let obj = send_id(send_id(cls(b"NSObject\0"), sel(b"alloc\0")), sel(b"init\0"));
+            assert!(!obj.is_null(), "NSObject 实例创建失败");
+            assert!(respond(obj, b"description\0"), "存在选择器应返回 true");
+            assert!(
+                !respond(obj, b"hasPreciseDeltas\0"),
+                "误拼旧名必须返回 false(而不是发出后 unrecognized selector 崩溃)"
+            );
+            assert!(!respond(std::ptr::null_mut(), b"description\0"), "空对象不响应");
+        }
     }
 }

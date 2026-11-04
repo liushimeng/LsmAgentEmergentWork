@@ -67,6 +67,10 @@ pub enum ViewCommand {
     Clip(crate::agent::browser::human_input::ClipOp),
     /// ⌘/Ctrl+L:聚焦地址栏(39 号 P2b 顺带补齐)。
     FocusAddrbar,
+    /// 查看器窗口被人工关闭(`windowWillClose:` 退出前上报)。
+    /// 宿主据此**不自动重生**查看器(不与用户抢窗口);进程意外死亡
+    /// (崩溃,无此信号)则按自愈策略重生(见 `bridge::push_frame`)。
+    ViewerClosed,
 }
 
 /// 解析查看器发来的一行 JSON 命令。非法行返回 None(忽略,不打断通道)。
@@ -113,6 +117,7 @@ pub fn parse_command(line: &str) -> Option<ViewCommand> {
             Some(ViewCommand::Clip(op))
         }
         "focus_addrbar" => Some(ViewCommand::FocusAddrbar),
+        "viewer_closed" => Some(ViewCommand::ViewerClosed),
         _ => None,
     }
 }
@@ -146,17 +151,33 @@ impl ViewSink {
             .arg(title)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-                        // 调试开关:LAEW_BROWSER_VIEW_DEBUG=1 时把查看器 stderr 接到宿主,
-            // 便于抓 AppKit 侧的异常输出(默认丢弃,避免污染宿主日志)。
-            .stderr(if std::env::var("LAEW_BROWSER_VIEW_DEBUG").is_ok() {
-                std::process::Stdio::inherit()
-            } else {
-                std::process::Stdio::null()
-            })
+            // 查看器 stderr 默认转发进宿主运行日志(panic 文案/CrashDump 提示
+            // 曾全部进 /dev/null,2026-11-04 查看器崩溃事故取证因此少了第一现场);
+            // LAEW_BROWSER_VIEW_DEBUG=1 改为直连宿主 stderr(开发调试用)。
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .ok()?;
         let stdin = child.stdin.take()?;
         let stdout = child.stdout.take()?;
+        let stderr = child.stderr.take();
+        if std::env::var("LAEW_BROWSER_VIEW_DEBUG").is_ok() {
+            // 调试模式:不再转发(上面 piped 收走的 stderr 改印到宿主 stderr)。
+            if let Some(err) = stderr {
+                std::thread::spawn(move || {
+                    use std::io::BufRead as _;
+                    for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
+                        eprintln!("[bview] {line}");
+                    }
+                });
+            }
+        } else if let Some(err) = stderr {
+            std::thread::spawn(move || {
+                use std::io::BufRead as _;
+                for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
+                    tracing::warn!(target: "viewer_stderr", "{line}");
+                }
+            });
+        }
         std::thread::spawn(move || {
             // 持有 Child 直到其退出,避免僵尸;stdin drop 后查看器自然结束。
             let _ = child.wait();
@@ -346,6 +367,15 @@ mod tests {
         // 非法 clip 动作忽略。
         assert_eq!(parse_command(r#"{"cmd":"clip"}"#), None);
         assert_eq!(parse_command(r#"{"cmd":"clip","act":"fly"}"#), None);
+    }
+
+    #[test]
+    fn 解析命令_人工关窗信号() {
+        // 查看器 windowWillClose: 退出前上报;宿主据此不自动重生窗口。
+        assert_eq!(
+            parse_command(r#"{"cmd":"viewer_closed"}"#),
+            Some(ViewCommand::ViewerClosed)
+        );
     }
 
     #[test]
