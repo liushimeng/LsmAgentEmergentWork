@@ -138,8 +138,7 @@ pub(crate) fn layout_container(
         background_alpha: style.background_alpha,
         visible: style_visible(style),
         z_index: style.pos.z_index,
-        out_of_flow: false,
-    });
+        out_of_flow: false, rides_frame: false,});
     let box_idx = ctx.boxes_len() - 1;
     let content_h = layout_content(ctx, node, content_x, inner_w, style, depth + 1, cb);
     let box_h = constrain_height(style, (ctx.cursor_y() - start_y + content_h).max(1.0));
@@ -861,8 +860,7 @@ fn emit_item(
         background_alpha: cs.background_alpha,
         visible: style_visible(&cs),
         z_index: cs.pos.z_index,
-        out_of_flow: false,
-    });
+        out_of_flow: false, rides_frame: false,});
     ctx.emit_element(seq, &cs, &item.tag, x, y, used_w, used_h);
     if let Some(node) = item.node.as_ref() {
         ctx.emit_canvas_pixels(node, &cs, seq, x, y, used_w, used_h);

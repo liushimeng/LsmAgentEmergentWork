@@ -101,8 +101,7 @@ pub(crate) fn layout_dialog(
         background_alpha: style.background_alpha,
         visible: style_visible(style),
         z_index: style.pos.z_index,
-        out_of_flow: true,
-    });
+        out_of_flow: true, rides_frame: false,});
     super::push_border_and_shadow(ctx, style, bx, by, bw, bh);
     ctx.emit_element(seq, style, "dialog", bx, by, bw, bh);
     // 内容片段整体平移到对话框内容盒起点,并抬到顶层绘制层。
@@ -219,8 +218,7 @@ pub(crate) fn emit_select_panel(
             background_alpha: style.background_alpha,
             visible: style_visible(style) && document::attr(&options[i], "disabled").is_none(),
             z_index: style.pos.z_index,
-            out_of_flow: true,
-        });
+            out_of_flow: true, rides_frame: false,});
         let line = TextLine {
             text: label.clone(),
             x: panel_x + PANEL_PAD,

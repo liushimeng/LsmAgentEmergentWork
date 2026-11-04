@@ -25,7 +25,7 @@ pub(crate) fn translate(fragment: &mut Fragment, dx: f64, dy: f64) {
         l.y += dy;
     }
     for b in &mut fragment.boxes {
-        if b.out_of_flow {
+        if b.out_of_flow && !b.rides_frame {
             continue;
         }
         b.x += dx;
@@ -89,8 +89,7 @@ impl<'a> LayoutCtx<'a> {
                     background_alpha: style.background_alpha,
                     visible: style_visible(style),
                     z_index: style.pos.z_index,
-                    out_of_flow: false,
-                }],
+                    out_of_flow: false, rides_frame: false,}],
                 paints: Vec::new(),
                 borders: Vec::new(),
                 shadows: Vec::new(),
@@ -104,10 +103,14 @@ impl<'a> LayoutCtx<'a> {
         self.intrinsic = prev_intrinsic || content_width >= super::MAX_CONTENT_WIDTH;
         let lines0 = self.lines.len();
         let boxes0 = self.boxes.len();
+        let pads_mark = self.positioned_pads.len();
         let paints0 = self.paints.len();
         let borders0 = self.borders.len();
         let shadows0 = self.shadows.len();
         let display0 = self.display.len();
+        // 测量帧入栈:片段期间盒表命中的祖先盒按「索引 >= 帧起点」判定
+        // 是否属于本片段(position.rs::nearest_positioned_cb)。
+        self.frame_stack.push(boxes0);
         self.y = 0.0;
         let height = if style.display == "flex" {
             // flex/grid 格式化上下文不推进全局游标,高度取返回值。
@@ -153,6 +156,10 @@ impl<'a> LayoutCtx<'a> {
         let borders = self.borders.split_off(borders0);
         let shadows = self.shadows.split_off(shadows0);
         let display_items = self.display.split_off(display0);
+        // 本帧登记的定位祖先随片段一起丢弃:它们的坐标是片段局部的,
+        // 泄漏到外层帧会让后续 absolute 解析拿到错误坐标系。
+        self.positioned_pads.truncate(pads_mark);
+        self.frame_stack.pop();
         self.y = y0;
         self.intrinsic = prev_intrinsic;
         Fragment {
@@ -191,10 +198,14 @@ impl<'a> LayoutCtx<'a> {
         self.intrinsic = prev_intrinsic || content_width >= super::MAX_CONTENT_WIDTH;
         let lines0 = self.lines.len();
         let boxes0 = self.boxes.len();
+        let pads_mark = self.positioned_pads.len();
         let paints0 = self.paints.len();
         let borders0 = self.borders.len();
         let shadows0 = self.shadows.len();
         let display0 = self.display.len();
+        // 测量帧入栈:片段期间盒表命中的祖先盒按「索引 >= 帧起点」判定
+        // 是否属于本片段(position.rs::nearest_positioned_cb)。
+        self.frame_stack.push(boxes0);
         self.y = 0.0;
         // 块级子代路径才透传确定高;嵌套 flex/grid 容器的高度仍内容驱动
         // (容器自身 height:100% 由布局主流程按包含块求解,不经测量语境)。
@@ -213,6 +224,10 @@ impl<'a> LayoutCtx<'a> {
         let borders = self.borders.split_off(borders0);
         let shadows = self.shadows.split_off(shadows0);
         let display_items = self.display.split_off(display0);
+        // 本帧登记的定位祖先随片段一起丢弃:它们的坐标是片段局部的,
+        // 泄漏到外层帧会让后续 absolute 解析拿到错误坐标系。
+        self.positioned_pads.truncate(pads_mark);
+        self.frame_stack.pop();
         self.y = y0;
         self.intrinsic = prev_intrinsic;
         Fragment {

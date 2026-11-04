@@ -101,8 +101,7 @@ pub(crate) fn layout_container(
         background_alpha: style.background_alpha,
         visible: style_visible(style),
         z_index: style.pos.z_index,
-        out_of_flow: false,
-    });
+        out_of_flow: false, rides_frame: false,});
     let box_idx = ctx.boxes_len() - 1;
     // 第 41 轮:`caption` 排在表格内容之前,占表格总高的一段。
     // 第 49 轮:`caption-side: bottom` 时 caption 落到表格内容之后。
@@ -167,8 +166,7 @@ fn layout_caption(
         background_alpha: cap_style.background_alpha,
         visible: style_visible(&cap_style),
         z_index: cap_style.pos.z_index,
-        out_of_flow: false,
-    });
+        out_of_flow: false, rides_frame: false,});
     append(ctx, frag);
     ctx.advance_y(h);
     h
@@ -354,8 +352,7 @@ pub(crate) fn layout_content(
             background_alpha: row_style.background_alpha,
             visible: style_visible(&row_style),
             z_index: row_style.pos.z_index,
-            out_of_flow: false,
-        });
+            out_of_flow: false, rides_frame: false,});
     }
 
     for cell in &mut cells {
@@ -394,8 +391,7 @@ pub(crate) fn layout_content(
             background_alpha: cell.style.background_alpha,
             visible: style_visible(&cell.style),
             z_index: cell.style.pos.z_index,
-            out_of_flow: false,
-        });
+            out_of_flow: false, rides_frame: false,});
         // 第 41 轮:`border-collapse: collapse` 时相邻单元格共享边框 ——
         // 每格只画 top + left,末行补 bottom、末列补 right,消除双线。
         let mut cell_style = cell.style.clone();

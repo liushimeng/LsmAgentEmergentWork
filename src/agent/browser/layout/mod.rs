@@ -146,7 +146,7 @@ impl TextDecor {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ElementBox {
     pub selector: String,
     pub tag: String,
@@ -168,6 +168,32 @@ pub struct ElementBox {
     /// 盒坐标当成内容宽,后续条目被 flex 收缩压到 ~1px(猎聘「登录/注册」
     /// 入口 0×0 根因)。
     pub out_of_flow: bool,
+    /// 坐标属于**当前测量片段坐标系**(true)时随片段平移;false = 全局
+    /// 坐标(包含块在片段外),平移必须跳过。此前 out_of_flow 一个标志
+    /// 同时承担「跳聚合」与「跳平移」,而片段内解析的 absolute 坐标是
+    /// 片段局部的 —— 不随片段平移就恒落在页面原点(猎聘搜索条整体错位
+    /// 到 (0,0) 的根因)。
+    pub rides_frame: bool,
+}
+
+/// 布局期「进行中的定位祖先」登记:块级盒的 ElementBox 在其**子树布局
+/// 完成后**才写入(mod.rs 块级路径),而子树内 absolute 后代在容器 flow
+/// 尾部就解析包含块 —— 那一刻沿 DOM 上溯反查盒表必然落空。定位子项在
+/// 进入子树前先把内容盒原点登记到这里,`nearest_positioned_cb` 盒表未
+/// 命中时按选择器兜底。
+#[derive(Debug, Clone)]
+pub(crate) struct PositionedPad {
+    pub selector: String,
+    /// 内容盒(padding 盒内侧)原点与宽。
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    /// 包含块高(显式高已知;auto 高为 UNKNOWN_CB_H 语义,由消费方回退)。
+    pub h: f64,
+    /// 登记时的测量帧深度(见 LayoutCtx::frame_stack):消费方据此判断
+    /// 该登记是否属于当前帧 —— 跨帧登记的坐标不属于当前片段,不能标记
+    /// rides_frame。
+    pub depth: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -311,6 +337,8 @@ pub fn compute_full(
         borders: Vec::new(),
         shadows: Vec::new(),
         display: Vec::new(),
+        positioned_pads: Vec::new(),
+        frame_stack: Vec::new(),
         scroll_max: HashMap::new(),
         seq: 0,
         images,
@@ -478,6 +506,13 @@ pub(crate) struct LayoutCtx<'a> {
     shadows: Vec<ShadowDraw>,
     /// 绘制显示列表(阶段六):DFS 发射,终排后进 `Layout::display`。
     display: Vec<DisplayItem>,
+    /// 进行中的定位祖先登记(见 PositionedPad):子树布局期供
+    /// `nearest_positioned_cb` 兜底反查。
+    pub(crate) positioned_pads: Vec<PositionedPad>,
+    /// 测量帧栈:每个元素 = 该帧开始时的 `boxes.len()`(measure_content
+    /// push/pop)。用于判定盒表命中的祖先盒是否属于**当前片段** ——
+    /// 片段内解析的 absolute 坐标是片段局部的,必须随片段平移。
+    pub(crate) frame_stack: Vec<usize>,
     /// 第 46 轮:可滚动容器的最大滚动量(stable selector → px)。
     scroll_max: HashMap<String, f64>,
     /// DFS 先序序号(显示列表排序键之一)。
@@ -1578,8 +1613,7 @@ impl<'a> LayoutCtx<'a> {
                     background_alpha: style.background_alpha,
                     visible: style_visible(&style),
                     z_index: style.pos.z_index,
-                    out_of_flow: false,
-                });
+                    out_of_flow: false, rides_frame: false,});
                 push_border_and_shadow(self, &style, bx, by, iw, ih);
                 let tag = document::tag_name(&child);
                 self.emit_element(seq, &style, &tag, bx, by, iw, ih);
@@ -1622,8 +1656,7 @@ impl<'a> LayoutCtx<'a> {
                     background_alpha: style.background_alpha,
                     visible,
                     z_index: style.pos.z_index,
-                    out_of_flow: false,
-                });
+                    out_of_flow: false, rides_frame: false,});
                 let replaced_tag = document::tag_name(&child);
                 self.emit_element(seq, &style, &replaced_tag, bx + dx, by + dy, iw, ih);
                 self.emit_canvas_pixels(&child, &style, seq, bx + dx, by + dy, iw, ih);
@@ -1784,12 +1817,24 @@ impl<'a> LayoutCtx<'a> {
                     // 最近定位祖先;高度仍按本盒内容高供普通百分比高度求解。
                     (cb.0, cb.1, cb.2, cb_h)
                 } else {
-                    (
+                    let ccb = (
                         bx + style.padding_left + marker_inset,
                         start_y + style.padding_top,
                         (bw - style.padding_left - style.padding_right - marker_inset).max(0.0),
                         cb_h,
-                    )
+                    );
+                    // 先序登记:本盒 ElementBox 要等子树收口才写入,而子树内
+                    // absolute 在 flow 尾部就解析包含块 —— 先把内容盒原点
+                    // 记给 nearest_positioned_cb 兜底(见 PositionedPad)。
+                    self.positioned_pads.push(PositionedPad {
+                        selector: selector.clone(),
+                        x: ccb.0,
+                        y: ccb.1,
+                        w: ccb.2,
+                        h: ccb.3,
+                        depth: self.frame_stack.len(),
+                    });
+                    ccb
                 };
                 // 第 46 轮:可滚动容器(`overflow:auto|scroll`)—— 内容按运行时
                 // 滚动偏移上移(偏移量落在临时解析树的 `data-lsm-scroll-top`),
@@ -1900,8 +1945,7 @@ impl<'a> LayoutCtx<'a> {
                     background_alpha: style.background_alpha,
                     visible: style_visible(&style),
                     z_index: style.pos.z_index,
-                    out_of_flow: false,
-                });
+                    out_of_flow: false, rides_frame: false,});
                 // 边框/外阴影绘制指令(不占几何;relative 偏移需同步平移)。
                 push_border_and_shadow(self, &style, bx, start_y, bw, box_h);
                 // 阶段三:relative/sticky 整体偏移(不影响占位):先平移子树几何,

@@ -92,6 +92,7 @@ pub async fn inspect(
                         "content_type": r.content_type, "bytes": r.bytes,
                         "elapsed_ms": r.elapsed_ms, "redirect": r.redirect,
                         "from_cache": r.from_cache, "at_ms": r.at_ms,
+                        "req_body": r.req_body,
                     })
                 })
                 .collect();

@@ -53,8 +53,7 @@ fn 盒_of(lay: &super::Layout, selector: &str) -> super::ElementBox {
         background_alpha: 255,
         visible: true,
         z_index: 0,
-        out_of_flow: false,
-    }
+        out_of_flow: false, rides_frame: false,}
 }
 
 /// 按**标签名**取首个盒。

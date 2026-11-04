@@ -844,6 +844,7 @@ impl ThreadRuntime {
                     bytes: n.bytes,
                     elapsed_ms: n.elapsed_ms,
                     redirect: n.redirect,
+                    req_body: n.req_body,
                 })
                 .collect(),
             handled: parsed.get("handled").and_then(Value::as_bool).unwrap_or(false),
@@ -1209,10 +1210,12 @@ fn blocking_fetch(
     if let Some(body) = opts.get("body").and_then(Value::as_str) {
         builder = builder.body(body.to_string());
     }
+    // 请求体片段(诊断台账用):非 GET 请求把体前 256 字符带进网络记录。
+    let body_snippet: Option<&str> = opts.get("body").and_then(Value::as_str);
     let resp = match builder.send() {
         Ok(r) => r,
         Err(e) => {
-            record_network(url, &method, 0, "", 0, started);
+            record_network(url, &method, 0, "", 0, started, body_snippet);
             return json!({"error": format!("请求失败:{e}")});
         }
     };
@@ -1238,13 +1241,13 @@ fn blocking_fetch(
         MAX_FETCH_BODY
     };
     if declared > max_body {
-        record_network(url, &method, status, &content_type, 0, started);
+        record_network(url, &method, status, &content_type, 0, started, body_snippet);
         return json!({"error": format!("响应体超过上限({} MB)", max_body / 1024 / 1024)});
     }
     let bytes = match resp.bytes() {
         Ok(b) => b.to_vec(),
         Err(e) => {
-            record_network(url, &method, status, &content_type, 0, started);
+            record_network(url, &method, status, &content_type, 0, started, body_snippet);
             return json!({"error": format!("读取响应失败:{e}")});
         }
     };
@@ -1255,16 +1258,16 @@ fn blocking_fetch(
     // 经典脚本与样式表装载不受 CORS 约束(script/style:true 时跳过)。
     if !is_script_load && !is_style_load {
         if let Some(err) = check_cors(&base_url, target.as_str(), &method, &headers) {
-            record_network(url, &method, status, &content_type, 0, started);
+            record_network(url, &method, status, &content_type, 0, started, body_snippet);
             return json!({"error": err});
         }
     }
     // 阶段四第二步：CSP connect-src 门禁。
     if let Some(err) = check_connect_csp(&base_url, target.as_str()) {
-        record_network(url, &method, status, &content_type, 0, started);
+        record_network(url, &method, status, &content_type, 0, started, body_snippet);
         return json!({"error": err});
     }
-    record_network(url, &method, status, &content_type, bytes.len(), started);
+    record_network(url, &method, status, &content_type, bytes.len(), started, body_snippet);
     // JS 响应体套 for-in 守卫:AMD 装载器在线程内同步 eval 模块源码,
     // 模块里的 `for(x in nullable)` 同样会被 Boa 规范偏差打断。
     let body = if content_type.contains("javascript") || content_type.contains("ecmascript") {
@@ -1293,7 +1296,15 @@ fn blocking_fetch(
     })
 }
 
-fn record_network(url: &str, method: &str, status: u16, content_type: &str, bytes: usize, started: Instant) {
+fn record_network(
+    url: &str,
+    method: &str,
+    status: u16,
+    content_type: &str,
+    bytes: usize,
+    started: Instant,
+    req_body: Option<&str>,
+) {
     REQ_ENV.with(|c| {
         let mut env = c.borrow_mut();
         if env.network.len() < 200 {
@@ -1305,6 +1316,10 @@ fn record_network(url: &str, method: &str, status: u16, content_type: &str, byte
                 bytes,
                 elapsed_ms: started.elapsed().as_millis() as u64,
                 redirect: false,
+                // 请求体片段入台账:GET 不记;非 GET 截 256 字符(够看参数形状)。
+                req_body: req_body
+                    .filter(|_| method != "GET")
+                    .map(|b| b.chars().take(256).collect()),
             });
         }
     });

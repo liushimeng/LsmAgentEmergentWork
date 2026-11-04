@@ -239,8 +239,7 @@ pub async fn load_stylesheets(
                     elapsed_ms: 0,
                     redirect: false,
                     from_cache: true,
-                    at_ms: super::now_ms(),
-                });
+                    at_ms: super::now_ms(), req_body: None,});
                 fetched.push((link.href, css));
                 continue;
             }
@@ -267,8 +266,7 @@ pub async fn load_stylesheets(
                     elapsed_ms: resp.elapsed_ms,
                     redirect: resp.redirect_chain.len() > 1,
                     from_cache: false,
-                    at_ms: super::now_ms(),
-                });
+                    at_ms: super::now_ms(), req_body: None,});
                 if !(200..300).contains(&status) {
                     out.console.push(ConsoleRecord {
                         level: "warn".to_string(),
@@ -406,8 +404,7 @@ async fn fetch_import_css(
                 elapsed_ms: 0,
                 redirect: false,
                 from_cache: true,
-                at_ms: super::now_ms(),
-            });
+                at_ms: super::now_ms(), req_body: None,});
             return Some(css);
         }
     }
@@ -430,8 +427,7 @@ async fn fetch_import_css(
                 elapsed_ms: resp.elapsed_ms,
                 redirect: resp.redirect_chain.len() > 1,
                 from_cache: false,
-                at_ms: super::now_ms(),
-            });
+                at_ms: super::now_ms(), req_body: None,});
             if !(200..300).contains(&status) {
                 out.console.push(ConsoleRecord {
                     level: "warn".to_string(),

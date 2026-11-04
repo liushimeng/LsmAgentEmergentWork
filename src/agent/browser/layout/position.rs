@@ -19,9 +19,15 @@ pub(crate) fn layout_deferred(
 ) {
     for d in deferred {
         let mark = ctx.display_len();
-        layout_abs(ctx, &d.node, &d.style, cb, depth, (d.static_x, d.static_y));
+        let rides = layout_abs(ctx, &d.node, &d.style, cb, depth, (d.static_x, d.static_y));
+        // 显示项的 out_of_flow 只服务「片段平移跳过」:全局坐标(rides=false)
+        // 保持跳过;片段局部坐标(rides=true)清标志,随片段平移到锚点。
+        // 只翻转普通流项(oof=false)—— 子树内嵌套 absolute 若已按**全局**
+        // 包含块解析(oof=true,坐标是全局系),外层帧的平移同样不能动它。
         for it in &mut ctx.display[mark..] {
-            it.out_of_flow = true;
+            if !it.out_of_flow {
+                it.out_of_flow = !rides;
+            }
         }
     }
 }
@@ -29,11 +35,24 @@ pub(crate) fn layout_deferred(
 /// 最近定位祖先的实际包含块。static 父盒与 Flex/Grid 的局部测量都会
 /// 产生自己的临时坐标系,但它们都不是 CSS absolute 的包含块;必须沿 DOM
 /// 上溯,不能直接使用调用方恰好传入的临时 cb。
+///
+/// 返回 (包含块, rides_frame):`rides_frame=true` 表示解析结果落在**当前
+/// 测量片段**的局部坐标系里(pads 兜底 / 本帧内盒命中 / 片段内 fallback),
+/// 该 absolute 子树的盒与显示项必须随片段平移;false = 全局坐标(外层盒
+/// 命中或初始包含块),平移必须跳过 —— 否则双重平移。
+///
+/// 盒表命不中的根因:块级盒的 ElementBox 在子树布局完成后才写入,
+/// 而子树内 absolute 在容器 flow 尾部就解析 —— 先序登记(PositionedPad)
+/// 兜底(实测猎聘搜索条 `._40108NOybO` absolute 锚在 relative 祖先内,
+/// 反查落空后回退片段局部原点,又因 out_of_flow 跳过平移,整条搜索条
+/// 画到页面 (0,0) 与导航重叠)。
 fn nearest_positioned_cb(
     ctx: &LayoutCtx,
     node: &NodeRef,
     fallback: (f64, f64, f64, f64),
-) -> (f64, f64, f64, f64) {
+) -> ((f64, f64, f64, f64), bool) {
+    let frame_origin = *ctx.frame_stack.last().unwrap_or(&0);
+    let in_frame = !ctx.frame_stack.is_empty();
     let mut cur = node.parent();
     let mut positioned_seen = false;
     while let Some(ancestor) = cur {
@@ -42,17 +61,34 @@ fn nearest_positioned_cb(
             if style.pos.position != "static" || style.transform.is_some() {
                 positioned_seen = true;
                 let selector = Document::stable_selector(&ancestor);
-                if let Some(b) = ctx.boxes.iter().rev().find(|b| b.selector == selector) {
+                if let Some(idx) = ctx.boxes.iter().rposition(|b| b.selector == selector) {
+                    let b = &ctx.boxes[idx];
+                    let h = if b.h > 1.0 {
+                        (b.h - style.padding_top - style.padding_bottom).max(0.0)
+                    } else {
+                        fallback.3
+                    };
                     return (
-                        b.x + style.padding_left,
-                        b.y + style.padding_top,
-                        (b.w - style.padding_left - style.padding_right).max(0.0),
-                        if b.h > 1.0 {
-                            (b.h - style.padding_top - style.padding_bottom).max(0.0)
-                        } else {
-                            fallback.3
-                        },
+                        (
+                            b.x + style.padding_left,
+                            b.y + style.padding_top,
+                            (b.w - style.padding_left - style.padding_right).max(0.0),
+                            h,
+                        ),
+                        // 本帧内发射的盒 = 片段局部坐标;外层盒 = 全局坐标。
+                        in_frame && idx >= frame_origin,
                     );
+                }
+                // 盒表未命中(尚未写盒)→ 先序登记兜底;只认当前帧的登记,
+                // 跨帧登记的坐标不属于本片段。
+                if let Some(pad) = ctx
+                    .positioned_pads
+                    .iter()
+                    .rev()
+                    .find(|p| p.selector == selector && p.depth == ctx.frame_stack.len())
+                {
+                    let h = if pad.h > 1.0 && pad.h < super::UNKNOWN_CB_H { pad.h } else { fallback.3 };
+                    return (((pad.x, pad.y, pad.w, h)), true);
                 }
             }
         }
@@ -60,11 +96,13 @@ fn nearest_positioned_cb(
     }
     if positioned_seen {
         // 定位祖先可能尚未收口写盒,沿用调用方携带的同一包含块。
-        fallback
+        // 片段内的 fallback cb 是片段局部的 → 随片段平移;顶层 flow 的
+        // fallback 本就是全局坐标 → 不平移。
+        (fallback, in_frame)
     } else {
-        // 没有定位祖先时是初始包含块,不能回退到零宽临时父盒。
+        // 没有定位祖先时是初始包含块(视口,全局坐标),不能回退到零宽临时父盒。
         let (vw, vh) = ctx.viewport();
-        (0.0, 0.0, vw, vh)
+        ((0.0, 0.0, vw, vh), false)
     }
 }
 
@@ -75,17 +113,21 @@ fn layout_abs(
     cb: (f64, f64, f64, f64),
     depth: usize,
     static_pos: (f64, f64),
-) {
+) -> bool {
     if depth > 60 {
-        return;
+        return false;
     }
     let fixed = style.pos.position == "fixed";
-    let (cx, cy, cw, ch) = if fixed {
+    let ((cx, cy, cw, ch), mut rides) = if fixed {
         let (vw, vh) = ctx.viewport();
-        (0.0, 0.0, vw, vh)
+        ((0.0, 0.0, vw, vh), false)
     } else {
         nearest_positioned_cb(ctx, node, cb)
     };
+    // fixed 视口坐标恒为全局系。
+    if fixed {
+        rides = false;
+    }
     let pad_l = style.padding_left;
     let pad_r = style.padding_right;
     let pad_t = style.padding_top;
@@ -96,8 +138,14 @@ fn layout_abs(
 
     // 宽度按 border-box 求解;显式 content-box 再把 padding 加回。
     // auto 仍走 shrink-to-fit,最后统一应用 min/max 约束。
+    // CSS 2.1 §10.3.7:width auto 且 left/right 均非 auto(典型 `inset:0`)
+    // → 由约束求解拉伸铺满包含块,而非 shrink-to-fit(猎聘 hero 背景
+    // `#home-banner-bg-root{inset:0}` 此前塌缩到内容 1×1)。
     let mut bw = if let Some(w) = style.width.or(style.width_percent.map(|p| p / 100.0 * avail_w)) {
         if style.box_sizing_content { w + pad_l + pad_r } else { w }
+    } else if let (Some(l), Some(r)) = (style.pos.resolved_left(cw), style.pos.resolved_right(cw))
+    {
+        (cw - l - r - style.margin_left - style.margin_right).max(1.0)
     } else {
         let frag = ctx.measure_content(node, super::MAX_CONTENT_WIDTH, style, depth);
         let mut w = 0.0f64;
@@ -126,6 +174,15 @@ fn layout_abs(
         avail_h_known.then(|| style.height_percent.map(|p| p / 100.0 * avail_h)).flatten()
     }) {
         if style.box_sizing_content { h + pad_t + pad_b } else { h }
+    } else if avail_h_known {
+        // §10.6.4 对称:height auto 且 top/bottom 均非 auto → 约束求解。
+        match (
+            style.pos.resolved_top(ch),
+            style.pos.resolved_bottom(ch),
+        ) {
+            (Some(t), Some(b)) => (ch - t - b - style.margin_top - style.margin_bottom).max(1.0),
+            _ => ctx.measure_content(node, content_w, style, depth).height.max(1.0) + pad_t + pad_b,
+        }
     } else {
         ctx.measure_content(node, content_w, style, depth).height.max(1.0) + pad_t + pad_b
     };
@@ -202,6 +259,7 @@ fn layout_abs(
         visible: style_visible(style),
         z_index: style.pos.z_index,
         out_of_flow: true,
+        rides_frame: rides,
     });
     // 阶段三第三步:定位体系里的替换元素(<img>)同样要贴图。
     // `measure_content` 的 img 分支只产出几何、不产出绘制指令(见 layout/mod.rs),
@@ -231,11 +289,18 @@ fn layout_abs(
     // 任何祖先的内在尺寸聚合(第 174 轮猎聘「登录/注册」0×0 根因的另一半:
     // measure_content 替换元素捷径盒 tag=img 曾以 oof=false 注入)。
     for b in &mut frag.boxes {
+        let rode_frame = !b.out_of_flow || b.rides_frame;
         b.out_of_flow = true;
+        // 只重标「随上面 translate 进本帧」的盒子;嵌套 absolute 已按全局
+        // 包含块解析的盒(oof 且未随帧)保持全局语义,外层平移不得移动。
+        if rode_frame {
+            b.rides_frame = rides;
+        }
     }
     super::append(ctx, frag);
     ctx.apply_group(mark, style, bx, by, bw, bh);
     if fixed {
         ctx.fixed_depth -= 1;
     }
+    rides
 }

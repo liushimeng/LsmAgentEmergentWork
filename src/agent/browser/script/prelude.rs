@@ -1676,6 +1676,16 @@ function __mk(n) {
     var c = el.children;
     return c.length ? c[c.length - 1] : null;
   }, function (v) {});
+  // Element 版子节点访问(快照层子节点全是元素,直接取首尾)。缺这对属性时
+  // 站点遍历代码 `el.firstElementChild.xxx` 读到 undefined,挂载/水合链静默断
+  // (实测猎聘登录盒 firstElementChild 探测失败)。
+  define("firstElementChild", function () {
+    return el.children.length ? el.children[0] : null;
+  }, function (v) {});
+  define("lastElementChild", function () {
+    var c = el.children;
+    return c.length ? c[c.length - 1] : null;
+  }, function (v) {});
   define("textContent", function () {
     return Object.prototype.hasOwnProperty.call(__lsmText, key) ? __lsmText[key] : (n.text || "");
   }, function (v) {
@@ -2051,6 +2061,15 @@ function __newEl(tag) {
   // childNodes.length;静态空数组恒 0,探测恒 false)。
   def("childNodes", function () { return (el.__htmlKids || []).concat(el.__kids || []); });
   def("children", function () { return (el.__htmlKids || []).concat(el.__kids || []).filter(function (k) { return k && k.nodeType === 1; }); });
+  // Element 版子节点访问:与 children 同源(已滤非元素),动态节点此前整体缺失。
+  def("firstElementChild", function () {
+    var c = (el.__htmlKids || []).concat(el.__kids || []).filter(function (k) { return k && k.nodeType === 1; });
+    return c.length ? c[0] : null;
+  });
+  def("lastElementChild", function () {
+    var c = (el.__htmlKids || []).concat(el.__kids || []).filter(function (k) { return k && k.nodeType === 1; });
+    return c.length ? c[c.length - 1] : null;
+  });
   // 几何 getter:宿主已把动态子树重新解析进 DOM 并参与布局,rect 随每轮快照回填。
   // 站点读到的尺寸因此与截图里画出来的盒子一致(地图才能按真实容器尺寸装载)。
   def("clientWidth", function () { return __lsmDynGeo(el).w; });
@@ -2302,6 +2321,14 @@ function __newEl(tag) {
     var all = (el.__htmlKids || []).concat(el.__kids);
     return all.length ? all[all.length - 1] : null;
   }, function (v) {});
+  def("firstElementChild", function () {
+    var c = (el.__htmlKids || []).concat(el.__kids).filter(function (k) { return k && k.nodeType === 1; });
+    return c.length ? c[0] : null;
+  });
+  def("lastElementChild", function () {
+    var c = (el.__htmlKids || []).concat(el.__kids).filter(function (k) { return k && k.nodeType === 1; });
+    return c.length ? c[c.length - 1] : null;
+  });
   el.ownerDocument = document;
   // 39 号 P2b:动态节点的文本控件选区方法(与快照元素同构)。
   __lsmInstallDynSetSelectionRange(el);

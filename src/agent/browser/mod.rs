@@ -179,6 +179,8 @@ pub struct NetworkRecord {
     /// 是否来自全内存 HTTP 缓存（命中强缓存时 elapsed_ms=0）。
     pub from_cache: bool,
     pub at_ms: u128,
+    /// 页面 fetch/XHR 请求体片段(≤256 字符;宿主预取类记录为 None)。
+    pub req_body: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1083,8 +1085,7 @@ impl LsmBrowserManager {
                     elapsed_ms: resp.elapsed_ms,
                     redirect: resp.redirect_chain.len() > 1,
                     from_cache,
-                    at_ms: now_ms(),
-                }];
+                    at_ms: now_ms(), req_body: None,}];
                 recs.extend(resources_out.network.clone());
                 recs.extend(pipeline.network.clone());
                 recs.extend(images_out.network.clone());
@@ -1442,8 +1443,7 @@ impl LsmBrowserManager {
                 elapsed_ms: resp.elapsed_ms,
                 redirect: resp.redirect_chain.len() > 1,
                 from_cache,
-                at_ms: now_ms(),
-            },
+                at_ms: now_ms(), req_body: None,},
         );
         Ok(NavOutcome {
             page_id: page_id.to_string(),

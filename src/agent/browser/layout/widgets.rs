@@ -745,8 +745,7 @@ fn emit_select_list(
                     background_alpha: 255,
                     visible: !disabled,
                     z_index: style.pos.z_index,
-                    out_of_flow: false,
-                });
+                    out_of_flow: false, rides_frame: false,});
             }
         }
         y += row_h;

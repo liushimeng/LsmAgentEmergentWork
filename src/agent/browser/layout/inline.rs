@@ -799,8 +799,7 @@ impl<'a> LayoutCtx<'a> {
             background_alpha: st.background_alpha,
             visible: style_visible(st),
             z_index: st.pos.z_index,
-            out_of_flow: false,
-        });
+            out_of_flow: false, rides_frame: false,});
         push_border_and_shadow(self, st, box_x, box_y, box_w, box_h);
         self.emit_element_tf(seq, st, &owner.tag, box_x, box_y, box_w, box_h, tf);
     }
@@ -834,8 +833,7 @@ impl<'a> LayoutCtx<'a> {
             background_alpha: style.background_alpha,
             visible: style_visible(style),
             z_index: style.pos.z_index,
-            out_of_flow: false,
-        });
+            out_of_flow: false, rides_frame: false,});
         // 输入框/按钮等交互元素的边框与外阴影(绘制不占几何)。
         push_border_and_shadow(self, style, x, y, w, h);
         self.emit_element(seq, style, &tag, x, y, w, h);
@@ -1011,8 +1009,7 @@ impl<'a> LayoutCtx<'a> {
             background_alpha: style.background_alpha,
             visible: style_visible(style),
             z_index: style.pos.z_index,
-            out_of_flow: false,
-        });
+            out_of_flow: false, rides_frame: false,});
         push_border_and_shadow(self, style, bx, by, cw, h);
         let tag = document::tag_name(node);
         self.emit_element_tf(box_seq, style, &tag, bx, by, cw, h, tf);
@@ -1161,7 +1158,14 @@ impl<'a> LayoutCtx<'a> {
             let rows = super::widgets::select_list_rows(node).max(1) as f64;
             (rows * (style.font_size * 1.45).max(14.0) + 4.0).max(16.0)
         } else {
-            (style.font_size * 1.45).max(16.0)
+            // 文本类控件的固有高跟随 line-height(Chrome 语义:input 内容盒高
+            // = 行高,`line-height:46px` 的搜索框应 46 高而不是默认 ~20)。
+            // 未设置时回落字号 × 1.45。
+            if style.line_height > 0.0 {
+                style.line_height.max(16.0)
+            } else {
+                (style.font_size * 1.45).max(16.0)
+            }
         };
         let h = style.height.unwrap_or(natural_h).max(1.0);
         (w, h)
@@ -1498,8 +1502,7 @@ impl<'a> LayoutCtx<'a> {
             background_alpha: style.background_alpha,
             visible: style_visible(style),
             z_index: style.pos.z_index,
-            out_of_flow: false,
-        });
+            out_of_flow: false, rides_frame: false,});
         // 输入框/按钮等交互元素的边框与外阴影(绘制不占几何)。
         push_border_and_shadow(self, style, bx, by, w, h);
         let tag = document::tag_name(node);

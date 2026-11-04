@@ -1994,8 +1994,7 @@ fn performance资源时序来自网络台账() {
         elapsed_ms: 1200,
         redirect: false,
         from_cache: false,
-        at_ms: 0,
-    }];
+        at_ms: 0, req_body: None,}];
     let script = "(function(){ var rs=performance.getEntriesByType('resource'); \
                   return JSON.stringify({n:rs.length, name:rs[0]&&rs[0].name, size:rs[0]&&rs[0].transferSize}); })()"
         .to_string();
@@ -2384,8 +2383,7 @@ fn 回复邮箱_旧轮动作合并进新回复且时序在前() {
         content_type: "text/plain".into(),
         bytes: 1,
         elapsed_ms: 1,
-        redirect: false,
-    });
+        redirect: false, req_body: None,});
     let mut cur = JsReply {
         outcome: JsOutcome { ok: true, ..Default::default() },
         network: Vec::new(),
@@ -2653,4 +2651,28 @@ fn 千层递归不被RuntimeLimit误杀() {
     );
     assert!(reply.outcome.ok, "{:?}", reply.outcome.error);
     assert_eq!(reply.outcome.value.trim_matches('"'), "1000");
+}
+
+#[test]
+fn 快照元素_firstElementChild与lastElementChild() {
+    // Element Traversal 标准属性;此前快照包装器缺失,站点遍历代码
+    // `el.firstElementChild.xxx` 读到 undefined 直接断链(猎聘登录盒
+    // 挂载点探测实测)。
+    let handle = JsHandle::spawn();
+    let reply = eval_on(
+        &handle,
+        "JSON.stringify({first: document.getElementById('list').firstElementChild.id, \
+         last: document.getElementById('list').lastElementChild.id, \
+         wrapFirst: document.getElementById('wrap').firstElementChild.id, \
+         inputNull: document.getElementById('box').firstElementChild === null})",
+        SNAP_PAGE,
+        "https://a.test/",
+    );
+    assert!(reply.outcome.ok, "{:?}", reply.outcome.error);
+    assert_eq!(
+        reply.outcome.value,
+        "{\"first\":\"i1\",\"last\":\"i2\",\"wrapFirst\":\"list\",\"inputNull\":true}",
+        "{}",
+        reply.outcome.value
+    );
 }

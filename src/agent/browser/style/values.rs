@@ -1362,6 +1362,46 @@ pub fn apply_declaration(
                 st.pos.position = v;
             }
         }
+        "inset" => {
+            // CSS Positioning L3 简写:1-4 值展开到 top/right/bottom/left,
+            // 单值语义与单边属性完全一致(长度|百分比|auto|calc)。
+            // 实测猎聘首页 `#home-banner-bg-root{inset:0}` 铺满容器,缺这条
+            // 简写时四边全 auto → 绝对定位元素塌缩到内容尺寸(hero 背景
+            // 1×1 像素),整幅 banner 视觉缺失。
+            let toks: Vec<&str> = value.split_whitespace().collect();
+            let sides: Option<(&str, &str, &str, &str)> = match toks.as_slice() {
+                [a] => Some((a, a, a, a)),
+                [a, c] => Some((a, c, a, c)),
+                [a, c, d] => Some((a, c, d, c)),
+                [a, c, d, e] => Some((a, c, d, e)),
+                _ => None,
+            };
+            if let Some((t, r, b, l)) = sides {
+                for (side, v) in [("top", t), ("right", r), ("bottom", b), ("left", l)] {
+                    let percent = parse_percent(v);
+                    let len =
+                        if percent.is_some() { None } else { parse_length(v, st.font_size, ctx) };
+                    match side {
+                        "top" => {
+                            st.pos.top = len;
+                            st.pos.top_percent = percent;
+                        }
+                        "right" => {
+                            st.pos.right = len;
+                            st.pos.right_percent = percent;
+                        }
+                        "bottom" => {
+                            st.pos.bottom = len;
+                            st.pos.bottom_percent = percent;
+                        }
+                        _ => {
+                            st.pos.left = len;
+                            st.pos.left_percent = percent;
+                        }
+                    }
+                }
+            }
+        }
         "top" | "right" | "bottom" | "left" => {
             let percent = parse_percent(value);
             let v = if percent.is_some() { None } else { parse_length(value, st.font_size, ctx) };

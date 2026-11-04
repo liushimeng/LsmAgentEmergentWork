@@ -84,6 +84,10 @@ pub struct NetRecordLite {
     pub bytes: usize,
     pub elapsed_ms: u64,
     pub redirect: bool,
+    /// 页面 fetch/XHR 发出的请求体片段(≤256 字符,GET 不记)。
+    /// 定位「站点 API 拒收我们的请求」类问题(实测猎聘搜索 API -1400:
+    /// 请求体/头与环境差异)时,台账只看响应侧不够,必须能对出请求侧。
+    pub req_body: Option<String>,
 }
 
 /// 线程回复。
@@ -596,6 +600,7 @@ pub(crate) async fn run_pipeline(
                             elapsed_ms: 0,
                             redirect: false,
                             from_cache: true,
+                            req_body: None,
                             at_ms: super::now_ms(),
                         });
                         scripts.push(ScriptSource {
@@ -630,6 +635,7 @@ pub(crate) async fn run_pipeline(
                             redirect: resp.redirect_chain.len() > 1,
                             from_cache: false,
                             at_ms: super::now_ms(),
+                            req_body: None,
                         });
                         scripts.push(ScriptSource {
                             kind: "external",
@@ -919,6 +925,7 @@ pub(crate) fn append_reply(
             redirect: rec.redirect,
             from_cache: false,
             at_ms: super::now_ms(),
+            req_body: rec.req_body.clone(),
         });
     }
     reply

@@ -2005,3 +2005,54 @@ fn 零字号容器内inline_block兄弟水平排开() {
     );
     assert!((x2 - x1) < 200.0, "两枚药丸不应天各一方:x1={x1} x2={x2}");
 }
+
+#[test]
+fn flex子项内absolute锚定relative祖先_不落页面原点() {
+    // 猎聘搜索条根因(2026-11-04):flex 子项内容在片段局部坐标系测量,
+    // 子树内 absolute 在容器 flow 尾部解析包含块,而块级盒的 ElementBox
+    // 要等子树收口才写入 —— relative 祖先反查必然落空,回退片段局部原点
+    // (0,0);又因 out_of_flow 跳过片段平移,整条搜索条画到页面左上角与
+    // 导航重叠。PositionedPad 先序登记 + rides_frame 随片段平移修复。
+    let doc = Document::parse(
+        "<body><div id=wrap style='display:flex;margin:0 auto;width:1184px'>\
+         <div id=left style='flex-shrink:0'>\
+         <div id=anchor style='position:relative;width:784px'>\
+         <div id=pill style='position:absolute;left:0;top:0;width:100%;height:40px'>P</div>\
+         </div></div></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 1920.0, &font());
+    let anchor = layout.rect_for("#anchor").unwrap();
+    let pill = layout.rect_for("#pill").unwrap();
+    // pill 锚定 anchor 内容盒原点,而不是页面 (0,0)。
+    assert!((pill.0 - anchor.0).abs() < 2.0, "pill.x={} anchor.x={}", pill.0, anchor.0);
+    assert!((pill.1 - anchor.1).abs() < 2.0, "pill.y={} anchor.y={}", pill.1, anchor.1);
+    assert!(anchor.0 > 100.0, "anchor.x={}(应居中远离左缘)", anchor.0);
+}
+
+#[test]
+fn inset简写_绝对元素铺满定位祖先() {
+    // 猎聘 hero 背景 `#home-banner-bg-root{inset:0}` 此前塌缩 1×1 像素。
+    let doc = Document::parse(
+        "<body><div id=hero style='position:relative;width:1200px;height:600px'>\
+         <div id=bg style='position:absolute;inset:0'>B</div></div></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 1280.0, &font());
+    let bg = layout.rect_for("#bg").unwrap();
+    assert!((bg.2 - 1200.0).abs() < 2.0, "bg.w={}(inset:0 应铺满宽)", bg.2);
+    assert!((bg.3 - 600.0).abs() < 2.0, "bg.h={}(inset:0 应铺满高)", bg.3);
+}
+
+#[test]
+fn input固有高跟随行高() {
+    // Chrome 语义:input 内容盒高 = line-height。猎聘搜索框
+    // `input{line-height:46px}` 此前恒 ~20px,整条搜索条高度塌缩。
+    let doc = Document::parse(
+        "<body><input id=q style='line-height:46px' placeholder='搜索职位'></body>",
+        "https://a.test/",
+    );
+    let layout = compute(&doc, 800.0, &font());
+    let q = layout.rect_for("#q").unwrap();
+    assert!(q.3 >= 44.0, "q.h={}(line-height:46 应驱动固有高)", q.3);
+}

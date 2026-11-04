@@ -580,6 +580,7 @@ pub(crate) async fn apply_js_reply(
             elapsed_ms: rec.elapsed_ms,
             redirect: rec.redirect,
             from_cache: false,
+            req_body: rec.req_body.clone(),
             at_ms: super::now_ms(),
         });
     }
@@ -658,8 +659,7 @@ pub(crate) async fn apply_js_reply(
                 elapsed_ms: rec.elapsed_ms,
                 redirect: rec.redirect,
                 from_cache: false,
-                at_ms: super::now_ms(),
-            });
+                at_ms: super::now_ms(), req_body: None,});
         }
         for log in images_out.console {
             if tab.console.len() > 400 {
@@ -805,6 +805,7 @@ pub(crate) async fn run_pending_scripts(mgr: &LsmBrowserManager, pid: &str, budg
             elapsed_ms: rec.elapsed_ms,
             redirect: rec.redirect,
             from_cache: false,
+            req_body: rec.req_body,
             at_ms: super::now_ms(),
         });
     }
@@ -2926,8 +2927,7 @@ async fn act_eval(
                         elapsed_ms: 0,
                         redirect: false,
                         from_cache: false,
-                        at_ms: super::now_ms(),
-                    });
+                        at_ms: super::now_ms(), req_body: None,});
                 }
                 "click" | "navigate" | "new_tab" | "back" | "forward" | "reload" | "submit" => {
                     pending.push(action.clone());

@@ -461,8 +461,7 @@ pub async fn load_images(
                     elapsed_ms: resp.elapsed_ms,
                     redirect: resp.redirect_chain.len() > 1,
                     from_cache: false,
-                    at_ms: super::now_ms(),
-                });
+                    at_ms: super::now_ms(), req_body: None,});
                 if !(200..300).contains(&status) {
                     out.console.push(ConsoleRecord {
                         level: "warn".to_string(),
