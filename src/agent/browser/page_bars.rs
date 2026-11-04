@@ -376,13 +376,14 @@ pub(crate) const OVERLAY_SOFTEN_OPACITY: f64 = 0.25;
 /// 站点加载/风控遮罩软化(仅查看器帧):把 `inspect::is_loading_overlay_item`
 /// 命中的「整幅不透明遮罩」透明度降到 [`OVERLAY_SOFTEN_OPACITY`]。
 ///
-/// 用户控制态(`request_human` 交还人工)下,站点自身的全屏 loading 遮罩
-/// (实测猎聘 `/zhaopin/` 的 `.searchjobs-spin-loading-box` 白底 z=9999:
-/// 搜索 API 400 → React loading 永真 → 遮罩永驻)会让人工完全看不见遮罩下的
-/// 登录表单/验证码 —— 人工只能对着白屏空点「我已完成」,HITL 流程死锁。
-/// 软化后人工看得见即可操作:点击命中按面积升序,小表单元素天然优先于
-/// 全屏遮罩,不受遮罩影响。**只在查看器帧调用**,取证截图路径
-/// (`screenshot_locked`)不经过本函数,证据图保持站点原貌。
+/// 站点自身的全屏 loading 遮罩(实测猎聘 `/zhaopin/` 的
+/// `.searchjobs-spin-loading-box` 白底 z=9999:搜索 API 400 → React loading
+/// 永真 → 遮罩永驻)会让人工只看到一片白屏——HITL 时对着白屏空点「我已完成」
+/// 死锁,Agent 工作期同样看不见页面(2026-11-04 报障)。因此查看器帧**常开**
+/// 软化(不限控制权状态):人工看得见遮罩下的登录表单/验证码/正文;点击命中
+/// 按面积升序,小表单元素天然优先于全屏遮罩,不受遮罩影响。
+/// **只在查看器帧调用**,取证截图路径(`screenshot_locked`)不经过本函数,
+/// 证据图保持站点原貌。
 ///
 /// 返回软化的项数(0=无遮罩,调用方据此决定是否叠提示胶囊)。
 pub(crate) fn soften_loading_overlays(
@@ -412,7 +413,7 @@ pub(crate) fn draw_overlay_note(pixmap: &mut Pixmap, font: &FontSet) {
     if vw < 320.0 || vh < 240.0 {
         return;
     }
-    let label = "站点加载遮罩 · 已临时半透明以便人工操作";
+    let label = "站点加载遮罩 · 已临时半透明以便查看页面";
     let size = 14.0f32;
     let text_w = font.text_width(label, size as f64) as f32;
     let pad_x = 14.0f32;

@@ -38,10 +38,13 @@
   判据(不透明背景 + ≥95% 视口 + 严格高于全部内容 z),把命中项 opacity 降
   到 0.25;`detect_loading_overlay` 拆出 `loading_overlay_content_max_z` /
   `is_loading_overlay_item` 两个 `pub(in browser)` 助手,单一真源。
-- `view/bridge.rs::push_frame`:控制权为 `User` 且检出遮罩时,克隆 `Layout`
-  软化后渲染查看器帧(仅此罕见路径付费),叠加琥珀胶囊
-  「站点加载遮罩 · 已临时半透明以便人工操作」。**Agent 控制态/取证截图
-  (`screenshot_locked` 不经 page_bars 层)保持站点原貌,证据链不受污染。**
+- `view/bridge.rs::push_frame`:**检出遮罩即软化(常开,不看控制权状态)**,
+  克隆 `Layout` 把命中项降到 25% 后渲染查看器帧(检测先行,无遮罩零克隆),
+  叠加琥珀胶囊「站点加载遮罩 · 已临时半透明以便查看页面」。取证截图
+  (`screenshot_locked` 不经 page_bars 层)保持站点原貌,证据链不受污染。
+  ⚠️ 语义演进:最初仅「用户控制态」软化,真机报障「页面显示还是空白」
+  (Agent 工作期人工照样对着白屏,`page_health.loading_overlay` 可证)——
+  查看器本就不是取证面,遮罩常开软化对证据零影响,遂放宽。
 - 真机验证:2026-11-04 11:15 request_human → 用户态 → 查看器胶囊在位,
   页头/登录表单/hero 透过 25% 白纱清晰可见。
 

@@ -892,8 +892,8 @@ fn inspect_blockers(tab: &super::TabState, doc: &Document) -> Value {
 /// 自定义白底)与风控挑战层都是这个形态。命中说明页面**看起来全白**是站点状态
 /// 而非内核渲染故障,应如实上报而不是让 Agent 反复截图重试。
 ///
-/// 供两处消费:`inspect(page_health)` 如实上报;`page_bars` 在用户控制态把
-/// 命中项临时半透明化(仅查看器帧,HITL 人工可见性,不进截图取证路径)。
+/// 供两处消费:`inspect(page_health)` 如实上报;`page_bars` 把命中项临时
+/// 半透明化(仅查看器帧,人工可见性,**常开**不看控制权状态;不进截图取证路径)。
 pub(in crate::agent::browser) fn detect_loading_overlay(
     display: &[super::render::display::DisplayItem],
     vp_w: f64,

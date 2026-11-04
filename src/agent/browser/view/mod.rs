@@ -180,7 +180,16 @@ impl ViewSink {
         }
         std::thread::spawn(move || {
             // 持有 Child 直到其退出,避免僵尸;stdin drop 后查看器自然结束。
-            let _ = child.wait();
+            // 退出状态记账:2026-11-04 两度「无 CrashDump 的不明死亡」无从查因,
+            // 此后每种死法(信号/退出码)都有唯一日志线索。
+            match child.wait() {
+                Ok(status) => {
+                    tracing::warn!(target: "viewer_stderr", "查看器子进程退出:{status}");
+                }
+                Err(err) => {
+                    tracing::warn!(target: "viewer_stderr", "查看器子进程 wait 失败:{err}");
+                }
+            }
         });
         // 命令通道:查看器 stdout 按行 JSON → 宿主命令队列。
         std::thread::spawn(move || {

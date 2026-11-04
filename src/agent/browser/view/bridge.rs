@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use super::super::{
-    document, images, layout, page_bars, style, urlutil, LsmBrowserManager, TabState,
+    document, images, inspect, layout, page_bars, style, urlutil, LsmBrowserManager, TabState,
     ViewFollow,
 };
 use super::ViewCommand;
@@ -398,15 +398,22 @@ impl LsmBrowserManager {
                 return;
             }
         }
-        // 用户控制态 × 站点加载/风控遮罩:查看器帧把整幅不透明遮罩临时半透明化,
-        // 让人工看得见遮罩下的登录表单/验证码(实测猎聘 `/zhaopin/` 搜索 API 400
-        // 后遮罩永驻,人工对着白屏无法完成登录,HITL 死锁)。仅查看器帧渲染路径,
-        // 取证截图(`screenshot_locked`)不经此处,证据图保持站点原貌。
-        let user_control =
-            crate::agent::web_control::state_of(crate::agent::web_control::Engine::Lsm, &tab.id)
-                == crate::agent::web_control::ControlState::User;
+        // 站点加载/风控遮罩软化(查看器帧**常开**,不再限用户控制态):
+        // 整幅不透明遮罩(实测猎聘 `/zhaopin/` 的 `.searchjobs-spin-loading-box`
+        // 白底 z=9999,搜索 API 400 → React loading 永真 → 遮罩永驻)会让人工
+        // 只看到一片白屏(2026-11-04 真机报障「页面显示还是空白」;此前仅
+        // `request_human` 用户控制态软化,Agent 工作期无人管)。
+        // 查看器不是取证面:命中遮罩才克隆布局,把遮罩降到 25% 白纱 + 琥珀
+        // 提示胶囊;取证截图(`screenshot_locked`)不经此处,证据图保持站点原貌。
+        // 检测先行:无遮罩零克隆零额外开销。
         let mut overlay_softened = 0usize;
-        let rendered = if user_control {
+        let has_overlay = inspect::detect_loading_overlay(
+            &tab.layout.display,
+            tab.viewport.width as f64,
+            tab.viewport.height as f64,
+        )
+        .is_some();
+        let rendered = if has_overlay {
             let mut layout = tab.layout.clone();
             overlay_softened = page_bars::soften_loading_overlays(
                 &mut layout.display,
