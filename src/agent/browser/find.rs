@@ -80,6 +80,18 @@ fn fold_char(c: char) -> char {
     c.to_ascii_lowercase()
 }
 
+/// 按键 → 可追加到查找词的单字符(`"Space"` 还原成 `' '`)。
+/// 非单字符 / 组合键 / 不可打印一律返回 `None`。
+fn find_append_char(key: &str, mods: &super::human_input::Mods) -> Option<char> {
+    let key = if key == "Space" { " " } else { key };
+    let mut it = key.chars();
+    let c = it.next()?;
+    if it.next().is_some() || mods.combo() || !(c.is_ascii_graphic() || c.is_whitespace()) {
+        return None;
+    }
+    Some(c)
+}
+
 /// 在一段文本里找全部匹配区间(char 索引,左闭右开)。
 fn find_ranges(text: &str, query: &[char]) -> Vec<(usize, usize)> {
     let chars: Vec<char> = text.chars().map(fold_char).collect();
@@ -308,14 +320,9 @@ impl LsmBrowserManager {
             _ => {}
         }
         // 可打印单字符(无组合键)追加。
-        let mut it = key.chars();
-        let Some(c) = it.next() else {
-            return json!({"ignored": true, "reason": "empty_key"});
-        };
-        let printable = c.is_ascii_graphic() || c.is_whitespace();
-        if it.next().is_some() || mods.combo() || !printable {
+        let Some(c) = find_append_char(key, mods) else {
             return json!({"ignored": true, "reason": "not_printable"});
-        }
+        };
         {
             let mut inner = self.inner.lock().await;
             if let Some(tab) = inner.tabs.get_mut(pid) {
@@ -472,6 +479,21 @@ mod tests {
         assert!(find_ranges("任意", &[]).is_empty());
         assert!(find_ranges("", &['a']).is_empty());
         assert!(find_ranges("短", &['a', 'b']).is_empty());
+    }
+
+    #[test]
+    fn 查找词追加字符_空格还原与组合键拒绝() {
+        use crate::agent::browser::human_input::Mods;
+        let m = Mods::default();
+        assert_eq!(find_append_char("a", &m), Some('a'));
+        // `normalize_key` 把空格归一成 "Space",查找词要能打空格。
+        assert_eq!(find_append_char("Space", &m), Some(' '));
+        // 多字符键名(方向键等)不可追加。
+        assert_eq!(find_append_char("ArrowLeft", &m), None);
+        assert_eq!(find_append_char("Enter", &m), None);
+        // 组合键不产生查找词文本。
+        let ctrl = Mods { ctrl: true, ..Default::default() };
+        assert_eq!(find_append_char("a", &ctrl), None);
     }
 
     #[test]
