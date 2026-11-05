@@ -433,7 +433,7 @@ pub async fn inspect(
                 // selectionStart/End/setSelectionRange)。
                 "selection_note": "页面自由选区:跨元素拖选可用,getSelection().toString() 可读;但 Selection/Range 全 API 未建模,且跨元素高亮只画首尾元素内区段(中间元素不画)",
                 // 39 号 P2c:页面查找(Ctrl/Cmd+F)能力缺口如实上报。
-                "find_note": "页面查找(Ctrl/Cmd+F)可用:匹配高亮+查找栏画在查看器帧合成层(不进截图);多行文本按单行近似,混合内容(元素含子元素文本)按最外层文本元素匹配、高亮覆盖该行,查找栏只键盘可操作(Esc 关闭)",
+                "find_note": "页面查找(Ctrl/Cmd+F)可用:匹配高亮+查找栏画在查看器帧合成层(不进截图);每元素按自有文本(直接文本节点)匹配、父子不重复;多行文本按单行近似,混合内容里夹子元素时高亮 x 会偏移,查找栏只键盘可操作(Esc 关闭)",
                 "request_loop": request_loop,
                 "request_loop_note": if request_loop.is_some() {
                     "同路径请求大量重复(疑似验证码组件反复重置/轮询循环):结合 inspect(console) 的异常看组件是否在自愈循环;刷新通常无济于事,必要时改用 MCP_Web_Chrome_Use 或 request_human"

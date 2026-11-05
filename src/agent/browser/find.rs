@@ -100,10 +100,30 @@ fn find_ranges(text: &str, query: &[char]) -> Vec<(usize, usize)> {
     out
 }
 
-/// 遍历布局盒(渲染元素),收集「最内层有文本元素」的匹配几何。
+/// 元素**自有文本**(直接文本节点,不含元素子代)。
 ///
-/// 去重口径:某元素的任一**祖先**已被收录 → 跳过(父元素文本是子代之和,
-/// 与 `page_sel` 的白名单口径同源,避免父子重复命中)。
+/// 查找按自有文本切分而非 `node_text`(整子树):每个元素只贡献自己直接
+/// 持有的文本,子元素贡献各自的 —— **顺序无关**地覆盖全部可见文本且
+/// 父子不重复命中(对比:整子树口径在 `<p>文本 <a>链接</a></p>` 上会
+/// 同时命中 p 与 a;祖先去重口径则依赖布局盒发射序,实测 `<a>` 盒先于
+/// `<p>` 盒时照样双命中)。
+///
+/// 近似:高亮 x 按「自有文本首尾相接」推算,混合内容里夹子元素时
+/// 子元素之后的文本段位置会偏移(见 `page_health.find_note`)。
+fn own_text(node: &kuchikiki::NodeRef) -> String {
+    let mut out = String::new();
+    for child in node.children() {
+        if let kuchikiki::NodeData::Text(t) = child.data() {
+            let s = t.borrow();
+            if !s.trim().is_empty() {
+                out.push_str(&s);
+            }
+        }
+    }
+    document::collapse_ws(&out)
+}
+
+/// 遍历布局盒(渲染元素),收集各元素自有文本的匹配几何。
 fn search_document(
     font: &FontSet,
     doc: &Document,
@@ -116,7 +136,6 @@ fn search_document(
         return Vec::new();
     }
     let mut out: Vec<FindMatch> = Vec::new();
-    let mut covered: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut budget = FIND_SCAN_BUDGET;
     for b in &layout.boxes {
         if budget == 0 {
@@ -132,28 +151,17 @@ fn search_document(
         if node.as_element().is_none() {
             continue;
         }
-        // 祖先已收录 → 本元素是父级容器,跳过(先判祖先再取文本,避免对每个
-        // 父级容器都做一次整子树 `node_text` 遍历)。
-        let mut cur = node.parent();
-        let mut ancestor_covered = false;
-        while let Some(p) = cur {
-            if p.as_element().is_some() {
-                let psel = Document::stable_selector(&p);
-                if covered.contains(&psel) {
-                    ancestor_covered = true;
-                    break;
-                }
-            }
-            cur = p.parent();
-        }
-        if ancestor_covered {
+        // script/style/head 等不参与查找(自有文本是源码/元数据)。
+        if matches!(
+            document::tag_name(&node).as_str(),
+            "script" | "style" | "head" | "title" | "meta" | "link" | "noscript" | "template"
+        ) {
             continue;
         }
-        let text = document::node_text(&node);
+        let text = own_text(&node);
         if text.is_empty() {
             continue;
         }
-        covered.insert(b.selector.clone());
         let size = node_font_size(engine, &node).max(8.0);
         let spans = font.char_spans(&text, size, (b.w - 4.0).max(1.0));
         if spans.is_empty() {
@@ -471,6 +479,34 @@ mod tests {
         assert_eq!(FindState::NO_MATCH, usize::MAX);
         let st = FindState::default();
         assert!(!st.active && st.matches.is_empty() && st.current == usize::MAX);
+    }
+
+    #[test]
+    fn 混合内容父子去重_只命中一个元素() {
+        let doc = Document::parse(
+            "<html><body><p id='p'>前缀 <a id='a'>链接词</a> 后缀</p></body></html>",
+            "https://t/",
+        );
+        let media = MediaCtx::new(800.0, 600.0);
+        let font = FontSet::fallback();
+        let sizes = crate::agent::browser::images::ImageSizes::default();
+        let layout =
+            crate::agent::browser::layout::compute_full(&doc, 800.0, &font, &media, &sizes);
+        let engine = StyleEngine::from_document(&doc, media);
+        let m = search_document(&font, &doc, &engine, &layout, "链接词");
+        assert_eq!(m.len(), 1, "父子不重复命中:{m:?}");
+        assert_eq!(m[0].selector, "#a", "命中应是持有该文本的 <a>:{m:?}");
+        // 单行矩形应落在元素盒的垂直范围内。
+        let (_, y, _, h) = m[0].rect;
+        let (_, by, _, bh) = layout.rect_for("#a").unwrap();
+        assert!(
+            y >= by - 1.0 && y + h <= by + bh + 1.0,
+            "矩形应在元素盒内:{m:?} box=({by},{bh})"
+        );
+        // 混合内容里 <p> 的自有文本(前缀/后缀)仍各自可搜,不与 <a> 互相污染。
+        let m = search_document(&font, &doc, &engine, &layout, "前缀");
+        assert_eq!(m.len(), 1, "混合内容的直接文本应可搜:{m:?}");
+        assert_eq!(m[0].selector, "#p", "{m:?}");
     }
 
     #[test]
