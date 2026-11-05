@@ -8,6 +8,7 @@
 pub mod api;
 pub mod cache;
 pub mod document;
+pub mod find;
 pub mod human_input;
 pub mod images;
 pub mod inspect;
@@ -240,6 +241,8 @@ pub struct TabState {
     /// 39 号 P2b:页面级自由选区(跨元素拖选,与 `form_caret` 两本账)。
     /// `document_with_state` 落首/尾元素 `data-lsm-page-sel` 属性。
     pub page_sel: Option<document::PageSelection>,
+    /// P2c:页面查找(Ctrl/Cmd+F)状态;查找栏与高亮画在查看器帧合成层。
+    pub find: find::FindState,
     pub focused: Option<String>,
     pub mouse: Option<(f64, f64)>,
     pub layout: layout::Layout,
@@ -1133,6 +1136,7 @@ impl LsmBrowserManager {
             pseudo_states: HashMap::new(),
             form_caret: HashMap::new(),
             page_sel: None,
+            find: find::FindState::default(),
             focused: None,
             mouse: None,
             layout,

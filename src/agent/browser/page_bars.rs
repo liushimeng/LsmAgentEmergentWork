@@ -869,6 +869,7 @@ mod tests {
             pseudo_states: Default::default(),
             form_caret: Default::default(),
             page_sel: None,
+            find: super::super::find::FindState::default(),
             focused: None,
             mouse: None,
             layout: Default::default(),

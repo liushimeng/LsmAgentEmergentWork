@@ -199,6 +199,42 @@ fn 焦点循环_前进后退与回绕() {
     assert_eq!(next_focusable(&[], Some("a"), true), None);
 }
 
+// ---------- 光标形状(P2c) ----------
+
+#[test]
+fn 光标形状判定_文本链接按钮与普通元素() {
+    let doc = Document::parse(
+        "<html><body><a href='/x'>链接</a><button>按钮</button>\
+         <input id='t' type='text'><input id='c' type='checkbox'>\
+         <p>段落</p><span id='rb' role='button'>角色</span>\
+         <div id='oc' onclick='x()'>点我</div></body></html>",
+        "https://t.test/",
+    );
+    let kind = |sel: &str| {
+        let node = doc
+            .select(sel)
+            .ok()
+            .and_then(|v| v.into_iter().next())
+            .expect(sel);
+        let tag = crate::agent::browser::document::tag_name(&node);
+        let typ = crate::agent::browser::document::attr(&node, "type")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        cursor_kind_for_node(&node, &tag, &typ)
+    };
+    assert_eq!(kind("a"), CursorKind::Pointer, "链接=手型");
+    assert_eq!(kind("button"), CursorKind::Pointer, "按钮=手型");
+    assert_eq!(kind("#t"), CursorKind::Text, "文本输入=I 型");
+    assert_eq!(kind("#c"), CursorKind::Pointer, "复选框=手型");
+    assert_eq!(kind("p"), CursorKind::Default, "段落=箭头");
+    assert_eq!(kind("#rb"), CursorKind::Pointer, "role=button=手型");
+    assert_eq!(kind("#oc"), CursorKind::Pointer, "onclick=手型");
+    // 协议取值固定(帧 kind 'k' 的 payload)。
+    assert_eq!(CursorKind::Default.as_str(), "default");
+    assert_eq!(CursorKind::Pointer.as_str(), "pointer");
+    assert_eq!(CursorKind::Text.as_str(), "text");
+}
+
 // ---------- 坐标命中(data: 页面,无外网) ----------
 
 async fn open_hidden(mgr: &LsmBrowserManager, body: &str) -> String {

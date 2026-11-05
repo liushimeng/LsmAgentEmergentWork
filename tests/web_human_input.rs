@@ -107,6 +107,30 @@ document.getElementById('d2').addEventListener('drop', function(){
 </body></html>"#
                 .to_string(),
         ),
+        // P2c:页面查找(Ctrl/Cmd+F)验证页 —— 已知重复词与链接/输入框。
+        "/find" => (
+            "200 OK",
+            r#"<!doctype html><html><head><title>查找页</title></head><body>
+<p id="p1" style="font-size:16px">Apple banana apple</p>
+<p id="p2" style="font-size:16px">Banana split</p>
+<a id="lk" href="/next" style="display:block;width:120px;height:30px">链接</a>
+<input id="q" style="width:200px;height:30px" value="">
+</body></html>"#
+                .to_string(),
+        ),
+        // P2c:模态 dialog 焦点锁验证页(弹内两按钮在前、弹外一按钮在后:
+        // 无焦点锁时 Tab 会从弹内二走到弹外,有锁则回绕弹内一)。
+        "/modal" => (
+            "200 OK",
+            r#"<!doctype html><html><head><title>模态页</title></head><body>
+<dialog id="dlg" open data-lsm-modal>
+<button id="d1" style="width:120px;height:30px">弹内一</button>
+<button id="d2" style="width:120px;height:30px">弹内二</button>
+</dialog>
+<button id="outside" style="width:120px;height:30px">弹外</button>
+</body></html>"#
+                .to_string(),
+        ),
         "/next" => (
             "200 OK",
             "<html><head><title>下一页</title></head><body><h1>NEXT</h1></body></html>".to_string(),
@@ -787,6 +811,42 @@ async fn open_sel(tool: &McpWebLsmBrowserUseTool, base: &str) -> String {
     pid
 }
 
+async fn open_find(tool: &McpWebLsmBrowserUseTool, base: &str) -> String {
+    let open = exec(
+        tool,
+        json!({"action": "open", "url": format!("{base}/find"), "mode": "hidden", "reuse": false}),
+    )
+    .await;
+    assert_eq!(open["code"], 0, "{open}");
+    let pid = open["data"]["page_id"].as_str().unwrap().to_string();
+    web_control::set_state(Engine::Lsm, &pid, ControlState::User, None, "test");
+    pid
+}
+
+async fn open_modal(tool: &McpWebLsmBrowserUseTool, base: &str) -> String {
+    let open = exec(
+        tool,
+        json!({"action": "open", "url": format!("{base}/modal"), "mode": "hidden", "reuse": false}),
+    )
+    .await;
+    assert_eq!(open["code"], 0, "{open}");
+    let pid = open["data"]["page_id"].as_str().unwrap().to_string();
+    web_control::set_state(Engine::Lsm, &pid, ControlState::User, None, "test");
+    pid
+}
+
+/// 读回某元素 `inspect elements` 的 `state`(聚焦/悬停/选中等)。
+async fn elem_state(tool: &McpWebLsmBrowserUseTool, pid: &str, selector: &str) -> Value {
+    let v = exec(
+        tool,
+        json!({"action": "inspect", "page_id": pid, "info": "elements",
+               "params": {"selector": selector, "nth": 0}}),
+    )
+    .await;
+    assert_eq!(v["code"], 0, "{v}");
+    v["data"]["state"].clone()
+}
+
 /// eval_js 在 **user 控制态**下被 4004 拒(它是写操作)。人工输入用例需要
 /// 读回页面状态时,临时取回 agent 态执行 eval,随后还回 user 态。
 async fn eval_js(tool: &McpWebLsmBrowserUseTool, pid: &str, js: &str) -> Value {
@@ -1005,5 +1065,109 @@ async fn 点击遮罩关闭模态弹窗() {
     exec(&tool, json!({"action": "close", "page_id": &pid})).await;
 }
 
+// ---------- P2c:页面查找 / 光标形状 / 模态焦点锁 ----------
 
+/// 页面查找(Ctrl/Cmd+F):开 → 输入 query 命中 → Enter 切换 → Esc 关闭。
+#[tokio::test]
+async fn 页面查找_输入命中与切换() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+    let pid = open_find(&tool, &base).await;
+    let mgr = LsmBrowserManager::global();
+
+    // 开启(查看器命令同一入口;隐藏模式下无查找栏像素,经回执断言)。
+    let out = mgr.toggle_find(&pid).await;
+    assert_eq!(out["active"], true, "{out}");
+
+    // 输入 "apple"(大小写不敏感;p1 出现两次)。
+    for c in "apple".chars() {
+        let r = key(&mgr, &pid, &c.to_string()).await;
+        assert_eq!(r["query_changed"], true, "{r}");
+    }
+    // 首个 Enter:切到下一个并回报总数。
+    let step = key(&mgr, &pid, "Enter").await;
+    assert_eq!(step["total"], 2, "apple 应命中 2 次:{step}");
+    assert_eq!(step["current"], 1, "{step}");
+    // 再按 Enter 回绕到 0。
+    let step = key(&mgr, &pid, "Enter").await;
+    assert_eq!(step["current"], 0, "回绕:{step}");
+    // Shift+Enter 反向。
+    let step = key_mods(&mgr, &pid, "Enter", Mods { shift: true, ..Default::default() }).await;
+    assert_eq!(step["current"], 1, "反向:{step}");
+
+    // Esc 关闭;关闭后 Enter 不再产生查找语义(回到页面原生语义)。
+    let closed = key(&mgr, &pid, "Escape").await;
+    assert_eq!(closed["closed"], true, "{closed}");
+    let again = key(&mgr, &pid, "Enter").await;
+    assert!(again.get("current").is_none(), "关闭后不再查找:{again}");
+    assert!(again.get("outcome").is_some(), "关闭后 Enter 走页面原生语义:{again}");
+
+    web_control::clear(Engine::Lsm, &pid);
+    exec(&tool, json!({"action": "close", "page_id": &pid})).await;
+}
+
+/// 光标形状跟随:悬停链接 = 手型,悬停文本框 = I 型,空白 = 箭头。
+#[tokio::test]
+async fn 光标形状_悬停目标决定手型与文本型() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+    let pid = open_find(&tool, &base).await;
+    let mgr = LsmBrowserManager::global();
+
+    let (lx, ly) = center_of(&tool, &pid, "#lk").await;
+    let out = mgr
+        .handle_human_input(&pid, HumanInput::Move { x: lx, y: ly })
+        .await;
+    assert_eq!(out["cursor"], "pointer", "链接应为手型:{out}");
+
+    let (tx, ty) = center_of(&tool, &pid, "#q").await;
+    let out = mgr
+        .handle_human_input(&pid, HumanInput::Move { x: tx, y: ty })
+        .await;
+    assert_eq!(out["cursor"], "text", "文本框应为 I 型:{out}");
+
+    // 空白处(无命中)回落箭头。
+    let out = mgr
+        .handle_human_input(&pid, HumanInput::Move { x: 700.0, y: 5.0 })
+        .await;
+    assert_eq!(out["cursor"], "default", "空白应为箭头:{out}");
+
+    web_control::clear(Engine::Lsm, &pid);
+    exec(&tool, json!({"action": "close", "page_id": &pid})).await;
+}
+
+/// 模态 dialog 焦点锁:焦点在弹内时,Tab/Shift+Tab 只在弹内按钮间循环。
+///
+/// 页面顺序 = 弹内一 → 弹内二 → 弹外:**无焦点锁时** Tab 会从弹内二走到弹外;
+/// 有锁则回绕弹内一。弹内点击不关闭弹窗(与点遮罩区分)。
+#[tokio::test]
+async fn 模态dialog焦点锁_Tab不出弹窗() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+    let pid = open_modal(&tool, &base).await;
+    let mgr = LsmBrowserManager::global();
+
+    // 点弹内二 → 聚焦弹内二(弹内点击不触发遮罩关闭)。
+    let (d2x, d2y) = center_of(&tool, &pid, "#d2").await;
+    human_click(&mgr, &pid, d2x, d2y).await;
+    assert_eq!(elem_state(&tool, &pid, "#d2").await["focused"], true, "点击后弹内二应聚焦");
+
+    // Tab:有锁 → 回绕弹内一;无锁会走到弹外。
+    let tab = key(&mgr, &pid, "Tab").await;
+    assert_eq!(tab["moved"], true, "{tab}");
+    assert_eq!(elem_state(&tool, &pid, "#d1").await["focused"], true, "Tab 应回绕弹内一:{tab}");
+    assert_eq!(elem_state(&tool, &pid, "#outside").await["focused"], false, "焦点不应出弹窗");
+
+    // Shift+Tab 反向回弹内二;仍不出弹窗。
+    let back = key_mods(&mgr, &pid, "Tab", Mods { shift: true, ..Default::default() }).await;
+    assert_eq!(back["moved"], true, "{back}");
+    assert_eq!(elem_state(&tool, &pid, "#d2").await["focused"], true, "Shift+Tab 应回弹内二");
+    assert_eq!(elem_state(&tool, &pid, "#outside").await["focused"], false, "焦点仍不应出弹窗");
+
+    web_control::clear(Engine::Lsm, &pid);
+    exec(&tool, json!({"action": "close", "page_id": &pid})).await;
+}
 

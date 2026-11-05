@@ -200,6 +200,10 @@ impl LsmBrowserManager {
     /// 键盘:组合键(⌘/Ctrl+C/X/V、A/Z/Y)→ 剪贴板/编辑;其余先派 JS keydown
     /// (带 e.key/e.keyCode 载荷),再按原生语义路由,收尾尽力补发 keyup。
     pub(super) async fn human_key(&self, pid: &str, key: &str, mods: &Mods) -> Value {
+        // P2c:查找模式(Ctrl/Cmd+F)下全部键进查找栏,不产生页面语义。
+        if self.find_active(pid).await {
+            return self.find_key(pid, key, mods).await;
+        }
         if let Some(op) = clip_op_for(key, mods) {
             return self.handle_human_clip(pid, op).await;
         }
@@ -296,7 +300,27 @@ impl LsmBrowserManager {
                 return json!({"key": key, "panels_closed": panels, "dialog": dialog.ok()});
             }
             "Tab" => {
-                let next = next_focusable(&ctx.focusables, ctx.focused.as_deref(), !mods.shift);
+                // P2c:模态 dialog 焦点锁 —— 有模态框时 Tab/Shift+Tab 只在
+                // dialog 子树内循环(无模态框保持全量文档序,与现状一致)。
+                // `ctx.focusables` 由 `collect_text_ctx` 已算好,直接复用
+                // (避免在锁内重跑一遍 `focusable_selectors` 的 O(n·boxes) 扫描)。
+                let focus_list = {
+                    let inner = self.inner.lock().await;
+                    let Some(tab) = inner.tabs.get(pid) else {
+                        return json!({"key": key, "moved": false});
+                    };
+                    let doc = tab.document_with_state();
+                    if dialog_selectors(&doc).is_empty() {
+                        ctx.focusables.clone()
+                    } else {
+                        ctx.focusables
+                            .iter()
+                            .filter(|s| in_open_dialog(&doc, s))
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    }
+                };
+                let next = next_focusable(&focus_list, ctx.focused.as_deref(), !mods.shift);
                 let Some(next) = next else {
                     return json!({"key": key, "moved": false});
                 };

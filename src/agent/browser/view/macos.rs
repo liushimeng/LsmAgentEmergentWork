@@ -116,6 +116,8 @@ msg!(send_f64, () -> f64);
 msg!(send_i64_sel, (arg: Sel) -> i64);
 // NSTrackingArea initWithRect:options:owner:userInfo:
 msg!(send_id_rect_u64_id_id, (rect: NSRect, opts: u64, owner: Id, info: Id) -> Id);
+// NSView addCursorRect:cursor:(P2c 光标形状跟随)。
+msg!(send_void_rect_id, (rect: NSRect, cursor: Id) -> ());
 // NSMenu popUpMenuPositioningItem:atLocation:inView:(右键原生菜单,阶段二)。
 msg!(send_i8_id_point_id, (item: Id, loc: NSPoint, view: Id) -> i8);
 
@@ -150,6 +152,8 @@ struct FrameSlot {
     urlbar: Option<(String, bool, bool)>,
     /// ⌘/Ctrl+L 聚焦地址栏请求(39 号 P2b)。
     focus_addrbar: bool,
+    /// P2c:光标形状(`"default"|"pointer"|"text"`),读线程写、定时器消费。
+    cursor: Option<String>,
     close: bool,
     seq: u64,
     shown_seq: u64,
@@ -161,10 +165,15 @@ static SLOT: once_cell::sync::Lazy<Mutex<FrameSlot>> =
         title: None,
         urlbar: None,
         focus_addrbar: false,
+        cursor: None,
         close: false,
         seq: 0,
         shown_seq: 0,
     }));
+
+/// 当前光标形状(`resetCursorRects` 读取;主 RunLoop 线程写)。
+static CURSOR_KIND: once_cell::sync::Lazy<Mutex<String>> =
+    once_cell::sync::Lazy::new(|| Mutex::new("default".to_string()));
 
 /// ObjC 对象指针的跨线程容器(只在主 RunLoop 线程读写,static 存储需要 Send)。
 #[derive(Clone, Copy)]
@@ -326,13 +335,14 @@ unsafe fn sync_content_size() {
 /// 定时器回调:取新帧 → NSImage initWithData → setImage;标题/地址栏/关闭同理。
 extern "C" fn on_tick(_self: Id, _cmd: Sel, _timer: Id) {
     crate::ffi_guard::guard("on_tick", || unsafe {
-        let (img, title, urlbar, focus_addrbar, close, seq) = {
+        let (img, title, urlbar, focus_addrbar, cursor, close, seq) = {
             let mut s = SLOT.lock().unwrap();
             let img = s.image.take();
             let title = s.title.take();
             let urlbar = s.urlbar.take();
             let focus_addrbar = std::mem::take(&mut s.focus_addrbar);
-            (img, title, urlbar, focus_addrbar, s.close, s.seq)
+            let cursor = s.cursor.take();
+            (img, title, urlbar, focus_addrbar, cursor, s.close, s.seq)
         };
         if close {
             let app = send_id(cls(b"NSApplication\0"), sel(b"sharedApplication\0"));
@@ -360,6 +370,16 @@ extern "C" fn on_tick(_self: Id, _cmd: Sel, _timer: Id) {
                     // 全选当前 URL(真实浏览器 ⌘L 即全选,便于直接覆盖输入)。
                     send_void_id(field, sel(b"selectAll:\0"), std::ptr::null_mut());
                 }
+            }
+        }
+        // P2c:应用光标形状变化(主线程;cursor rect 重挂)。
+        if let Some(kind) = cursor {
+            *CURSOR_KIND.lock().unwrap() = kind;
+            let win = WINDOW.lock().unwrap().0;
+            let iv = IMAGE_VIEW.lock().unwrap().0;
+            // `invalidateCursorRectsForView:` 缺失时守卫降级(不做光标跟随)。
+            if !win.is_null() && !iv.is_null() && respond(win, b"invalidateCursorRectsForView:\0") {
+                send_void_id(win, sel(b"invalidateCursorRectsForView:\0"), iv);
             }
         }
         if let Some(png) = img {
@@ -743,6 +763,12 @@ extern "C" fn on_pv_other_down(_self: Id, _cmd: Sel, event: Id) {
             };
             if btn == 2 {
                 forward_pointer(_self, event, "down", Some("middle"), false);
+            } else if btn == 3 {
+                // 侧键 1 = 后退(P2c;Apple 鼠标/触控板辅助键序号)。
+                send_cmd("{\"cmd\":\"back\"}");
+            } else if btn == 4 {
+                // 侧键 2 = 前进。
+                send_cmd("{\"cmd\":\"forward\"}");
             }
         }
     });
@@ -838,6 +864,11 @@ extern "C" fn on_pv_key_down(_self: Id, _cmd: Sel, event: Id) {
             send_cmd("{\"cmd\":\"focus_addrbar\"}");
             return;
         }
+        // ⌘/Ctrl+F:页面查找(39 号 P2c;转 find_toggle,不进页面)。
+        if (meta || ctrl) && code == 3 {
+            send_cmd("{\"cmd\":\"find_toggle\"}");
+            return;
+        }
         let shift = flags & NSEVENT_SHIFT != 0;
         let alt = flags & NSEVENT_OPTION != 0;
         let key = match mac_special_key(code) {
@@ -881,6 +912,44 @@ extern "C" fn on_pv_accepts_first_responder(_self: Id, _cmd: Sel) -> i8 {
     1
 }
 
+/// 光标形状 → `NSCursor` 类(缺失选择器时返回 null,由调用方降级)。
+///
+/// 选择器先 `respondsToSelector:` 守卫:`IBeamCursor` 在较老 SDK 上可能缺失
+/// (54 号事故教训:不发不存在的消息,foreign exception 会 abort 查看器)。
+unsafe fn nscursor_for_kind(kind: &str) -> Id {
+    let nsc = cls(b"NSCursor\0");
+    if nsc.is_null() {
+        return std::ptr::null_mut();
+    }
+    let sel_name: &'static [u8] = match kind {
+        "pointer" => b"pointingHandCursor\0",
+        "text" => b"IBeamCursor\0",
+        _ => b"arrowCursor\0",
+    };
+    if respond(nsc, sel_name) {
+        send_id(nsc, sel(sel_name))
+    } else {
+        std::ptr::null_mut()
+    }
+}
+
+/// `resetCursorRects`:整幅页面区挂当前光标(P2c 光标形状跟随)。
+///
+/// 用 cursor rect 而非 `[NSCursor set]`——后者只在鼠标跟踪上下文(移动/按下)
+/// 里可靠,静止悬停时不会生效;cursor rect 由 AppKit 在鼠标进入/移动时自动应用,
+/// 宿主改形状后 `invalidateCursorRectsForView:` 触发本方法重挂。
+extern "C" fn on_pv_reset_cursor_rects(_self: Id, _cmd: Sel) {
+    crate::ffi_guard::guard("on_pv_reset_cursor_rects", || unsafe {
+        let kind = CURSOR_KIND.lock().unwrap().clone();
+        let cur = nscursor_for_kind(&kind);
+        if cur.is_null() {
+            return;
+        }
+        let bounds = send_rect(_self, sel(b"bounds\0"));
+        send_void_rect_id(_self, sel(b"addCursorRect:cursor:\0"), bounds, cur);
+    });
+}
+
 /// 注册页面视图类(NSImageView 子类:保留 setImage 绘制,叠加事件捕获)。
 unsafe fn ensure_page_view_class() -> Id {
     {
@@ -906,6 +975,12 @@ unsafe fn ensure_page_view_class() -> Id {
         b"acceptsFirstResponder\0",
         on_pv_accepts_first_responder as extern "C" fn(Id, Sel) -> i8 as *const c_void,
         b"B@:\0",
+    );
+    // P2c:光标形状跟随(cursor rect 整幅页面区)。
+    ok &= add(
+        b"resetCursorRects\0",
+        on_pv_reset_cursor_rects as extern "C" fn(Id, Sel) as *const c_void,
+        b"v@:\0",
     );
     for (name, imp) in [
         (b"mouseDown:\0".as_slice(), on_pv_mouse_down as extern "C" fn(Id, Sel, Id) as *const c_void),
@@ -1332,6 +1407,13 @@ pub fn run(width: u32, height: u32, title: &str) -> i32 {
                     Some((b'f', _)) => {
                         if let Ok(mut s) = SLOT.lock() {
                             s.focus_addrbar = true;
+                        }
+                    }
+                    // P2c:光标形状跟随(定时器在主线程应用 cursor rect)。
+                    Some((b'k', payload)) => {
+                        let kind = String::from_utf8_lossy(&payload).trim().to_string();
+                        if let Ok(mut s) = SLOT.lock() {
+                            s.cursor = Some(kind);
                         }
                     }
                     Some((b'c', _)) | None => {

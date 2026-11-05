@@ -200,6 +200,14 @@ impl LsmBrowserManager {
                 }
                 return;
             }
+            ViewCommand::ToggleFind => {
+                // ⌘/Ctrl+F:页面查找(39 号 P2c)。作用于显示页,门内做控制权闸门。
+                let target = self.input_target_page().await;
+                if let Some(pid) = target {
+                    let _ = self.toggle_find(&pid).await;
+                }
+                return;
+            }
             ViewCommand::FocusAddrbar => {
                 // ⌘/Ctrl+L:查看器侧直接把焦点交给地址栏(命令由查看器本地拦截,
                 // 宿主只落「显示跟随」语义,无页面动作)。
@@ -238,7 +246,8 @@ impl LsmBrowserManager {
             | ViewCommand::CloseTab
             | ViewCommand::NextTab
             | ViewCommand::Clip(_)
-            | ViewCommand::FocusAddrbar => unreachable!("已在函数开头单独处理"),
+            | ViewCommand::FocusAddrbar
+            | ViewCommand::ToggleFind => unreachable!("已在函数开头单独处理"),
         };
         self.refresh_view(&page_id).await;
     }
@@ -448,6 +457,8 @@ impl LsmBrowserManager {
         if overlay_softened > 0 {
             page_bars::draw_overlay_note(&mut pixmap, &self.font);
         }
+        // 页面查找(Ctrl/Cmd+F):匹配高亮 + 查找栏,同在帧合成层(39 号 P2c)。
+        crate::agent::browser::find::draw(&mut pixmap, &self.font, tab);
         let png = pixmap.encode_png().unwrap_or_default();
         if png.is_empty() {
             return;

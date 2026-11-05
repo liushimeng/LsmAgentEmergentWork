@@ -27,14 +27,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
     DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetClientRect, GetMessageW,
     GetWindowTextW, LoadCursorW, MoveWindow, PostQuitMessage, RegisterClassW, SendMessageW,
-    SetTimer, SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage, BS_PUSHBUTTON,
-    CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, ES_AUTOHSCROLL, HMENU,
-    IDC_ARROW, MF_STRING, MSG, SW_SHOWNORMAL, TPM_RIGHTBUTTON, TPM_RETURNCMD, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_KEYDOWN, WM_KILLFOCUS,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CHILD,
-    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+    SetCursor, SetTimer, SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage,
+    BS_PUSHBUTTON, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, ES_AUTOHSCROLL, HMENU,
+    IDC_ARROW, IDC_HAND, IDC_IBEAM, MF_STRING, MSG, SW_SHOWNORMAL, TPM_RIGHTBUTTON,
+    TPM_RETURNCMD, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_DESTROY,
+    WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDBLCLK,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER,
+    WM_XBUTTONDOWN, WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
+    WS_VISIBLE,
 };
 // EM_SETSEL 定义在 Controls 模块(不在 WindowsAndMessaging;39 号 P2b)。
 use windows::Win32::UI::Controls::EM_SETSEL;
@@ -63,6 +64,8 @@ static TAKE_IMAGE: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 static PENDING_URL: Mutex<Option<(String, bool, bool)>> = Mutex::new(None);
 /// ⌘/Ctrl+L 聚焦地址栏请求(39 号 P2b)。
 static FOCUS_ADDRBAR_FLAG: Mutex<bool> = Mutex::new(false);
+/// P2c:光标形状(`"default"|"pointer"|"text"`),WM_SETCURSOR 读取。
+static CURSOR_KIND: Mutex<String> = Mutex::new("default".to_string());
 static ADDR_EDIT: Mutex<Option<HwndCell>> = Mutex::new(None);
 static BACK_BTN: Mutex<Option<HwndCell>> = Mutex::new(None);
 static FWD_BTN: Mutex<Option<HwndCell>> = Mutex::new(None);
@@ -341,6 +344,11 @@ unsafe fn forward_key(wp: WPARAM, sys: bool) {
         send_cmd("{\"cmd\":\"focus_addrbar\"}");
         return;
     }
+    // Ctrl+F:页面查找(39 号 P2c;浏览器级快捷键,不进页面)。
+    if ctrl && vk == 0x46 {
+        send_cmd("{\"cmd\":\"find_toggle\"}");
+        return;
+    }
     if ctrl || alt {
         // 组合键只转发剪贴板三键(宿主侧按聚焦控件整值处理)。
         if ctrl && (vk == 0x43 || vk == 0x56 || vk == 0x58) {
@@ -538,6 +546,35 @@ unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESUL
             let (x, y) = lparam_xy(lp);
             forward_pointer(hwnd, x, y, "up", Some("middle"), false);
             LRESULT(0)
+        }
+        // P2c:鼠标侧键前进/后退(XBUTTON1=后退、XBUTTON2=前进)。
+        WM_XBUTTONDOWN => {
+            let xbtn = ((wp.0 >> 16) & 0xFFFF) as u16;
+            if xbtn == 0x0001 {
+                send_cmd("{\"cmd\":\"back\"}");
+            } else if xbtn == 0x0002 {
+                send_cmd("{\"cmd\":\"forward\"}");
+            }
+            LRESULT(0)
+        }
+        // P2c:光标形状跟随(手型/文本 I 型/箭头),仅客户区生效。
+        WM_SETCURSOR => {
+            let hit = (lp.0 & 0xFFFF) as u16;
+            if hit == 1 {
+                // HTCLIENT
+                let kind = CURSOR_KIND.lock().unwrap().clone();
+                let idc = match kind.as_str() {
+                    "pointer" => IDC_HAND,
+                    "text" => IDC_IBEAM,
+                    _ => IDC_ARROW,
+                };
+                if let Ok(h) = LoadCursorW(None, idc) {
+                    SetCursor(h);
+                }
+                LRESULT(1)
+            } else {
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
         }
         WM_MOUSEWHEEL => {
             forward_wheel(hwnd, wp, lp, false);
@@ -931,6 +968,12 @@ pub fn run(width: u32, height: u32, title: &str) -> i32 {
                     // ⌘/Ctrl+L:聚焦地址栏(39 号 P2b)。
                     Some((b'f', _)) => {
                         *FOCUS_ADDRBAR_FLAG.lock().unwrap() = true;
+                    }
+                    // P2c:光标形状跟随(WM_SETCURSOR 消费)。
+                    Some((b'k', payload)) => {
+                        if let Ok(kind) = std::str::from_utf8(&payload) {
+                            *CURSOR_KIND.lock().unwrap() = kind.trim().to_string();
+                        }
                     }
                     Some((b'c', _)) | None => {
                         *CLOSE_FLAG.lock().unwrap() = true;

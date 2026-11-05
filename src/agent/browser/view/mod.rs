@@ -39,6 +39,8 @@ const KIND_CLOSE: u8 = b'c';
 const KIND_URLBAR: u8 = b'u';
 /// 聚焦地址栏请求(⌘/Ctrl+L;39 号 P2b)。
 const KIND_FOCUS_ADDRBAR: u8 = b'f';
+/// 光标形状帧(P2c:`"default"|"pointer"|"text"`,payload 为原始字符串)。
+pub(crate) const KIND_CURSOR: u8 = b'k';
 
 /// 查看器 → 宿主的交互命令(工具栏按钮 / 地址栏回车 / 人类键鼠)。
 #[derive(Debug, Clone, PartialEq)]
@@ -67,6 +69,8 @@ pub enum ViewCommand {
     Clip(crate::agent::browser::human_input::ClipOp),
     /// ⌘/Ctrl+L:聚焦地址栏(39 号 P2b 顺带补齐)。
     FocusAddrbar,
+    /// ⌘/Ctrl+F:切换页面查找模式(39 号 P2c)。
+    ToggleFind,
     /// 查看器窗口被人工关闭(`windowWillClose:` 退出前上报)。
     /// 宿主据此**不自动重生**查看器(不与用户抢窗口);进程意外死亡
     /// (崩溃,无此信号)则按自愈策略重生(见 `bridge::push_frame`)。
@@ -117,6 +121,7 @@ pub fn parse_command(line: &str) -> Option<ViewCommand> {
             Some(ViewCommand::Clip(op))
         }
         "focus_addrbar" => Some(ViewCommand::FocusAddrbar),
+        "find_toggle" => Some(ViewCommand::ToggleFind),
         "viewer_closed" => Some(ViewCommand::ViewerClosed),
         _ => None,
     }
@@ -262,6 +267,11 @@ impl ViewSink {
     pub fn focus_addrbar(&self) {
         self.send(KIND_FOCUS_ADDRBAR, b"");
     }
+
+    /// P2c:上报光标形状(`"default"|"pointer"|"text"`),查看器跟随变形。
+    pub fn send_cursor(&self, kind: &str) {
+        self.send(KIND_CURSOR, kind.as_bytes());
+    }
 }
 
 impl std::fmt::Debug for ViewSink {
@@ -376,6 +386,26 @@ mod tests {
         // 非法 clip 动作忽略。
         assert_eq!(parse_command(r#"{"cmd":"clip"}"#), None);
         assert_eq!(parse_command(r#"{"cmd":"clip","act":"fly"}"#), None);
+        // P2c:页面查找开关(⌘/Ctrl+F)。
+        assert_eq!(
+            parse_command(r#"{"cmd":"find_toggle"}"#),
+            Some(ViewCommand::ToggleFind)
+        );
+        // P2b:聚焦地址栏。
+        assert_eq!(
+            parse_command(r#"{"cmd":"focus_addrbar"}"#),
+            Some(ViewCommand::FocusAddrbar)
+        );
+    }
+
+    #[test]
+    fn 光标帧常量与命令互斥() {
+        // 帧 kind 不得与既有种类冲突('i'/'t'/'c'/'u'/'f')。
+        assert_ne!(KIND_CURSOR, KIND_IMAGE);
+        assert_ne!(KIND_CURSOR, KIND_TITLE);
+        assert_ne!(KIND_CURSOR, KIND_CLOSE);
+        assert_ne!(KIND_CURSOR, KIND_URLBAR);
+        assert_ne!(KIND_CURSOR, KIND_FOCUS_ADDRBAR);
     }
 
     #[test]

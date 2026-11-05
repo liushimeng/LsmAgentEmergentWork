@@ -61,6 +61,62 @@ pub enum MouseButton {
     Middle,
 }
 
+/// 光标形状(39 号 P2c:人工悬停时查看器跟随变形)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorKind {
+    Default,
+    Pointer,
+    Text,
+}
+
+impl CursorKind {
+    /// 帧 kind `'k'` 的 payload 取值。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CursorKind::Default => "default",
+            CursorKind::Pointer => "pointer",
+            CursorKind::Text => "text",
+        }
+    }
+}
+
+/// 由节点判定光标形状(纯函数,单测覆盖)。
+///
+/// 文本类控件 → `Text`(I 型);链接/按钮/控件/`role`/`onclick`/`tabindex`/
+/// `contenteditable` → `Pointer`(手型);其余 `Default`(箭头)。
+pub(crate) fn cursor_kind_for_node(
+    node: &kuchikiki::NodeRef,
+    tag: &str,
+    typ: &str,
+) -> CursorKind {
+    if is_text_like(tag, typ) {
+        return CursorKind::Text;
+    }
+    if tag == "a" && document::attr(node, "href").is_some() {
+        return CursorKind::Pointer;
+    }
+    if matches!(tag, "button" | "select" | "summary" | "label" | "option" | "input") {
+        return CursorKind::Pointer;
+    }
+    if let Some(role) = document::attr(node, "role") {
+        let r = role.to_ascii_lowercase();
+        if matches!(
+            r.as_str(),
+            "button" | "link" | "checkbox" | "radio" | "tab" | "menuitem" | "combobox"
+                | "slider" | "option"
+        ) {
+            return CursorKind::Pointer;
+        }
+    }
+    if document::attr(node, "onclick").is_some()
+        || document::attr(node, "tabindex").is_some()
+        || document::attr(node, "contenteditable").is_some()
+    {
+        return CursorKind::Pointer;
+    }
+    CursorKind::Default
+}
+
 impl MouseButton {
     fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
@@ -93,7 +149,7 @@ impl Mods {
     }
 
     /// 组合键(非纯 Shift)是否按下:组合键不产生页面文本/导航语义。
-    fn combo(&self) -> bool {
+    pub(super) fn combo(&self) -> bool {
         self.ctrl || self.meta || self.alt
     }
 }
@@ -143,6 +199,8 @@ struct PageInputState {
     page_dragging: bool,
     /// P2a:单控件撤销/重做历史(key = stable selector)。
     edits: std::collections::HashMap<String, text_edit::EditHistory>,
+    /// P2c:最近一次上报查看器的光标形状(仅在变化时发帧)。
+    pub(crate) last_cursor: Option<CursorKind>,
 }
 
 /// P2b:页面级自由选区的拖选会话(锚点固定,头随指针)。
@@ -201,6 +259,8 @@ struct HitTarget {
     fixed: bool,
     /// 控件字号(文本光标映射用;非文本控件为 0)。
     font_size: f64,
+    /// 光标形状(P2c:悬停时查看器跟随变形)。
+    pub(crate) cursor: CursorKind,
 }
 
 /// 焦点上下文(锁内收敛)。
@@ -400,6 +460,10 @@ impl LsmBrowserManager {
     async fn human_move(&self, pid: &str, x: f64, y: f64) -> Value {
         let hit = self.human_hit_test(pid, x, y).await;
         let hit_sel = hit.as_ref().map(|h| h.selector.clone());
+        // P2c:光标形状跟随悬停目标(仅在变化时发帧)。
+        if let Some(h) = &hit {
+            self.push_cursor_kind(pid, h.cursor).await;
+        }
         // HTML5 drag 近似:按下中且位移超阈值 → dragstart 一次,后续 dragover。
         // 无 dataTransfer 模型(页面拿不到拖拽数据),只保证事件序列与坐标。
         let drag_evt: Option<(String, String, bool)> = {
@@ -630,7 +694,12 @@ impl LsmBrowserManager {
                 }
             }
         }
-        json!({"x": x, "y": y, "hover": hit_sel, "restyled": changed})
+        // P2c:回执带光标形状(测试断言与日志用;查看器不消费回执)。
+        let cursor = hit
+            .as_ref()
+            .map(|h| h.cursor.as_str())
+            .unwrap_or("default");
+        json!({"x": x, "y": y, "hover": hit_sel, "restyled": changed, "cursor": cursor})
     }
 
     /// 按下:hover 链 + `:active` + 可聚焦元素聚焦 + JS mousedown;
@@ -657,6 +726,7 @@ impl LsmBrowserManager {
         let Some(hit) = hit else {
             return json!({"x": x, "y": y, "hit": false, "pressed": true});
         };
+        self.push_cursor_kind(pid, hit.cursor).await;
         // disabled 控件:人工点击不分发事件也不聚焦(与 Agent 侧 `click_inner`
         // 的 disabled 闸同语义;39 号 P2b 顺带补齐)。
         let disabled = is_disabled_control(&hit.tag, &hit.typ)
@@ -1416,6 +1486,28 @@ impl LsmBrowserManager {
         }
     }
 
+    /// P2c:上报光标形状给查看器(仅在变化时发帧,避免每 move 一帧)。
+    async fn push_cursor_kind(&self, pid: &str, kind: CursorKind) {
+        let changed = {
+            let mut s = self.human.lock().unwrap_or_else(|p| p.into_inner());
+            let st = s.page(pid);
+            if st.last_cursor == Some(kind) {
+                false
+            } else {
+                st.last_cursor = Some(kind);
+                true
+            }
+        };
+        if !changed {
+            return;
+        }
+        if let Ok(guard) = self.view.lock() {
+            if let Some(sink) = guard.as_ref() {
+                sink.send_cursor(kind.as_str());
+            }
+        }
+    }
+
     /// 人类输入落进度栏事件时间线(task_local 台账只覆盖 Agent 任务树,
     /// 人工输入发生在树外,直接写 `TabState.bars`)。best-effort:锁被占时
     /// 跳过本条,不阻塞输入路径。
@@ -1500,6 +1592,7 @@ impl LsmBrowserManager {
             } else {
                 0.0
             };
+            let cursor = cursor_kind_for_node(&node, &tag, &typ);
             resolved.push(HitTarget {
                 selector: b.selector.clone(),
                 tag,
@@ -1509,6 +1602,7 @@ impl LsmBrowserManager {
                 label_for,
                 fixed,
                 font_size,
+                cursor,
             });
             if resolved.len() >= 6 {
                 break;
@@ -1579,7 +1673,7 @@ fn pick_top_layer(
     smallest
 }
 
-fn in_open_dialog(doc: &Document, selector: &str) -> bool {
+pub(super) fn in_open_dialog(doc: &Document, selector: &str) -> bool {
     doc.select(selector)
         .ok()
         .and_then(|v| v.into_iter().next())
@@ -1646,7 +1740,7 @@ fn user_select_none(engine: &StyleEngine, node: &kuchikiki::NodeRef) -> bool {
 }
 
 /// 页面上所有**模态** dialog 的稳定选择器(文档序;最后一个 = 顶层)。
-fn dialog_selectors(doc: &Document) -> Vec<String> {
+pub(super) fn dialog_selectors(doc: &Document) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     if let Ok(dialogs) = doc.select("dialog") {
         for d in dialogs {
@@ -1709,7 +1803,7 @@ pub(crate) fn is_text_like(tag: &str, typ: &str) -> bool {
 }
 
 /// 节点计算字号(从根下推继承链;文本光标映射与键路由折行共用)。
-fn node_font_size(engine: &StyleEngine, node: &kuchikiki::NodeRef) -> f64 {
+pub(super) fn node_font_size(engine: &StyleEngine, node: &kuchikiki::NodeRef) -> f64 {
     let mut chain: Vec<kuchikiki::NodeRef> = Vec::new();
     let mut cur = Some(node.clone());
     while let Some(n) = cur {
@@ -1726,7 +1820,7 @@ fn node_font_size(engine: &StyleEngine, node: &kuchikiki::NodeRef) -> f64 {
 }
 
 /// 文档序可聚焦选择器列表(有布局盒才算;tabindex 排序未建模,按文档序近似)。
-fn focusable_selectors(tab: &TabState, doc: &Document) -> Vec<String> {
+pub(super) fn focusable_selectors(tab: &TabState, doc: &Document) -> Vec<String> {
     let mut out = Vec::new();
     if let Ok(all) = doc.select("*") {
         for node in all {
