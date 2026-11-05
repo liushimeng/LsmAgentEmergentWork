@@ -963,11 +963,23 @@ pub fn ua_default(tag: &str, parent: &ComputedStyle) -> ComputedStyle {
         // 表单控件 UA 默认描边:真实浏览器给 input/textarea/select/button
         // 默认 1px 灰边框 + 白底;缺它时裸表单控件在渲染输出中完全不可见
         // (页面未自定义控件样式时截图/视觉核验拿不到输入框几何)。
-        "input" | "textarea" | "select" | "button" => {
+        "input" | "textarea" | "select" => {
             st.border_widths = [1.0; 4];
             st.border_drawn = [true; 4];
             st.border_colors = [BorderColor::Rgba([118, 118, 118], 255); 4];
             st.background = Some([255, 255, 255]);
+        }
+        // 第 55 轮:Chrome UA 给 button 文字**居中**(`button{text-align:center}`)。
+        // 缺它时站点未自定义 text-align 的按钮文字恒贴左缘(天猫搜索按钮
+        // 「搜索」二字顶在红盒左边界,与真机 Chrome 明显不符)。
+        // ★ button 从上面的联合臂里拆出来 —— Rust match 取先命中臂,
+        //   合并臂在前会遮蔽本臂。
+        "button" => {
+            st.border_widths = [1.0; 4];
+            st.border_drawn = [true; 4];
+            st.border_colors = [BorderColor::Rgba([118, 118, 118], 255); 4];
+            st.background = Some([255, 255, 255]);
+            st.text_align = "center".to_string();
         }
         // 第 48 轮:此前 `hr` 走通用块级路径时 content_h=0 且无边框,
         // 水平线整条不可见;fieldset 无 UA 边框、legend 仍按 inline 排版。

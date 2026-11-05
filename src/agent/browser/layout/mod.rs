@@ -80,6 +80,26 @@ pub(crate) struct DeferredBox {
     pub static_y: f64,
 }
 
+/// 待二次解析的绝对定位元素(flex/grid 条目内,包含块在条目之外)。
+///
+/// 条目内容测量期,`nearest_positioned_cb` 沿 DOM 上溯能找到最近的定位
+/// 祖先(如天猫 `#J_Search`),但**拿不到它的几何**:该祖先是 flex 条目,
+/// 引擎只在条目定位完成后才把条目盒写进 `ctx.boxes`;块级流虽有
+/// `PositionedPad` 先序登记,flex/grid 引擎没有对应机制。
+/// 于是包含块退化成条目自身的临时盒(宽度 1px),`right` 反向锚定算出
+/// 负坐标(天猫搜索按钮跑到搜索框左侧 950px)。
+///
+/// 延后到条目定位后重放:此时容器自身的包含块(容器外最近定位祖先的
+/// padding 盒)已知,重放坐标直接落在容器坐标系,无需片段平移补偿。
+#[derive(Clone)]
+pub(crate) struct PendingAbs {
+    pub node: NodeRef,
+    pub style: ComputedStyle,
+    /// 静态位置(无 inset 时的定位基准),坐标系 = 条目局部坐标。
+    pub static_x: f64,
+    pub static_y: f64,
+}
+
 /// 元素自身的「确定高度」:显式长度,或包含块高度确定时的百分比高度。
 ///
 /// CSS 语义:百分比高度仅在包含块高度确定(非 auto、不依赖内容)时生效,
@@ -342,6 +362,8 @@ pub fn compute_full(
         display: Vec::new(),
         positioned_pads: Vec::new(),
         frame_stack: Vec::new(),
+        abs_pending: Vec::new(),
+        abs_defer: false,
         scroll_max: HashMap::new(),
         seq: 0,
         images,
@@ -393,6 +415,22 @@ pub fn compute_full(
     let icb = (0.0, 0.0, ctx.width, icb_h);
     ctx.layout_children(&body, body_margin_left, content_width, &mut buf, 0, &body_style, icb);
     ctx.flush_inline(&mut buf, content_width);
+    // 兜底:未被任何 flex/grid 容器认领的待解析绝对定位元素,用初始包含块
+    // 补画 —— 「延后解析」不得退化为「元素丢失」(理论上不该有残留)。
+    if !ctx.abs_pending.is_empty() {
+        let pend = std::mem::take(&mut ctx.abs_pending);
+        let (vw, vh) = ctx.viewport();
+        for p in pend {
+            position::layout_abs_with_cb(
+                &mut ctx,
+                &p.node,
+                &p.style,
+                (0.0, 0.0, vw, vh),
+                0,
+                (p.static_x, p.static_y),
+            );
+        }
+    }
     // body 末子块穿出的 margin_bottom 与 body 自身边距折叠(CSS 2.1 8.3.1);
     // body 有 padding-bottom/下边框/overflow 时收编进内容高。
     if contains_child_margins(&body_style) {
@@ -520,6 +558,13 @@ pub(crate) struct LayoutCtx<'a> {
     /// push/pop)。用于判定盒表命中的祖先盒是否属于**当前片段** ——
     /// 片段内解析的 absolute 坐标是片段局部的,必须随片段平移。
     pub(crate) frame_stack: Vec<usize>,
+    /// 待二次解析的绝对定位元素(见 PendingAbs):flex/grid 条目内容测量期
+    /// 内,其包含块(最近的定位祖先)往往是**条目之外**的祖先,而该祖先的
+    /// 几何要到条目定位完成才确定 —— 条目测量期无法就地解析,改为延后。
+    pub(crate) abs_pending: Vec<PendingAbs>,
+    /// 当前是否处于「flex/grid 条目内容测量」语境:此语境下,包含块解析
+    /// 失败的绝对定位元素改为压入 `abs_pending`,由条目定位后重放。
+    pub(crate) abs_defer: bool,
     /// 第 46 轮:可滚动容器的最大滚动量(stable selector → px)。
     scroll_max: HashMap<String, f64>,
     /// DFS 先序序号(显示列表排序键之一)。
@@ -1525,6 +1570,8 @@ impl<'a> LayoutCtx<'a> {
         if depth > 60 {
             return;
         }
+        // 包含块解析追踪开关(见 LAEW_CB_TRACE):函数级取一次,避免逐祖先读环境变量。
+        let trace = std::env::var("LAEW_CB_TRACE").is_ok();
         // 绘制层(CSS 2.1 附录 E 第 8 步):定位元素(position != static)连同其
         // 子树绘制在常规流内容之上。此前只按 (z, seq) 排序,定位元素若在 DOM
         // 顺序上靠前会被后面的常规流图片/背景整块盖住(实测猎聘登录框被 hero
@@ -1888,8 +1935,24 @@ impl<'a> LayoutCtx<'a> {
                         h: ccb.3,
                         depth: self.frame_stack.len(),
                     });
+                    if trace {
+                        eprintln!(
+                            "[cbtrace] PAD registered sel={} at ({},{},{}x{}) frame_depth={}",
+                            selector, ccb.0, ccb.1, ccb.2, ccb.3, self.frame_stack.len()
+                        );
+                    }
                     ccb
                 };
+                if trace {
+                    eprintln!(
+                        "[cbtrace] child sel={} pos={} cb_in={:?} child_cb={:?} depth={}",
+                        selector,
+                        style.pos.position,
+                        cb,
+                        child_cb,
+                        self.frame_stack.len()
+                    );
+                }
                 // 第 46 轮:可滚动容器(`overflow:auto|scroll`)—— 内容按运行时
                 // 滚动偏移上移(偏移量落在临时解析树的 `data-lsm-scroll-top`),
                 // 超出盒高的部分由祖先裁剪链裁掉(见 `apply_group`)。

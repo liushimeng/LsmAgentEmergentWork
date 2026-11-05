@@ -32,6 +32,9 @@ struct Item {
     image: Option<String>,
     /// 内容片段(列宽确定后测量;定位时平移注入)。
     frag: Option<Fragment>,
+    /// 条目内容测量期延后解析的绝对定位元素(见 PendingAbs):其包含块
+    /// 在条目之外,几何要到条目定位后才确定 —— 发射时用容器包含块重放。
+    pending_abs: Vec<super::PendingAbs>,
 }
 
 impl Item {
@@ -58,6 +61,7 @@ fn element_item(node: &NodeRef, cs: ComputedStyle, image: Option<String>) -> Ite
         col_span: 1,
         row_span: 1,
         frag: None,
+        pending_abs: Vec::new(),
     }
 }
 
@@ -75,6 +79,7 @@ fn anon_item(text: &str, parent: &ComputedStyle) -> Item {
         col_span: 1,
         row_span: 1,
         frag: None,
+        pending_abs: Vec::new(),
     }
 }
 
@@ -158,7 +163,7 @@ pub(crate) fn layout_content(
     content_w: f64,
     style: &ComputedStyle,
     depth: usize,
-    _cb: (f64, f64, f64, f64),
+    cb: (f64, f64, f64, f64),
 ) -> f64 {
     if depth > 60 {
         return 0.0;
@@ -172,7 +177,9 @@ pub(crate) fn layout_content(
                 content_w + style.padding_left + style.padding_right,
                 super::UNKNOWN_CB_H,
             );
+            let pend_mark = ctx.abs_pending.len();
             super::position::layout_deferred(ctx, deferred, pad_cb, depth);
+            replay_pending(ctx, cb, depth, pend_mark);
         }
         return 0.0;
     }
@@ -263,6 +270,8 @@ pub(crate) fn layout_content(
             area_w,
             area_h,
             style,
+            cb,
+            depth,
         );
     }
 
@@ -274,7 +283,9 @@ pub(crate) fn layout_content(
             content_w + style.padding_left + style.padding_right,
             super::UNKNOWN_CB_H,
         );
+        let pend_mark = ctx.abs_pending.len();
         super::position::layout_deferred(ctx, deferred, pad_cb, depth);
+        replay_pending(ctx, cb, depth, pend_mark);
     }
     avail_h.max(total_h)
 }
@@ -782,8 +793,40 @@ fn measure_items(
         } else {
             let node = item.node.as_ref().unwrap().clone();
             let cs = item.style.clone();
+            // 条目内容测量期:包含块在条目之外的绝对定位元素**就地**解析不到
+            // 几何(最近的定位祖先是 grid 条目,盒要到定位后才写),改为延后 ——
+            // 条目定位后由 emit_item 用容器包含块重放。
+            let pend_mark = ctx.abs_pending.len();
+            let prev_defer = ctx.abs_defer;
+            ctx.abs_defer = true;
             item.frag = Some(ctx.measure_content(&node, inner_w, &cs, depth));
+            ctx.abs_defer = prev_defer;
+            item.pending_abs = ctx.abs_pending.drain(pend_mark..).collect();
         }
+    }
+}
+
+/// 重放本容器认领的待解析绝对定位元素:用**容器自身的包含块**解析
+/// (与 flex 同构:见 flex.rs::replay_pending)。
+fn replay_pending(
+    ctx: &mut LayoutCtx,
+    container_cb: (f64, f64, f64, f64),
+    depth: usize,
+    pend_mark: usize,
+) {
+    if ctx.abs_pending.len() <= pend_mark {
+        return;
+    }
+    let pend: Vec<super::PendingAbs> = ctx.abs_pending.drain(pend_mark..).collect();
+    for p in pend {
+        super::position::layout_abs_with_cb(
+            ctx,
+            &p.node,
+            &p.style,
+            container_cb,
+            depth,
+            (p.static_x, p.static_y),
+        );
     }
 }
 
@@ -796,6 +839,8 @@ fn emit_item(
     area_w: f64,
     area_h: f64,
     style: &ComputedStyle,
+    container_cb: (f64, f64, f64, f64),
+    depth: usize,
 ) {
     let (mt, mr, mb, ml) = item.margins();
     let (pt, _, pb, pl) = item.pads();
@@ -889,6 +934,45 @@ fn emit_item(
     append(ctx, frag);
     // 阶段六:条目子树组效果回补(opacity / overflow)。
     ctx.apply_group(mark, &cs, x, y, used_w, used_h);
+    // 条目内**延后解析**的绝对定位元素:此刻条目坐标已定,用容器包含块重放
+    // (坐标系 = 容器坐标系;不随条目片段平移,也不受条目 overflow 裁剪)。
+    if !item.pending_abs.is_empty() {
+        let pend = std::mem::take(&mut item.pending_abs);
+        // 条目内容盒(容器坐标系):条目自身即包含块时用它。
+        let item_content_w = (used_w - pl - item.style.padding_right).max(1.0);
+        let item_content_h = (used_h - pt - pb).max(1.0);
+        for p in pend {
+            // 最近定位祖先是条目自身 → 包含块 = 条目内容盒;
+            // 否则(在条目之外)→ 容器自身的包含块。
+            let cb = match item.node.as_ref() {
+                Some(item_node)
+                    if super::position::item_is_containing_block(ctx, &p.node, item_node) =>
+                {
+                    (x + pl, y + pt, item_content_w, item_content_h)
+                }
+                _ => container_cb,
+            };
+            if std::env::var("LAEW_CB_TRACE").is_ok() {
+                eprintln!(
+                    "[cbtrace] replay sel={} cb={:?} item=({},{},{}x{})",
+                    Document::stable_selector(&p.node),
+                    cb,
+                    x,
+                    y,
+                    used_w,
+                    used_h
+                );
+            }
+            super::position::layout_abs_with_cb(
+                ctx,
+                &p.node,
+                &p.style,
+                cb,
+                depth,
+                (p.static_x + x + pl, p.static_y + y + pt),
+            );
+        }
+    }
 }
 
 /// 条目对齐:`auto` 跟随容器 `*-items`(start/end 已在样式层归一)。

@@ -26,5 +26,6 @@
 | [52-猎聘白屏根因与样式引擎性能优化.md](52-猎聘白屏根因与样式引擎性能优化.md) | 猎聘 `/zhaopin/` 白屏=站点自身 `.searchjobs-spin-loading-box` 全视口遮罩(接口 400 不收尾);BOSS 白屏=站点下发安全验证页(内核渲染正常);**真正的内核 bug=样式引擎 O(节点×规则)**,主体预过滤 `SubjectHint` 4.5× 且显示列表逐字节一致 / `page_health.loading_overlay` 诊断 |
 | [53-猎聘加载遮罩白屏HITL软化与首页hero水合断链.md](53-猎聘加载遮罩白屏HITL软化与首页hero水合断链.md) | ① zhaopin 白屏遮罩 × request_human 死锁 → **用户态查看器帧软化遮罩**(仅查看器,不进取证截图)+琥珀胶囊;② 首页 hero 空藏青块=SEO 版水合 JS 断链(600s 大预算仍断),管线基线预算 240s→360s、`page_health.script_cut` 诚实化(pending=0 截断不再漏报);**截图问题先像素统计再定论**(AI 读图会把稀疏字形脑补成完整布局) |
 | [54-闲鱼渲染链多根因修复.md](54-闲鱼渲染链多根因修复.md) | 闲鱼四联症:mtop `FAIL_SYS_TOKEN_EMPTY` 死循环(Set-Cookie 回传断链两处:jar 不回传/批内快照过期) / `__lsmIsDescendant` 同名遮蔽断 MutationObserver subtree 派发→登录页组件重复 11~28 份 / open(page_id,新URL) 静默另开新页 / DOM_TRACE 字节截断 panic;mtop 类接口 **200 ≠ 成功**要看响应体 ret |
+| [55-天猫搜索条绝对定位跨测量帧包含块解析根因修复.md](55-天猫搜索条绝对定位跨测量帧包含块解析根因修复.md) | 天猫搜索按钮跑到搜索框左侧 950px:flex/grid 条目内 abs 元素的包含块(最近定位祖先=flex 条目)几何要到条目定位后才确定,测量期退化成条目自身 1px 临时盒 → `right` 反向锚定算出负坐标;附「解析失败后继续上溯」次根因与 LAEW_CB_TRACE 诊断设施 |
 
 > ⚠️ 真站结论受**时间与风控策略**影响。部分篇目按停测要求**未复测**，引用前先看篇内标注。

@@ -809,9 +809,19 @@ pub(crate) fn emit_singleline_text(
         return;
     }
     let line_height = size * 1.35;
+    // 控件文字按 `text-align` 对齐(Chrome 语义:button 文字居中,
+    // 站点自定义 text-align 亦生效)。此前恒 `bx+3.0` 贴左,天猫搜索按钮
+    // 「搜索」二字顶在红盒左边界(第 55 轮真机实测)。
+    let inset = 3.0;
+    let text_w = ctx.font().text_width(&clipped, size);
+    let tx = match style.text_align.as_str() {
+        "center" => bx + ((w - text_w) / 2.0).max(inset),
+        "right" | "end" => bx + (w - text_w - inset).max(inset),
+        _ => bx + inset,
+    };
     let line = super::TextLine {
         text: clipped,
-        x: bx + 3.0,
+        x: tx,
         y: by + ((h - line_height) / 2.0).max(1.0),
         size,
         color,

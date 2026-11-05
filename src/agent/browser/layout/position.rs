@@ -50,19 +50,41 @@ fn nearest_positioned_cb(
     ctx: &LayoutCtx,
     node: &NodeRef,
     fallback: (f64, f64, f64, f64),
-) -> ((f64, f64, f64, f64), bool) {
+) -> ((f64, f64, f64, f64), bool, bool) {
     let frame_origin = *ctx.frame_stack.last().unwrap_or(&0);
     let in_frame = !ctx.frame_stack.is_empty();
+    let trace = std::env::var("LAEW_CB_TRACE").is_ok();
     let mut cur = node.parent();
     let mut positioned_seen = false;
     while let Some(ancestor) = cur {
         if ancestor.as_element().is_some() {
             let style = ctx.engine.computed_chain(&ancestor);
+            if trace {
+                eprintln!(
+                    "[cbtrace] chain ancestor={} pos={} tf={} frame_depth={}",
+                    Document::stable_selector(&ancestor),
+                    style.pos.position,
+                    style.transform.is_some(),
+                    ctx.frame_stack.len()
+                );
+            }
             if style.pos.position != "static" || style.transform.is_some() {
                 positioned_seen = true;
                 let selector = Document::stable_selector(&ancestor);
                 if let Some(idx) = ctx.boxes.iter().rposition(|b| b.selector == selector) {
                     let b = &ctx.boxes[idx];
+                    if trace {
+                        eprintln!(
+                            "[cbtrace] ancestor={} box=({},{},{}x{}) idx={} total_boxes={}",
+                            selector,
+                            b.x,
+                            b.y,
+                            b.w,
+                            b.h,
+                            idx,
+                            ctx.boxes.len()
+                        );
+                    }
                     let h = if b.h > 1.0 {
                         (b.h - style.padding_top - style.padding_bottom).max(0.0)
                     } else {
@@ -77,6 +99,8 @@ fn nearest_positioned_cb(
                         ),
                         // 本帧内发射的盒 = 片段局部坐标;外层盒 = 全局坐标。
                         in_frame && idx >= frame_origin,
+                        // 盒表命中 = 包含块几何已确定。
+                        true,
                     );
                 }
                 // 盒表未命中(尚未写盒)→ 先序登记兜底;只认当前帧的登记,
@@ -88,8 +112,25 @@ fn nearest_positioned_cb(
                     .find(|p| p.selector == selector && p.depth == ctx.frame_stack.len())
                 {
                     let h = if pad.h > 1.0 && pad.h < super::UNKNOWN_CB_H { pad.h } else { fallback.3 };
-                    return (((pad.x, pad.y, pad.w, h)), true);
+                    if trace {
+                        eprintln!(
+                            "[cbtrace] ancestor={} PAD=({},{},{}x{}) fallback={:?}",
+                            selector, pad.x, pad.y, pad.w, pad.h, fallback
+                        );
+                    }
+                    return (((pad.x, pad.y, pad.w, h)), true, true);
                 }
+                // ★ 最近定位祖先的几何**未解析成功** → 包含块就是它,
+                //   不能继续上溯找更外层的定位祖先(CSS:包含块由**最近**的
+                //   定位祖先决定)。继续上溯会拿到更大的包含块,把元素锚到
+                //   错误的位置(实测:grid 条目内的绝对定位元素被锚到 grid
+                //   容器右缘,而不是条目右缘)。
+                //   几何拿不到时回退调用方携带的包含块,并置 resolved=false,
+                //   由调用方决定是否延后解析。
+                if trace {
+                    eprintln!("[cbtrace] ancestor={} 未解析出几何 → 回退 fallback", selector);
+                }
+                return (fallback, in_frame, false);
             }
         }
         cur = ancestor.parent();
@@ -98,11 +139,17 @@ fn nearest_positioned_cb(
         // 定位祖先可能尚未收口写盒,沿用调用方携带的同一包含块。
         // 片段内的 fallback cb 是片段局部的 → 随片段平移;顶层 flow 的
         // fallback 本就是全局坐标 → 不平移。
-        (fallback, in_frame)
+        //
+        // ★ 几何**未解析成功**:最近的定位祖先存在但拿不到盒/登记 ——
+        //   典型场景:该祖先是 flex/grid 条目,几何要到条目定位后才确定。
+        //   此时 fallback 常是条目自身的临时盒(宽度退化为 1px),
+        //   `right`/`bottom` 反向锚定会算出负坐标(天猫搜索按钮左移 950px)。
+        //   调用方据此决定是否延后解析(见 layout_abs 的 abs_defer 分支)。
+        (fallback, in_frame, false)
     } else {
         // 没有定位祖先时是初始包含块(视口,全局坐标),不能回退到零宽临时父盒。
         let (vw, vh) = ctx.viewport();
-        ((0.0, 0.0, vw, vh), false)
+        ((0.0, 0.0, vw, vh), false, true)
     }
 }
 
@@ -117,10 +164,11 @@ fn layout_abs(
     if depth > 60 {
         return false;
     }
+    let trace = std::env::var("LAEW_CB_TRACE").is_ok();
     let fixed = style.pos.position == "fixed";
-    let ((cx, cy, cw, ch), mut rides) = if fixed {
+    let ((cx, cy, cw, ch), mut rides, resolved) = if fixed {
         let (vw, vh) = ctx.viewport();
-        ((0.0, 0.0, vw, vh), false)
+        ((0.0, 0.0, vw, vh), false, true)
     } else {
         nearest_positioned_cb(ctx, node, cb)
     };
@@ -128,6 +176,82 @@ fn layout_abs(
     if fixed {
         rides = false;
     }
+    // ★ 包含块几何未解析成功 + 当前处于 flex/grid 条目测量语境:
+    //   最近的定位祖先在条目之外,其几何要到条目定位后才确定 —— 就地布局
+    //   只能用条目自身的临时盒(宽度 1px),反向锚定直接算错。
+    //   改为延后:压入待解析队列,由条目定位后用容器包含块重放
+    //   (见 PendingAbs / flex.rs::emit_item)。
+    if !fixed && ctx.abs_defer && !resolved {
+        ctx.abs_pending.push(super::PendingAbs {
+            node: node.clone(),
+            style: style.clone(),
+            static_x: static_pos.0,
+            static_y: static_pos.1,
+        });
+        return false;
+    }
+    layout_abs_resolved(ctx, node, style, (cx, cy, cw, ch), rides, depth, static_pos)
+}
+
+/// 判定「条目内延后解析的绝对定位元素」的最近定位祖先是否**就是该条目本身**。
+///
+/// - `true` → 条目自身(position:relative 等)即包含块 → 用条目内容盒
+///   (条目坐标系 → 容器坐标系)。
+/// - `false` → 包含块在条目之外(通常是容器的包含块:容器外最近定位祖先)。
+pub(crate) fn item_is_containing_block(
+    ctx: &LayoutCtx,
+    node: &NodeRef,
+    item_node: &NodeRef,
+) -> bool {
+    let mut cur = node.parent();
+    while let Some(ancestor) = cur {
+        if ancestor.as_element().is_some() {
+            let style = ctx.engine.computed_chain(&ancestor);
+            if style.pos.position != "static" || style.transform.is_some() {
+                return &ancestor == item_node;
+            }
+        }
+        cur = ancestor.parent();
+    }
+    false
+}
+
+/// 强制包含块重放入口:flex/grid 条目定位完成后,用**容器自身的包含块**
+/// (容器外最近定位祖先的 padding 盒,坐标系 = 容器坐标系)解析此前延后的
+/// 绝对定位元素。坐标直接落在容器坐标系,条目片段平移不再影响它。
+pub(crate) fn layout_abs_with_cb(
+    ctx: &mut LayoutCtx,
+    node: &NodeRef,
+    style: &ComputedStyle,
+    cb: (f64, f64, f64, f64),
+    depth: usize,
+    static_pos: (f64, f64),
+) -> bool {
+    if depth > 60 {
+        return false;
+    }
+    if style.pos.position == "fixed" {
+        let (vw, vh) = ctx.viewport();
+        return layout_abs_resolved(ctx, node, style, (0.0, 0.0, vw, vh), false, depth, static_pos);
+    }
+    // 重放坐标属于当前(容器)坐标系:随容器片段一起平移。
+    let rides = !ctx.frame_stack.is_empty();
+    layout_abs_resolved(ctx, node, style, cb, rides, depth, static_pos)
+}
+
+/// 包含块已定型的绝对定位元素布置:解尺寸 → 定位 → 发射。
+fn layout_abs_resolved(
+    ctx: &mut LayoutCtx,
+    node: &NodeRef,
+    style: &ComputedStyle,
+    cb: (f64, f64, f64, f64),
+    rides: bool,
+    depth: usize,
+    static_pos: (f64, f64),
+) -> bool {
+    let (cx, cy, cw, ch) = cb;
+    let fixed = style.pos.position == "fixed";
+    let trace = std::env::var("LAEW_CB_TRACE").is_ok();
     let pad_l = style.padding_left;
     let pad_r = style.padding_right;
     let pad_t = style.padding_top;
@@ -222,6 +346,22 @@ fn layout_abs(
         static_y
     };
 
+    if trace {
+        eprintln!(
+            "[cbtrace] abs node={} tag={} cb={:?} bx={} by={} bw={} bh={} left={:?} right={:?} top={:?} static={:?}",
+            Document::stable_selector(node),
+            document::tag_name(node),
+            (cx, cy, cw, ch),
+            bx,
+            by,
+            bw,
+            bh,
+            style.pos.resolved_left(cw),
+            style.pos.resolved_right(cw),
+            style.pos.resolved_top(ch),
+            static_pos
+        );
+    }
     // 自身视觉的绘制序必须**早于**子树内容(浏览器语义:元素背景画在内容之下)。
     // seq 在测量子树**之前**预分配:此前在测量之后才取,绝对定位元素自己的
     // 背景 seq 更大 → 画在子树之上,把子树整块盖住(实测猎聘首页登录弹层

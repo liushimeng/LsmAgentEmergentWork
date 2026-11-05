@@ -113,6 +113,7 @@ cargo test --test cli_provider -- --nocapture   # 失败时打印子进程输出
 | `LAEW_WEB_CONTROL` | `off`/`0`/`false`/`no` | 关闭**整个浏览器控制权状态机**(两浏览器工具同参):不记控制权、不挂蒙层、不拦 Agent 写操作,回到改造前行为。见 `src/agent/web_control.rs` |
 | `LAEW_WEB_MASK` | `off`/`0`/`false`/`no` | 只关**控制权蒙层与输入闸**(闸门与状态栏文案保留):人工想全程自己点页面时用。见 `src/agent/chrome_browser/control_mask.rs` |
 | `LAEW_JS_FORIN_GUARD` | `off`/`0`/`false`/`no` | 关闭 `for...in` 空值守卫的**源码级改写**(诊断用:压缩混淆脚本失败时排除改写误伤)。见 `src/agent/browser/script/for_in_guard.rs` |
+| `LAEW_CB_TRACE` | `1`/`true`/`yes`/`on` | 打印**绝对定位包含块解析链路**(祖先链 position/帧深度、盒表/`PositionedPad` 命中、abs 元素最终 cb 与 bx/by、flex/grid 条目重放 cb)。定位「元素锚到错误位置」类布局故障,典型如 flex/grid 条目内的绝对定位元素(`right`/`bottom` 反向锚定算到负坐标)。默认关闭。见 `src/agent/browser/layout/position.rs`、`measure.rs`、`mod.rs`、`flex.rs`、`grid.rs` |
 | `LAEW_DUMP_HTML` | 文件路径 | 脚本管线后的整页 HTML 落盘,供离线布局探针分析。见 `src/agent/browser/mod.rs` |
 | `LAEW_DUMP_DISPLAY` | 文件路径 | 每次渲染把显示列表全量落盘(kind/x/y/w/h/z/clip/文字摘要),定位「布局有文本/渲染无像素」类矛盾。见 `src/agent/browser/render/mod.rs` |
 | `LAEW_WEB_EVIDENCE` | `off`/`0`/`false`/`no` | 关闭网页取证纪律硬闸门。见 `src/agent/safety/web_evidence.rs` |

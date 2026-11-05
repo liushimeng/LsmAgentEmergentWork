@@ -112,6 +112,15 @@ impl<'a> LayoutCtx<'a> {
         // 是否属于本片段(position.rs::nearest_positioned_cb)。
         self.frame_stack.push(boxes0);
         self.y = 0.0;
+        if std::env::var("LAEW_CB_TRACE").is_ok() {
+            eprintln!(
+                "[cbtrace] measure node={} display={} content_w={} new_depth={}",
+                Document::stable_selector(node),
+                style.display,
+                content_width,
+                self.frame_stack.len()
+            );
+        }
         let height = if style.display == "flex" {
             // flex/grid 格式化上下文不推进全局游标,高度取返回值。
             flex::layout_content(

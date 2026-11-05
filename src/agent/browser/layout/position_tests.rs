@@ -90,3 +90,66 @@ fn 高度约束冲突时_min_height优先() {
     assert_near(box_by_id(&lay, "bounded").h, 450.0, "块级 min/max 钳序");
     assert_near(box_by_id(&lay, "grid").h, 320.0, "Grid max-height");
 }
+
+
+#[test]
+fn flex条目内绝对定位元素_包含块解析到条目外定位祖先() {
+    // 天猫搜索条同构:flex 容器 > (position:relative) 条目 > flex 表单 >
+    // flex 条目 > position:absolute;right:2px 按钮。
+    //
+    // 旧实现:按钮的包含块(#mid)虽是最近的定位祖先,但它是 flex 条目 ——
+    // 几何要到条目定位后才确定,条目测量期解析不到,退化成条目自身的
+    // 1px 临时盒,`right` 反向锚定算出负坐标(天猫实测按钮左移 950px)。
+    let l = layout(
+        "<body><div id=outer style='display:flex;width:600px'>\
+         <div id=mid style='position:relative;flex:1'>\
+         <div id=form style='display:flex;height:44px'>\
+         <div id=wrap style='width:0'>\
+         <button id=btn style='position:absolute;top:2px;right:2px;width:72px;height:36px'>S</button>\
+         </div></div></div></div></body>",
+    );
+    let mid = box_by_id(&l, "mid");
+    let btn = box_by_id(&l, "btn");
+    assert_near(btn.w, 72.0, "按钮宽度");
+    // 按钮右缘贴包含块(#mid)右缘内侧 2px。
+    assert_near(
+        btn.x + btn.w,
+        mid.x + mid.w - 2.0,
+        "按钮右缘应贴包含块右缘内侧 2px",
+    );
+}
+
+#[test]
+fn grid条目内绝对定位元素_包含块解析到条目外定位祖先() {
+    // 与 flex 同构:grid 条目内的绝对定位元素同样要解析到条目外的定位祖先。
+    let l = layout(
+        "<body><div id=outer style='display:grid;grid-template-columns:600px;position:relative'>\
+         <div id=cell style='position:relative'>\
+         <div id=wrap style='width:0'>\
+         <div id=abs style='position:absolute;top:2px;right:2px;width:72px;height:36px'></div>\
+         </div></div></div></body>",
+    );
+    let cell = box_by_id(&l, "cell");
+    let abs = box_by_id(&l, "abs");
+    assert_near(
+        abs.x + abs.w,
+        cell.x + cell.w - 2.0,
+        "绝对定位元素右缘应贴包含块右缘内侧 2px",
+    );
+}
+
+#[test]
+fn button文字居中() {
+    // Chrome UA:`button{text-align:center}`。缺它时站点未自定义 text-align
+    // 的按钮文字恒贴左缘(第 55 轮天猫搜索按钮「搜索」二字顶在红盒左边界)。
+    let l = layout("<body><button id=btn style='width:200px;height:40px'>搜索</button></body>");
+    let btn = box_by_id(&l, "btn");
+    let text = l
+        .lines
+        .iter()
+        .find(|t| t.text == "搜索")
+        .expect("应有按钮文字");
+    let text_cx = text.x + FontSet::fallback().text_width("搜索", text.size) / 2.0;
+    let btn_cx = btn.x + btn.w / 2.0;
+    assert_near(text_cx, btn_cx, "按钮文字应水平居中");
+}
