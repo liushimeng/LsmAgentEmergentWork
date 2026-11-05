@@ -224,6 +224,14 @@ pub fn collect_image_urls(html: &str, base_url: &str, viewport_width: f64) -> Ve
             push(&raw, &mut out);
         }
     }
+    // 第 55 轮:svg `<image>` 位图引用(与 `<img>`/poster 同一预取链,
+    // 否则矢量内的位图资源永不下载 → 图引用区域空白)。
+    for node in doc.select("svg image").unwrap_or_default() {
+        let href = document::attr(&node, "href")
+            .or_else(|| document::attr(&node, "xlink:href"))
+            .unwrap_or_default();
+        push(&href, &mut out);
+    }
     out
 }
 

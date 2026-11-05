@@ -1,11 +1,14 @@
 //! 媒体控件条(第 50 轮):`video[controls]` 底部悬浮条与 `audio[controls]`
-//! 整条形态。
+//! 整条形态;**媒体 poster 真实绘制**(第 55 轮)。
 //!
 //! 内核不解码音视频(48 轮边界不变),但 `controls` 属性声明了「这里应有
 //! 播放器 UI」——此前只画空盒占位,截图取证无法区分「有控件的播放器」
 //! 与「一块空白」。这里补**静态控件条**:半透明黑底 + 播放三角 +
 //! 进度条(无解码态恒 0)+ 时间文案。条本体不占布局(悬浮绘制,叠在
 //! 元素内容之上),发射在 `emit_canvas_pixels` 公共尾钩。
+//!
+//! 第 55 轮补 `emit_media_poster`:`video[poster]`/`object[data]`/
+//! `embed[src]` 已解码时画真实像素并撤占位(必须先于控件条发射)。
 
 use super::*;
 
@@ -130,6 +133,67 @@ impl<'a> LayoutCtx<'a> {
             fixed: self.fixed_depth > 0,
             out_of_flow: false,
             layer,
+            sticky: None,
+        });
+    }
+}
+
+impl<'a> LayoutCtx<'a> {
+    /// 媒体/嵌入 poster 真实绘制(第 55 轮)。
+    ///
+    /// `video[poster]` / `object[data]` / `embed[src]` 的资源第 48 轮已进
+    /// 预取链并用于固有尺寸,但像素一直不过绘制链 —— 播放器首帧图已下载
+    /// 却只画 `MediaFrameNote` 空盒占位。这里在资源已解码时发射真实
+    /// `Image`(按 `object-fit` 缺省 `fill`),并撤掉本元素的占位。
+    ///
+    /// 仍未解码/非图片资源时保留占位(「能力边界可见」语义不变)。
+    pub(crate) fn emit_media_poster(
+        &mut self,
+        node: &NodeRef,
+        style: &ComputedStyle,
+        seq: u64,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+    ) {
+        let tag = document::tag_name(node).to_ascii_lowercase();
+        if !matches!(tag.as_str(), "video" | "object" | "embed") || !style_visible(style) {
+            return;
+        }
+        let Some(src) = self.media_image_src(node) else {
+            return;
+        };
+        if !self.image_loaded(&src) {
+            return;
+        }
+        // 撤掉 emit_element 画的本元素 MediaFrameNote(同 seq 尾部回扫)。
+        if let Some(idx) = self.display.iter().rposition(|it| {
+            it.seq == seq
+                && matches!(&it.kind, DisplayKind::MediaFrameNote { tag: t, .. } if *t == tag)
+        }) {
+            self.display.remove(idx);
+        }
+        self.display.push(DisplayItem {
+            kind: DisplayKind::Image {
+                src,
+                fit: style.object_fit.clone(),
+                off_x: 0.0,
+                off_y: 0.0,
+            },
+            x,
+            y,
+            w,
+            h,
+            radius: style.border_radius,
+            z: style.pos.z_index.max(self.z_floor),
+            seq,
+            opacity: style.opacity,
+            clip: None,
+            transform: self.own_transform(style, x, y, w, h),
+            fixed: self.fixed_depth > 0,
+            out_of_flow: false,
+            layer: self.layer_for(style),
             sticky: None,
         });
     }

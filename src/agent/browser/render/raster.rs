@@ -11,6 +11,7 @@ use tiny_skia::{Pixmap, PremultipliedColorU8};
 
 use super::super::images::{DecodedImage, ImageStore};
 use super::super::style::{Affine, CornerRadius, GradientKind, GradientSpec};
+use super::super::svg::{GradientPaint, GradientStop, SpreadMethod, SvgPaint};
 use super::blur::{blur_mask, half_width_for, MAX_MASK_PIXELS};
 use super::display::{BgFill, DisplayItem, DisplayKind, TextDecorKind, WidgetGlyphKind};
 use super::FontSet;
@@ -328,7 +329,8 @@ pub(crate) fn rasterize(
                 cap_round,
             } => {
                 draw_svg_shape(
-                    pixmap, &sc, &mapper, item, subpaths, *fill, *stroke, *stroke_w, *cap_round,
+                    pixmap, &sc, &mapper, item, subpaths, fill.clone(), stroke.clone(), *stroke_w,
+                    *cap_round,
                 );
             }
         }
@@ -466,11 +468,14 @@ fn dist_segment(px: f64, py: f64, x0: f64, y0: f64, x1: f64, y1: f64) -> f64 {
     ((px - qx).powi(2) + (py - qy).powi(2)).sqrt()
 }
 
-/// 第 50 轮:SVG 形状光栅化。
+/// 第 50 轮:SVG 形状光栅化(第 55 轮补渐变)。
 ///
 /// 点集为元素内容盒局部坐标(item.x/y 为内容盒原点,页坐标系)。填充走
 /// 2×2 超采样扫描判定(evenodd / 非零卷绕),描边走距离场(1px 羽化,
 /// butt/round cap);填充先画、描边后画(SVG 语义)。
+///
+/// 渐变按**形状 bbox**(objectBoundingBox)或**预映射局部坐标**
+/// (userSpaceOnUse)逐采样点求 `t`,再按 `spreadMethod` 与色标插值。
 #[allow(clippy::too_many_arguments)]
 fn draw_svg_shape(
     pixmap: &mut Pixmap,
@@ -478,8 +483,8 @@ fn draw_svg_shape(
     mapper: &Mapper,
     item: &DisplayItem,
     subpaths: &[(Vec<(f64, f64)>, bool)],
-    fill: Option<(([u8; 3], u8), bool)>,
-    stroke: Option<([u8; 3], u8)>,
+    fill: Option<(SvgPaint, bool)>,
+    stroke: Option<SvgPaint>,
     stroke_w: f64,
     cap_round: bool,
 ) {
@@ -513,12 +518,9 @@ fn draw_svg_shape(
     if rect.empty() {
         return;
     }
-    let ((fr, fg, fb), fa, evenodd) = match fill {
-        Some(((c, a), e)) => ((c[0], c[1], c[2]), a, e),
-        None => ((0, 0, 0), 0, false),
-    };
-    let (sr, sg, sb) = stroke.map(|(c, _)| (c[0], c[1], c[2])).unwrap_or((0, 0, 0));
-    let sa = stroke.map(|(_, a)| a).unwrap_or(0);
+    let evenodd = fill.as_ref().map_or(false, |(_, e)| *e);
+    // objectBoundingBox 渐变的单位方形基准(形状几何 bbox,局部坐标)。
+    let bbox = (x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0));
     let hw = stroke_w / 2.0;
     let samples: [(f64, f64); 4] = [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)];
     let w = pixmap.width() as i64;
@@ -527,6 +529,9 @@ fn draw_svg_shape(
         for px in rect.x0..rect.x1 {
             let mut fill_cov = 0.0f64;
             let mut stroke_cov = 0.0f64;
+            let mut fill_acc = (0u32, 0u32, 0u32, 0u32);
+            let mut stroke_acc = (0u32, 0u32, 0u32, 0u32);
+            let (mut fill_n, mut stroke_n) = (0u32, 0u32);
             for (ox, oy) in samples {
                 // 画布亚像素 → 页坐标局部(与 Mapper::local 同式,含逆变换)。
                 let cx = px as f64 + ox + mapper.scroll_x;
@@ -539,21 +544,159 @@ fn draw_svg_shape(
                 let sy = ly - item.y;
                 if has_fill && fill_contains(subpaths, sx, sy, evenodd) {
                     fill_cov += 0.25;
+                    fill_n += 1;
+                    if let Some((paint, _)) = &fill {
+                        let (c, a) = svg_paint_at(paint, bbox, sx, sy);
+                        fill_acc.0 += c[0] as u32;
+                        fill_acc.1 += c[1] as u32;
+                        fill_acc.2 += c[2] as u32;
+                        fill_acc.3 += (a * 255.0).round() as u32;
+                    }
                 }
                 if has_stroke {
-                    stroke_cov += 0.25 * stroke_coverage(subpaths, sx, sy, hw, cap_round);
+                    let cov = stroke_coverage(subpaths, sx, sy, hw, cap_round);
+                    if cov > 0.0 {
+                        stroke_cov += 0.25 * cov;
+                        stroke_n += 1;
+                        if let Some(paint) = &stroke {
+                            let (c, a) = svg_paint_at(paint, bbox, sx, sy);
+                            stroke_acc.0 += c[0] as u32;
+                            stroke_acc.1 += c[1] as u32;
+                            stroke_acc.2 += c[2] as u32;
+                            stroke_acc.3 += (a * 255.0).round() as u32;
+                        }
+                    }
                 }
             }
-            if fill_cov > 0.0 {
-                let a = (fa as f64 / 255.0 * fill_cov * item.opacity * 255.0).round() as u8;
-                blend_pixel(pixels, w, px, py, fr, fg, fb, a);
+            if fill_cov > 0.0 && fill_n > 0 {
+                let a = (fill_acc.3 / fill_n) as f64 / 255.0 * fill_cov * item.opacity * 255.0;
+                blend_pixel(
+                    pixels,
+                    w,
+                    px,
+                    py,
+                    (fill_acc.0 / fill_n) as u8,
+                    (fill_acc.1 / fill_n) as u8,
+                    (fill_acc.2 / fill_n) as u8,
+                    a.round().clamp(0.0, 255.0) as u8,
+                );
             }
-            if stroke_cov > 0.0 {
-                let a = (sa as f64 / 255.0 * stroke_cov * item.opacity * 255.0).round() as u8;
-                blend_pixel(pixels, w, px, py, sr, sg, sb, a);
+            if stroke_cov > 0.0 && stroke_n > 0 {
+                let a =
+                    (stroke_acc.3 / stroke_n) as f64 / 255.0 * stroke_cov * item.opacity * 255.0;
+                blend_pixel(
+                    pixels,
+                    w,
+                    px,
+                    py,
+                    (stroke_acc.0 / stroke_n) as u8,
+                    (stroke_acc.1 / stroke_n) as u8,
+                    (stroke_acc.2 / stroke_n) as u8,
+                    a.round().clamp(0.0, 255.0) as u8,
+                );
             }
         }
     }
+}
+
+/// 绘制属性在局部点 `(x,y)` 处的颜色与 alpha(0..1)。
+fn svg_paint_at(paint: &SvgPaint, bbox: (f64, f64, f64, f64), x: f64, y: f64) -> ([u8; 3], f64) {
+    match paint {
+        SvgPaint::Solid(c, a) => (*c, *a),
+        SvgPaint::Gradient(g) => match svg_gradient_t(g, bbox, x, y) {
+            Some(t) => svg_gradient_color(&g.stops, t),
+            None => ([0, 0, 0], 0.0),
+        },
+    }
+}
+
+/// 渐变参数 `t`(含 `spreadMethod`)。
+///
+/// - `userSpaceOnUse`:`coords` 已是内容盒局部坐标,直接算;
+/// - `objectBoundingBox`:把局部点归一进单位方形,再按 `inv`
+///   (`gradientTransform` 的逆)变回渐变空间。
+fn svg_gradient_t(paint: &GradientPaint, bbox: (f64, f64, f64, f64), x: f64, y: f64) -> Option<f64> {
+    let c = &paint.coords;
+    let (px, py) = if paint.user_space {
+        (x, y)
+    } else {
+        let (bx, by, bw, bh) = bbox;
+        let qx = (x - bx) / bw.max(1e-9);
+        let qy = (y - by) / bh.max(1e-9);
+        match paint.inv {
+            Some(inv) => inv.apply(qx, qy),
+            None => (qx, qy),
+        }
+    };
+    let raw = if paint.radial {
+        let r = c[2];
+        if !(r > 0.0) {
+            return None;
+        }
+        // 焦点 fx/fy 偏移不建模(按圆心距离近似,见模块边界说明)。
+        ((px - c[0]).powi(2) + (py - c[1]).powi(2)).sqrt() / r
+    } else {
+        let dx = c[2] - c[0];
+        let dy = c[3] - c[1];
+        let len2 = dx * dx + dy * dy;
+        if len2 <= 1e-12 {
+            0.0
+        } else {
+            ((px - c[0]) * dx + (py - c[1]) * dy) / len2
+        }
+    };
+    Some(match paint.spread {
+        SpreadMethod::Pad => raw.clamp(0.0, 1.0),
+        SpreadMethod::Reflect => {
+            let m = raw.abs() % 2.0;
+            if m > 1.0 {
+                2.0 - m
+            } else {
+                m
+            }
+        }
+        SpreadMethod::Repeat => {
+            let m = raw % 1.0;
+            if m < 0.0 {
+                m + 1.0
+            } else {
+                m
+            }
+        }
+    })
+}
+
+/// 色标插值(sRGB 分量 + alpha 线性;首尾 Pad)。
+fn svg_gradient_color(stops: &[GradientStop], t: f64) -> ([u8; 3], f64) {
+    if stops.is_empty() {
+        return ([0, 0, 0], 0.0);
+    }
+    let first = &stops[0];
+    if t <= first.offset {
+        return (first.color, first.alpha);
+    }
+    let last = &stops[stops.len() - 1];
+    if t >= last.offset {
+        return (last.color, last.alpha);
+    }
+    for i in 0..stops.len() - 1 {
+        let a = &stops[i];
+        let b = &stops[i + 1];
+        if t >= a.offset && t <= b.offset {
+            let span = (b.offset - a.offset).max(1e-9);
+            let k = ((t - a.offset) / span).clamp(0.0, 1.0);
+            let lerp = |va: u8, vb: u8| (va as f64 * (1.0 - k) + vb as f64 * k).round() as u8;
+            return (
+                [
+                    lerp(a.color[0], b.color[0]),
+                    lerp(a.color[1], b.color[1]),
+                    lerp(a.color[2], b.color[2]),
+                ],
+                a.alpha * (1.0 - k) + b.alpha * k,
+            );
+        }
+    }
+    (last.color, last.alpha)
 }
 
 /// 扫描线点在多边形内判定(evenodd 交叉计数 / nonzero 卷绕数,跨全部子路径)。

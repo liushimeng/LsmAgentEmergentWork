@@ -680,6 +680,9 @@ impl<'a> LayoutCtx<'a> {
         h: f64,
     ) {
         self.emit_svg_shapes(node, style, seq, x, y, w, h);
+        // 第 55 轮:video/object/embed 的 poster/data/src 已预取并解码时真实绘制。
+        // 必须先于控件条发射 —— 控件条走 `next_seq()`(seq 更大),会叠在海报之上。
+        self.emit_media_poster(node, style, seq, x, y, w, h);
         // 第 50 轮:video/audio 带 controls 属性 → 静态控件条(悬浮,不占布局)。
         self.emit_media_controls(node, style, seq, x, y, w, h);
         if !document::tag_name(node).eq_ignore_ascii_case("canvas") || !style_visible(style) {

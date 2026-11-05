@@ -86,8 +86,8 @@ LsmAgentBrowser 已有「HTML 解析 → CSS 计算 → 布局 → 显示列表 
 | 图片 object-position | ✅🆕（第 49 轮） | 复用 `background-position` 解析；`content_image_paint` 折算偏移 |
 | 画布 canvas | 🆕/✅ | HTML width/height/缺省 300×150 进布局；已有 RGBA 矩形/像素读写/PNG 回写 |
 | Canvas 高级 2D | ⛔ | 路径、文字、渐变、远程图片入 Canvas、WebGL 未实现 |
-| 矢量图形 svg | 🟡→✅（第 48 轮几何）→✅（第 50 轮矢量光栅化子集） | 形状(rect/circle/ellipse/line/polyline/polygon/path 全指令)、fill/stroke/opacity/fill-rule、transform 链、viewBox/aspect、use/defs 已真实光栅化(50 号文档)；渐变/文本/`<image>`/filter 仍缺 |
-| 视频/音频/字幕轨道 | 🟡→✅（第 48 轮）→✅（第 50 轮控件条） | video/object/embed 替换式几何 + poster/data/src 预取 + 占位框；**第 50 轮 `controls` 属性画静态控件条(播放三角/进度/时间)，audio 无 controls UA 隐藏、有 controls 300×30**；无解码/播放状态；source/track 计入结构内容 |
+| 矢量图形 svg | 🟡→✅（第 48 轮几何）→✅（第 50 轮矢量光栅化子集）→✅（第 55 轮渐变/文本/`<image>`） | 形状(rect/circle/ellipse/line/polyline/polygon/path 全指令)、fill/stroke/opacity/fill-rule、transform 链、viewBox/aspect、use/defs 已真实光栅化(50 号文档)；**第 55 轮补 `linearGradient`/`radialGradient`(填充+描边)、`<text>`/`<tspan>`、`<image>`(href 预取 + preserveAspectRatio)**；`filter`/`pattern`/`mask`/`clipPath` 仍缺 |
+| 视频/音频/字幕轨道 | 🟡→✅（第 48 轮）→✅（第 50 轮控件条）→✅（第 55 轮 poster 真实绘制） | video/object/embed 替换式几何 + poster/data/src 预取 + 占位框；**第 50 轮 `controls` 属性画静态控件条(播放三角/进度/时间)，audio 无 controls UA 隐藏、有 controls 300×30**；**第 55 轮 poster/data/src 已解码时画真实 `Image` 并撤占位(未加载仍保留占位)**；无解码/播放状态；source/track 计入结构内容 |
 | 内联框架 iframe | 🟡→✅（第 48 轮） | 缺省 300×150 + MediaFrameNote 占位；不加载/渲染子文档 |
 | 嵌入对象/参数/object/embed | 🟡→✅（第 48 轮） | 替换式几何 + data/src 预取 + 占位框；不执行插件 |
 
@@ -171,5 +171,6 @@ cargo test --no-fail-fast
 3. ~~`border-collapse`/caption/colgroup/百分比列宽~~（第 41 轮已完成）；
    ~~`border-spacing`/`caption-side`~~（第 49 轮已完成）。
 4. dialog top-layer/::backdrop/焦点圈禁。
-5. ~~SVG 子集光栅化~~（第 50 轮已完成，渐变/文本/`<image>` 仍缺）；video poster 静态显示与 iframe 子文档隔离（poster/占位第 48 轮、控件条第 50 轮已落地，子文档隔离仍非目标）。
+5. ~~SVG 子集光栅化~~（第 50 轮已完成）；~~SVG 渐变/文本/`<image>`~~（第 55 轮已完成，`filter` 仍缺）；~~video poster 静态显示~~（第 55 轮已落地）；iframe 子文档隔离仍非目标。
 6. Shadow DOM 与动画帧同步；~~sticky 真吸附~~（第 50 轮视口 top/bottom 已落地，容器内吸附仍缺）。
+7. dialog 焦点圈禁（top-layer/::backdrop 第 41/42 轮已落地）。

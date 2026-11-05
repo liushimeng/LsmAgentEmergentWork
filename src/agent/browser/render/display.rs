@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use super::super::layout::{BorderDraw, Layout, PaintBox, ShadowDraw, TextLine};
 use super::super::style::{Affine, CornerRadius, GradientSpec};
+use super::super::svg::SvgPaint;
 
 /// 裁剪矩形(页坐标 x/y/w/h)。
 pub type ClipRect = (f64, f64, f64, f64);
@@ -90,8 +91,8 @@ pub enum DisplayKind {
     ///(evenodd/非零卷绕)+ 距离场描边(butt/round cap)。
     SvgShape {
         subpaths: Arc<Vec<(Vec<(f64, f64)>, bool)>>,
-        fill: Option<(([u8; 3], u8), bool)>,
-        stroke: Option<([u8; 3], u8)>,
+        fill: Option<(SvgPaint, bool)>,
+        stroke: Option<SvgPaint>,
         stroke_w: f64,
         cap_round: bool,
     },

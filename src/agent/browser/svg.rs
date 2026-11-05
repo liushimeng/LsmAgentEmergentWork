@@ -6,23 +6,87 @@
 //! `render/raster.rs` 扫描线填充 + 距离场描边。
 //!
 //! 支持子集:`rect`(含圆角)/`circle`/`ellipse`/`line`/`polyline`/`polygon`/
-//! `path`(M L H V C S Q T A Z)/`g`/`defs`+`use`/嵌套 `svg`(按平移近似);
-//! 绘制属性 `fill`/`stroke`/`stroke-width`/`fill-opacity`/`stroke-opacity`/
-//! `opacity`/`fill-rule`/`stroke-linecap`;变换 `translate`/`scale`/`rotate`/
+//! `path`(M L H V C S Q T A Z)/`g`/`defs`+`use`/嵌套 `svg`(按平移近似)/
+//! `text`+`tspan`;绘制属性 `fill`/`stroke`/`stroke-width`/`fill-opacity`/
+//! `stroke-opacity`/`opacity`/`fill-rule`/`stroke-linecap`;渐变
+//! `linearGradient`/`radialGradient`(含 `<stop>`/`href` 继承/`gradientUnits`/
+//! `gradientTransform`/`spreadMethod`);变换 `translate`/`scale`/`rotate`/
 //! `matrix`/`skewX`/`skewY`;`viewBox` + `preserveAspectRatio`(meet/none/slice)。
 //!
-//! 边界(如实上报):渐变/pattern/filter/mask/clipPath/文本/`<image>`/
-//! stroke-dasharray/CSS 作用于 svg 子元素均不支持。
+//! 边界(如实上报):`pattern`/`filter`/`mask`/`clipPath`/`marker`/`<image>`/
+//! stroke-dasharray/CSS 作用于 svg 子元素均不支持;径向渐变焦点 `fx/fy`
+//! 偏移不建模(按圆心距离近似);`color-interpolation` 统一按 sRGB。
 
 use crate::agent::browser::document;
 use crate::agent::browser::style::transform::Affine;
 use crate::agent::browser::style::values::parse_color;
 use kuchikiki::NodeRef;
+use std::collections::HashMap;
 
 /// 解析产物上限:防御畸形 path 无限展开(形状 × 子路径 × 点三级封顶)。
 const MAX_SHAPES: usize = 512;
 const MAX_SUBPATHS: usize = 256;
 const MAX_POINTS: usize = 4096;
+
+/// 渐变铺展方式(`spreadMethod`)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpreadMethod {
+    /// 钳位到首尾色标(缺省)。
+    Pad,
+    /// 镜像反射。
+    Reflect,
+    /// 周期平铺。
+    Repeat,
+}
+
+/// 渐变停止点(`<stop>`);`offset` 已归一到 0..1。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct GradientStop {
+    pub offset: f64,
+    pub color: [u8; 3],
+    /// 0..1(已含 `stop-opacity`)。
+    pub alpha: f64,
+}
+
+/// 渐变绘制参数。
+///
+/// `coords` 的语义由 `user_space` 决定:
+/// - `userSpaceOnUse`:`coords` 已映射到**内容盒局部坐标**
+///   (施加过 `viewbox_map ∘ tf ∘ gradientTransform`),`r` 按变换的
+///   几何平均缩放预解;
+/// - `objectBoundingBox`(缺省):`coords` 是**形状 bbox 单位方形**里的
+///   梯度坐标,光栅期再套 `translate(bbox.x0,bbox.y0) ∘ scale(bbox.w,bbox.h)`;
+///   `inv` 为 `gradientTransform` 的逆(把单位方形点变回渐变空间)。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct GradientPaint {
+    /// false = 线性,true = 径向。
+    pub radial: bool,
+    pub user_space: bool,
+    /// 线性 `[x1,y1,x2,y2,0]`;径向 `[cx,cy,r,fx,fy]`。
+    pub coords: [f64; 5],
+    /// 仅 `objectBoundingBox` 使用:`gradientTransform` 的逆。
+    pub inv: Option<Affine>,
+    pub spread: SpreadMethod,
+    pub stops: Vec<GradientStop>,
+}
+
+/// SVG 绘制属性:纯色或渐变。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum SvgPaint {
+    /// rgb + alpha(0..1)。
+    Solid([u8; 3], f64),
+    Gradient(GradientPaint),
+}
+
+impl SvgPaint {
+    /// 折叠组透明度后的 u8 alpha(纯色取自身 alpha,渐变取首 stop alpha)。
+    pub(crate) fn alpha0(&self) -> f64 {
+        match self {
+            SvgPaint::Solid(_, a) => *a,
+            SvgPaint::Gradient(g) => g.stops.first().map_or(0.0, |s| s.alpha),
+        }
+    }
+}
 
 /// 单个可绘制形状。
 ///
@@ -32,14 +96,55 @@ const MAX_POINTS: usize = 4096;
 pub(crate) struct SvgShape {
     pub subpaths: Vec<(Vec<(f64, f64)>, bool)>,
     /// `None` = 不填充(fill:none 或透明度折叠为 0)。
-    pub fill: Option<([u8; 3], u8)>,
+    pub fill: Option<SvgPaint>,
     pub evenodd: bool,
-    pub stroke: Option<([u8; 3], u8)>,
+    pub stroke: Option<SvgPaint>,
     pub stroke_w: f64,
     pub cap_round: bool,
 }
 
-/// 解析入口:`svg` 元素 → 内容盒局部坐标形状集。
+/// SVG 文本 run(一个 `<text>` 的直接文本或一个 `<tspan>`)。
+///
+/// 坐标为**内容盒局部坐标**,`y` 语义由 `central` 决定:
+/// `false` = 字母基线;`true` = 字形盒垂直中心(`dominant-baseline:middle|central`)。
+#[derive(Debug, Clone)]
+pub(crate) struct SvgText {
+    pub text: String,
+    pub x: f64,
+    pub y: f64,
+    pub size: f64,
+    pub color: [u8; 3],
+    pub alpha: f64,
+    pub bold: bool,
+    /// `text-anchor`:0=start、0.5=middle、1=end。
+    pub anchor: f64,
+    pub central: bool,
+}
+
+/// SVG `<image>` 位图引用(坐标为内容盒局部坐标)。
+#[derive(Debug, Clone)]
+pub(crate) struct SvgImage {
+    /// `href` / `xlink:href` 原始值(相对地址由布局期按基准 URL 解析)。
+    pub href: String,
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+    /// `preserveAspectRatio` 含 `slice`。
+    pub slice: bool,
+    /// `preserveAspectRatio="none"`(拉伸)。
+    pub stretch: bool,
+}
+
+/// svg 子树的解析产物(按文档序):形状、文本与位图。
+#[derive(Debug, Clone)]
+pub(crate) enum SvgNode {
+    Shape(SvgShape),
+    Text(SvgText),
+    Image(SvgImage),
+}
+
+/// 解析入口:`svg` 元素 → 内容盒局部坐标形状集(仅形状,不含文本)。
 ///
 /// `current_color` 为 svg 元素 CSS `color` 计算值(`fill="currentColor"`
 /// 的解析基准)。无形状返回空 Vec(调用方保留能力占位)。
@@ -49,39 +154,87 @@ pub(crate) fn collect_shapes(
     content_h: f64,
     current_color: [u8; 3],
 ) -> Vec<SvgShape> {
+    collect_nodes(svg, content_w, content_h, current_color)
+        .into_iter()
+        .filter_map(|n| match n {
+            SvgNode::Shape(s) => Some(s),
+            _ => None,
+        })
+        .collect()
+}
+
+/// 解析入口:`svg` 元素 → 内容盒局部坐标的**形状 + 文本**(按文档序)。
+///
+/// 形状与文本同表输出,保证 `<text>` 与图形的上下叠放关系与 DOM 一致。
+pub(crate) fn collect_nodes(
+    svg: &NodeRef,
+    content_w: f64,
+    content_h: f64,
+    current_color: [u8; 3],
+) -> Vec<SvgNode> {
     if !(content_w.is_finite() && content_h.is_finite() && content_w > 0.0 && content_h > 0.0) {
         return Vec::new();
     }
     let mut ids = Vec::new();
     index_ids(svg, &mut ids, 0);
+    let gradients = collect_gradients(svg, current_color, content_w, content_h);
+    let map = viewbox_map(svg, content_w, content_h);
+    let vb = viewbox_dims(svg);
     let mut raw = Vec::new();
     let st = SvgState::root(current_color);
-    walk_children(svg, &st, &mut raw, false, &ids, 0);
-    let map = viewbox_map(svg, content_w, content_h);
+    walk_children(svg, &st, &mut raw, false, &ids, &gradients, &map, vb, 0);
     let (sx, sy) = map_scale(&map);
     raw.truncate(MAX_SHAPES);
     raw.into_iter()
-        .filter(|s| !shape_is_empty(&s.subpaths))
-        .map(|s| {
-            let mut subpaths = Vec::with_capacity(s.subpaths.len());
-            for (pts, closed) in s.subpaths {
-                let v: Vec<(f64, f64)> = pts
-                    .iter()
-                    .take(MAX_POINTS)
-                    .map(|p| map.apply(p.0, p.1))
-                    .collect();
-                subpaths.push((v, closed));
+        .filter(|n| match n {
+            SvgNode::Shape(s) => !shape_is_empty(&s.subpaths),
+            SvgNode::Text(t) => !t.text.is_empty(),
+            SvgNode::Image(im) => im.w > 0.0 && im.h > 0.0,
+        })
+        .map(|n| match n {
+            SvgNode::Shape(s) => {
+                let mut subpaths = Vec::with_capacity(s.subpaths.len());
+                for (pts, closed) in s.subpaths {
+                    let v: Vec<(f64, f64)> = pts
+                        .iter()
+                        .take(MAX_POINTS)
+                        .map(|p| map.apply(p.0, p.1))
+                        .collect();
+                    subpaths.push((v, closed));
+                }
+                // 描边宽按用户空间变换 + viewBox 映射的几何平均缩放近似
+                //(非等比变换与规范有偏差,图标场景可接受)。
+                let stroke_w = (s.stroke_w * (sx * sy).abs().sqrt()).clamp(0.0, 512.0);
+                SvgNode::Shape(SvgShape {
+                    subpaths,
+                    fill: s.fill,
+                    evenodd: s.evenodd,
+                    stroke: s.stroke,
+                    stroke_w,
+                    cap_round: s.cap_round,
+                })
             }
-            // 描边宽按用户空间变换 + viewBox 映射的几何平均缩放近似
-            //(非等比变换与规范有偏差,图标场景可接受)。
-            let stroke_w = (s.stroke_w * (sx * sy).abs().sqrt()).clamp(0.0, 512.0);
-            SvgShape {
-                subpaths,
-                fill: s.fill,
-                evenodd: s.evenodd,
-                stroke: s.stroke,
-                stroke_w,
-                cap_round: s.cap_round,
+            SvgNode::Text(t) => {
+                let (x, y) = map.apply(t.x, t.y);
+                let scale = map_scale(&map);
+                let s = (scale.0 * scale.1).sqrt().max(1e-9);
+                SvgNode::Text(SvgText {
+                    x,
+                    y,
+                    size: (t.size * s).max(1.0),
+                    ..t
+                })
+            }
+            SvgNode::Image(im) => {
+                let (x, y) = map.apply(im.x, im.y);
+                let (x1, y1) = map.apply(im.x + im.w, im.y + im.h);
+                SvgNode::Image(SvgImage {
+                    x,
+                    y,
+                    w: (x1 - x).abs(),
+                    h: (y1 - y).abs(),
+                    ..im
+                })
             }
         })
         .collect()
@@ -99,9 +252,9 @@ struct SvgState {
     tf: Affine,
     /// 根用户空间 → 当前空间的描宽近似缩放(sqrt|det| 累计)。
     tf_scale: f64,
-    /// `(rgb, alpha)` alpha ∈ 0..1;`None` = paint none。
-    fill: Option<([u8; 3], f64)>,
-    stroke: Option<([u8; 3], f64)>,
+    /// alpha ∈ 0..1;`None` = paint none。
+    fill: Option<SvgPaint>,
+    stroke: Option<SvgPaint>,
     stroke_w: f64,
     opacity: f64,
     evenodd: bool,
@@ -114,7 +267,7 @@ impl SvgState {
         Self {
             tf: Affine::identity(),
             tf_scale: 1.0,
-            fill: Some(([0, 0, 0], 1.0)),
+            fill: Some(SvgPaint::Solid([0, 0, 0], 1.0)),
             stroke: None,
             stroke_w: 1.0,
             opacity: 1.0,
@@ -125,24 +278,33 @@ impl SvgState {
     }
 
     /// 子元素属性覆盖(缺省继承父态)。
-    fn inherit(node: &NodeRef, parent: &SvgState) -> Self {
+    ///
+    /// `gradients`/`map`/`vb` 供 `url(#id)` 渐变解析与 `userSpaceOnUse`
+    /// 坐标预映射使用(见 `GradientPaint`)。
+    fn inherit(
+        node: &NodeRef,
+        parent: &SvgState,
+        gradients: &GradientMap,
+        map: &Affine,
+        vb: Option<(f64, f64)>,
+    ) -> Self {
         let own_tf = parse_transform(node);
         let mut st = Self {
             tf: parent.tf.compose(&own_tf),
             tf_scale: parent.tf_scale * affine_scale(&own_tf),
-            fill: parent.fill,
-            stroke: parent.stroke,
+            fill: parent.fill.clone(),
+            stroke: parent.stroke.clone(),
             stroke_w: parent.stroke_w,
             opacity: parent.opacity,
             evenodd: parent.evenodd,
             cap_round: parent.cap_round,
             current_color: parent.current_color,
         };
-        if let Some(v) = paint_value(node, "fill", st.current_color) {
-            st.fill = v.map(|(c, a)| (c, a as f64 / 255.0));
+        if let Some(v) = paint_value(node, "fill", st.current_color, gradients, &st.tf, map, vb) {
+            st.fill = v;
         }
-        if let Some(v) = paint_value(node, "stroke", st.current_color) {
-            st.stroke = v.map(|(c, a)| (c, a as f64 / 255.0));
+        if let Some(v) = paint_value(node, "stroke", st.current_color, gradients, &st.tf, map, vb) {
+            st.stroke = v;
         }
         if let Some(v) = num_attr(node, "stroke-width") {
             st.stroke_w = v.max(0.0);
@@ -151,10 +313,12 @@ impl SvgState {
             st.opacity *= v.clamp(0.0, 1.0);
         }
         if let Some(v) = num_attr(node, "fill-opacity") {
-            st.fill = st.fill.map(|(c, a)| (c, a * v.clamp(0.0, 1.0)));
+            let k = v.clamp(0.0, 1.0);
+            st.fill = st.fill.map(|p| scale_paint_alpha(p, k));
         }
         if let Some(v) = num_attr(node, "stroke-opacity") {
-            st.stroke = st.stroke.map(|(c, a)| (c, a * v.clamp(0.0, 1.0)));
+            let k = v.clamp(0.0, 1.0);
+            st.stroke = st.stroke.map(|p| scale_paint_alpha(p, k));
         }
         if let Some(v) = document::attr(node, "fill-rule") {
             st.evenodd = v.trim().eq_ignore_ascii_case("evenodd");
@@ -166,29 +330,34 @@ impl SvgState {
     }
 }
 
+/// 把绘制属性的 alpha 乘上系数(渐变对每个 stop 生效)。
+fn scale_paint_alpha(p: SvgPaint, k: f64) -> SvgPaint {
+    match p {
+        SvgPaint::Solid(c, a) => SvgPaint::Solid(c, a * k),
+        SvgPaint::Gradient(mut g) => {
+            for s in &mut g.stops {
+                s.alpha *= k;
+            }
+            SvgPaint::Gradient(g)
+        }
+    }
+}
+
 /// 变换的描宽近似缩放(sqrt|det|)。
 fn affine_scale(t: &Affine) -> f64 {
     let det = t.a * t.d - t.b * t.c;
     det.abs().sqrt()
 }
 
-/// 用户坐标原始形状(收集期,未做 viewBox 映射;点已含变换链)。
-struct RawShape {
-    subpaths: Vec<(Vec<(f64, f64)>, bool)>,
-    fill: Option<([u8; 3], u8)>,
-    evenodd: bool,
-    stroke: Option<([u8; 3], u8)>,
-    /// 已乘 `tf_scale`。
-    stroke_w: f64,
-    cap_round: bool,
-}
-
 fn walk_children(
     node: &NodeRef,
     st: &SvgState,
-    out: &mut Vec<RawShape>,
+    out: &mut Vec<SvgNode>,
     in_defs: bool,
     ids: &[(String, NodeRef)],
+    gradients: &GradientMap,
+    map: &Affine,
+    vb: Option<(f64, f64)>,
     depth: usize,
 ) {
     if depth > 16 || out.len() >= MAX_SHAPES {
@@ -201,21 +370,32 @@ fn walk_children(
         let tag = document::tag_name(&child).to_ascii_lowercase();
         match tag.as_str() {
             "g" | "a" | "switch" => {
-                let cst = SvgState::inherit(&child, st);
-                walk_children(&child, &cst, out, in_defs, ids, depth + 1);
+                let cst = SvgState::inherit(&child, st, gradients, map, vb);
+                walk_children(&child, &cst, out, in_defs, ids, gradients, map, vb, depth + 1);
             }
-            // 资源容器:只登记 id 供 use 引用,不直接渲染。
+            // 资源容器:只登记 id 供 use/渐变引用,不直接渲染。
             "defs" | "symbol" | "marker" | "clippath" | "mask" | "pattern" | "lineargradient"
             | "radialgradient" | "filter" => {
-                walk_children(&child, st, out, true, ids, depth + 1);
+                walk_children(&child, st, out, true, ids, gradients, map, vb, depth + 1);
             }
             "svg" => {
                 // 嵌套 svg:按 x/y 平移近似(独立 viewBox 精确映射不在子集内)。
-                let mut cst = SvgState::inherit(&child, st);
+                let mut cst = SvgState::inherit(&child, st, gradients, map, vb);
                 let x = num_attr(&child, "x").unwrap_or(0.0);
                 let y = num_attr(&child, "y").unwrap_or(0.0);
                 cst.tf = cst.tf.compose(&Affine::translate(x, y));
-                walk_children(&child, &cst, out, in_defs, ids, depth + 1);
+                walk_children(&child, &cst, out, in_defs, ids, gradients, map, vb, depth + 1);
+            }
+            "text" => {
+                if !in_defs {
+                    let cst = SvgState::inherit(&child, st, gradients, map, vb);
+                    emit_text_runs(&child, &cst, out, gradients, map, vb);
+                }
+            }
+            "image" => {
+                if !in_defs {
+                    emit_svg_image(&child, st, out, gradients, map, vb);
+                }
             }
             "use" => {
                 let href = document::attr(&child, "href")
@@ -229,7 +409,7 @@ fn walk_children(
                 else {
                     continue;
                 };
-                let mut cst = SvgState::inherit(&child, st);
+                let mut cst = SvgState::inherit(&child, st, gradients, map, vb);
                 let x = num_attr(&child, "x").unwrap_or(0.0);
                 let y = num_attr(&child, "y").unwrap_or(0.0);
                 cst.tf = cst.tf.compose(&Affine::translate(x, y));
@@ -238,16 +418,19 @@ fn walk_children(
                 let ttag = document::tag_name(target).to_ascii_lowercase();
                 match ttag.as_str() {
                     "g" | "a" | "switch" | "svg" => {
-                        walk_children(target, &cst, out, in_defs, ids, depth + 1);
+                        walk_children(
+                            target, &cst, out, in_defs, ids, gradients, map, vb, depth + 1,
+                        );
                     }
-                    _ => emit_shape(target, &ttag, &cst, out),
+                    "text" => emit_text_runs(target, &cst, out, gradients, map, vb),
+                    _ => emit_shape(target, &ttag, &cst, out, gradients, map, vb),
                 }
             }
             _ => {
                 if in_defs {
                     continue;
                 }
-                emit_shape(&child, &tag, st, out);
+                emit_shape(&child, &tag, st, out, gradients, map, vb);
             }
         }
     }
@@ -256,11 +439,20 @@ fn walk_children(
 /// 图形元素 → 原始形状(应用元素自身 transform 与绘制属性;无图形返回)。
 ///
 /// `use` 内联与直接渲染共用本函数(规范上 use 引用的是图形元素或 g)。
-fn emit_shape(node: &NodeRef, tag: &str, st: &SvgState, out: &mut Vec<RawShape>) {
+#[allow(clippy::too_many_arguments)]
+fn emit_shape(
+    node: &NodeRef,
+    tag: &str,
+    st: &SvgState,
+    out: &mut Vec<SvgNode>,
+    gradients: &GradientMap,
+    map: &Affine,
+    vb: Option<(f64, f64)>,
+) {
     let Some(subpaths) = shape_subpaths(node, tag) else {
         return;
     };
-    let cst = SvgState::inherit(node, st);
+    let cst = SvgState::inherit(node, st, gradients, map, vb);
     let fill = fold_paint(cst.fill, cst.opacity);
     let stroke = fold_paint(cst.stroke, cst.opacity);
     if fill.is_none() && (stroke.is_none() || cst.stroke_w <= 0.0) {
@@ -279,21 +471,21 @@ fn emit_shape(node: &NodeRef, tag: &str, st: &SvgState, out: &mut Vec<RawShape>)
     if mapped.is_empty() {
         return;
     }
-    out.push(RawShape {
+    out.push(SvgNode::Shape(SvgShape {
         subpaths: mapped,
         fill,
         evenodd: cst.evenodd,
         stroke,
         stroke_w: cst.stroke_w * cst.tf_scale,
         cap_round: cst.cap_round,
-    });
+    }));
 }
 
-/// 透明度折叠到 u8(alpha<=0.01 视为无绘制)。
-fn fold_paint(paint: Option<([u8; 3], f64)>, group_opacity: f64) -> Option<([u8; 3], u8)> {
-    let (c, a) = paint?;
-    let eff = a * group_opacity;
-    (eff > 0.01).then(|| (c, (eff * 255.0).round().clamp(0.0, 255.0) as u8))
+/// 组透明度折叠(alpha<=0.01 视为无绘制)。
+fn fold_paint(paint: Option<SvgPaint>, group_opacity: f64) -> Option<SvgPaint> {
+    let p = paint?;
+    let folded = scale_paint_alpha(p, group_opacity);
+    (folded.alpha0() > 0.01).then_some(folded)
 }
 
 /// id 索引(use 目标反查)。
@@ -930,20 +1122,599 @@ fn num_attr(node: &NodeRef, name: &str) -> Option<f64> {
         .filter(|v| v.is_finite())
 }
 
-/// 绘制属性解析:`None`(属性不存在)= 继承;`Some(None)` = none/不支持;
-/// `Some(Some(color))` = 具体色。
+/// 绘制属性解析:`None`(属性不存在)= 继承;`Some(None)` = none/未解析;
+/// `Some(Some(paint))` = 具体绘制(纯色或渐变)。
 fn paint_value(
     node: &NodeRef,
     name: &str,
     current_color: [u8; 3],
-) -> Option<Option<([u8; 3], u8)>> {
+    gradients: &GradientMap,
+    tf: &Affine,
+    map: &Affine,
+    vb: Option<(f64, f64)>,
+) -> Option<Option<SvgPaint>> {
     let v = document::attr(node, name)?;
     let v = v.trim();
-    if v.is_empty() || v.eq_ignore_ascii_case("none") || v.starts_with("url(") {
+    if v.is_empty() || v.eq_ignore_ascii_case("none") {
         return Some(None);
     }
     if v.eq_ignore_ascii_case("currentcolor") {
-        return Some(Some((current_color, 255)));
+        return Some(Some(SvgPaint::Solid(current_color, 1.0)));
     }
-    parse_color(v)
+    if v.starts_with("url(") {
+        return Some(resolve_url_paint(v, current_color, gradients, tf, map));
+    }
+    parse_color(v).map(|inner| inner.map(|(c, a)| SvgPaint::Solid(c, a as f64 / 255.0)))
+}
+
+// ---------- 渐变 ----------
+
+/// 渐变原始定义(坐标在渐变自身坐标系,未做 `userSpaceOnUse` 预映射)。
+struct GradientDef {
+    radial: bool,
+    user_space: bool,
+    /// 线性 `[x1,y1,x2,y2,0]`;径向 `[cx,cy,r,fx,fy]`。
+    coords: [f64; 5],
+    transform: Affine,
+    spread: SpreadMethod,
+    stops: Vec<GradientStop>,
+}
+
+/// `id → 渐变定义`。
+type GradientMap = HashMap<String, GradientDef>;
+
+/// 收集 svg 子树里的全部渐变定义(按 id 索引)。
+fn collect_gradients(
+    svg: &NodeRef,
+    current_color: [u8; 3],
+    content_w: f64,
+    content_h: f64,
+) -> GradientMap {
+    let mut ids = Vec::new();
+    index_ids(svg, &mut ids, 0);
+    let mut out = HashMap::new();
+    let mut stack: Vec<String> = Vec::new();
+    for (id, node) in &ids {
+        let tag = document::tag_name(node).to_ascii_lowercase();
+        if !matches!(tag.as_str(), "lineargradient" | "radialgradient") {
+            continue;
+        }
+        if let Some(def) = parse_gradient(node, current_color, &ids, &mut stack, 0, content_w, content_h)
+        {
+            out.insert(id.clone(), def);
+        }
+    }
+    out
+}
+
+/// 解析单个渐变元素(`href` 继承父渐变的缺省属性与色标)。
+#[allow(clippy::too_many_arguments)]
+fn parse_gradient(
+    node: &NodeRef,
+    current_color: [u8; 3],
+    ids: &[(String, NodeRef)],
+    stack: &mut Vec<String>,
+    depth: usize,
+    content_w: f64,
+    content_h: f64,
+) -> Option<GradientDef> {
+    let tag = document::tag_name(node).to_ascii_lowercase();
+    let radial = match tag.as_str() {
+        "lineargradient" => false,
+        "radialgradient" => true,
+        _ => return None,
+    };
+    if depth > 8 {
+        return None;
+    }
+    let id = document::attr(node, "id")
+        .map(|v| v.trim().to_string())
+        .unwrap_or_default();
+    if !id.is_empty() {
+        if stack.contains(&id) {
+            return None;
+        }
+        stack.push(id.clone());
+    }
+    let mut def = GradientDef {
+        radial,
+        user_space: false,
+        coords: if radial {
+            [0.5, 0.5, 0.5, 0.5, 0.5]
+        } else {
+            [0.0, 0.0, 1.0, 0.0, 0.0]
+        },
+        transform: Affine::identity(),
+        spread: SpreadMethod::Pad,
+        stops: Vec::new(),
+    };
+    // href 继承:父渐变提供缺省值与色标。
+    if let Some(href) = href_id(node) {
+        if let Some((_, parent)) = ids.iter().find(|(i, _)| i.eq_ignore_ascii_case(&href)) {
+            if let Some(p) = parse_gradient(
+                parent,
+                current_color,
+                ids,
+                stack,
+                depth + 1,
+                content_w,
+                content_h,
+            ) {
+                def = p;
+            }
+        }
+    }
+    if let Some(v) = document::attr(node, "gradientUnits") {
+        def.user_space = v.trim().eq_ignore_ascii_case("userSpaceOnUse");
+    }
+    if let Some(v) = document::attr(node, "gradientTransform") {
+        def.transform = transform_str(&v);
+    }
+    if let Some(v) = document::attr(node, "spreadMethod") {
+        def.spread = match v.trim().to_ascii_lowercase().as_str() {
+            "reflect" => SpreadMethod::Reflect,
+            "repeat" => SpreadMethod::Repeat,
+            _ => SpreadMethod::Pad,
+        };
+    }
+    // 坐标:百分比按 gradientUnits 语义求解(objectBoundingBox 为单位方形分数,
+    // userSpaceOnUse 为视口百分比)。
+    let vb = if def.user_space {
+        viewbox_dims(&root_of(node)).unwrap_or((content_w, content_h))
+    } else {
+        (1.0, 1.0)
+    };
+    let g = |name: &str, horiz: bool, def_v: f64| -> f64 {
+        pct_attr(node, name, horiz, vb).unwrap_or(def_v)
+    };
+    if radial {
+        let cx = g("cx", true, def.coords[0]);
+        let cy = g("cy", false, def.coords[1]);
+        let r = g("r", true, def.coords[2]);
+        let fx = g("fx", true, cx);
+        let fy = g("fy", false, cy);
+        def.coords = [cx, cy, r, fx, fy];
+    } else {
+        let x1 = g("x1", true, def.coords[0]);
+        let y1 = g("y1", false, def.coords[1]);
+        let x2 = g("x2", true, def.coords[2]);
+        let y2 = g("y2", false, def.coords[3]);
+        def.coords = [x1, y1, x2, y2, 0.0];
+    }
+    // 色标:自身有 <stop> 子元素才覆盖(否则继承父渐变的)。
+    let mut has_stops = false;
+    for c in node.children() {
+        if c.as_element().is_some() && document::tag_name(&c).eq_ignore_ascii_case("stop") {
+            has_stops = true;
+            break;
+        }
+    }
+    if has_stops {
+        def.stops = parse_stops(node, current_color);
+    }
+    if !id.is_empty() {
+        stack.pop();
+    }
+    Some(def)
+}
+
+/// 节点所属 svg 根(向上走到顶层元素)。
+fn root_of(node: &NodeRef) -> NodeRef {
+    let mut cur = node.clone();
+    while let Some(p) = cur.parent() {
+        if p.as_element().is_some() {
+            cur = p;
+        } else {
+            break;
+        }
+    }
+    cur
+}
+
+/// `viewBox` 的宽高(用户单位);无 viewBox 返回 `None`。
+fn viewbox_dims(svg: &NodeRef) -> Option<(f64, f64)> {
+    let vb = document::attr(svg, "viewBox").or_else(|| document::attr(svg, "viewbox"))?;
+    let n = parse_number_list(&vb);
+    if n.len() >= 4 && n[2] > 0.0 && n[3] > 0.0 {
+        Some((n[2], n[3]))
+    } else {
+        None
+    }
+}
+
+/// `href` / `xlink:href` 原始值(不剥 `#`,供 `<image>` 等 URL 引用使用)。
+fn href_raw(node: &NodeRef) -> Option<String> {
+    document::attr(node, "href")
+        .or_else(|| document::attr(node, "xlink:href"))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// `href` / `xlink:href` 的 `#id` 部分。
+fn href_id(node: &NodeRef) -> Option<String> {
+    href_raw(node).map(|v| {
+        v.trim_start_matches('#')
+            .trim_matches(|c| c == '\'' || c == '"')
+            .trim()
+            .to_string()
+    })
+}
+
+/// 渐变坐标/半径属性:支持数字与百分比(百分比基准由 `vb` 给出)。
+fn pct_attr(node: &NodeRef, name: &str, horizontal: bool, vb: (f64, f64)) -> Option<f64> {
+    let raw = document::attr(node, name)?.trim().to_string();
+    if let Some(num) = raw.strip_suffix('%') {
+        let f: f64 = num.trim().parse().ok()?;
+        let base = if horizontal { vb.0 } else { vb.1 };
+        Some(f / 100.0 * base)
+    } else {
+        raw.parse::<f64>().ok().filter(|v| v.is_finite())
+    }
+}
+
+/// 解析 `<stop>` 子元素(offset 钳到非递减)。
+fn parse_stops(node: &NodeRef, current_color: [u8; 3]) -> Vec<GradientStop> {
+    let mut stops = Vec::new();
+    for child in node.children() {
+        if child.as_element().is_none() || !document::tag_name(&child).eq_ignore_ascii_case("stop") {
+            continue;
+        }
+        let offset = parse_stop_offset(document::attr(&child, "offset").as_deref());
+        let color = document::attr(&child, "stop-color")
+            .and_then(|v| parse_stop_color(&v, current_color))
+            .or_else(|| {
+                document::attr(&child, "style").and_then(|s| {
+                    css_decl(&s, "stop-color").and_then(|v| parse_stop_color(v, current_color))
+                })
+            })
+            .unwrap_or([0, 0, 0]);
+        let alpha = document::attr(&child, "stop-opacity")
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .map(|v| v.clamp(0.0, 1.0))
+            .or_else(|| {
+                document::attr(&child, "style").and_then(|s| {
+                    css_decl(&s, "stop-opacity").and_then(|v| v.trim().parse::<f64>().ok())
+                })
+            })
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0);
+        stops.push(GradientStop {
+            offset,
+            color,
+            alpha,
+        });
+    }
+    let mut prev = 0.0f64;
+    for s in &mut stops {
+        s.offset = s.offset.clamp(0.0, 1.0).max(prev);
+        prev = s.offset;
+    }
+    stops
+}
+
+fn parse_stop_offset(raw: Option<&str>) -> f64 {
+    let Some(raw) = raw else { return 0.0 };
+    let raw = raw.trim();
+    if let Some(num) = raw.strip_suffix('%') {
+        num.trim()
+            .parse::<f64>()
+            .map(|v| v / 100.0)
+            .unwrap_or(0.0)
+    } else {
+        raw.parse::<f64>().unwrap_or(0.0)
+    }
+}
+
+fn parse_stop_color(v: &str, current_color: [u8; 3]) -> Option<[u8; 3]> {
+    let v = v.trim();
+    if v.eq_ignore_ascii_case("currentcolor") {
+        return Some(current_color);
+    }
+    parse_color(v).and_then(|inner| inner).map(|(c, _)| c)
+}
+
+/// 从 `style="a:b;c:d"` 里取单个声明值。
+fn css_decl<'a>(style: &'a str, name: &str) -> Option<&'a str> {
+    for part in style.split(';') {
+        let Some((k, v)) = part.split_once(':') else {
+            continue;
+        };
+        if k.trim().eq_ignore_ascii_case(name) {
+            return Some(v.trim());
+        }
+    }
+    None
+}
+
+/// 把渐变定义解析成绘制参数:userSpaceOnUse 预映射到内容盒局部坐标。
+fn resolve_gradient(def: &GradientDef, tf: &Affine, map: &Affine) -> GradientPaint {
+    let mut coords = def.coords;
+    let inv = if def.user_space {
+        // gradientTransform → 元素用户空间 → 根用户空间 → 内容盒局部
+        let m = map.compose(&tf.compose(&def.transform));
+        coords = transform_coords(def.radial, coords, &m);
+        None
+    } else {
+        def.transform.invert()
+    };
+    GradientPaint {
+        radial: def.radial,
+        user_space: def.user_space,
+        coords,
+        inv,
+        spread: def.spread,
+        stops: def.stops.clone(),
+    }
+}
+
+/// 线性映射两个端点;径向映射圆心/焦点并按变换的几何平均缩放半径。
+fn transform_coords(radial: bool, coords: [f64; 5], m: &Affine) -> [f64; 5] {
+    if radial {
+        let (cx, cy) = m.apply(coords[0], coords[1]);
+        let (fx, fy) = m.apply(coords[3], coords[4]);
+        let det = m.a * m.d - m.b * m.c;
+        let scale = det.abs().sqrt().max(1e-9);
+        [cx, cy, coords[2] * scale, fx, fy]
+    } else {
+        let (x1, y1) = m.apply(coords[0], coords[1]);
+        let (x2, y2) = m.apply(coords[2], coords[3]);
+        [x1, y1, x2, y2, 0.0]
+    }
+}
+
+/// `url(#id) fallback` 解析:命中渐变用渐变,否则用兜底色。
+fn resolve_url_paint(
+    v: &str,
+    current_color: [u8; 3],
+    gradients: &GradientMap,
+    tf: &Affine,
+    map: &Affine,
+) -> Option<SvgPaint> {
+    let open = v.find('(')?;
+    let close = v[open..].find(')')? + open;
+    let inner = v[open + 1..close].trim();
+    let id = inner
+        .trim()
+        .trim_start_matches('#')
+        .trim_matches(|c| c == '\'' || c == '"')
+        .trim();
+    if let Some(def) = gradients.get(id) {
+        return Some(SvgPaint::Gradient(resolve_gradient(def, tf, map)));
+    }
+    let rest = v[close + 1..].trim();
+    if rest.is_empty() || rest.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    if rest.eq_ignore_ascii_case("currentcolor") {
+        return Some(SvgPaint::Solid(current_color, 1.0));
+    }
+    parse_color(rest)
+        .and_then(|inner| inner)
+        .map(|(c, a)| SvgPaint::Solid(c, a as f64 / 255.0))
+}
+
+// ---------- 文本 ----------
+
+/// 文本 run 的继承态。
+#[derive(Debug, Clone)]
+struct TextState {
+    x: f64,
+    y: f64,
+    size: f64,
+    color: [u8; 3],
+    alpha: f64,
+    bold: bool,
+    anchor: f64,
+    central: bool,
+}
+
+impl TextState {
+    fn inherit(
+        node: &NodeRef,
+        parent: &TextState,
+        gradients: &GradientMap,
+        tf: &Affine,
+        map: &Affine,
+        vb: Option<(f64, f64)>,
+    ) -> Self {
+        let mut st = parent.clone();
+        let dx = num_list_attr(node, "dx");
+        let dy = num_list_attr(node, "dy");
+        if let Some(v) = dx.first() {
+            st.x += *v;
+        }
+        if let Some(v) = dy.first() {
+            st.y += *v;
+        }
+        if let Some(v) = num_list_attr(node, "x").first() {
+            st.x = *v;
+        }
+        if let Some(v) = num_list_attr(node, "y").first() {
+            st.y = *v;
+        }
+        if let Some(v) = num_attr(node, "font-size") {
+            if v > 0.0 {
+                st.size = v;
+            }
+        }
+        if let Some(v) = document::attr(node, "font-weight") {
+            let w = v.trim().to_ascii_lowercase();
+            st.bold = w == "bold" || w.parse::<i64>().map(|n| n >= 600).unwrap_or(false);
+        }
+        if let Some(v) = document::attr(node, "text-anchor") {
+            st.anchor = match v.trim().to_ascii_lowercase().as_str() {
+                "middle" => 0.5,
+                "end" => 1.0,
+                _ => 0.0,
+            };
+        }
+        if let Some(v) = document::attr(node, "dominant-baseline") {
+            let v = v.trim().to_ascii_lowercase();
+            st.central = v == "middle" || v == "central";
+        }
+        if let Some(v) = paint_value(node, "fill", parent.color, gradients, tf, map, vb) {
+            match v {
+                Some(SvgPaint::Solid(c, a)) => {
+                    st.color = c;
+                    st.alpha = a;
+                }
+                // 渐变文字不在子集内,保留继承色(如实边界)。
+                Some(SvgPaint::Gradient(_)) => {}
+                None => st.alpha = 0.0,
+            }
+        }
+        st
+    }
+
+    fn to_run(&self, text: String) -> SvgText {
+        SvgText {
+            text,
+            x: self.x,
+            y: self.y,
+            size: self.size,
+            color: self.color,
+            alpha: self.alpha,
+            bold: self.bold,
+            anchor: self.anchor,
+            central: self.central,
+        }
+    }
+}
+
+/// `<image>` 元素 → 位图引用(应用元素变换链,未做 viewBox 映射)。
+#[allow(clippy::too_many_arguments)]
+fn emit_svg_image(
+    node: &NodeRef,
+    st: &SvgState,
+    out: &mut Vec<SvgNode>,
+    gradients: &GradientMap,
+    map: &Affine,
+    vb: Option<(f64, f64)>,
+) {
+    let Some(href) = href_raw(node) else {
+        return;
+    };
+    let x = num_attr(node, "x").unwrap_or(0.0);
+    let y = num_attr(node, "y").unwrap_or(0.0);
+    let w = num_attr(node, "width").unwrap_or(0.0);
+    let h = num_attr(node, "height").unwrap_or(0.0);
+    if !(w > 0.0 && h > 0.0) {
+        return;
+    }
+    let cst = SvgState::inherit(node, st, gradients, map, vb);
+    let (x0, y0) = cst.tf.apply(x, y);
+    let (x1, y1) = cst.tf.apply(x + w, y + h);
+    let par = document::attr(node, "preserveAspectRatio")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    out.push(SvgNode::Image(SvgImage {
+        href,
+        x: x0.min(x1),
+        y: y0.min(y1),
+        w: (x1 - x0).abs(),
+        h: (y1 - y0).abs(),
+        slice: par.contains("slice"),
+        stretch: par.contains("none"),
+    }));
+}
+
+/// `<text>` 元素 → 文本 run 列表(直接文本与每个 `<tspan>` 各一条)。
+///
+/// run 坐标先按 `<text>` 元素自身的变换链(`st.tf`,与形状点同一链)搬到
+/// 根用户空间,再随 `collect_nodes` 的 viewBox 映射进内容盒局部坐标。
+fn emit_text_runs(
+    node: &NodeRef,
+    st: &SvgState,
+    out: &mut Vec<SvgNode>,
+    gradients: &GradientMap,
+    map: &Affine,
+    vb: Option<(f64, f64)>,
+) {
+    // 文本基色取继承的 `fill`(与形状同源的 SvgState),`fill:none` 不画。
+    let (base_color, base_alpha) = match &st.fill {
+        Some(SvgPaint::Solid(c, a)) => (*c, *a),
+        // 渐变文字不在子集内,退回 CSS 当前色。
+        Some(SvgPaint::Gradient(_)) => (st.current_color, 1.0),
+        None => (st.current_color, 0.0),
+    };
+    let base = TextState {
+        x: 0.0,
+        y: 0.0,
+        size: 16.0,
+        color: base_color,
+        alpha: base_alpha,
+        bold: false,
+        anchor: 0.0,
+        central: false,
+    };
+    let mut ts = TextState::inherit(node, &base, gradients, &st.tf, map, vb);
+    ts.alpha *= st.opacity;
+    let mut runs = Vec::new();
+    push_text_children(node, &ts, &mut runs, gradients, map, vb, 0);
+    for mut r in runs {
+        let (x, y) = st.tf.apply(r.x, r.y);
+        r.x = x;
+        r.y = y;
+        out.push(SvgNode::Text(r));
+    }
+}
+
+fn push_text_children(
+    node: &NodeRef,
+    ts: &TextState,
+    out: &mut Vec<SvgText>,
+    gradients: &GradientMap,
+    map: &Affine,
+    vb: Option<(f64, f64)>,
+    depth: usize,
+) {
+    if depth > 8 {
+        return;
+    }
+    for child in node.children() {
+        if child.as_element().is_some() {
+            if document::tag_name(&child).eq_ignore_ascii_case("tspan") {
+                let cts = TextState::inherit(&child, ts, gradients, &Affine::identity(), map, vb);
+                let direct: String = child
+                    .children()
+                    .filter_map(|c| c.as_text().map(|t| t.borrow().clone()))
+                    .collect();
+                let direct = normalize_text(&direct);
+                if !direct.is_empty() {
+                    out.push(cts.to_run(direct));
+                }
+                push_text_children(&child, &cts, out, gradients, map, vb, depth + 1);
+            }
+        } else if let Some(t) = child.as_text() {
+            let s = normalize_text(&t.borrow());
+            if !s.is_empty() {
+                out.push(ts.to_run(s));
+            }
+        }
+    }
+}
+
+/// SVG 缺省空白折叠(连续空白压成一个空格,首尾丢弃)。
+fn normalize_text(s: &str) -> String {
+    let mut out = String::new();
+    let mut ws = false;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            ws = !out.is_empty();
+        } else {
+            if ws {
+                out.push(' ');
+                ws = false;
+            }
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// 数字流属性(`x`/`y`/`dx`/`dy` 可以是列表)。
+fn num_list_attr(node: &NodeRef, name: &str) -> Vec<f64> {
+    document::attr(node, name)
+        .map(|v| parse_number_list(&v))
+        .unwrap_or_default()
 }

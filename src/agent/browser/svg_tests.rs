@@ -164,7 +164,11 @@ fn currentColor取CSS颜色() {
         "<svg><path d='M 0 0 L 10 0 L 10 10 Z' fill='currentColor'/></svg>",
     );
     let s = &shapes[0];
-    let (c, _) = s.fill.expect("currentColor 应解析为具体色");
+    let paint = s.fill.clone().expect("currentColor 应解析为具体色");
+    let c = match paint {
+        super::svg::SvgPaint::Solid(c, _) => c,
+        other => panic!("currentColor 应是纯色,实际 {other:?}"),
+    };
     assert_eq!(c, [10, 20, 30], "currentColor 取传入的 CSS color");
 }
 
@@ -291,4 +295,289 @@ fn sticky像素随滚动吸附() {
     assert!(top_px[0] < 60 && top_px[1] < 60, "滚动 250 后 sticky 头应钉在视口顶,实际 {top_px:?}");
     let still = before.get_pixel(200, 5).0;
     assert!(still[0] > 235, "未滚动时视口顶应为白底,实际 {still:?}");
+}
+
+// ---------- 第 55 轮:渐变 / 文本 / 媒体 poster ----------
+
+#[test]
+fn 线性渐变填充落到像素() {
+    let img = render_html(
+        "<body style='margin:0'><svg width='100' height='100' viewBox='0 0 100 100'>\
+         <defs><linearGradient id='g' x1='0%' y1='0%' x2='100%' y2='0%'>\
+         <stop offset='0' stop-color='#ff0000'/><stop offset='1' stop-color='#0000ff'/>\
+         </linearGradient></defs>\
+         <rect x='0' y='0' width='100' height='100' fill='url(#g)'/></svg></body>",
+    );
+    let l = img.get_pixel(10, 50).0;
+    assert!(l[0] > 180 && l[2] < 120, "左端应偏红,实际 {l:?}");
+    let r = img.get_pixel(90, 50).0;
+    assert!(r[2] > 180 && r[0] < 120, "右端应偏蓝,实际 {r:?}");
+}
+
+#[test]
+fn 径向渐变中心与边缘() {
+    let img = render_html(
+        "<body style='margin:0'><svg width='100' height='100' viewBox='0 0 100 100'>\
+         <defs><radialGradient id='r' cx='50%' cy='50%' r='50%'>\
+         <stop offset='0' stop-color='#ffffff'/><stop offset='1' stop-color='#000000'/>\
+         </radialGradient></defs>\
+         <rect x='0' y='0' width='100' height='100' fill='url(#r)'/></svg></body>",
+    );
+    let c = img.get_pixel(50, 50).0;
+    assert!(c[0] > 230, "中心应接近白,实际 {c:?}");
+    let e = img.get_pixel(6, 6).0;
+    assert!(e[0] < 130, "近角应明显变暗,实际 {e:?}");
+}
+
+#[test]
+fn userSpaceOnUse坐标映射() {
+    let img = render_html(
+        "<body style='margin:0'><svg width='200' height='200' viewBox='0 0 100 100'>\
+         <defs><linearGradient id='g' gradientUnits='userSpaceOnUse' x1='0' y1='0' x2='100' y2='0'>\
+         <stop offset='0' stop-color='#ff0000'/><stop offset='1' stop-color='#0000ff'/>\
+         </linearGradient></defs>\
+         <rect x='0' y='0' width='100' height='100' fill='url(#g)'/></svg></body>",
+    );
+    let l = img.get_pixel(20, 100).0;
+    assert!(l[0] > 180 && l[2] < 120, "左端应偏红,实际 {l:?}");
+    let r = img.get_pixel(180, 100).0;
+    assert!(r[2] > 180 && r[0] < 120, "右端应偏蓝,实际 {r:?}");
+}
+
+#[test]
+fn spreadMethod_repeat周期() {
+    let img = render_html(
+        "<body style='margin:0'><svg width='100' height='100' viewBox='0 0 100 100'>\
+         <defs><linearGradient id='g' x1='0%' y1='0%' x2='25%' y2='0%' spreadMethod='repeat'>\
+         <stop offset='0' stop-color='#ff0000'/><stop offset='1' stop-color='#0000ff'/>\
+         </linearGradient></defs>\
+         <rect x='0' y='0' width='100' height='100' fill='url(#g)'/></svg></body>",
+    );
+    let a = img.get_pixel(12, 50).0;
+    let b = img.get_pixel(37, 50).0;
+    assert!(
+        (a[0] as i32 - b[0] as i32).abs() <= 12 && (a[2] as i32 - b[2] as i32).abs() <= 12,
+        "repeat 周期 25px:x=12 与 x=37 应同色,实际 {a:?} vs {b:?}"
+    );
+}
+
+#[test]
+fn 渐变href继承色标() {
+    let img = render_html(
+        "<body style='margin:0'><svg width='100' height='100' viewBox='0 0 100 100'>\
+         <defs><linearGradient id='base' x1='0%' y1='0%' x2='100%' y2='0%'>\
+         <stop offset='0' stop-color='#ff0000'/><stop offset='1' stop-color='#0000ff'/>\
+         </linearGradient><linearGradient id='g' href='#base'/></defs>\
+         <rect x='0' y='0' width='100' height='100' fill='url(#g)'/></svg></body>",
+    );
+    let l = img.get_pixel(10, 50).0;
+    let r = img.get_pixel(90, 50).0;
+    assert!(l[0] > 180 && l[2] < 120, "继承后左端应偏红,实际 {l:?}");
+    assert!(r[2] > 180 && r[0] < 120, "继承后右端应偏蓝,实际 {r:?}");
+}
+
+#[test]
+fn 渐变缺引用回退色() {
+    let img = render_html(
+        "<body style='margin:0'><svg width='100' height='100' viewBox='0 0 100 100'>\
+         <rect x='0' y='0' width='100' height='100' fill='url(#missing) #00ff00'/></svg></body>",
+    );
+    let c = img.get_pixel(50, 50).0;
+    assert!(c[1] > 180 && c[0] < 120, "缺引用应回退绿色,实际 {c:?}");
+}
+
+#[test]
+fn 渐变描边落到像素() {
+    let img = render_html(
+        "<body style='margin:0'><svg width='100' height='100' viewBox='0 0 100 100'>\
+         <defs><linearGradient id='g' x1='0%' y1='0%' x2='100%' y2='0%'>\
+         <stop offset='0' stop-color='#ff0000'/><stop offset='1' stop-color='#0000ff'/>\
+         </linearGradient></defs>\
+         <path d='M10 50 L90 50' stroke='url(#g)' stroke-width='8' fill='none'/></svg></body>",
+    );
+    let l = img.get_pixel(15, 50).0;
+    assert!(l[0] > 150 && l[2] < 120, "描边左端应偏红,实际 {l:?}");
+    let r = img.get_pixel(85, 50).0;
+    assert!(r[2] > 150 && r[0] < 120, "描边右端应偏蓝,实际 {r:?}");
+}
+
+#[test]
+fn svg文本进显示列表() {
+    let lay = layout_html(
+        "<body style='margin:0'><svg width='200' height='60' viewBox='0 0 200 60'>\
+         <text x='10' y='40' font-size='32' fill='#ff0000'>Hi</text></svg></body>",
+    );
+    let texts: Vec<_> = lay
+        .display
+        .iter()
+        .filter(|it| matches!(it.kind, DisplayKind::Text { .. }))
+        .collect();
+    assert!(!texts.is_empty(), "svg text 应产出 Text 显示项");
+    assert!(
+        !lay.display
+            .iter()
+            .any(|it| matches!(&it.kind, DisplayKind::MediaFrameNote { tag, .. } if tag == "svg")),
+        "有文本时不得再画 svg 空盒占位"
+    );
+}
+
+#[test]
+fn svg文本落到像素() {
+    let img = render_html(
+        "<body style='margin:0'><svg width='200' height='60' viewBox='0 0 200 60'>\
+         <text x='10' y='40' font-size='32' fill='#ff0000'>Hi</text></svg></body>",
+    );
+    let mut red = 0;
+    for y in 8..40 {
+        for x in 10..74 {
+            let c = img.get_pixel(x, y).0;
+            if c[0] > 150 && c[1] < 120 {
+                red += 1;
+            }
+        }
+    }
+    assert!(red > 20, "svg 文本应有红色像素,实际 {red}");
+}
+
+#[test]
+fn media_poster绘制并撤占位() {
+    let html = "<body style='margin:0'><video poster='https://img.test/p.jpg' width='100' height='80'></video></body>";
+    let doc = Document::parse(html, "https://a.test/");
+    let font = FontSet::fallback();
+    let media = crate::agent::browser::style::MediaCtx::new(400.0, 720.0);
+    let mut sizes = crate::agent::browser::images::ImageSizes::default();
+    sizes
+        .sizes
+        .insert("https://img.test/p.jpg".to_string(), (100.0, 80.0));
+    let lay = layout::compute_full(&doc, 400.0, &font, &media, &sizes);
+    assert!(
+        lay.display.iter().any(
+            |it| matches!(&it.kind, DisplayKind::Image { src, .. } if src == "https://img.test/p.jpg")
+        ),
+        "poster 应产出 Image 显示项"
+    );
+    assert!(
+        !lay.display
+            .iter()
+            .any(|it| matches!(&it.kind, DisplayKind::MediaFrameNote { tag, .. } if tag == "video")),
+        "有 poster 时不得再画 video 空盒占位"
+    );
+    // 像素:poster 图已解码 → 画面着色。
+    let mut store: ImageStore = ImageStore::new();
+    let mut rgba = Vec::with_capacity(100 * 80 * 4);
+    for _ in 0..100 * 80 {
+        rgba.extend_from_slice(&[255, 0, 0, 255]);
+    }
+    store.insert(
+        "https://img.test/p.jpg".to_string(),
+        std::sync::Arc::new(crate::agent::browser::images::DecodedImage {
+            width: 100,
+            height: 80,
+            rgba,
+        }),
+    );
+    let pm = font
+        .render_pixmap(&lay, 400, 300, 0.0, 0.0, false, &store)
+        .unwrap();
+    let img = image::load_from_memory(&pm.encode_png().unwrap())
+        .unwrap()
+        .to_rgba8();
+    let c = img.get_pixel(50, 40).0;
+    assert!(c[0] > 200 && c[1] < 80, "poster 应画红色像素,实际 {c:?}");
+}
+
+#[test]
+fn svg文本继承fill与组变换() {
+    let lay = layout_html(
+        "<body style='margin:0'><svg width='200' height='60' viewBox='0 0 200 60'>\
+         <g fill='#ff0000' transform='translate(10,0)'>\
+         <text x='10' y='40' font-size='32'>Hi</text></g></svg></body>",
+    );
+    let texts: Vec<(String, [u8; 3], f64)> = lay
+        .display
+        .iter()
+        .filter_map(|it| match &it.kind {
+            DisplayKind::Text { text, color, .. } => Some((text.clone(), *color, it.x)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts.len(), 1, "应有一条文本 run,实际 {texts:?}");
+    assert_eq!(texts[0].0, "Hi");
+    assert_eq!(texts[0].1, [255, 0, 0], "应继承 g 的 fill,实际 {:?}", texts[0].1);
+    assert!((texts[0].2 - 20.0).abs() < 1.0, "组平移 10 + x=10 → 20,实际 {}", texts[0].2);
+}
+
+#[test]
+fn 收集svg_image地址() {
+    let urls = crate::agent::browser::images::collect_image_urls(
+        "<svg><image href='/a.png' width='10' height='10'/></svg>",
+        "https://a.test/",
+        800.0,
+    );
+    assert!(
+        urls.contains(&"https://a.test/a.png".to_string()),
+        "svg image 地址应进预取链,实际 {urls:?}"
+    );
+}
+
+#[test]
+fn svg_image绘制并撤占位() {
+    let html = "<body style='margin:0'><svg width='120' height='90' viewBox='0 0 120 90'>\
+                <image href='https://img.test/a.png' x='10' y='10' width='100' height='70'/></svg></body>";
+    let doc = Document::parse(html, "https://a.test/");
+    let font = FontSet::fallback();
+    let media = crate::agent::browser::style::MediaCtx::new(400.0, 720.0);
+    let mut sizes = crate::agent::browser::images::ImageSizes::default();
+    sizes
+        .sizes
+        .insert("https://img.test/a.png".to_string(), (100.0, 70.0));
+    let lay = layout::compute_full(&doc, 400.0, &font, &media, &sizes);
+    assert!(
+        lay.display.iter().any(
+            |it| matches!(&it.kind, DisplayKind::Image { src, .. } if src == "https://img.test/a.png")
+        ),
+        "svg image 应产出 Image 显示项"
+    );
+    assert!(
+        !lay.display
+            .iter()
+            .any(|it| matches!(&it.kind, DisplayKind::MediaFrameNote { tag, .. } if tag == "svg")),
+        "有 image 时不得再画 svg 空盒占位"
+    );
+    // 像素:contain 适配,图落在 (10,10)-(110,80) 内。
+    let mut store: ImageStore = ImageStore::new();
+    let mut rgba = Vec::with_capacity(100 * 70 * 4);
+    for _ in 0..100 * 70 {
+        rgba.extend_from_slice(&[0, 128, 255, 255]);
+    }
+    store.insert(
+        "https://img.test/a.png".to_string(),
+        std::sync::Arc::new(crate::agent::browser::images::DecodedImage {
+            width: 100,
+            height: 70,
+            rgba,
+        }),
+    );
+    let pm = font
+        .render_pixmap(&lay, 400, 300, 0.0, 0.0, false, &store)
+        .unwrap();
+    let img = image::load_from_memory(&pm.encode_png().unwrap())
+        .unwrap()
+        .to_rgba8();
+    let c = img.get_pixel(60, 45).0;
+    assert!(c[2] > 200 && c[0] < 80, "svg image 应画蓝色像素,实际 {c:?}");
+}
+
+#[test]
+fn svg_image未加载保留占位() {
+    let lay = layout_html(
+        "<body style='margin:0'><svg width='120' height='90' viewBox='0 0 120 90'>\
+         <image href='https://img.test/missing.png' x='10' y='10' width='100' height='70'/></svg></body>",
+    );
+    assert!(
+        lay.display
+            .iter()
+            .any(|it| matches!(&it.kind, DisplayKind::MediaFrameNote { tag, .. } if tag == "svg")),
+        "image 未加载时应保留 svg 空盒占位"
+    );
 }
