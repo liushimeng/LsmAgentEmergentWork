@@ -78,7 +78,7 @@ pub fn apply(doc: &Document, actions: &[JsAction], base_url: &str) -> ApplySumma
                 a.kind,
                 a.selector,
                 a.key,
-                &a.value[..a.value.len().min(100)]
+                a.value.chars().take(100).collect::<String>()
             );
         }
     }

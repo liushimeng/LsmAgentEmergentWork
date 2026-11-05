@@ -476,8 +476,11 @@ pub(super) async fn run_open(mut args: Value) -> Result<String> {
     let ua = str_arg(&args, "user_agent");
     let mgr = McpWebLsmBrowserUseTool::mgr();
     let had_pages = mgr.has_browser().await;
+    // 显式 page_id = 点名承载页:同 URL 廉价复用,不同 URL 在该页内原地导航
+    // (此前被忽略,URL 换站时悄悄另开新页,Agent 后续操作全打在旧页上)。
+    let prefer_page = str_arg(&args, "page_id").map(str::to_string);
     let out = match mgr
-        .new_page(&url, mode, ua, width, height, new_window, reuse, timeout, &hints)
+        .new_page_in(prefer_page.as_deref(), &url, mode, ua, width, height, new_window, reuse, timeout, &hints)
         .await
     {
         Ok(v) => v,

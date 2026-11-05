@@ -990,9 +990,20 @@ fn native_fetch(
     let result = REQ_ENV.with(|c| {
         let env = c.borrow();
         let base = env.base_url.clone();
-        let cookies = env.cookies.clone();
+        let mut cookies = env.cookies.clone();
         let deadline = env.deadline;
         drop(env);
+        // JS 侧每次调用都会带上最新 document.cookie(__lsmCookie):
+        // 批内先收到的 Set-Cookie(如 mtop 的 _m_h5_tk 令牌)必须立刻随
+        // 下一次请求回发,否则同批重试永远拿 FAIL_SYS_TOKEN_EMPTY。
+        // REQ_ENV.cookies 只是 begin_request 时的快照,批内会过期。
+        if let Ok(o) = serde_json::from_str::<serde_json::Value>(&opts) {
+            if let Some(js_cookies) = o.get("cookies").and_then(|v| v.as_str()) {
+                if !js_cookies.trim().is_empty() {
+                    cookies = js_cookies.to_string();
+                }
+            }
+        }
         blocking_fetch(&url, &opts, &base, &cookies, deadline)
     });
     Ok(JsValue::from(JsString::from(result.to_string())))

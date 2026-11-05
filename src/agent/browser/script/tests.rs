@@ -839,6 +839,34 @@ const OBS_PAGE: &str = "<html><head><title>观察者</title></head><body>\
 </body></html>";
 
 #[test]
+fn mutation_observer_后代嵌套变更subtree派发不中断() {
+    // 2026-11-05 闲鱼回归:prelude 的对象版 __lsmIsDescendant 与 env_js 的
+    // 索引版同名,SELECTOR_JS 后拼接把对象版遮蔽 —— subtree 观察者遇到
+    // 「目标是观察节点的后代」记录时,元素对象进索引版做数值比较抛
+    // ToObject 异常,整链派发中断,站点框架状态机停摆、DOM 反复重挂载。
+    // 直接命中(目标=观察节点本身)不走该分支,此前测试覆盖不到。
+    let handle = JsHandle::spawn();
+    let armed = eval_on(
+        &handle,
+        "(function(){ window.__sub = 0; window.__subErr = ''; \
+         var mo = new MutationObserver(function(rs){ window.__sub += rs.length; }); \
+         mo.observe(document.body, {childList: true, subtree: true}); \
+         var d = document.createElement('div'); \
+         document.body.appendChild(d); \
+         d.appendChild(document.createElement('span')); \
+         return 'armed'; })()",
+        OBS_PAGE,
+        "https://a.test/",
+    );
+    assert!(armed.outcome.ok, "{:?}", armed.outcome.error);
+    let got = eval_on(&handle, "window.__sub", OBS_PAGE, "https://a.test/");
+    assert_eq!(
+        got.outcome.value, "2",
+        "body 直挂 + 后代嵌套各一条记录,subtree 派发不得因后代记录中断"
+    );
+}
+
+#[test]
 fn mutation_observer_子节点变更触发回调() {
     // 此前 env_js 的 MutationObserver 是空壳:构造成功但回调永不触发,
     // 前端框架的「等 DOM 变化再渲染」链条整段停摆。

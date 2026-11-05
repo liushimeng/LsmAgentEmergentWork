@@ -898,7 +898,7 @@ function __lsmFireScriptLoad(url) {
     } catch (e) { __cerror("script onreadystatechange 失败: " + String((e && e.stack) || e)); }
     try {
       if (typeof el.onload === "function") el.onload({ type: "load", target: el });
-    } catch (e) { __cerror("script onload 失败: " + String((e && e.stack) || e)); }
+    } catch (e) { __cerror("script onload 失败: " + String(e) + " @ " + String((e && e.stack) || "")); }
   }
 }
 
@@ -2826,9 +2826,8 @@ try {
   Object.defineProperty(document, "cookie", {
     get: function () { return __lsmCookie; },
     set: function (v) {
-      var line = String(v);
-      __lsmCookieApply([line]);
-      __push({ type: "set_cookie", value: line });
+      // 回传动作在 __lsmCookieApply 内统一做(见其注释),此处不再重复 push。
+      __lsmCookieApply([String(v)]);
     },
     configurable: true
   });
@@ -2856,6 +2855,11 @@ function __lsmCookieApply(lines) {
     var val = pair.slice(i + 1).trim();
     if (/expires=Thu, 01 Jan 1970/i.test(String(line))) delete map[name];
     else map[name] = val;
+    // 回传宿主 Cookie Jar(整条 Set-Cookie 原样,含 Domain/Path/Max-Age 属性):
+    // 此前只改 JS 侧 __lsmCookie,宿主 jar 学不到;下一轮 __lsmRefresh 用宿主
+    // jar 整串覆盖 __lsmCookie,把刚拿到的 _m_h5_tk 等令牌 cookie 静默清掉,
+    // mtop 只能无限重拿令牌(实测闲鱼首页骨架永不填充 + 登录页 QR 反复重挂载)。
+    try { __push({ type: "set_cookie", value: String(line) }); } catch (e) {}
   });
   __lsmCookie = Object.keys(map).map(function (k) { return k + "=" + map[k]; }).join("; ");
 }
@@ -3921,7 +3925,7 @@ function __fireDyn(target, type) {
     ev.target = target;
     ev.currentTarget = L.node;
     handled = true;
-    try { L.fn(ev); } catch (e) { __cerror("dyn listener " + type + ": " + String((e && e.stack) || e)); }
+    try { L.fn(ev); } catch (e) { __cerror("dyn listener " + type + ": " + String(e) + " @ " + String((e && e.stack) || "")); }
     if (ev.defaultPrevented) prevented = true;
     if (ev.propagationStopped) break;
   }
@@ -3972,7 +3976,11 @@ function __lsmDetachedHas(root, node) {
   }
   return false;
 }
-function __lsmIsDescendant(node, root) {
+// 注意:不能叫 __lsmIsDescendant —— env_js 的 SELECTOR_JS 在 PRELUDE_BODY 之后
+// 拼接,那边有同名**索引版**函数,函数声明提升会让索引版遮蔽本对象版;
+// MutationObserver 的 subtree 匹配一旦走进索引版,元素对象参与数值比较会抛
+// ToObject 异常,观察者派发整链断裂(实测闲鱼登录页 DOM 重复挂载 10+ 份根因)。
+function __lsmNodeInSubtree(node, root) {
   if (!node || !root) return false;
   var nk = __lsmKey(node), rk = __lsmKey(root);
   if (!nk || !rk) return node === root;
@@ -4008,10 +4016,28 @@ function __lsmResolve(node) {
   return node;
 }
 // 祖先链里是否含指定选择器(子树判定,按选择器而非索引)。
+// 2026-11-05 闲鱼回归:动态节点此前走不进来(只认快照 __lsm_node),subtree
+// 观察者看不到「动态子树内部的嵌套变更」,框架状态机收不到就重挂载。
+// 现按混合链上行:动态 __parentDyn → 快照挂点 __parentStatic → 快照父链。
 function __lsmHasAncestorSel(node, sel) {
-  var idx = node && node.__lsm_node ? node.__lsm_node.i : -1;
-  var guard = 0;
-  while (idx >= 0 && idx < __lsmNodes.length && guard++ < 128) {
+  if (!node || !sel) return false;
+  var cur = node, guard = 0;
+  while (cur && guard++ < 256) {
+    if (cur.__lsm_node) {
+      return __lsmSnapHasSel(cur.__lsm_node.i, sel, guard);
+    }
+    if (cur.__parentDyn) { cur = cur.__parentDyn; continue; }
+    if (cur.__parentStatic) {
+      var ps = cur.__parentStatic;
+      return __lsmSnapHasSel(ps && ps.i != null ? ps.i : -1, sel, guard);
+    }
+    break;
+  }
+  return false;
+}
+function __lsmSnapHasSel(idx, sel, guardBase) {
+  var g = guardBase || 0;
+  while (idx >= 0 && idx < __lsmNodes.length && g++ < 256) {
     if (String(__lsmNodes[idx].sel || "") === sel) return true;
     var p = __lsmNodes[idx].parent;
     if (p == null || p < 0 || p >= __lsmNodes.length) break;
@@ -4203,7 +4229,7 @@ function __lsmMutMatches(obs, rec) {  for (var t = 0; t < obs._targets.length; t
     if (!hit && o.sel && o.sel === __lsmNodeSel(rec.target)) hit = true;
     if (!hit && o.subtree) {
       if (o.sel && __lsmHasAncestorSel(rec.target, o.sel)) hit = true;
-      else if (!o.sel && __lsmIsDescendant(rec.target, o.node)) hit = true;
+      else if (!o.sel && __lsmNodeInSubtree(rec.target, o.node)) hit = true;
     }
     if (!hit) continue;
     if (rec.type === "attributes") {
@@ -4443,9 +4469,9 @@ function __lsmResizeEntry(target, rect, w, h) {
 
 // 组合入口:三类观察者一次派发(宿主请求收口与虚拟时钟批次共用)。
 function __lsmFlushObservers() {
-  try { __lsmFlushMutations(); } catch (e) { __cerror("观察者派发失败: " + String(e)); }
-  try { __lsmFlushIntersection(); } catch (e2) { __cerror("IntersectionObserver 派发失败: " + String(e2)); }
-  try { __lsmFlushResize(); } catch (e3) { __cerror("ResizeObserver 派发失败: " + String(e3)); }
+  try { __lsmFlushMutations(); } catch (e) { __cerror("观察者派发失败: " + String((e && e.stack) || e)); }
+  try { __lsmFlushIntersection(); } catch (e2) { __cerror("IntersectionObserver 派发失败: " + String((e2 && e2.stack) || e2)); }
+  try { __lsmFlushResize(); } catch (e3) { __cerror("ResizeObserver 派发失败: " + String((e3 && e3.stack) || e3)); }
 }
 
 // window 暴露:站点普遍写 `new window.MutationObserver(...)`。

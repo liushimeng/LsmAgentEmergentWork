@@ -873,6 +873,21 @@ pub(crate) fn append_reply(
     doc: &super::document::Document,
 ) -> Vec<JsAction> {
     let summary = dom_ops::apply(doc, &reply.outcome.actions, base_url);
+    // LAEW_DOM_TRACE:导航类动作不进 dom_ops::apply(调用方另行执行),
+    // 单独打一行,排障「页面自己跳走」类问题时不再两眼一抹黑。
+    if !std::env::var("LAEW_DOM_TRACE").unwrap_or_default().is_empty() {
+        for a in reply.outcome.actions.iter().filter(|a| {
+            matches!(
+                a.kind.as_str(),
+                "click" | "navigate" | "new_tab" | "submit" | "back" | "forward" | "reload"
+            )
+        }) {
+            eprintln!(
+                "[domtrace] nav-action kind={} url={} (来源页面 {})",
+                a.kind, a.value, base_url
+            );
+        }
+    }
     for line in &summary.cookies {
         inner
             .cookies

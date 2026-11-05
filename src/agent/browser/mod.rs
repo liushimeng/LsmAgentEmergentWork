@@ -713,6 +713,28 @@ impl LsmBrowserManager {
         timeout_ms: u64,
         hints: &NavHints,
     ) -> EngineResult<OpenOutcome> {
+        self.new_page_in(None, url, mode, user_agent, width, height, new_window, reuse, timeout_ms, hints)
+            .await
+    }
+
+    /// open(page_id=X, url=Y):显式指定承载页。URL 与该页不同时**在该页内
+    /// 原地导航**,而不是按站点匹配找不到就悄悄另开新页 —— 模型普遍把
+    /// page_id 当「在这个页里打开」用,落空后另开的新页没有任何回执指向,
+    /// 后续 inspect/control 仍打在旧页上,表现为「页面跳走/操作不生效」
+    /// (2026-11-05 闲鱼实测:open(page_id,登录URL) 后 Agent 一直看首页)。
+    pub async fn new_page_in(
+        &self,
+        prefer_page: Option<&str>,
+        url: &str,
+        mode: BrowserMode,
+        user_agent: Option<&str>,
+        width: Option<u32>,
+        height: Option<u32>,
+        new_window: bool,
+        reuse: bool,
+        timeout_ms: u64,
+        hints: &NavHints,
+    ) -> EngineResult<OpenOutcome> {
         let started = std::time::Instant::now();
         let requested = urlutil::resolve("", url)
             .ok_or_else(|| EngineError::param(format!("URL 非法:{url}")))?;
@@ -730,7 +752,13 @@ impl LsmBrowserManager {
                                    "hint": "先 close 不需要的 page_id 再 open(new_window=true)"})));
         }
         if reuse && !new_window {
-            if let Some(existing) = find_reusable(&inner, &requested) {
+            // 显式 page_id 优先:调用方点名要在这一页打开(同 URL 走廉价复用,
+            // 不同 URL 原地导航);未点名才按 URL/站点全局找可复用页。
+            let preferred = match prefer_page {
+                Some(p) if inner.tabs.contains_key(p) => Some(p.to_string()),
+                _ => None,
+            };
+            if let Some(existing) = preferred.or_else(|| find_reusable(&inner, &requested)) {
                 // 2026-11-01 天猫二轮:精确同 URL 复用改**廉价复用** ——
                 // 原实现无条件全量重导航:重站(天猫)全管线 240s+顺延 60s+图片 20s
                 // ≈ 327.7s 黑盒,且导航会 shutdown 旧 JS 线程,把首开后台自建的
