@@ -82,6 +82,53 @@ pub enum DisplayKind {
         open: bool,
         color: [u8; 3],
     },
+    /// 第 50 轮:SVG 矢量形状(图标/箭头/星标)。
+    ///
+    /// `subpaths` 为**元素内容盒局部坐标**折线(已含 transform 复合与
+    /// viewBox 映射),`(points, closed)` 的 closed 表示描边闭合;
+    /// `fill`/`stroke` 的 `None` = 不绘制;光栅化走扫描线填充
+    ///(evenodd/非零卷绕)+ 距离场描边(butt/round cap)。
+    SvgShape {
+        subpaths: Arc<Vec<(Vec<(f64, f64)>, bool)>>,
+        fill: Option<(([u8; 3], u8), bool)>,
+        stroke: Option<([u8; 3], u8)>,
+        stroke_w: f64,
+        cap_round: bool,
+    },
+}
+
+/// 第 50 轮:`position: sticky` 吸附参数(视口 top/bottom)。
+///
+/// 布局期只登记静态几何与约束,**光栅期**按滚动量现算平移 —— 页面滚动
+/// 不触发重排(与 fixed 同思路,但吸附有包含块约束与阈值)。
+#[derive(Debug, Clone, Copy)]
+pub struct StickyInfo {
+    /// 吸附阈值(top 优先于 bottom)。
+    pub top: Option<f64>,
+    pub bottom: Option<f64>,
+    /// 子树静态文档坐标 y(视口顶滚过 `static_y - top` 才开始吸附)。
+    pub static_y: f64,
+    /// 子树外高。
+    pub outer_h: f64,
+    /// 视口高(bottom 吸附需要)。
+    pub viewport_h: f64,
+    /// 吸附最大位移 = 包含块底界 - 静态盒底(≥0,防穿透包含块)。
+    pub max_shift: f64,
+}
+
+impl StickyInfo {
+    /// 按滚动量算平移:top 吸附向下钉住(0..=max_shift);
+    /// bottom 吸附在盒底越过视口底-inset 时向上顶(-max_shift..=0)。
+    pub fn shift(&self, scroll_y: f64) -> f64 {
+        if let Some(t) = self.top {
+            (scroll_y + t - self.static_y).clamp(0.0, self.max_shift)
+        } else if let Some(b) = self.bottom {
+            (scroll_y + self.viewport_h - b - (self.static_y + self.outer_h))
+                .clamp(-self.max_shift, 0.0)
+        } else {
+            0.0
+        }
+    }
 }
 
 /// 文本装饰线类型(第 48 轮)。
@@ -113,6 +160,8 @@ pub enum WidgetGlyphKind {
     ClockIcon,
     /// 第 41 轮新增:向上三角(number 微调按钮上箭头)。
     CaretUp,
+    /// 第 50 轮新增:媒体控件条播放三角(▶)。
+    PlayTriangle,
 }
 
 /// 绘制项。`x/y/w/h` 为**局部**(页坐标)border box;`opacity` 已含祖先组透明度乘积;
@@ -149,6 +198,9 @@ pub struct DisplayItem {
     /// 第 41 轮新增第 2 档:顶层 UI 脱离常规层叠上下文,永远画在定位层之上,
     /// 且**不参与祖先 `overflow:hidden` 的裁剪交集**(见 `layout/top_layer.rs`)。
     pub layer: u8,
+    /// 第 50 轮:`position: sticky` 子树标记 —— 光栅期按滚动量现算平移,
+    /// 页面滚动不触发重排。`None` = 常规项。
+    pub sticky: Option<StickyInfo>,
 }
 
 impl DisplayItem {
@@ -175,6 +227,7 @@ impl DisplayItem {
             DisplayKind::Border { .. } => 2,
             DisplayKind::CanvasNote { .. } | DisplayKind::MediaFrameNote { .. } => 3,
             DisplayKind::WidgetGlyph { .. } => 4,
+            DisplayKind::SvgShape { .. } => 5,
             DisplayKind::Image { .. } => 5,
             DisplayKind::TextDecor { .. } => 8,
             DisplayKind::TextShadow { .. } => 6,
@@ -295,6 +348,7 @@ pub fn build_legacy(layout: &Layout) -> Vec<DisplayItem> {
                 fixed: false,
                 out_of_flow: false,
             layer: 0,
+            sticky: None,
             });
         }
     }
@@ -325,6 +379,7 @@ pub fn build_legacy(layout: &Layout) -> Vec<DisplayItem> {
             fixed: false,
             out_of_flow: false,
             layer: 0,
+            sticky: None,
         });
     }
     for p in &layout.paints {
@@ -376,6 +431,7 @@ fn shadow_item(s: &ShadowDraw, seq: u64) -> DisplayItem {
         fixed: false,
         out_of_flow: false,
         layer: 0,
+        sticky: None,
     }
 }
 
@@ -398,6 +454,7 @@ fn border_item(b: &BorderDraw, seq: u64) -> DisplayItem {
         fixed: false,
         out_of_flow: false,
         layer: 0,
+        sticky: None,
     }
 }
 
@@ -422,6 +479,7 @@ fn image_item(p: &PaintBox, seq: u64) -> DisplayItem {
         fixed: false,
         out_of_flow: false,
         layer: 0,
+        sticky: None,
     }
 }
 
@@ -446,5 +504,6 @@ fn text_item(l: &TextLine, seq: u64) -> DisplayItem {
         fixed: false,
         out_of_flow: false,
         layer: 0,
+        sticky: None,
     }
 }

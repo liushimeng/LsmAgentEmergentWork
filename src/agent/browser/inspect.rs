@@ -962,6 +962,7 @@ mod overlay_tests {
             fixed: false,
             out_of_flow: false,
             layer: 1,
+            sticky: None,
         }
     }
 
@@ -987,6 +988,7 @@ mod overlay_tests {
             fixed: false,
             out_of_flow: false,
             layer: 0,
+            sticky: None,
         }
     }
 

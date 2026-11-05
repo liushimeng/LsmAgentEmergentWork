@@ -109,7 +109,14 @@ pub(crate) fn push_border_and_shadow(
 /// 元素是否参与绘制(visibility/opacity)。
 /// 替换类标签:`<img>` 与 `<svg>`(后者按 viewBox/属性取固有尺寸)。
 pub(crate) fn is_replaced_tag(node: &NodeRef) -> bool {
-    is_replaced_tag_name(&document::tag_name(node))
+    let tag = document::tag_name(node);
+    // 第 50 轮:audio 无 controls 属性 = UA display:none(与真浏览器一致;
+    // 此前 300×150 空盒占位误导截图取证)。有 controls 走 300×30 控件条
+    // 形态(见 media_controls.rs / media_natural_size)。
+    if tag.eq_ignore_ascii_case("audio") && document::attr(node, "controls").is_none() {
+        return false;
+    }
+    is_replaced_tag_name(&tag)
 }
 
 /// 按标签名判定替换元素(供无 `NodeRef` 的调用点复用)。

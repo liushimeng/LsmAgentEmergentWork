@@ -379,10 +379,17 @@ impl FontSet {
                     DisplayKind::WidgetGlyph { glyph, open, color } => {
                         format!("widget({glyph:?},open={open},color={color:?})")
                     }
+                    DisplayKind::SvgShape { subpaths, fill, stroke, .. } => format!(
+                        "svg(subpaths={} pts={} fill={:?} stroke={:?})",
+                        subpaths.len(),
+                        subpaths.iter().map(|(p, _)| p.len()).sum::<usize>(),
+                        fill.is_some(),
+                        stroke.is_some()
+                    ),
                 };
                 buf.push_str(&format!(
-                    "#{i} {} x={:.0} y={:.0} w={:.0} h={:.0} op={:.2} fixed={} z={:?} clip={:?}\n",
-                    kind, it.x, it.y, it.w, it.h, it.opacity, it.fixed, it.z, it.clip
+                    "#{i} {} x={:.0} y={:.0} w={:.0} h={:.0} op={:.2} fixed={} sticky={:?} z={:?} clip={:?}\n",
+                    kind, it.x, it.y, it.w, it.h, it.opacity, it.fixed, it.sticky.is_some(), it.z, it.clip
                 ));
             }
             std::fs::write(&path, buf).ok();

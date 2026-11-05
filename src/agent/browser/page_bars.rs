@@ -988,6 +988,7 @@ mod tests {
             fixed: false,
             out_of_flow: false,
             layer: 1,
+            sticky: None,
         }
     }
 
@@ -1007,6 +1008,7 @@ mod tests {
             fixed: false,
             out_of_flow: false,
             layer: 1,
+            sticky: None,
         }
     }
 

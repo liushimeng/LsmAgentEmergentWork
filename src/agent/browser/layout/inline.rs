@@ -1199,7 +1199,7 @@ impl<'a> LayoutCtx<'a> {
             buf.force_break();
             return;
         }
-        if super::helpers::is_replaced_tag_name(&tag) {
+        if super::helpers::is_replaced_tag(node) {
             let (iw, ih, _isrc) = self.replaced_size(node, style, avail_w, None);
             let atomic = InlineAtomic::new(
                 node.clone(),
@@ -1385,7 +1385,7 @@ impl<'a> LayoutCtx<'a> {
             // 第 44 轮:行内替换元素(<img>/<svg>/<canvas>/<iframe>)走**行内原子盒**
             // 路径 —— 参与行宽、断行与基线对齐(此前只抬高行高,宽度不占位、
             // 盒顶对齐行顶,且换行后仍停在段首)。
-            if super::helpers::is_replaced_tag_name(&tag) {
+            if super::helpers::is_replaced_tag(&child) {
                 let (iw, ih, _isrc) = self.replaced_size(&child, &child_style, avail_w, None);
                 let atomic = InlineAtomic::new(
                     child.clone(),
@@ -1452,6 +1452,7 @@ impl<'a> LayoutCtx<'a> {
                     fixed: self.fixed_depth > 0,
                     out_of_flow: false,
                     layer: self.layer_for(&child_style),
+                    sticky: None,
                 });
             }
             self.collect_inline(&child, &child_style, buf, depth + 1, child_x, avail_w, tf, row);

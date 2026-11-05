@@ -14,7 +14,10 @@ mod measure;
 mod page_sel;
 mod grid;
 mod helpers;
+mod media_controls;
 mod position;
+mod sticky;
+mod svg_paint;
 mod table;
 mod top_layer;
 mod widgets;
@@ -349,6 +352,7 @@ pub fn compute_full(
         pending_margin_bottom: 0.0,
         intrinsic: false,
         positioned_layer: 0,
+        sticky_marks: Vec::new(),
     };
     let body = doc
         .root()
@@ -409,6 +413,8 @@ pub fn compute_full(
     ctx.borders.sort_by_key(|b| b.z_index);
     ctx.shadows.sort_by_key(|s| s.z_index);
     // 阶段六:显示列表终排(z 分层 → DFS 先序 → 同元素通道序)。
+    // 第 50 轮:先求解 sticky 吸附参数(需要 boxes 定包含块底界)。
+    sticky::resolve(&mut ctx);
     let mut display_items = std::mem::take(&mut ctx.display);
     display::sort_items(&mut display_items);
     // 页高钳制(第 178 轮):布局几何的任何非有限/超界值在收尾归零标不可见,
@@ -458,6 +464,7 @@ pub fn compute_full(
                     fixed: false,
                     out_of_flow: false,
             layer: 0,
+            sticky: None,
                 });
             };
             if let Some(bg) = style.background {
@@ -545,6 +552,9 @@ pub(crate) struct LayoutCtx<'a> {
     /// 绘制层:定位元素(position != static)及其子树按 CSS 2.1 附录 E 第 8 步
     /// 绘制在常规流内容之上。布局子树时置 1,离开后还原。
     pub(crate) positioned_layer: u8,
+    /// 第 50 轮:sticky 子树登记(进入 push / 块级分支退出回填,
+    /// 收尾由 `sticky::resolve` 求解吸附参数)。
+    pub(crate) sticky_marks: Vec<sticky::StickyMark>,
 }
 
 impl<'a> LayoutCtx<'a> {
@@ -602,6 +612,7 @@ impl<'a> LayoutCtx<'a> {
             fixed: self.fixed_depth > 0,
             out_of_flow: false,
             layer: self.layer_for(style),
+            sticky: None,
         });
         let thumb_h = (h * visible).max(8.0).min(h);
         let thumb_y = y + (h - thumb_h) * ratio;
@@ -623,6 +634,7 @@ impl<'a> LayoutCtx<'a> {
             fixed: self.fixed_depth > 0,
             out_of_flow: false,
             layer: self.layer_for(style),
+            sticky: None,
         });
     }
 
@@ -655,6 +667,8 @@ impl<'a> LayoutCtx<'a> {
     }
 
     /// Canvas 已有真实 PNG 时覆盖能力占位;未产生像素时仍保留 CanvasNote。
+    /// 第 50 轮:svg 在此先走矢量形状发射(有形状时撤 MediaFrameNote 占位),
+    /// 全部替换元素建盒路径(块级/行内原子/flex/grid/absolute)共用本钩子。
     fn emit_canvas_pixels(
         &mut self,
         node: &NodeRef,
@@ -665,6 +679,9 @@ impl<'a> LayoutCtx<'a> {
         w: f64,
         h: f64,
     ) {
+        self.emit_svg_shapes(node, style, seq, x, y, w, h);
+        // 第 50 轮:video/audio 带 controls 属性 → 静态控件条(悬浮,不占布局)。
+        self.emit_media_controls(node, style, seq, x, y, w, h);
         if !document::tag_name(node).eq_ignore_ascii_case("canvas") || !style_visible(style) {
             return;
         }
@@ -687,6 +704,7 @@ impl<'a> LayoutCtx<'a> {
             fixed: self.fixed_depth > 0,
             out_of_flow: false,
             layer: self.layer_for(style),
+            sticky: None,
         });
     }
 
@@ -753,6 +771,7 @@ impl<'a> LayoutCtx<'a> {
             fixed: is_fixed,
             out_of_flow: false,
             layer,
+            sticky: None,
         };
         for layer in &style.box_shadow {
             self.display.push(base(DisplayKind::Shadow {
@@ -840,6 +859,7 @@ impl<'a> LayoutCtx<'a> {
             fixed: self.fixed_depth > 0,
             out_of_flow: false,
             layer: self.positioned_layer,
+            sticky: None,
         });
     }
 
@@ -878,6 +898,7 @@ impl<'a> LayoutCtx<'a> {
                 fixed: self.fixed_depth > 0,
                 out_of_flow: false,
             layer: self.positioned_layer,
+            sticky: None,
             });
         }
         for kind in [
@@ -906,6 +927,7 @@ impl<'a> LayoutCtx<'a> {
                 fixed: self.fixed_depth > 0,
                 out_of_flow: false,
             layer: self.positioned_layer,
+            sticky: None,
             });
         }
         // 阴影层(先声明在下):每层一个 TextShadow 项,排在本体之前绘制。
@@ -932,6 +954,7 @@ impl<'a> LayoutCtx<'a> {
                 fixed: self.fixed_depth > 0,
                 out_of_flow: false,
             layer: self.positioned_layer,
+            sticky: None,
             });
         }
         self.display.push(DisplayItem {
@@ -954,6 +977,7 @@ impl<'a> LayoutCtx<'a> {
             fixed: self.fixed_depth > 0,
             out_of_flow: false,
             layer: self.positioned_layer,
+            sticky: None,
         });
     }
 
@@ -1216,6 +1240,11 @@ impl<'a> LayoutCtx<'a> {
 
     /// 媒体/嵌入固有尺寸:优先已解码的 poster/data 图,缺省 300×150。
     pub(crate) fn media_natural_size(&self, node: &NodeRef) -> (f64, f64) {
+        // 第 50 轮:audio[controls] 是细条播放器,不是 300×150 视频框
+        //(真浏览器一致);无 controls 的 audio 在 is_replaced_tag 处已隐藏。
+        if document::tag_name(node).eq_ignore_ascii_case("audio") {
+            return (300.0, 30.0);
+        }
         self.media_image_src(node)
             .and_then(|src| self.images.natural(&src))
             .unwrap_or((300.0, 150.0))
@@ -1461,6 +1490,7 @@ impl<'a> LayoutCtx<'a> {
             fixed: self.fixed_depth > 0,
             out_of_flow: false,
             layer: self.positioned_layer,
+            sticky: None,
         });
     }
 
@@ -1636,8 +1666,9 @@ impl<'a> LayoutCtx<'a> {
                 self.pending_margin_bottom = 0.0;
                 let by = self.y + gap;
                 let visible = style_visible(&style);
-                // relative/sticky 整体偏移(不影响占位)。
-                let (dx, dy) = if matches!(style.pos.position.as_str(), "relative" | "sticky") {
+                // relative 整体偏移(不影响占位);sticky 第 50 轮起走吸附,
+                // inset 不再当偏移用。
+                let (dx, dy) = if style.pos.position == "relative" {
                     relative_offset(&style, width, if cb.3 == UNKNOWN_CB_H { 0.0 } else { cb.3 })
                 } else {
                     (0.0, 0.0)
@@ -1716,6 +1747,26 @@ impl<'a> LayoutCtx<'a> {
                 // 阶段六:元素先序 seq 与子树显示项标记(组效果回补区间)。
                 let seq = self.next_seq();
                 let mark_display = self.display.len();
+                // 第 50 轮:sticky 子树登记(块级分支退出处回填几何,
+                // 收尾由 sticky::resolve 求解吸附参数;inset 语义 = 吸附
+                // 阈值而非偏移,故下方 relative 偏移分支不含 sticky)。
+                let sticky_enter = if style.pos.position == "sticky"
+                    && (style.pos.top.is_some() || style.pos.bottom.is_some())
+                {
+                    self.sticky_marks.push(sticky::StickyMark {
+                        start_seq: seq,
+                        end_seq: seq,
+                        top: style.pos.top,
+                        bottom: style.pos.bottom,
+                        static_y: 0.0,
+                        outer_h: 0.0,
+                        viewport_h: self.viewport_h,
+                        cb_selector: Document::stable_selector(parent),
+                    });
+                    true
+                } else {
+                    false
+                };
                 // 相邻兄弟外边距折叠(CSS 2.1 8.3.1):间隙取折叠值而非求和。
                 let gap = collapse_margin(self.pending_margin_bottom, style.margin_top);
                 self.pending_margin_bottom = 0.0;
@@ -1948,9 +1999,11 @@ impl<'a> LayoutCtx<'a> {
                     out_of_flow: false, rides_frame: false,});
                 // 边框/外阴影绘制指令(不占几何;relative 偏移需同步平移)。
                 push_border_and_shadow(self, &style, bx, start_y, bw, box_h);
-                // 阶段三:relative/sticky 整体偏移(不影响占位):先平移子树几何,
+                // 阶段三:relative 整体偏移(不影响占位):先平移子树几何,
                 // 再以**偏移后**盒矩形做组回补与自身发射 —— 变换原点随之正确。
-                let (rdx, rdy) = if matches!(style.pos.position.as_str(), "relative" | "sticky") {
+                // (第 50 轮:sticky 的 inset 是吸附阈值而非偏移,改走光栅期
+                // 吸附平移,不再并入 relative 偏移。)
+                let (rdx, rdy) = if style.pos.position == "relative" {
                     relative_offset(&style, width, if cb.3 == UNKNOWN_CB_H { 0.0 } else { cb.3 })
                 } else {
                     (0.0, 0.0)
@@ -2003,6 +2056,15 @@ impl<'a> LayoutCtx<'a> {
                 float::finish(self, placement, &mut floats, &mut inline_row);
                 if style.float != "none" {
                     self.pending_margin_bottom = float_saved_pending;
+                }
+                // 第 50 轮:sticky 登记回填(seq 半开区间 + 静态几何;
+                // 兄弟在此之后分配更高 seq,天然不在区间内)。
+                if sticky_enter {
+                    if let Some(m) = self.sticky_marks.last_mut() {
+                        m.end_seq = self.seq;
+                        m.static_y = start_y;
+                        m.outer_h = box_h;
+                    }
                 }
                 continue;
             }

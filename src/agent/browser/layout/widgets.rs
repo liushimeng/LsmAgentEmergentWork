@@ -1189,6 +1189,7 @@ impl<'a> LayoutCtx<'a> {
         fixed: self.fixed_depth > 0,
         out_of_flow: false,
         layer: self.layer_for(style),
+        sticky: None,
     });
 }
 
@@ -1220,6 +1221,7 @@ pub(crate) fn emit_widget_glyph(
         fixed: self.fixed_depth > 0,
         out_of_flow: false,
         layer: self.layer_for(style),
+        sticky: None,
     });
 }
 }

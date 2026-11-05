@@ -228,10 +228,14 @@ pub(crate) fn rasterize(
         // `position: fixed`:盒坐标以**视口**为原点(布局层对 fixed 取包含块
         // (0,0,vw,vh)),与普通项的页面原点不同系 —— 这里必须把滚动量归零,
         // 否则固定控件会随页面滚动平移(地图缩放控件/工具栏一滚就跑位)。
+        // 第 50 轮:sticky 子树按滚动量现算吸附平移,与滚动偏移同一通道,
+        // 页面滚动不触发重排。画布位置 = 页坐标 - 滚动量 + 吸附位移,
+        // 即等效滚动量 = scroll_y - shift。
+        let sticky_dy = item.sticky.as_ref().map_or(0.0, |s| s.shift(scroll_y));
         let (item_sx, item_sy) = if item.fixed {
             (0.0, 0.0)
         } else {
-            (scroll_x, scroll_y)
+            (scroll_x, scroll_y - sticky_dy)
         };
         let mapper = Mapper::new(item, item_sx, item_sy);
         // 局部盒:文本类按内容宽度(字形逐字绘制,盒宽取文本宽)。
@@ -316,6 +320,17 @@ pub(crate) fn rasterize(
             DisplayKind::WidgetGlyph { glyph, open, color } => {
                 draw_widget_glyph(pixmap, &sc, &mapper, item, *glyph, *open, *color);
             }
+            DisplayKind::SvgShape {
+                subpaths,
+                fill,
+                stroke,
+                stroke_w,
+                cap_round,
+            } => {
+                draw_svg_shape(
+                    pixmap, &sc, &mapper, item, subpaths, *fill, *stroke, *stroke_w, *cap_round,
+                );
+            }
         }
     }
 }
@@ -394,6 +409,12 @@ fn glyph_contains(
             // 滑块拇指:竖向圆角条(盒高由布局给定,此处只判横向占比)。
             (nx - 0.5).abs() <= 0.26 && ny >= 0.06 && ny <= 0.94
         }
+        WidgetGlyphKind::PlayTriangle => {
+            // 播放三角:右指实心三角形(左顶点在 0.1,底边在 0.9)。
+            let t = ((nx - 0.1) / 0.8).clamp(0.0, 1.0);
+            let half = 0.42 * t;
+            t > 0.0 && (ny - 0.5).abs() <= half
+        }
         WidgetGlyphKind::CalendarIcon => {
             // 日历:外框 + 顶栏 + 上下两条装订短线。
             let frame = nx >= 0.12 && nx <= 0.88 && ny >= 0.16 && ny <= 0.86;
@@ -443,6 +464,163 @@ fn dist_segment(px: f64, py: f64, x0: f64, y0: f64, x1: f64, y1: f64) -> f64 {
     let qx = x0 + t * dx;
     let qy = y0 + t * dy;
     ((px - qx).powi(2) + (py - qy).powi(2)).sqrt()
+}
+
+/// 第 50 轮:SVG 形状光栅化。
+///
+/// 点集为元素内容盒局部坐标(item.x/y 为内容盒原点,页坐标系)。填充走
+/// 2×2 超采样扫描判定(evenodd / 非零卷绕),描边走距离场(1px 羽化,
+/// butt/round cap);填充先画、描边后画(SVG 语义)。
+#[allow(clippy::too_many_arguments)]
+fn draw_svg_shape(
+    pixmap: &mut Pixmap,
+    sc: &Scissor,
+    mapper: &Mapper,
+    item: &DisplayItem,
+    subpaths: &[(Vec<(f64, f64)>, bool)],
+    fill: Option<(([u8; 3], u8), bool)>,
+    stroke: Option<([u8; 3], u8)>,
+    stroke_w: f64,
+    cap_round: bool,
+) {
+    if subpaths.is_empty() {
+        return;
+    }
+    let has_fill = fill.is_some();
+    let has_stroke = stroke.is_some() && stroke_w > 0.0;
+    if !has_fill && !has_stroke {
+        return;
+    }
+    // 局部坐标 bbox → 画布 scissor(描边外扩半宽 + 羽化)。
+    let (mut x0, mut y0, mut x1, mut y1) =
+        (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for (pts, _) in subpaths {
+        for p in pts {
+            x0 = x0.min(p.0);
+            y0 = y0.min(p.1);
+            x1 = x1.max(p.0);
+            y1 = y1.max(p.1);
+        }
+    }
+    let half = if has_stroke { stroke_w / 2.0 + 1.0 } else { 0.0 };
+    let rect = mapper.scissor_of(
+        sc,
+        item.x + x0 - half,
+        item.y + y0 - half,
+        (x1 - x0) + half * 2.0,
+        (y1 - y0) + half * 2.0,
+    );
+    if rect.empty() {
+        return;
+    }
+    let ((fr, fg, fb), fa, evenodd) = match fill {
+        Some(((c, a), e)) => ((c[0], c[1], c[2]), a, e),
+        None => ((0, 0, 0), 0, false),
+    };
+    let (sr, sg, sb) = stroke.map(|(c, _)| (c[0], c[1], c[2])).unwrap_or((0, 0, 0));
+    let sa = stroke.map(|(_, a)| a).unwrap_or(0);
+    let hw = stroke_w / 2.0;
+    let samples: [(f64, f64); 4] = [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)];
+    let w = pixmap.width() as i64;
+    let pixels = pixmap.pixels_mut();
+    for py in rect.y0..rect.y1 {
+        for px in rect.x0..rect.x1 {
+            let mut fill_cov = 0.0f64;
+            let mut stroke_cov = 0.0f64;
+            for (ox, oy) in samples {
+                // 画布亚像素 → 页坐标局部(与 Mapper::local 同式,含逆变换)。
+                let cx = px as f64 + ox + mapper.scroll_x;
+                let cy = py as f64 + oy + mapper.scroll_y;
+                let (lx, ly) = match mapper.inv {
+                    None => (cx, cy),
+                    Some(m) => (m.a * cx + m.c * cy + m.e, m.b * cx + m.d * cy + m.f),
+                };
+                let sx = lx - item.x;
+                let sy = ly - item.y;
+                if has_fill && fill_contains(subpaths, sx, sy, evenodd) {
+                    fill_cov += 0.25;
+                }
+                if has_stroke {
+                    stroke_cov += 0.25 * stroke_coverage(subpaths, sx, sy, hw, cap_round);
+                }
+            }
+            if fill_cov > 0.0 {
+                let a = (fa as f64 / 255.0 * fill_cov * item.opacity * 255.0).round() as u8;
+                blend_pixel(pixels, w, px, py, fr, fg, fb, a);
+            }
+            if stroke_cov > 0.0 {
+                let a = (sa as f64 / 255.0 * stroke_cov * item.opacity * 255.0).round() as u8;
+                blend_pixel(pixels, w, px, py, sr, sg, sb, a);
+            }
+        }
+    }
+}
+
+/// 扫描线点在多边形内判定(evenodd 交叉计数 / nonzero 卷绕数,跨全部子路径)。
+fn fill_contains(subpaths: &[(Vec<(f64, f64)>, bool)], x: f64, y: f64, evenodd: bool) -> bool {
+    let mut winding = 0i32;
+    let mut crossings = 0i32;
+    for (pts, _) in subpaths {
+        let n = pts.len();
+        if n < 2 {
+            continue;
+        }
+        for i in 0..n {
+            let a = pts[i];
+            let b = pts[(i + 1) % n];
+            if (a.1 <= y) != (b.1 <= y) {
+                let t = (y - a.1) / (b.1 - a.1);
+                let cx = a.0 + t * (b.0 - a.0);
+                if cx > x {
+                    crossings += 1;
+                    winding += if b.1 > a.1 { 1 } else { -1 };
+                }
+            }
+        }
+    }
+    if evenodd {
+        crossings % 2 == 1
+    } else {
+        winding != 0
+    }
+}
+
+/// 描边覆盖(距离场):到各段最短距离 ≤ 半宽,1px 羽化;闭合子路径补
+/// 闭合段,round cap 额外计端点圆。
+fn stroke_coverage(
+    subpaths: &[(Vec<(f64, f64)>, bool)],
+    x: f64,
+    y: f64,
+    half_w: f64,
+    cap_round: bool,
+) -> f64 {
+    let mut best = f64::INFINITY;
+    for (pts, closed) in subpaths {
+        let n = pts.len();
+        if n < 2 {
+            continue;
+        }
+        for i in 0..n - 1 {
+            let d = dist_segment(x, y, pts[i].0, pts[i].1, pts[i + 1].0, pts[i + 1].1);
+            if d < best {
+                best = d;
+            }
+        }
+        if *closed {
+            let d = dist_segment(x, y, pts[n - 1].0, pts[n - 1].1, pts[0].0, pts[0].1);
+            if d < best {
+                best = d;
+            }
+        } else if cap_round {
+            for p in [pts[0], pts[n - 1]] {
+                let d = ((x - p.0).powi(2) + (y - p.1).powi(2)).sqrt();
+                if d < best {
+                    best = d;
+                }
+            }
+        }
+    }
+    (half_w + 0.5 - best).clamp(0.0, 1.0)
 }
 
 /// 背景填充:纯色圆角矩形或渐变(渐变按像素求值,支持圆角、裁剪与 transform)。

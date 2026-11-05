@@ -25,12 +25,15 @@ pub mod security;
 /// 显示器尺寸探测(headed 查看器视口夹紧,避免窗口超出屏幕)。
 pub mod screen;
 pub mod storage;
+pub mod svg;
 pub mod style;
 pub mod urlutil;
 pub mod view;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod svg_tests;
 
 use std::collections::HashMap;
 use std::sync::Arc;

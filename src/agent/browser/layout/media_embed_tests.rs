@@ -213,3 +213,81 @@ fn 空alt不画占位() {
         "空 alt 不应画任何占位文本"
     );
 }
+
+// ---------- 第 50 轮:媒体控件条 ----------
+
+#[test]
+fn video带controls画播放三角与进度条() {
+    let html = "<html><body><video id='v' width='320' height='180' controls></video></body></html>";
+    let doc = Document::parse(html, "https://a.test/");
+    let lay = compute(&doc, 800.0, &font());
+    assert!(
+        lay.display.iter().any(|it| matches!(
+            it.kind,
+            super::super::render::display::DisplayKind::WidgetGlyph {
+                glyph: super::super::render::display::WidgetGlyphKind::PlayTriangle,
+                ..
+            }
+        )),
+        "video[controls] 必须画播放三角"
+    );
+    // 进度条轨道:条底部区域应有半透明白 Background。
+    let v = box_of(&lay, "video");
+    let track = lay.display.iter().any(|it| match &it.kind {
+        super::super::render::display::DisplayKind::Background { fill } => {
+            it.y > v.1 + v.3 - 30.0 && it.h < 6.0 && it.w > 40.0
+        }
+        _ => false,
+    });
+    assert!(track, "video[controls] 应画进度条轨道");
+}
+
+#[test]
+fn video无controls不画控件条() {
+    let html = "<html><body><video id='v' width='320' height='180'></video></body></html>";
+    let doc = Document::parse(html, "https://a.test/");
+    let lay = compute(&doc, 800.0, &font());
+    assert!(
+        !lay.display.iter().any(|it| matches!(
+            it.kind,
+            super::super::render::display::DisplayKind::WidgetGlyph {
+                glyph: super::super::render::display::WidgetGlyphKind::PlayTriangle,
+                ..
+            }
+        )),
+        "无 controls 属性不得画控件条"
+    );
+}
+
+#[test]
+fn audio带controls为300x30细条() {
+    let html = "<html><body><audio id='a' controls></audio></body></html>";
+    let doc = Document::parse(html, "https://a.test/");
+    let lay = compute(&doc, 800.0, &font());
+    let a = box_of(&lay, "audio");
+    assert!(
+        (a.2 - 300.0).abs() < 1.0 && (a.3 - 30.0).abs() < 1.0,
+        "audio[controls] 应为 300×30 控件条,实际 {a:?}"
+    );
+    assert!(
+        lay.display.iter().any(|it| matches!(
+            it.kind,
+            super::super::render::display::DisplayKind::WidgetGlyph {
+                glyph: super::super::render::display::WidgetGlyphKind::PlayTriangle,
+                ..
+            }
+        )),
+        "audio[controls] 必须画播放三角"
+    );
+}
+
+#[test]
+fn audio无controls不建盒() {
+    let html = "<html><body><audio id='a'></audio></body></html>";
+    let doc = Document::parse(html, "https://a.test/");
+    let lay = compute(&doc, 800.0, &font());
+    assert!(
+        !lay.boxes.iter().any(|b| b.tag.eq_ignore_ascii_case("audio")),
+        "audio 无 controls 应 UA 隐藏,不建替换盒"
+    );
+}
