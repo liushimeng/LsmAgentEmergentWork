@@ -85,7 +85,7 @@ LsmAgentBrowser 已有「HTML 解析 → CSS 计算 → 布局 → 显示列表 
 | 图片 alt | ✅🆕（第 49 轮） | 可访问名用 alt；**加载失败于内容盒内画 alt 文本占位**（`alt` 非空且有尺寸时） |
 | 图片 object-position | ✅🆕（第 49 轮） | 复用 `background-position` 解析；`content_image_paint` 折算偏移 |
 | 画布 canvas | 🆕/✅ | HTML width/height/缺省 300×150 进布局；已有 RGBA 矩形/像素读写/PNG 回写 |
-| Canvas 高级 2D | ⛔ | 路径、文字、渐变、远程图片入 Canvas、WebGL 未实现 |
+| Canvas 高级 2D | 🆕（第 56 轮） | **像素权威迁移宿主光栅化**（`script/canvas_raster.rs`）：路径全量（arc/arcTo/ellipse/贝塞尔 + nonzero/evenodd 填充）、变换（后乘 CTM）、fillText/strokeText/measureText（FontSet 真实度量）、linear/radial 渐变、drawImage（画布互贴 + 图片源懒解码）、阴影、虚线、五种复合模式、save/restore、clip、isPointInPath；`toDataURL` 按像素版本缓存。仍缺：createPattern/Path2D/filter/离屏级联/WebGL/DPR 缩放（见 56 号文档） |
 | 矢量图形 svg | 🟡→✅（第 48 轮几何）→✅（第 50 轮矢量光栅化子集）→✅（第 55 轮渐变/文本/`<image>`） | 形状(rect/circle/ellipse/line/polyline/polygon/path 全指令)、fill/stroke/opacity/fill-rule、transform 链、viewBox/aspect、use/defs 已真实光栅化(50 号文档)；**第 55 轮补 `linearGradient`/`radialGradient`(填充+描边)、`<text>`/`<tspan>`、`<image>`(href 预取 + preserveAspectRatio)**；`filter`/`pattern`/`mask`/`clipPath` 仍缺 |
 | 视频/音频/字幕轨道 | 🟡→✅（第 48 轮）→✅（第 50 轮控件条）→✅（第 55 轮 poster 真实绘制） | video/object/embed 替换式几何 + poster/data/src 预取 + 占位框；**第 50 轮 `controls` 属性画静态控件条(播放三角/进度/时间)，audio 无 controls UA 隐藏、有 controls 300×30**；**第 55 轮 poster/data/src 已解码时画真实 `Image` 并撤占位(未加载仍保留占位)**；无解码/播放状态；source/track 计入结构内容 |
 | 内联框架 iframe | 🟡→✅（第 48 轮） | 缺省 300×150 + MediaFrameNote 占位；不加载/渲染子文档 |
@@ -172,5 +172,6 @@ cargo test --no-fail-fast
    ~~`border-spacing`/`caption-side`~~（第 49 轮已完成）。
 4. dialog top-layer/::backdrop/焦点圈禁。
 5. ~~SVG 子集光栅化~~（第 50 轮已完成）；~~SVG 渐变/文本/`<image>`~~（第 55 轮已完成，`filter` 仍缺）；~~video poster 静态显示~~（第 55 轮已落地）；iframe 子文档隔离仍非目标。
-6. Shadow DOM 与动画帧同步；~~sticky 真吸附~~（第 50 轮视口 top/bottom 已落地，容器内吸附仍缺）。
+6. Shadow DOM 与动画帧同步；~~sticky 真吸附~~（第 50 轮视口 top/bottom 已落地，容器内吸附仍缺）；CSS `transition`/`@keyframes` 帧同步仍未实现（下一轮候选）。
 7. dialog 焦点圈禁（top-layer/::backdrop 第 41/42 轮已落地）。
+8. ~~Canvas 高级 2D（路径/文字/渐变/图像源）~~（第 56 轮已落地，见 56 号文档）；createPattern/Path2D/WebGL 仍缺。

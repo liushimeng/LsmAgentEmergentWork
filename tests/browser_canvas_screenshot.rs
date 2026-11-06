@@ -92,3 +92,104 @@ async fn canvas像素与验证卡几何进入真实截图() {
     assert_eq!(image.get_pixel(cx, cy).0, [0, 255, 0, 255], "Canvas 中心像素未进入截图:({cx},{cy}) geo={geo}");
     exec(&tool, json!({"action":"close","page_id":page_id})).await;
 }
+
+/// 第 56 轮:Canvas 2D 路径(圆环描边)/渐变/文字经宿主光栅化进入真实截图。
+#[tokio::test]
+async fn canvas路径渐变文字进入真实截图() {
+    std::env::set_var("LAEW_ALLOW_PRIVATE_ENDPOINT", "1");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else { break };
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                loop {
+                    let Ok(n) = socket.read(&mut tmp).await else { return };
+                    if n == 0 { return }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") { break }
+                }
+                let body = r##"<!doctype html><html><head><style>
+                html,body{margin:0}#wrap{padding:20px;background:#ffffff}
+                #c{width:160px;height:90px;display:block}
+                </style></head><body><div id="wrap"><canvas id="c" width="160" height="90"></canvas></div>
+                <script>
+                var c = document.getElementById('c');
+                var x = c.getContext('2d');
+                var g = x.createLinearGradient(0, 0, 160, 0);
+                g.addColorStop(0, '#ff2200');
+                g.addColorStop(1, '#0033ff');
+                x.fillStyle = g;
+                x.fillRect(0, 0, 160, 30);
+                x.beginPath();
+                x.arc(45, 60, 20, 0, Math.PI * 2);
+                x.lineWidth = 6;
+                x.strokeStyle = '#00cc44';
+                x.stroke();
+                x.font = 'bold 14px sans-serif';
+                x.fillStyle = '#802010';
+                x.fillText('LAEW', 100, 65);
+                </script>
+                </body></html>"##;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    let base = format!("http://{}", addr);
+    let tool = McpWebLsmBrowserUseTool;
+    let open = exec(
+        &tool,
+        json!({"action":"open","url":base,"mode":"hidden","reuse":false,"viewport":{"width":1280,"height":800}}),
+    )
+    .await;
+    assert_eq!(open["code"], 0, "{open}");
+    let page_id = open["data"]["page_id"].as_str().unwrap().to_string();
+
+    let geometry = exec(
+        &tool,
+        json!({"action":"control","page_id":page_id,"control_action":"eval_js","params":{"script":"(function(){var r=document.getElementById('c').getBoundingClientRect();return JSON.stringify({x:r.x,y:r.y,w:r.width,h:r.height});})()"}}),
+    )
+    .await;
+    let result = geometry["data"]["result"].as_str().unwrap_or("{}");
+    let geo: Value = serde_json::from_str(result).unwrap_or_else(|_| panic!("几何结果非法:{geometry}"));
+    assert!((geo["w"].as_f64().unwrap() - 160.0).abs() < 2.0, "canvas 几何:{geo}");
+    assert!((geo["h"].as_f64().unwrap() - 90.0).abs() < 2.0, "canvas 几何:{geo}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("canvas56.png");
+    let shot = exec(
+        &tool,
+        json!({"action":"control","page_id":page_id,"control_action":"screenshot","params":{"save_path":path.to_string_lossy(),"full_page":false}}),
+    )
+    .await;
+    assert_eq!(shot["code"], 0, "{shot}");
+    assert!(path.exists(), "截图应真实落盘:{shot}");
+    let bytes = std::fs::read(&path).unwrap();
+    let image = image::load_from_memory(&bytes).expect("截图 PNG 应可解码").to_rgba8();
+
+    let ox = geo["x"].as_f64().unwrap().round() as i32;
+    let oy = geo["y"].as_f64().unwrap().round() as i32;
+    let at = |lx: i32, ly: i32| -> [u8; 4] {
+        let px = (ox + lx).clamp(0, image.width() as i32 - 1) as u32;
+        let py = (oy + ly).clamp(0, image.height() as i32 - 1) as u32;
+        image.get_pixel(px, py).0
+    };
+    // 渐变左端偏红、右端偏蓝;圆环描边偏绿。
+    let left = at(8, 10);
+    assert!(left[0] > 180 && left[2] < 90, "渐变左端应偏红:{left:?} geo={geo}");
+    let right = at(152, 10);
+    assert!(right[2] > 150 && right[0] < 90, "渐变右端应偏蓝:{right:?} geo={geo}");
+    let ring = at(45, 40);
+    assert!(ring[1] > 120, "圆环描边应偏绿:{ring:?} geo={geo}");
+    // 截图无 alpha 通道语义:圆环中心孔应露出页面白底(无绿)。
+    let hole = at(45, 60);
+    assert!(hole[0] as u32 + hole[1] as u32 + hole[2] as u32 > 660, "圆环中心孔应近白:{hole:?} geo={geo}");
+    exec(&tool, json!({"action":"close","page_id":page_id})).await;
+}

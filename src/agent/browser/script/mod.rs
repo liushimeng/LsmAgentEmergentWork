@@ -6,6 +6,7 @@
 
 pub mod amd_fill;
 pub mod canvas_js;
+pub mod canvas_raster;
 pub mod diag;
 pub mod dom_ops;
 pub mod env_js;

@@ -289,6 +289,15 @@ impl ThreadRuntime {
             NativeFunction::from_fn_ptr(native_canvas_png_raw),
         )
         .map_err(|e| format!("注册 Canvas PNG 原始像素函数失败:{e}"))?;
+        // 第 56 轮:Canvas 2D 宿主光栅化单一分发入口。
+        // JS 薄壳(canvas_js.rs)把全部绘制命令序列化成 JSON 指令进来,
+        // 像素/路径/渐变权威在 canvas_raster.rs 的线程本地状态里。
+        ctx.register_global_callable(
+            js_string!("__lsmCv"),
+            3,
+            NativeFunction::from_fn_ptr(native_lsm_cv),
+        )
+        .map_err(|e| format!("注册 Canvas 光栅化入口失败:{e}"))?;
         // ToObject 调试探针必须在 PRELUDE 求值前决定是否安装(默认不安装,
         // 包装内建方法会改变属性身份,不能常驻)。
         let trace_to_obj = std::env::var("LAEW_JS_TRACE_TOOBJ")
@@ -1179,6 +1188,122 @@ fn encode_canvas_png(width: u32, height: u32, rgba: &[u8]) -> JsResult<JsValue> 
 
 fn canvas_error(message: String) -> boa_engine::JsError {
     boa_engine::JsError::from_native(boa_engine::JsNativeError::error().with_message(message))
+}
+
+/// 第 56 轮:Canvas 2D 宿主光栅化分发入口。
+/// 参数:`__lsmCv(key, opJsonString, extraTypedArray?)`;返回 JSON 字符串
+/// 或 `Uint8Array`(get_pixels)。
+fn native_lsm_cv(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    use boa_engine::object::builtins::JsUint8Array;
+    let key = args
+        .get_or_undefined(0)
+        .to_string(ctx)?
+        .to_std_string_escaped();
+    let op_json = args
+        .get_or_undefined(1)
+        .to_string(ctx)?
+        .to_std_string_escaped();
+    let extra: Option<Vec<u8>> = args
+        .get(2)
+        .filter(|v| !v.is_null_or_undefined())
+        .and_then(|v| v.as_object())
+        .and_then(|o| JsUint8Array::from_object(o).ok())
+        .and_then(|a| a.to_vec(ctx).ok());
+    let op: Value =
+        serde_json::from_str(&op_json).unwrap_or_else(|_| serde_json::json!({"op": "?"}));
+    let fetch = |url: &str| fetch_image_bytes(url);
+    match super::canvas_raster::handle(&key, &op, extra.as_deref(), &fetch) {
+        super::canvas_raster::CvOut::Json(v) => Ok(JsValue::from(JsString::from(v.to_string()))),
+        super::canvas_raster::CvOut::Pixels(p) => {
+            JsUint8Array::from_iter(p, ctx).map(Into::into).map_err(|_| {
+                canvas_error("Canvas 像素返回失败(内存不足?)".to_string())
+            })
+        }
+    }
+}
+
+/// 取回图片源字节:`data:` 本地解码(base64 或 percent),`http(s)` 走
+/// 同 SSRF/TLS 门禁的阻塞 fetch(图片目的地指纹头,15s 超时)。
+fn fetch_image_bytes(url: &str) -> Option<Vec<u8>> {
+    if let Some(rest) = url.strip_prefix("data:") {
+        let comma = rest.find(',')?;
+        let meta = &rest[..comma];
+        let payload = &rest[comma + 1..];
+        return if meta.to_ascii_lowercase().ends_with(";base64") {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(payload.as_bytes())
+                .ok()
+        } else {
+            Some(percent_decode(payload))
+        };
+    }
+    let base = REQ_ENV.with(|c| c.borrow().base_url.clone());
+    let resolved = url::Url::parse(&base)
+        .ok()
+        .and_then(|b| b.join(url).ok())
+        .or_else(|| url::Url::parse(url).ok())?;
+    if !matches!(resolved.scheme(), "http" | "https") {
+        return None;
+    }
+    if crate::agent::safety::url_safety::is_safe_endpoint(resolved.as_str()).is_err() {
+        return None;
+    }
+    let ua = REQ_ENV.with(|c| c.borrow().user_agent.clone());
+    let client = build_blocking_client(crate::llm::tls_insecure_for(resolved.as_str()));
+    let reqctx = super::super::reqctx::RequestContext::subresource(
+        &base,
+        super::super::reqctx::Dest::Image,
+        &ua,
+    );
+    let mut builder = client
+        .get(resolved.as_str())
+        .timeout(Duration::from_millis(15_000));
+    for (k, v) in reqctx.headers(resolved.as_str()) {
+        if let (Ok(name), Ok(val)) = (
+            reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+            reqwest::header::HeaderValue::from_str(&v),
+        ) {
+            builder = builder.header(name, val);
+        }
+    }
+    let resp = builder.send().ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let bytes = resp.bytes().ok()?.to_vec();
+    // 字节上限在 canvas_raster 侧统一判定(与宿主图片管线同源),这里只防极端值。
+    if bytes.len() > 64 * 1024 * 1024 {
+        return None;
+    }
+    Some(bytes)
+}
+
+/// `%XX` 百分号解码(非 base64 的 data: URL 载荷)。
+fn percent_decode(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let hex = |c: u8| -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    };
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
 }
 
 /// 线程内阻塞 HTTP(页面 fetch/XHR 通道)。SSRF/TLS 策略与主网络栈一致。

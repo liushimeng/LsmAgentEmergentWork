@@ -21,6 +21,7 @@ mod widget_tests;
 
 pub use display::{BgFill, ClipRect, DisplayItem, DisplayKind};
 pub(crate) use raster::fit_rect;
+pub(crate) use blur::blur_mask;
 
 use std::collections::HashMap;
 use std::sync::Mutex;

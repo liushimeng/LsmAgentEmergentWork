@@ -2704,3 +2704,182 @@ fn 快照元素_firstElementChild与lastElementChild() {
         reply.outcome.value
     );
 }
+
+// ---------- Canvas 2D 宿主光栅化(第 56 轮) ----------
+
+/// 路径/圆弧/渐变/文字经真实 JS 线程与 `__lsmCv` 原生往返。
+fn canvas_eval(handle: &JsHandle, script: &str) -> String {
+    let reply = eval_on(handle, script, PAGE, "https://a.test/");
+    assert!(reply.outcome.ok, "{:?}", reply.outcome.error);
+    reply.outcome.value
+}
+
+#[test]
+fn canvas_圆弧路径填充与取色() {
+    let handle = JsHandle::spawn();
+    let v = canvas_eval(
+        &handle,
+        r##"(function(){
+            var c = document.createElement("canvas");
+            c.width = 60; c.height = 60;
+            var x = c.getContext("2d");
+            x.beginPath();
+            x.arc(30, 30, 20, 0, Math.PI * 2);
+            x.fillStyle = "#0000ff";
+            x.fill();
+            var d = x.getImageData(30, 30, 1, 1).data;
+            var out = x.getImageData(30, 6, 1, 1).data;
+            return JSON.stringify({r: d[2], a: d[3], outA: out[3]});
+        })()"##,
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&v).unwrap();
+    assert_eq!(parsed["r"], 255, "圆心应为蓝:{v}");
+    assert_eq!(parsed["a"], 255, "圆心应不透明:{v}");
+    assert_eq!(parsed["outA"], 0, "圆外应透明:{v}");
+}
+
+#[test]
+fn canvas_线性渐变与虚线描边() {
+    let handle = JsHandle::spawn();
+    let v = canvas_eval(
+        &handle,
+        r##"(function(){
+            var c = document.createElement("canvas");
+            c.width = 30; c.height = 10;
+            var x = c.getContext("2d");
+            var g = x.createLinearGradient(0, 0, 30, 0);
+            g.addColorStop(0, "#ff0000");
+            g.addColorStop(1, "#0000ff");
+            x.fillStyle = g;
+            x.fillRect(0, 0, 30, 10);
+            var l = x.getImageData(1, 5, 1, 1).data;
+            var r = x.getImageData(28, 5, 1, 1).data;
+            var dashOn = (function(){
+                x.setLineDash([4, 4]);
+                x.beginPath();
+                x.moveTo(0, 5); x.lineTo(29, 5);
+                x.strokeStyle = "#ff00ff"; x.lineWidth = 1;
+                x.stroke();
+                return x.getImageData(1, 5, 1, 1).data[3];
+            })();
+            return JSON.stringify({lr: l[0], lb: l[2], rr: r[0], rb: r[2], dashOn: dashOn});
+        })()"##,
+    );
+    let p: serde_json::Value = serde_json::from_str(&v).unwrap();
+    assert!(p["lr"].as_i64().unwrap() > 240 && p["lb"].as_i64().unwrap() < 32, "渐变左端应红:{v}");
+    assert!(p["rb"].as_i64().unwrap() > 240 && p["rr"].as_i64().unwrap() < 32, "渐变右端应蓝:{v}");
+    assert!(p["dashOn"].as_i64().unwrap() > 0, "虚线亮段应有描边:{v}");
+}
+
+#[test]
+fn canvas_文字度量与填充() {
+    let handle = JsHandle::spawn();
+    let v = canvas_eval(
+        &handle,
+        r##"(function(){
+            var c = document.createElement("canvas");
+            c.width = 120; c.height = 30;
+            var x = c.getContext("2d");
+            x.font = "16px sans-serif";
+            var m = x.measureText("AB12中");
+            x.fillStyle = "#008800";
+            x.fillText("AB12", 4, 20);
+            var d = x.getImageData(5, 10, 20, 10).data;
+            var ink = 0;
+            for (var i = 3; i < d.length; i += 4) if (d[i] > 0) ink++;
+            return JSON.stringify({w: m.width, ink: ink});
+        })()"##,
+    );
+    let p: serde_json::Value = serde_json::from_str(&v).unwrap();
+    assert!(p["w"].as_f64().unwrap() > 20.0, "真实字体度量应显著大于估算:{v}");
+    assert!(p["ink"].as_i64().unwrap() > 0, "fillText 应有像素落墨(或占位条):{v}");
+}
+
+#[test]
+fn canvas_变换裁剪与save_restore() {
+    let handle = JsHandle::spawn();
+    let v = canvas_eval(
+        &handle,
+        r##"(function(){
+            var c = document.createElement("canvas");
+            c.width = 40; c.height = 40;
+            var x = c.getContext("2d");
+            x.save();
+            x.translate(20, 20);
+            x.rotate(Math.PI / 2);
+            x.fillStyle = "#ffffff";
+            x.fillRect(-2, -2, 4, 4);
+            x.restore();
+            var rotPx = x.getImageData(20, 20, 1, 1).data[3];
+            // clip:裁剪矩形外的填充应被拦掉。
+            x.beginPath();
+            x.rect(10, 10, 10, 10);
+            x.clip();
+            x.fillStyle = "#123456";
+            x.fillRect(0, 0, 40, 40);
+            var inClip = x.getImageData(15, 15, 1, 1).data[3];
+            var outClip = x.getImageData(5, 5, 1, 1).data[3];
+            return JSON.stringify({rot: rotPx, inClip: inClip, outClip: outClip});
+        })()"##,
+    );
+    let p: serde_json::Value = serde_json::from_str(&v).unwrap();
+    assert_eq!(p["rot"], 255, "旋转 90° 后的方块中心应落在 (20,20):{v}");
+    assert_eq!(p["inClip"], 255, "clip 区内应有内容:{v}");
+    assert_eq!(p["outClip"], 0, "clip 区外应被裁掉:{v}");
+}
+
+#[test]
+fn canvas_画布互贴与put_getImageData() {
+    let handle = JsHandle::spawn();
+    let v = canvas_eval(
+        &handle,
+        r##"(function(){
+            var a = document.createElement("canvas");
+            a.width = 10; a.height = 10;
+            var ca = a.getContext("2d");
+            ca.fillStyle = "#ff8800";
+            ca.fillRect(0, 0, 10, 10);
+            var b = document.createElement("canvas");
+            b.width = 20; b.height = 20;
+            var cb = b.getContext("2d");
+            cb.drawImage(a, 5, 5);
+            var blit = cb.getImageData(10, 10, 1, 1).data;
+            var outside = cb.getImageData(2, 2, 1, 1).data[3];
+            // putImageData 整体覆盖 + getImageData 读回。
+            var img = cb.createImageData(4, 4);
+            for (var i = 0; i < img.data.length; i += 4) {
+                img.data[i] = 0; img.data[i + 1] = 255; img.data[i + 2] = 0; img.data[i + 3] = 255;
+            }
+            cb.putImageData(img, 0, 0);
+            var put = cb.getImageData(1, 1, 1, 1).data;
+            return JSON.stringify({br: blit[0], bg: blit[1], out: outside, pg: put[1]});
+        })()"##,
+    );
+    let p: serde_json::Value = serde_json::from_str(&v).unwrap();
+    assert_eq!(p["br"], 255, "贴图区红通道:{v}");
+    assert_eq!(p["bg"], 136, "贴图区绿通道:{v}");
+    assert_eq!(p["out"], 0, "贴图外应透明:{v}");
+    assert_eq!(p["pg"], 255, "putImageData 后应有绿:{v}");
+}
+
+#[test]
+fn canvas_to_data_url_第56轮路径画布可解码() {
+    let handle = JsHandle::spawn();
+    let v = canvas_eval(
+        &handle,
+        r##"(function(){
+            var c = document.createElement("canvas");
+            c.width = 40; c.height = 40;
+            var x = c.getContext("2d");
+            x.beginPath();
+            x.moveTo(5, 35); x.lineTo(20, 5); x.lineTo(35, 35); x.closePath();
+            x.fillStyle = "#ee6622";
+            x.fill();
+            var d = c.toDataURL();
+            return d.slice(0, 22) + "|" + d.length;
+        })()"##,
+    );
+    assert!(v.starts_with("data:image/png;base64,"), "{v}");
+    let len: usize = v.rsplit('|').next().unwrap().parse().unwrap();
+    assert!(len > 200, "路径画布应有实质内容:{v}");
+}
