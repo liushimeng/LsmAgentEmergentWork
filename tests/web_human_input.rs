@@ -135,6 +135,53 @@ document.getElementById('d2').addEventListener('drop', function(){
             "200 OK",
             "<html><head><title>下一页</title></head><body><h1>NEXT</h1></body></html>".to_string(),
         ),
+        // P2d:pointer 事件 / hover 兼容事件 / wheel / datalist 联想 /
+        // select 多选 / number 步进 验证页。
+        "/p2d" => (
+            "200 OK",
+            r#"<!doctype html><html><head><title>P2d页</title></head><body>
+<div id="wall" style="width:100px;height:40px;background:#ccc">滚我</div>
+<div id="pa" style="width:100px;height:40px;background:#eee">甲区</div>
+<div id="pb" style="width:100px;height:40px;background:#ddd">乙区</div>
+<div style="position:absolute;left:600px;top:0;width:360px">
+<span id="out"></span><span id="out2"></span><span id="out3"></span>
+<span id="out4"></span><span id="out5"></span><span id="out6"></span>
+</div>
+<input id="ac" list="fruits" style="width:220px;height:30px" value="">
+<datalist id="fruits">
+<option value="Apple" label="苹果"></option>
+<option value="Banana" label="香蕉"></option>
+<option value="app-store"></option>
+<option value="Cherry" label="樱桃"></option>
+</datalist>
+<select id="ms" multiple name="ms" style="width:120px;height:104px">
+<option value="a">甲</option><option value="b">乙</option>
+<option value="c">丙</option><option value="d">丁</option>
+</select>
+<input id="num" type="number" min="0" max="10" step="2" style="width:120px;height:30px">
+<div style="height:2400px"></div>
+<script>
+var l1=[],l2=[],l3=[],l4=[],l5=[],l6=[];
+function put(el,a){a.push(el);document.getElementById(a===l1?'out':a===l2?'out2':a===l3?'out3':a===l4?'out4':a===l5?'out5':'out6').textContent=a.join('|');}
+document.addEventListener('pointerdown',function(e){put('PD:'+e.pointerType+':'+e.pointerId,l1);});
+document.getElementById('wall').addEventListener('pointerdown',function(e){put('WALL:'+e.pointerType,l1);});
+document.addEventListener('pointerup',function(e){put('PU:'+e.pointerType,l1);});
+document.getElementById('wall').addEventListener('click',function(){put('CLK',l1);});
+['pa','pb'].forEach(function(id){
+  document.getElementById(id).addEventListener('pointerover',function(){put('POV-'+id[1].toUpperCase(),l2);});
+  document.getElementById(id).addEventListener('mouseover',function(){put('OV-'+id[1].toUpperCase(),l2);});
+  document.getElementById(id).addEventListener('pointerout',function(){put('POUT-'+id[1].toUpperCase(),l2);});
+  document.getElementById(id).addEventListener('mouseout',function(){put('OUT-'+id[1].toUpperCase(),l2);});
+});
+document.getElementById('wall').addEventListener('wheel',function(e){e.preventDefault();put('WHEEL',l3);});
+document.getElementById('ac').addEventListener('input',function(){put('IN:'+this.value,l4);});
+document.getElementById('ac').addEventListener('change',function(){put('CH:'+this.value,l4);});
+document.getElementById('ms').addEventListener('change',function(){put('MS',l5);});
+document.getElementById('num').addEventListener('input',function(){put('NUM:'+this.value,l6);});
+</script>
+</body></html>"#
+                .to_string(),
+        ),
         p if p.starts_with("/search") => (
             "200 OK",
             format!(
@@ -235,6 +282,11 @@ async fn rect_of(tool: &McpWebLsmBrowserUseTool, pid: &str, selector: &str) -> (
 }
 
 // ---------- 用例 ----------
+
+/// 系统剪贴板互斥:pbcopy/pbpaste 是进程外全局资源,并行用例会互相
+/// 抢走对方刚写入的内容(高负载下偶发「粘贴串值」)。涉及剪贴板的
+/// 用例串行执行,其余用例保持并行。
+static CLIPBOARD_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[tokio::test]
 async fn 人工点击触发页面监听与控件默认行为() {
@@ -513,6 +565,7 @@ async fn 拖拽事件序列_dragstart_drop_dragend() {
 
 #[tokio::test]
 async fn 控件级复制粘贴_整值近似() {
+    let _clip_guard = CLIPBOARD_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
     allow_loopback();
     let base = start_site().await;
     let tool = McpWebLsmBrowserUseTool;
@@ -751,6 +804,7 @@ async fn ctrl全选替换与撤销重做() {
 
 #[tokio::test]
 async fn 选区剪贴板_双击词后剪切粘贴() {
+    let _clip_guard = CLIPBOARD_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
     allow_loopback();
     let base = start_site().await;
     let tool = McpWebLsmBrowserUseTool;
@@ -990,6 +1044,7 @@ async fn getSelection文本_控件选区与页面自由选区() {
 /// 无控件焦点时 Ctrl+C 复制页面自由选区(P2b-4)。
 #[tokio::test]
 async fn 页面选区复制_无焦点时走页面选区() {
+    let _clip_guard = CLIPBOARD_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
     allow_loopback();
     let base = start_site().await;
     let tool = McpWebLsmBrowserUseTool;
@@ -1171,3 +1226,287 @@ async fn 模态dialog焦点锁_Tab不出弹窗() {
     exec(&tool, json!({"action": "close", "page_id": &pid})).await;
 }
 
+
+// ---------- P2d 用例(指针事件 / hover 兼容 / wheel / datalist / 多选 / number) ----------
+
+/// 打开 P2d 验证页并转用户控制态。
+async fn open_p2d(tool: &McpWebLsmBrowserUseTool, base: &str) -> String {
+    let open = exec(
+        tool,
+        json!({"action": "open", "url": format!("{base}/p2d"), "mode": "hidden", "reuse": false}),
+    )
+    .await;
+    assert_eq!(open["code"], 0, "{open}");
+    let pid = open["data"]["page_id"].as_str().unwrap().to_string();
+    web_control::set_state(Engine::Lsm, &pid, ControlState::User, None, "test");
+    pid
+}
+
+/// 带修饰键的人工左键单击。
+async fn human_click_mods(
+    mgr: &LsmBrowserManager,
+    pid: &str,
+    x: f64,
+    y: f64,
+    mods: Mods,
+) -> Value {
+    mgr.handle_human_input(pid, HumanInput::Down { x, y, button: MouseButton::Left, mods }).await;
+    mgr.handle_human_input(pid, HumanInput::Up { x, y, button: MouseButton::Left, mods }).await
+}
+
+fn mods_of(ctrl: bool, shift: bool) -> Mods {
+    Mods { shift, ctrl, alt: false, meta: false }
+}
+
+/// 元素文本(inspect elements 的 text)。
+async fn text_of(tool: &McpWebLsmBrowserUseTool, pid: &str, selector: &str) -> String {
+    let v = exec(
+        tool,
+        json!({"action": "inspect", "page_id": pid, "info": "elements",
+               "params": {"selector": selector}}),
+    )
+    .await;
+    assert_eq!(v["code"], 0, "{v}");
+    v["data"]["text"].as_str().unwrap_or_default().to_string()
+}
+
+#[tokio::test]
+async fn 人工点击派发pointer事件序列() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+    let pid = open_p2d(&tool, &base).await;
+    let mgr = LsmBrowserManager::global();
+
+    // 完整点击序列:pointerdown 先于 mousedown 等价物、pointerup 先于 click,
+    // pointerType/pointerId 可读(只挂 pointer 监听的图表库语义)。
+    let (x, y) = center_of(&tool, &pid, "#wall").await;
+    let out = human_click(&mgr, &pid, x, y).await;
+    assert_eq!(out["clicked"], true, "{out}");
+    let log = text_of(&tool, &pid, "#out").await;
+    assert_eq!(log, "PD:mouse:1|WALL:mouse|PU:mouse|CLK", "pointer 兼容事件序列应按 Chrome 顺序派发:{log}");
+
+    web_control::clear(Engine::Lsm, &pid);
+    exec(&tool, json!({"action": "close", "page_id": &pid})).await;
+}
+
+#[tokio::test]
+async fn hover切换派发mouseover与pointer兼容事件() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+    let pid = open_p2d(&tool, &base).await;
+    let mgr = LsmBrowserManager::global();
+
+    // 移入甲区:pointerover + mouseover;再移到乙区:甲区先 out、乙区后 over。
+    let (ax, ay) = center_of(&tool, &pid, "#pa").await;
+    mgr.handle_human_input(&pid, HumanInput::Move { x: ax, y: ay }).await;
+    let (bx, by) = center_of(&tool, &pid, "#pb").await;
+    mgr.handle_human_input(&pid, HumanInput::Move { x: bx, y: by }).await;
+    let log = text_of(&tool, &pid, "#out2").await;
+    assert_eq!(
+        log, "POV-A|OV-A|POUT-A|OUT-A|POV-B|OV-B",
+        "hover 切换应按 pointerout→mouseout→pointerover→mouseover 派发:{log}"
+    );
+
+    web_control::clear(Engine::Lsm, &pid);
+    exec(&tool, json!({"action": "close", "page_id": &pid})).await;
+}
+
+#[tokio::test]
+async fn wheel事件preventDefault阻止原生滚动() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+    let pid = open_p2d(&tool, &base).await;
+    let mgr = LsmBrowserManager::global();
+
+    // #wall 的 wheel 监听 preventDefault → 页面不滚,但事件已送达。
+    // 并行测试挤 CPU 时 dispatch 往返可能超 800ms 上限(超时按未拦截放行,
+    // 这是设计内的 fail-open),重试至多 5 次拿稳定结论。
+    let (x, y) = center_of(&tool, &pid, "#wall").await;
+    let mut out = json!({});
+    for _ in 0..5 {
+        out = mgr
+            .handle_human_input(&pid, HumanInput::Wheel { x, y, dx: 0.0, dy: -2.0 })
+            .await;
+        if out["mode"] == "js_prevented" {
+            break;
+        }
+    }
+    assert_eq!(out["mode"], "js_prevented", "preventDefault 应拦截原生滚动:{out}");
+    let log = text_of(&tool, &pid, "#out3").await;
+    assert_eq!(log, "WHEEL", "wheel 事件应送达页面监听器:{log}");
+
+    // 无监听区域照常滚动(视口滚动 scrollY 增加)。
+    let (nx, ny) = center_of(&tool, &pid, "#num").await;
+    let out = mgr
+        .handle_human_input(&pid, HumanInput::Wheel { x: nx, y: ny, dx: 0.0, dy: -2.0 })
+        .await;
+    assert!(out["scrollY"].as_f64().unwrap_or(0.0) > 0.0, "未拦截的滚轮应照常滚动视口:{out}");
+
+    web_control::clear(Engine::Lsm, &pid);
+    exec(&tool, json!({"action": "close", "page_id": &pid})).await;
+}
+
+#[tokio::test]
+async fn datalist联想_过滤高亮与应用() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+    let pid = open_p2d(&tool, &base).await;
+    let mgr = LsmBrowserManager::global();
+
+    // 聚焦带 list 的 input → 展开全量建议(datalist option 获得几何)。
+    let (x, y) = center_of(&tool, &pid, "#ac").await;
+    human_click(&mgr, &pid, x, y).await;
+    let v = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": &pid, "info": "elements",
+               "params": {"selector": "datalist#fruits option", "nth": 0}}),
+    )
+    .await;
+    assert_eq!(v["code"], 0, "面板展开时命中项应有几何:{v}");
+    assert_eq!(v["data"]["rect"]["laid_out"], true, "面板展开时命中项应有真实布局:{v}");
+    assert!(v["data"]["rect"]["height"].as_f64().unwrap_or(0.0) > 0.0, "{v}");
+
+    // 键入 app → 只剩 Apple/app-store 两行;↓ 高亮首行;Enter 应用。
+    for ch in ["a", "p", "p"] {
+        key(&mgr, &pid, ch).await;
+    }
+    key(&mgr, &pid, "ArrowDown").await;
+    let out = key(&mgr, &pid, "Enter").await;
+    assert_eq!(out["datalist_applied"], true, "Enter 应应用高亮建议:{out}");
+    let val = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": &pid, "info": "elements",
+               "params": {"selector": "#ac"}}),
+    )
+    .await;
+    assert_eq!(val["data"]["value"], "Apple", "建议值应写入输入框:{val}");
+    let log = text_of(&tool, &pid, "#out4").await;
+    assert!(
+        log.contains("IN:Apple") && log.contains("CH:Apple"),
+        "应用建议应派发 input+change:{log}"
+    );
+
+    // 面板已关:再次聚焦重开(全量),Esc 只关面板不清值。
+    human_click(&mgr, &pid, x, y).await;
+    let out = key(&mgr, &pid, "Escape").await;
+    assert_eq!(out["datalist"], "closed", "Esc 应只关闭联想面板:{out}");
+    let closed = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": &pid, "info": "elements",
+               "params": {"selector": "datalist#fruits option", "nth": 0}}),
+    )
+    .await;
+    assert_eq!(closed["data"]["rect"]["laid_out"], false, "面板关闭后命中项不应再有布局:{closed}");
+
+    // 外部点击 light dismiss:重开后点空白处 → 面板收起。
+    human_click(&mgr, &pid, x, y).await;
+    let (px, py) = center_of(&tool, &pid, "#pa").await;
+    human_click(&mgr, &pid, px, py).await;
+    let closed = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": &pid, "info": "elements",
+               "params": {"selector": "datalist#fruits option", "nth": 0}}),
+    )
+    .await;
+    assert_eq!(closed["data"]["rect"]["laid_out"], false, "点击面板外应 light dismiss:{closed}");
+
+    web_control::clear(Engine::Lsm, &pid);
+    exec(&tool, json!({"action": "close", "page_id": &pid})).await;
+}
+
+#[tokio::test]
+async fn select多选_Ctrl翻转与Shift范围() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+    let pid = open_p2d(&tool, &base).await;
+    let mgr = LsmBrowserManager::global();
+
+    // 列表形态 option 行的几何(nth=1 → 「乙」)。
+    let opt_rect = |n: i64| {
+        let tool = &tool;
+        let pid = pid.clone();
+        async move {
+            let v = exec(
+                tool,
+                json!({"action": "inspect", "page_id": pid, "info": "elements",
+                       "params": {"selector": "#ms option", "nth": n}}),
+            )
+            .await;
+            assert_eq!(v["code"], 0, "{v}");
+            let r = &v["data"]["rect"];
+            (
+                r["x"].as_f64().unwrap() + r["width"].as_f64().unwrap() / 2.0,
+                r["y"].as_f64().unwrap() + r["height"].as_f64().unwrap() / 2.0,
+            )
+        }
+    };
+    let (a_x, a_y) = opt_rect(0).await;
+    let (b_x, b_y) = opt_rect(1).await;
+    let (c_x, c_y) = opt_rect(2).await;
+
+    // 普通点击「乙」→ 独占 {b}。
+    human_click(&mgr, &pid, b_x, b_y).await;
+    // Ctrl+点击「丙」→ 翻转加入 → {b,c}(.value = 首个选中 = b)。
+    human_click_mods(&mgr, &pid, c_x, c_y, mods_of(true, false)).await;
+    let log = text_of(&tool, &pid, "#out5").await;
+    assert_eq!(log, "MS|MS", "前两次点击(普通+Ctrl)各应派发一次 change:{log}");
+
+    // Shift+点击「甲」→ 锚点(丙)到甲的范围 → {a,b,c}。
+    human_click_mods(&mgr, &pid, a_x, a_y, mods_of(false, true)).await;
+    // Ctrl+点击「甲」→ 翻转移除 → {b,c}。
+    human_click_mods(&mgr, &pid, a_x, a_y, mods_of(true, false)).await;
+    // 选中态断言:乙/丙 selected、甲/丁 未选。
+    for (n, want) in [(0, false), (1, true), (2, true), (3, false)] {
+        let v = exec(
+            &tool,
+            json!({"action": "inspect", "page_id": &pid, "info": "elements",
+                   "params": {"selector": "#ms option", "nth": n}}),
+        )
+        .await;
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(
+            v["data"]["state"]["selected"], want,
+            "第 {n} 个 option 的选中态应为 {want}:{v}"
+        );
+    }
+
+    web_control::clear(Engine::Lsm, &pid);
+    exec(&tool, json!({"action": "close", "page_id": &pid})).await;
+}
+
+#[tokio::test]
+async fn number输入方向键步进() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+    let pid = open_p2d(&tool, &base).await;
+    let mgr = LsmBrowserManager::global();
+
+    // 聚焦 number(step=2,min=0,max=10):↑→2、↑→4、↓→2。
+    let (x, y) = center_of(&tool, &pid, "#num").await;
+    human_click(&mgr, &pid, x, y).await;
+    key(&mgr, &pid, "ArrowUp").await;
+    key(&mgr, &pid, "ArrowUp").await;
+    key(&mgr, &pid, "ArrowDown").await;
+    let log = text_of(&tool, &pid, "#out6").await;
+    assert_eq!(log, "NUM:2|NUM:4|NUM:2", "方向键应按 step 步进:{log}");
+    // 连按十次 ↑:钳制在 max=10。
+    for _ in 0..10 {
+        key(&mgr, &pid, "ArrowUp").await;
+    }
+    let v = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": &pid, "info": "elements",
+               "params": {"selector": "#num"}}),
+    )
+    .await;
+    assert_eq!(v["data"]["value"], "10", "步进应钳制在 max:{v}");
+
+    web_control::clear(Engine::Lsm, &pid);
+    exec(&tool, json!({"action": "close", "page_id": &pid})).await;
+}

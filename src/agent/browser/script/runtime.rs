@@ -191,6 +191,7 @@ fn take_reply(req: &mut JsRequest) -> Option<std::sync::mpsc::Sender<JsReply>> {
         JsRequest::RunScripts { reply, .. }
         | JsRequest::Eval { reply, .. }
         | JsRequest::Dispatch { reply, .. }
+        | JsRequest::DispatchSeq { reply, .. }
         | JsRequest::Diag { reply, .. } => Some(reply.clone()),
         JsRequest::Shutdown => None,
     }
@@ -364,6 +365,13 @@ impl ThreadRuntime {
                 nodes,
                 ..
             } => Some(self.dispatch(&selector, &event, payload.as_ref(), &env, &nodes)),
+            JsRequest::DispatchSeq {
+                selector,
+                events,
+                env,
+                nodes,
+                ..
+            } => Some(self.dispatch_seq(&selector, &events, &env, &nodes)),
             JsRequest::Shutdown => None,
         }
     }
@@ -778,6 +786,44 @@ impl ThreadRuntime {
             serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into()),
             serde_json::to_string(event).unwrap_or_else(|_| "\"\"".into()),
             if detail.is_empty() { "null".to_string() } else { detail }
+        );
+        self.eval_quiet(&src);
+        self.timer_budget = MAX_TIMER_CALLBACKS;
+        self.event_wall_ms = 0;
+        self.eval_quiet("__lsmTimerBudget=64");
+        self.event_loop(None);
+        self.collect(None)
+    }
+
+    /// P2d:pointer/mouse 兼容事件**成对批量**派发(一次 JS 往返发多个事件,
+    /// 顺序保持传入序)。`(事件名, 载荷)` 列表;返回聚合结论。
+    fn dispatch_seq(
+        &mut self,
+        selector: &str,
+        events: &[(String, Option<serde_json::Value>)],
+        env: &PageEnv,
+        nodes: &[SnapshotNode],
+    ) -> JsReply {
+        self.begin_request(env, 0);
+        if let Err(e) = self.refresh(nodes, env) {
+            return JsReply::error(e);
+        }
+        let seq: Vec<String> = events
+            .iter()
+            .map(|(ev, payload)| {
+                let detail = match payload {
+                    Some(v) => serde_json::to_string(v).unwrap_or_else(|_| "null".into()),
+                    None => "null".to_string(),
+                };
+                format!("[{}, {}]",
+                    serde_json::to_string(ev).unwrap_or_else(|_| "\"\"".into()),
+                    detail)
+            })
+            .collect();
+        let src = format!(
+            "__lsmDispatchSeq({}, [{}])",
+            serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into()),
+            seq.join(", ")
         );
         self.eval_quiet(&src);
         self.timer_budget = MAX_TIMER_CALLBACKS;

@@ -71,10 +71,47 @@ pub enum ViewCommand {
     FocusAddrbar,
     /// ⌘/Ctrl+F:切换页面查找模式(39 号 P2c)。
     ToggleFind,
+    /// P2d:人工缩放系数变化(查看器侧已生效,宿主只记账展示——
+    /// `page_health` 如实上报,Agent 能解释「为什么视口变了」)。
+    Zoom(f64),
     /// 查看器窗口被人工关闭(`windowWillClose:` 退出前上报)。
     /// 宿主据此**不自动重生**查看器(不与用户抢窗口);进程意外死亡
     /// (崩溃,无此信号)则按自愈策略重生(见 `bridge::push_frame`)。
     ViewerClosed,
+}
+
+/// P2d:浏览器级缩放档位表(Chrome 同款步进;查看器侧生效)。
+///
+/// 缩放语义 = Chrome:CSS 像素变大、可视 CSS 视口变小(媒体查询重估),
+/// 由查看器把内容区尺寸 ÷ 缩放系数上报为视口实现;帧等比居中绘制天然
+/// 完成放大(既有 letterbox 机制复用)。Agent 截图取证仍是未缩放基准。
+pub(crate) const ZOOM_STEPS: &[f64] = &[0.5, 0.67, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0];
+
+/// P2d:缩放步进(纯函数,双平台共用)。`dir > 0` 放大、`dir < 0` 缩小;
+/// 已在端点返回原值;当前值不在档位表内时先吸附到最近档位再步进。
+pub(crate) fn zoom_step(cur: f64, dir: i32) -> f64 {
+    if !cur.is_finite() || cur <= 0.0 {
+        return 1.0;
+    }
+    let nearest = ZOOM_STEPS
+        .iter()
+        .copied()
+        .min_by(|a, b| {
+            (a - cur).abs().total_cmp(&(b - cur).abs())
+        })
+        .unwrap_or(1.0);
+    match ZOOM_STEPS.iter().position(|&z| z == nearest) {
+        Some(i) => {
+            if dir > 0 {
+                ZOOM_STEPS[(i + 1).min(ZOOM_STEPS.len() - 1)]
+            } else if dir < 0 {
+                ZOOM_STEPS[i.saturating_sub(1)]
+            } else {
+                nearest
+            }
+        }
+        None => nearest,
+    }
 }
 
 /// 解析查看器发来的一行 JSON 命令。非法行返回 None(忽略,不打断通道)。
@@ -122,6 +159,14 @@ pub fn parse_command(line: &str) -> Option<ViewCommand> {
         }
         "focus_addrbar" => Some(ViewCommand::FocusAddrbar),
         "find_toggle" => Some(ViewCommand::ToggleFind),
+        // P2d:人工缩放记账(查看器侧已生效;非法值整行忽略)。
+        "zoom" => {
+            let z = v.get("z")?.as_f64()?;
+            if !z.is_finite() || !(0.25..=4.0).contains(&z) {
+                return None;
+            }
+            Some(ViewCommand::Zoom(z))
+        }
         "viewer_closed" => Some(ViewCommand::ViewerClosed),
         _ => None,
     }
@@ -415,6 +460,37 @@ mod tests {
             parse_command(r#"{"cmd":"viewer_closed"}"#),
             Some(ViewCommand::ViewerClosed)
         );
+    }
+
+    #[test]
+    fn 解析命令_人工缩放() {
+        assert_eq!(
+            parse_command(r#"{"cmd":"zoom","z":1.25}"#),
+            Some(ViewCommand::Zoom(1.25))
+        );
+        assert_eq!(parse_command(r#"{"cmd":"zoom","z":1}"#), Some(ViewCommand::Zoom(1.0)));
+        // 非法值忽略(缺字段 / 越界 / 非数值)。
+        assert_eq!(parse_command(r#"{"cmd":"zoom"}"#), None);
+        assert_eq!(parse_command(r#"{"cmd":"zoom","z":0}"#), None);
+        assert_eq!(parse_command(r#"{"cmd":"zoom","z":8}"#), None);
+        assert_eq!(parse_command(r#"{"cmd":"zoom","z":"big"}"#), None);
+    }
+
+    #[test]
+    fn 缩放档位步进_端点与吸附() {
+        // 基准档位步进。
+        assert_eq!(zoom_step(1.0, 1), 1.1);
+        assert_eq!(zoom_step(1.0, -1), 0.9);
+        assert_eq!(zoom_step(0.9, -1), 0.8);
+        // 端点饱和(不再外推)。
+        assert_eq!(zoom_step(ZOOM_STEPS[0], -1), ZOOM_STEPS[0]);
+        assert_eq!(zoom_step(*ZOOM_STEPS.last().unwrap(), 1), *ZOOM_STEPS.last().unwrap());
+        // 表外当前值先吸附最近档再步进(1.05 ≈ 1.0 → 放大到 1.1)。
+        assert_eq!(zoom_step(1.05, 1), 1.1);
+        // 非法当前值回到 1.0 基准;dir=0 只吸附。
+        assert_eq!(zoom_step(f64::NAN, 1), 1.0);
+        assert_eq!(zoom_step(0.0, 1), 1.0);
+        assert_eq!(zoom_step(1.24, 0), 1.25);
     }
 
     #[test]

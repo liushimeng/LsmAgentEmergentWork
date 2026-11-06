@@ -532,6 +532,10 @@ pub(crate) fn emit_form_control_text(
                 }
                 _ => {}
             }
+            // P2d:datalist 联想面板(text/search/url/tel/email/number 等
+            // 可挂 `list` 的输入框):面板自身按 `data-lsm-datalist-open`
+            // 标记决定是否发射,关闭时零成本。
+            super::top_layer::emit_datalist_panel(ctx, node, style, bx, by, w, h);
         }
         "button" => {
             let text = document::collapse_ws(&node.text_contents());

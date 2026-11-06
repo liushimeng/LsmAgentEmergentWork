@@ -11,3 +11,4 @@
 | [38-查看器跟随页语义与天猫白板根因.md](38-查看器跟随页语义与天猫白板根因.md) | 查看器显示跟随「最近交互页」而非「前台页」；天猫一轮 HITL 白板三根因（前台抢占/心跳盲推/导航无加载帧） |
 | [39-人类鼠标键盘交互与真浏览器输入链路设计.md](39-人类鼠标键盘交互与真浏览器输入链路设计.md) | 查看器页面区真实键鼠：双平台事件捕获 → `cmd:"input"` 协议 → 宿主 `human_input` 管线（控制权闸门/坐标命中/复用 Agent 交互语义）；P2c 页面查找/光标形状/模态焦点锁/侧键；控件全集×实现状态对照 |
 | [54-滚轮回调选择器拼错unrecognized-selector查看器abort.md](54-滚轮回调选择器拼错unrecognized-selector查看器abort.md) | 滚轮回调发不存在选择器 `hasPreciseDeltas`（真名 `hasPreciseScrollingDeltas`）→ NSException 穿越 nounwind 回调 abort 查看器；修复=真名+`respondsToSelector:` 守卫+`ffi_guard` 回调防火墙+选择器单测+意外死亡自愈；「单份 CrashDump+asi 无异常回溯⇔foreign exception」取证口诀 |
+| [56-人类键鼠P2d指针事件联想面板多选与浏览器缩放.md](56-人类键鼠P2d指针事件联想面板多选与浏览器缩放.md) | pointer/wheel/hover 兼容事件派发(成对事件**一次 JS 往返**)、datalist 联想面板、select[multiple] 多选、number 步进、双平台浏览器缩放(视口÷缩放的 Chrome 语义);顺带修 Windows 查看器编译断链、监听器 `this` 绑定、option 命中被 display:none 拦死 |

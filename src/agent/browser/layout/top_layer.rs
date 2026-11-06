@@ -241,3 +241,172 @@ pub(crate) fn emit_select_panel(
     }
     ctx.positioned_layer = prev_layer;
 }
+
+/// P2d:datalist 联想面板:input 下方的浮层建议列表(39 号设计文档)。
+///
+/// 展开态/命中项/高亮行由 `Document::apply_widget_state` 写入的内核私有
+/// 标记承载(input 带 `data-lsm-datalist-open`、命中 option 带
+/// `data-lsm-dl-hit`、input 的 `data-lsm-dl-idx` = 高亮行号),与
+/// `emit_select_panel` 同构:几何/翻转/ElementBox 登记同一套。
+pub(crate) fn emit_datalist_panel(
+    ctx: &mut LayoutCtx<'_>,
+    node: &NodeRef,
+    style: &ComputedStyle,
+    bx: f64,
+    by: f64,
+    w: f64,
+    h: f64,
+) {
+    if document::attr(node, document::ATTR_DATALIST_OPEN).is_none() {
+        return;
+    }
+    let Some(list_id) = document::attr(node, "list").filter(|v| !v.trim().is_empty()) else {
+        return;
+    };
+    // 由 input 上溯到根,再按 id 找 datalist(NodeRef 无文档级查询)。
+    let mut root = node.clone();
+    while let Some(p) = root.parent() {
+        root = p;
+    }
+    let Ok(list) = root.select(&format!("datalist#{list_id}")) else {
+        return;
+    };
+    let Some(list) = list.into_iter().next() else {
+        return;
+    };
+    // 只画带命中标记的 option(DOM 序 = 面板行序)。
+    let hits: Vec<NodeRef> = list
+        .as_node()
+        .select("option")
+        .map(|os| {
+            os.into_iter()
+                .map(|o| o.as_node().clone())
+                .filter(|o| document::attr(o, document::ATTR_DL_HIT).is_some())
+                .collect()
+        })
+        .unwrap_or_default();
+    if hits.is_empty() {
+        return;
+    }
+    // 行数由宿主状态层截断(datalist 上限 10 行,Chrome 同量级),这里照单全画。
+    let rows = hits.len();
+    let highlight: usize = document::attr(node, document::ATTR_DL_IDX)
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(usize::MAX);
+    let panel_w = w.max(60.0);
+    let panel_h = rows as f64 * PANEL_ROW_H + PANEL_PAD * 2.0;
+    let panel_x = bx;
+    let (_, vh) = ctx.viewport();
+    let below_y = by + h;
+    // 视口下缘放不下时向上翻转(与 select 面板同策略)。
+    let panel_y = if below_y + panel_h > vh {
+        (by - panel_h).max(0.0)
+    } else {
+        below_y
+    };
+
+    let prev_layer = ctx.positioned_layer;
+    ctx.positioned_layer = TOP_LAYER;
+
+    // 边框 → 面板底色 → 高亮行 → 文本(value 主列 + label 右列灰字)。
+    ctx.push_widget_fill(style, [110, 110, 110], 255, panel_x - 1.0, panel_y - 1.0, panel_w + 2.0, panel_h + 2.0, None);
+    ctx.push_widget_fill(style, [255, 255, 255], 255, panel_x, panel_y, panel_w, panel_h, None);
+    let size = style.font_size.max(10.0);
+    for (i, opt) in hits.iter().take(rows).enumerate() {
+        let row_y = panel_y + PANEL_PAD + i as f64 * PANEL_ROW_H;
+        let hl = highlight == i;
+        if hl {
+            ctx.push_widget_fill(
+                style,
+                [0, 120, 215],
+                255,
+                panel_x,
+                row_y,
+                panel_w,
+                PANEL_ROW_H,
+                None,
+            );
+        }
+        // 行登记真实几何:点击命中走 ElementBox(与 select 面板同机制)。
+        ctx.boxes.push(super::ElementBox {
+            selector: Document::stable_selector(opt),
+            tag: "option".to_string(),
+            x: panel_x,
+            y: row_y,
+            w: panel_w,
+            h: PANEL_ROW_H,
+            background: style.background,
+            background_alpha: style.background_alpha,
+            visible: style_visible(style) && document::attr(opt, "disabled").is_none(),
+            z_index: style.pos.z_index,
+            out_of_flow: true, rides_frame: false,});
+        let text = document::collapse_ws(&opt.text_contents());
+        let value = document::attr(opt, "value").unwrap_or_else(|| text.clone());
+        let label = document::attr(opt, "label").unwrap_or_default();
+        let disabled = document::attr(opt, "disabled").is_some();
+        let color = if disabled {
+            [150, 150, 150]
+        } else if hl {
+            [255, 255, 255]
+        } else {
+            style.color
+        };
+        let line = TextLine {
+            text: truncate_tail(&value, panel_w * 0.6, size, ctx),
+            x: panel_x + PANEL_PAD,
+            y: row_y + (PANEL_ROW_H - size) / 2.0,
+            size,
+            color,
+            bold: false,
+            visible: style_visible(style),
+            decor: TextDecor::default(),
+            highlight: None,
+        };
+        ctx.emit_text(&line, None, &[]);
+        ctx.lines.push(line);
+        // label 右列(灰字,无 label 时省略;高亮行白字)。
+        if !label.is_empty() {
+            let line = TextLine {
+                text: truncate_tail(&label, panel_w * 0.35, size, ctx),
+                x: panel_x + panel_w - PANEL_PAD - text_w_clamp(&label, panel_w * 0.35, size, ctx),
+                y: row_y + (PANEL_ROW_H - size) / 2.0,
+                size,
+                color: if disabled {
+                    [150, 150, 150]
+                } else if hl {
+                    [220, 240, 255]
+                } else {
+                    [128, 128, 128]
+                },
+                bold: false,
+                visible: style_visible(style),
+                decor: TextDecor::default(),
+                highlight: None,
+            };
+            ctx.emit_text(&line, None, &[]);
+            ctx.lines.push(line);
+        }
+    }
+    ctx.positioned_layer = prev_layer;
+}
+
+/// 文本超宽截断(带省略号近似:直接按预算截字符,供面板双列不互相压盖)。
+fn truncate_tail(text: &str, budget: f64, size: f64, ctx: &LayoutCtx<'_>) -> String {
+    let mut out = String::new();
+    let mut used = 0.0;
+    for ch in text.chars() {
+        let cw = ctx.font().text_width(&ch.to_string(), size);
+        if used + cw > budget {
+            return out;
+        }
+        out.push(ch);
+        used += cw;
+    }
+    out
+}
+
+/// 文本在预算宽度内的实际占宽(右对齐定位用)。
+fn text_w_clamp(text: &str, budget: f64, size: f64, ctx: &LayoutCtx<'_>) -> f64 {
+    let full = ctx.font().text_width(text, size);
+    full.min(budget)
+}

@@ -1390,6 +1390,12 @@ function __mk(n) {
     },
     focus: function () { __push({ type: "focus", selector: n.sel }); },
     blur: function () { __push({ type: "blur", selector: n.sel }); },
+    // 指针捕获(39 号 P2d):d3-drag 等库特性检测 PointerEvent 后会调用
+    // setPointerCapture —— 缺方法会抛错断链。内核无捕获语义(事件本就按
+    // 命中元素派发),提供 no-op stub 防崩。
+    setPointerCapture: function () {},
+    releasePointerCapture: function () {},
+    hasPointerCapture: function () { return false; },
     submit: function () { __push({ type: "submit", selector: n.sel }); },
     dispatchEvent: function (e) {
       var t = String((e && e.type) || e);
@@ -2008,6 +2014,10 @@ function __newEl(tag) {
     },
     focus: function () { __fireDyn(el, "focus"); },
     blur: function () { __fireDyn(el, "blur"); },
+    // 指针捕获 no-op stub(与快照元素同口径,39 号 P2d)。
+    setPointerCapture: function () {},
+    releasePointerCapture: function () {},
+    hasPointerCapture: function () { return false; },
     // 深拷贝:属性 / innerHTML 原文 / 子树都带走(旧实现返回空元素,
     // 站点「建模板 → cloneNode → 挂载」模式克隆出的控件是空壳)。
     cloneNode: function (deep) {
@@ -3897,7 +3907,10 @@ function __fire(sel, type, detail) {
     ev.currentTarget = targetIdx === -2 ? document
       : (targetIdx === -3 ? L.node : __mk(__lsmNodes[targetIdx]));
     handled = true;
-    try { L.fn(ev); } catch (e) { __cerror("listener " + type + ": " + String((e && e.stack) || e)); }
+    // P2d:监听器的 `this` 绑定 currentTarget(浏览器语义;原生写法
+    // `el.addEventListener('input', function(){ this.value })` 依赖此绑定,
+    // 此前 `this` 是 undefined,监听器一读 this.value 就拿到 undefined)。
+    try { L.fn.call(ev.currentTarget, ev); } catch (e) { __cerror("listener " + type + ": " + String((e && e.stack) || e)); }
     if (ev.defaultPrevented) prevented = true;
     if (ev.propagationStopped) break;
   }
@@ -4824,6 +4837,28 @@ function __lsmDispatchDoc(type) {
   var res = __fireDocument(String(type));
   __lsmDispatchResult = res;
   return JSON.stringify(res);
+}
+// P2d:pointer/mouse 兼容事件**同一次往返**派发(39 号设计文档):每个事件
+// 一次往返的开销(快照 refresh + eval + 事件循环泵)在重站上会吃掉
+// 双击/三击的连击窗口 —— pointerdown 与 mousedown 等成对事件合并为
+// 一次调用,顺序仍是指针事件先行(Chrome 兼容事件顺序)。
+function __lsmDispatchSeq(sel, seq) {
+  var handled = false, prevented = false;
+  for (var i = 0; i < seq.length; i++) {
+    var item = seq[i];
+    var d = null;
+    if (item[1]) {
+      try {
+        d = (typeof item[1] === "string") ? JSON.parse(item[1]) : item[1];
+      } catch (e) { d = null; }
+    }
+    var res = __fire(String(sel), String(item[0]), d);
+    if (res.handled) handled = true;
+    if (res.defaultPrevented) prevented = true;
+  }
+  var out = { handled: handled, defaultPrevented: prevented };
+  __lsmDispatchResult = out;
+  return JSON.stringify(out);
 }
 function __lsmReady(state) { document.readyState = String(state); }
 // 宿主侧脚本执行包装:间接 eval(全局作用域)失败时把 e.stack(含行列)回传,

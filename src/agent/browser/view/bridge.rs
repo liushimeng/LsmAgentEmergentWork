@@ -240,6 +240,16 @@ impl LsmBrowserManager {
                 self.apply_view_resize(&page_id, width, height).await;
                 return;
             }
+            ViewCommand::Zoom(z) => {
+                // P2d:人工缩放记账(缩放本身已在查看器侧生效——视口按新系数
+                // 换算另行走 resize);前台页存档,page_health 带出,Agent 能
+                // 解释「为什么视口变小了」。
+                let mut inner = self.inner.lock().await;
+                if let Some(tab) = inner.tabs.get_mut(&page_id) {
+                    tab.human_zoom = z;
+                }
+                return;
+            }
             ViewCommand::Input(_)
             | ViewCommand::ViewerClosed
             | ViewCommand::NewTab

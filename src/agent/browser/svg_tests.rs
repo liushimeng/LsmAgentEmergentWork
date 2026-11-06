@@ -210,7 +210,7 @@ fn 空svg保留能力占位() {
 
 fn render_html(html: &str) -> image::RgbaImage {
     let mut doc = Document::parse(html, "https://a.test/");
-    doc.apply_widget_state(&HashMap::new(), &HashMap::new(), &HashMap::new());
+    doc.apply_widget_state(&HashMap::new(), &HashMap::new(), &HashMap::new(), None);
     let font = FontSet::fallback();
     let lay = layout::compute(&doc, 400.0, &font);
     let pm = font

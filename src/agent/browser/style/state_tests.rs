@@ -15,7 +15,7 @@ fn state_doc(html: &str, values: &[(&str, &str)], open: &[(&str, bool)]) -> Docu
         .iter()
         .map(|(k, v)| ((*k).to_string(), *v))
         .collect();
-    doc.apply_widget_state(&values, &open, &HashMap::new());
+    doc.apply_widget_state(&values, &open, &HashMap::new(), None);
     doc
 }
 
@@ -116,7 +116,7 @@ fn pseudo_doc(html: &str, states: &[(&str, bool, bool)]) -> Document {
             },
         );
     }
-    doc.apply_widget_state(&HashMap::new(), &HashMap::new(), &map);
+    doc.apply_widget_state(&HashMap::new(), &HashMap::new(), &map, None);
     doc
 }
 

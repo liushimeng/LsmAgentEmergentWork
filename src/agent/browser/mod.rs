@@ -282,6 +282,30 @@ pub struct TabState {
     /// Agent 可据此 wait/重试,不再对「组件差一口气装不上」盲探测)。
     pub script_budget_cut: bool,
     pub script_pending: usize,
+    /// P2d:datalist 联想面板状态(`Some` = 面板展开;39 号设计文档)。
+    pub datalist: Option<DatalistState>,
+    /// P2d:select[multiple] 的人工 Shift 范围选择锚点(key = select 稳定
+    /// 选择器,value = 上次普通/Ctrl 点击的 option 下标)。
+    pub select_anchor: HashMap<String, usize>,
+    /// P2d:查看器上报的人工缩放系数(默认 1.0;仅记账展示,不参与渲染
+    /// ——缩放由查看器侧实现,Agent 截图取证仍是未缩放基准)。
+    pub human_zoom: f64,
+}
+
+/// P2d:datalist 联想面板状态(39 号设计文档)。
+///
+/// 命中项与高亮行由 `document_with_state` 落成内核私有属性
+/// (`data-lsm-datalist-open`/`data-lsm-dl-hit`/`data-lsm-dl-idx`),
+/// 布局层 `top_layer::emit_datalist_panel` 只认 DOM 标记(与 select
+/// 展开面板同哲学)。
+#[derive(Debug, Clone)]
+pub struct DatalistState {
+    /// 联想输入框(稳定选择器)。
+    pub input_sel: String,
+    /// 命中项:(option 稳定选择器, value, label),按 DOM 序。
+    pub hits: Vec<(String, String, String)>,
+    /// 高亮行下标(`usize::MAX` = 无高亮)。
+    pub highlight: usize,
 }
 
 impl TabState {
@@ -296,7 +320,12 @@ impl TabState {
     /// 解析当前 HTML 并落入运行时控件覆盖，供样式/布局/快照共享同一状态。
     pub fn document_with_state(&self) -> document::Document {
         let mut doc = document::Document::parse(&self.html, &self.url);
-        doc.apply_widget_state(&self.form_values, &self.widget_open, &self.pseudo_states);
+        doc.apply_widget_state(
+            &self.form_values,
+            &self.widget_open,
+            &self.pseudo_states,
+            self.datalist.as_ref(),
+        );
         doc.apply_caret_state(&self.form_caret);
         doc.apply_scroll_state(&self.scroll_offsets);
         if let Some(sel) = &self.page_sel {
@@ -1043,7 +1072,7 @@ impl LsmBrowserManager {
         .await;
         let t_images = std::time::Instant::now();
         let mut doc = document::Document::parse(&html, &resp.final_url);
-        doc.apply_widget_state(&pipeline.form_values, &HashMap::new(), &HashMap::new());
+        doc.apply_widget_state(&pipeline.form_values, &HashMap::new(), &HashMap::new(), None);
         let title = pipeline.title.clone().unwrap_or_else(|| doc.title());
         let media = style::MediaCtx::new(viewport.width as f64, viewport.height as f64);
         let layout = layout::compute_full(
@@ -1162,6 +1191,9 @@ impl LsmBrowserManager {
             webgl_asked: pipeline.webgl_asked,
             script_budget_cut: pipeline.budget_cut,
             script_pending: pipeline.pending_scripts,
+            datalist: None,
+            select_anchor: HashMap::new(),
+            human_zoom: 1.0,
         };
         inner.tabs.insert(page_id.clone(), tab);
         // 阶段四第二步：CSP 策略与页面源写入安全上下文（供 fetch/XHR connect-src 门禁）。
@@ -1405,7 +1437,7 @@ impl LsmBrowserManager {
         )
         .await;
         let mut doc = document::Document::parse(&html, &resp.final_url);
-        doc.apply_widget_state(&pipeline.form_values, &HashMap::new(), &HashMap::new());
+        doc.apply_widget_state(&pipeline.form_values, &HashMap::new(), &HashMap::new(), None);
         let title = pipeline.title.clone().unwrap_or_else(|| doc.title());
         let media = style::MediaCtx::new(viewport_w as f64, viewport_h as f64);
         let layout = layout::compute_full(&doc, viewport_w as f64, &self.font, &media, &images_out.sizes);

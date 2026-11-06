@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 
 use super::style::{ComputedStyle, StyleEngine};
 use super::urlutil;
+use super::DatalistState;
 
 /// 块级标签:文本抽取时插入换行。
 const BLOCK_TAGS: &[&str] = &[
@@ -44,6 +45,12 @@ pub const ATTR_PSEUDO_ACTIVE: &str = "data-lsm-active";
 
 /// `select` 展开态标记(内核私有):布局层据此铺出浮层 option 面板。
 pub const ATTR_SELECT_OPEN: &str = "data-lsm-select-open";
+/// P2d:datalist 联想面板展开标记(落在 input 上,内核私有)。
+pub const ATTR_DATALIST_OPEN: &str = "data-lsm-datalist-open";
+/// P2d:datalist 命中项标记(落在 datalist 内匹配 option 上,内核私有)。
+pub const ATTR_DL_HIT: &str = "data-lsm-dl-hit";
+/// P2d:datalist 高亮行下标(落在 input 上,值为行号或 usize::MAX,内核私有)。
+pub const ATTR_DL_IDX: &str = "data-lsm-dl-idx";
 /// 第 46 轮:元素级滚动偏移的内核私有标记(落到临时解析树,不入页面 HTML)。
 pub const ATTR_SCROLL_TOP: &str = "data-lsm-scroll-top";
 /// 39 号 P2a:文本光标位置(char 索引)的内核私有标记,布局层据此画光标条。
@@ -302,6 +309,7 @@ impl Document {
         form_values: &HashMap<String, String>,
         widget_open: &HashMap<String, bool>,
         pseudo_states: &HashMap<String, PseudoFlags>,
+        datalist: Option<&DatalistState>,
     ) {
         for node in self.select("*").unwrap_or_default() {
             let tag = tag_name(&node);
@@ -313,6 +321,23 @@ impl Document {
                 set_state_attr(&mut attrs, ATTR_PSEUDO_FOCUS, flags.focus);
                 set_state_attr(&mut attrs, ATTR_PSEUDO_FOCUS_VISIBLE, flags.focus_visible);
                 set_state_attr(&mut attrs, ATTR_PSEUDO_ACTIVE, flags.active);
+            }
+            // P2d:datalist 联想面板状态(开面板/命中项/高亮行)落内核私有属性。
+            if let Some(dl) = datalist {
+                if tag == "input" && stable == dl.input_sel {
+                    let mut attrs = node.as_element().unwrap().attributes.borrow_mut();
+                    attrs.insert(ATTR_DATALIST_OPEN.to_string(), String::new());
+                    attrs.insert(
+                        ATTR_DL_IDX.to_string(),
+                        dl.highlight.to_string(),
+                    );
+                } else if tag == "option" && dl.hits.iter().any(|(s, _, _)| *s == stable) {
+                    node.as_element()
+                        .unwrap()
+                        .attributes
+                        .borrow_mut()
+                        .insert(ATTR_DL_HIT.to_string(), String::new());
+                }
             }
             if let Some(open) = widget_open.get(&stable) {
                 if matches!(tag.as_str(), "details" | "dialog") {
@@ -377,12 +402,25 @@ impl Document {
                     let Ok(options) = node.select("option") else {
                         continue;
                     };
+                    // P2d:select[multiple] 的运行时值是 CSV(逗号连接,DOM 序),
+                    // 集合内全部 option 置 `selected`(不互斥);单选仍单值互斥。
+                    let multi = attr(&node, "multiple").is_some();
+                    let multi_set: std::collections::HashSet<&str> = if multi {
+                        value.split(',').filter(|t| !t.is_empty()).collect()
+                    } else {
+                        std::collections::HashSet::new()
+                    };
                     for opt in options {
                         let opt = opt.as_node().clone();
                         let opt_value = attr(&opt, "value")
                             .unwrap_or_else(|| collapse_ws(&opt.text_contents()));
+                        let hit = if multi {
+                            multi_set.contains(opt_value.as_str())
+                        } else {
+                            opt_value == *value
+                        };
                         let mut attrs = opt.as_element().unwrap().attributes.borrow_mut();
-                        if opt_value == *value {
+                        if hit {
                             attrs.insert("selected", String::new());
                         } else {
                             attrs.remove("selected");
@@ -743,6 +781,35 @@ impl Document {
                             .or_else(|| attr(n, "value"))
                             .unwrap_or_else(|| "on".to_string()),
                     ));
+                }
+                continue;
+            }
+            // P2d:select[multiple] 序列化 = 每个选中值一对(Chrome
+            // URLSearchParams 语义);运行时值是 CSV,或按 `selected` 属性遍历。
+            if tag == "select" && attr(n, "multiple").is_some() {
+                let values: Vec<String> = overrides
+                    .get(&selector)
+                    .map(|v| {
+                        v.split(',')
+                            .filter(|t| !t.is_empty())
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_else(|| {
+                        n.select("option")
+                            .map(|os| {
+                                os.into_iter()
+                                    .filter(|o| attr(o.as_node(), "selected").is_some())
+                                    .map(|o| {
+                                        let text = collapse_ws(&o.as_node().text_contents());
+                                        attr(o.as_node(), "value").unwrap_or(text)
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    });
+                for v in values {
+                    fields.push((name.clone(), v));
                 }
                 continue;
             }
@@ -1673,7 +1740,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        d.apply_widget_state(&HashMap::new(), &HashMap::new(), &pseudo);
+        d.apply_widget_state(&HashMap::new(), &HashMap::new(), &pseudo, None);
         let node = d.first("#half").unwrap().unwrap();
         let v = d.element_json(&node, 0, 1, None, &HashMap::new(), &pseudo, None);
         assert_eq!(v["state"]["indeterminate"], true);

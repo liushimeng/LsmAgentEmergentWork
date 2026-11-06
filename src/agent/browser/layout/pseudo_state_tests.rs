@@ -27,7 +27,7 @@ fn state_doc(html: &str, states: &[(&str, bool, bool)]) -> Document {
             },
         );
     }
-    doc.apply_widget_state(&HashMap::new(), &HashMap::new(), &map);
+    doc.apply_widget_state(&HashMap::new(), &HashMap::new(), &map, None);
     doc
 }
 

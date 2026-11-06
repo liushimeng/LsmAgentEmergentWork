@@ -259,6 +259,11 @@ impl LsmBrowserManager {
                 api::apply_js_reply(self, pid, &reply).await;
             }
         }
+        // P2d:datalist 联想面板键盘路由(↓/↑ 高亮、Enter 应用、Esc 关闭);
+        // 返回 None(普通键入 / 无高亮 Enter)则继续默认语义。
+        if let Some(out) = self.datalist_key(pid, key, mods).await {
+            return out;
+        }
         match key {
             "Enter" if ctx.text_like && ctx.ftag == "textarea" && ctx.editable => {
                 let sel = ctx.focused.clone().unwrap();
@@ -335,6 +340,8 @@ impl LsmBrowserManager {
                     }
                 }
                 api::relayout_and_push(self, pid).await;
+                // P2d:焦点移入带 list 的 input → 展开联想;移出 → 收起。
+                self.on_focus_maybe_datalist(pid, &next).await;
                 return json!({"key": key, "moved": true, "focused": next, "backward": mods.shift});
             }
             "Backspace" if ctx.editable => {
@@ -383,6 +390,11 @@ impl LsmBrowserManager {
                 }
                 if ctx.ftag == "input" && ctx.ftyp == "range" {
                     return self.step_range(pid, ctx.focused.as_deref().unwrap_or(""), dir).await;
+                }
+                // P2d:number 的上下方向键 = 步进(Chrome 语义),不走光标分支;
+                // 左右方向键仍是移光标。
+                if ctx.ftag == "input" && ctx.ftyp == "number" {
+                    return self.step_number(pid, ctx.focused.as_deref().unwrap_or(""), dir).await;
                 }
                 if ctx.text_like {
                     let sel = ctx.focused.clone().unwrap();
@@ -587,6 +599,20 @@ impl LsmBrowserManager {
             api::apply_js_reply(self, pid, &reply).await;
         }
         api::relayout_and_push(self, pid).await;
+        // P2d:键入后刷新 datalist 联想(面板开着才重过滤;普通输入零开销)。
+        {
+            let open = {
+                let inner = self.inner.lock().await;
+                inner
+                    .tabs
+                    .get(pid)
+                    .map(|t| t.datalist.as_ref().map(|d| d.input_sel == selector))
+                    .unwrap_or(None)
+            };
+            if open == Some(true) {
+                self.refresh_datalist(pid).await;
+            }
+        }
         json!({"via": via, "selector": selector, "value_len": value.chars().count(), "caret": caret.pos})
     }
 
@@ -683,6 +709,50 @@ impl LsmBrowserManager {
                 .and_then(|v| v.parse::<f64>().ok())
                 .unwrap_or(min + (max - min) / 2.0);
             let next = (cur + dir as f64 * step).clamp(min.min(max), max.max(min));
+            format_num(next)
+        };
+        self.set_runtime_value(pid, selector, &next_val).await;
+        if let Some(reply) = api::js_dispatch_bounded(self, pid, selector, "input").await {
+            api::apply_js_reply(self, pid, &reply).await;
+        }
+        api::relayout_and_push(self, pid).await;
+        json!({"selector": selector, "value": next_val})
+    }
+
+    /// number 步进(P2d,ArrowUp/Down):min/max/step 钳制,派发 `input`。
+    /// 与 range 不同,number 的 min/max 缺省是**无界**(range 缺省 0..100),
+    /// 空值起步从 0(Chrome 语义)。
+    async fn step_number(&self, pid: &str, selector: &str, dir: i32) -> Value {
+        let next_val = {
+            let inner = self.inner.lock().await;
+            let Some(tab) = inner.tabs.get(pid) else {
+                return json!({"ignored": true});
+            };
+            let doc = tab.document_with_state();
+            let Some(node) = doc.select(selector).ok().and_then(|v| v.into_iter().next()) else {
+                return json!({"ignored": true});
+            };
+            let min = document::attr(&node, "min")
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(f64::NEG_INFINITY);
+            let max = document::attr(&node, "max")
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(f64::INFINITY);
+            let step = document::attr(&node, "step")
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|s| *s > 0.0)
+                .unwrap_or(1.0);
+            let cur = tab
+                .form_values
+                .get(selector)
+                .cloned()
+                .or_else(|| document::attr(&node, "value"))
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .unwrap_or(0.0)
+                .clamp(min, max);
+            // 键路由层的方向约定:ArrowUp = -1(select 上一个选项语义)。
+            // number/range 的浏览器语义是 ArrowUp **递增**,这里取反。
+            let next = (cur - dir as f64 * step).clamp(min, max);
             format_num(next)
         };
         self.set_runtime_value(pid, selector, &next_val).await;

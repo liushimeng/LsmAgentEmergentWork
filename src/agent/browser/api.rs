@@ -6,6 +6,7 @@
 use serde_json::{json, Value};
 
 use super::document::{self, Document};
+use super::human_input::{self, pointer_payload};
 use super::js::{self, JsPageMeta};
 use super::script;
 use super::{EngineError, EngineResult, LsmBrowserManager};
@@ -156,6 +157,10 @@ fn p_u64(params: &Value, key: &str) -> Option<u64> {
         v.as_u64()
             .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
     })
+}
+
+fn p_flag(params: &Value, key: &str) -> bool {
+    params.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
 
 fn p_f64(params: &Value, key: &str) -> Option<f64> {
@@ -461,6 +466,67 @@ pub(crate) async fn js_dispatch_bounded_with(
     )
     .await
     .unwrap_or(None)
+}
+
+/// P2d:成对批量派发(pointer/mouse 兼容事件一次往返;超时 2s 同口径)。
+/// 返回聚合结论(any handled / any prevented)。
+pub(crate) async fn js_dispatch_seq_bounded(
+    mgr: &LsmBrowserManager,
+    pid: &str,
+    selector: &str,
+    events: Vec<(&str, Option<Value>)>,
+) -> Option<script::JsReply> {
+    let (handle, env, nodes) = {
+        let mut inner = mgr.inner.lock().await;
+        if let Some(tab) = inner.tabs.get_mut(pid) {
+            mgr.ensure_layout_locked(tab);
+        }
+        let inner = &*inner;
+        let Some(tab) = inner.tabs.get(pid) else {
+            return None;
+        };
+        let handle = tab.js.clone()?;
+        let mut env = script::build_env(
+            inner,
+            &tab.url,
+            &tab.title,
+            &tab.user_agent,
+            (tab.viewport.width, tab.viewport.height),
+            &tab.session_storage,
+            tab.security.get_csp(&tab.url),
+        );
+        env.scroll_x = tab.scroll_x;
+        env.scroll_y = tab.scroll_y;
+        env.resources = tab.network.iter().rev().take(120).rev().cloned().collect();
+        fill_selection_env(&mut env, tab);
+        let doc = tab_document(tab);
+        let rects = tab.layout.rect_map();
+        let nodes = doc.snapshot_nodes_with_rects((tab.viewport.width, tab.viewport.height), &rects);
+        (handle, env, nodes)
+    };
+    let sel = selector.to_string();
+    let events: Vec<(String, Option<Value>)> = events
+        .into_iter()
+        .map(|(e, p)| (e.to_string(), p))
+        .collect();
+    let result = tokio::task::spawn_blocking(move || {
+        handle.request(|tx| script::JsRequest::DispatchSeq {
+            selector: sel,
+            events,
+            env,
+            nodes,
+            reply: tx,
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(reply)) => Some(reply),
+        Ok(Err(e)) if e.contains("已退出") => {
+            mgr.clear_js(pid).await;
+            None
+        }
+        _ => None,
+    }
 }
 
 /// 应用 JS 回复:DOM 动作落到 `tab.html` 并重算布局;存储/Cookie/标题/滚动/台账合并。
@@ -1335,6 +1401,7 @@ pub(crate) async fn click_inner(
         reset_form,
         select_toggle,
         option_pick,
+        datalist_pick,
         open_selects,
     ) = {
         let inner = mgr.inner.lock().await;
@@ -1377,7 +1444,11 @@ pub(crate) async fn click_inner(
             })
             .unwrap_or_default();
         let mut select_toggle = None;
-        let mut option_pick = None;
+        // (select_sel, value, label, index, P2d 多选上下文:(选项全集, 初始选中下标集))。
+        let mut option_pick: Option<(String, String, String, usize, Option<(Vec<String>, Vec<usize>)>)> =
+            None;
+        // P2d:datalist 命中项点击 = (input_sel, 建议值)。
+        let mut datalist_pick: Option<(String, String)> = None;
         if tag == "select"
             && document::attr(node, "multiple").is_none()
             && !super::layout::select_is_list(node)
@@ -1398,9 +1469,64 @@ pub(crate) async fn click_inner(
                                 let label = document::collapse_ws(&opt.as_node().text_contents());
                                 let value = document::attr(opt.as_node(), "value")
                                     .unwrap_or_else(|| label.clone());
-                                option_pick = Some((select_sel, value, label, i));
+                                // P2d:多选 select 的修饰键语义(普通独占 / Ctrl
+                                // 翻转 / Shift 范围),携带选项全集供收口重算 CSV。
+                                let multi = if document::attr(&select, "multiple").is_some() {
+                                    let values: Vec<String> = select
+                                        .select("option")
+                                        .map(|os| {
+                                            os.into_iter()
+                                                .map(|o| {
+                                                    let t = document::collapse_ws(
+                                                        &o.as_node().text_contents(),
+                                                    );
+                                                    document::attr(o.as_node(), "value")
+                                                        .unwrap_or(t)
+                                                })
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
+                                    let initial: Vec<usize> = select
+                                        .select("option")
+                                        .map(|os| {
+                                            os.into_iter()
+                                                .enumerate()
+                                                .filter(|(_, o)| {
+                                                    document::attr(o.as_node(), "selected")
+                                                        .is_some()
+                                                })
+                                                .map(|(i, _)| i)
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
+                                    Some((values, initial))
+                                } else {
+                                    None
+                                };
+                                option_pick = Some((select_sel, value, label, i, multi));
                                 break;
                             }
+                        }
+                    }
+                }
+            } else if let Some(dl) = document::closest_tag(node, "datalist") {
+                // P2d:datalist 面板命中项点击 = 应用建议值到关联 input。
+                if let Some(id) = document::attr(&dl, "id").filter(|v| !v.trim().is_empty()) {
+                    let open_input = tab.datalist.as_ref().filter(|d| {
+                        doc.select(&format!("input[list='{id}']"))
+                            .ok()
+                            .and_then(|v| v.into_iter().next())
+                            .map(|n| Document::stable_selector(&n) == d.input_sel)
+                            .unwrap_or(false)
+                    });
+                    if let Some(state) = open_input {
+                        let hit = state
+                            .hits
+                            .iter()
+                            .find(|(s, _, _)| *s == stable)
+                            .cloned();
+                        if let Some((_, value, _)) = hit {
+                            datalist_pick = Some((state.input_sel.clone(), value));
                         }
                     }
                 }
@@ -1503,6 +1629,7 @@ pub(crate) async fn click_inner(
             reset_form,
             select_toggle,
             option_pick,
+            datalist_pick,
             open_selects,
         )
     };
@@ -1564,9 +1691,37 @@ pub(crate) async fn click_inner(
             }
             _ => None,
         };
+        // P2d:click 与 pointer 兼容事件**同一次往返**(指针事件先行):
+        // · Agent 原子点击(kind=="click")补 pointerdown/pointerup;
+        // · human 点击把 pointerup 挂在 click 前(human_down 已发 pointerdown)。
+        let mut click_seq: Vec<(&str, Option<Value>)> = Vec::new();
+        if kind == "click" {
+            let (cx, cy) = (
+                p_f64(params, "client_x").unwrap_or(rect.0),
+                p_f64(params, "client_y").unwrap_or(rect.1),
+            );
+            click_seq.push((
+                "pointerdown",
+                Some(pointer_payload(cx, cy, human_input::MouseButton::Left, true, 1)),
+            ));
+            click_seq.push((
+                "pointerup",
+                Some(pointer_payload(cx, cy, human_input::MouseButton::Left, false, 1)),
+            ));
+        } else if let Some(pc) = params.get("pointer_pre_click") {
+            let (cx, cy) = (
+                pc.get("x").and_then(Value::as_f64).unwrap_or(rect.0),
+                pc.get("y").and_then(Value::as_f64).unwrap_or(rect.1),
+            );
+            click_seq.push((
+                "pointerup",
+                Some(pointer_payload(cx, cy, human_input::MouseButton::Left, false, 1)),
+            ));
+        }
+        click_seq.push(("click", click_payload));
         let dispatch = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            js_dispatch(mgr, pid, &stable, "click", click_payload),
+            js_dispatch_seq_bounded(mgr, pid, &stable, click_seq),
         )
         .await
         .unwrap_or(None);
@@ -1624,7 +1779,57 @@ pub(crate) async fn click_inner(
         }
     }
     // option 点击 = 选中所属 select 并收起面板;change 事件按浏览器语义发给 select。
-    if let Some((select_sel, value, label, index)) = option_pick {
+    if let Some((select_sel, value, label, index, multi_ctx)) = option_pick {
+        // P2d:多选 select(Ctrl 翻转 / Shift 范围 / 普通独占),值以 CSV
+        //(DOM 序,逗号连接)进 form_values;`apply_widget_state` 据此给
+        // 集合内全部 option 置 `selected`。事件对齐 Chrome:input + change。
+        if let Some((values, initial)) = multi_ctx {
+            let ctrl = p_flag(params, "multi_ctrl");
+            let shift = p_flag(params, "multi_shift");
+            let csv = {
+                let inner = mgr.inner.lock().await;
+                let Some(tab) = inner.tabs.get(pid) else {
+                    return Ok(out);
+                };
+                let current: Vec<String> = tab
+                    .form_values
+                    .get(&select_sel)
+                    .map(|v| {
+                        v.split(',')
+                            .filter(|t| !t.is_empty())
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_else(|| {
+                        initial
+                            .iter()
+                            .filter_map(|&i| values.get(i).cloned())
+                            .collect()
+                    });
+                let last_anchor = tab.select_anchor.get(&select_sel).copied();
+                super::human_input::multi_pick(&values, &current, index, ctrl, shift, last_anchor)
+                    .join(",")
+            };
+            {
+                let mut inner = mgr.inner.lock().await;
+                if let Some(tab) = inner.tabs.get_mut(pid) {
+                    tab.form_values.insert(select_sel.clone(), csv.clone());
+                    tab.select_anchor.insert(select_sel.clone(), index);
+                }
+            }
+            for ev in ["input", "change"] {
+                if let Some(reply) = js_dispatch_bounded(mgr, pid, &select_sel, ev).await {
+                    apply_js_reply(mgr, pid, &reply).await;
+                }
+            }
+            out["selected"] = json!(true);
+            out["selector"] = json!(select_sel);
+            out["multi_values"] =
+                json!(csv.split(',').filter(|t| !t.is_empty()).collect::<Vec<_>>());
+            out["index"] = json!(index);
+            relayout_and_push(mgr, pid).await;
+            return Ok(out);
+        }
         {
             let mut inner = mgr.inner.lock().await;
             if let Some(tab) = inner.tabs.get_mut(pid) {
@@ -1646,6 +1851,19 @@ pub(crate) async fn click_inner(
         out["index"] = json!(index);
         out["dropdown_closed"] = json!(true);
         out["js_events"] = json!(js_events);
+        relayout_and_push(mgr, pid).await;
+        return Ok(out);
+    }
+
+    // P2d:datalist 命中项点击 = 应用建议值到关联 input(input+change)并关面板。
+    if let Some((input_sel, value)) = datalist_pick {
+        let applied = mgr.apply_datalist_value(pid, &input_sel, &value).await;
+        out["datalist_applied"] = json!(true);
+        out["selector"] = json!(input_sel);
+        out["value"] = json!(value);
+        if let Some(v) = applied.get("value") {
+            out["value"] = v.clone();
+        }
         relayout_and_push(mgr, pid).await;
         return Ok(out);
     }
@@ -1674,6 +1892,22 @@ pub(crate) async fn click_inner(
     }
 
     // 点击 select 面板之外 = light dismiss,收起所有已展开面板。
+    // P2d:datalist 联想面板同语义 —— 点击面板项(input 本身)之外即收起;
+    // 面板项点击已在上方 `datalist_pick` 分支提前返回。
+    {
+        let dl_close: Option<String> = {
+            let inner = mgr.inner.lock().await;
+            inner
+                .tabs
+                .get(pid)
+                .and_then(|t| t.datalist.as_ref().map(|d| d.input_sel.clone()))
+                .filter(|input_sel| datalist_pick.is_none() && *input_sel != stable)
+        };
+        if let Some(input_sel) = dl_close {
+            mgr.close_datalist(pid, &input_sel).await;
+            out["datalist_closed"] = json!(true);
+        }
+    }
     if !open_selects.is_empty() {
         {
             let mut inner = mgr.inner.lock().await;

@@ -850,3 +850,65 @@ async fn disabled控件人工点击不分发不聚焦() {
 
 
 
+
+// ===================== P2d:datalist 过滤与多选语义(纯函数) =====================
+
+#[test]
+fn datalist过滤_包含匹配大小写与空查询全量() {
+    let opts = vec![
+        ("#s1".to_string(), "Apple".to_string(), "苹果".to_string()),
+        ("#s2".to_string(), "Banana".to_string(), "香蕉".to_string()),
+        ("#s3".to_string(), "app-store".to_string(), String::new()),
+    ];
+    // 空查询 = 全量。
+    assert_eq!(datalist::filter_hits(&opts, "").len(), 3);
+    // value 包含匹配,大小写不敏感。
+    let hit = datalist::filter_hits(&opts, "APP");
+    assert_eq!(hit.len(), 2);
+    assert_eq!(hit[0].1, "Apple");
+    assert_eq!(hit[1].1, "app-store");
+    // label 包含匹配(中文)。
+    assert_eq!(datalist::filter_hits(&opts, "香蕉").len(), 1);
+    // 无命中。
+    assert!(datalist::filter_hits(&opts, "zzz").is_empty());
+    // 查询串前后空白不参与匹配。
+    assert_eq!(datalist::filter_hits(&opts, " apple ").len(), 1);
+}
+
+#[test]
+fn datalist过滤_超过上限截断() {
+    let opts: Vec<(String, String, String)> = (0..30)
+        .map(|i| (format!("#s{i}"), format!("opt-{i}"), String::new()))
+        .collect();
+    assert_eq!(datalist::filter_hits(&opts, "").len(), datalist::DL_MAX_ROWS);
+    assert_eq!(datalist::filter_hits(&opts, "opt-").len(), datalist::DL_MAX_ROWS);
+}
+
+#[test]
+fn 多选语义_翻转范围与独占() {
+    let all: Vec<String> = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+    // 普通点击 = 独占。
+    assert_eq!(multi_pick(&all, &["b".to_string()], 2, false, false, None), vec!["c"]);
+    // Ctrl 翻转:已有 → 移除。
+    assert_eq!(
+        multi_pick(&all, &["a".to_string(), "b".to_string()], 1, true, false, None),
+        vec!["a"]
+    );
+    // Ctrl 翻转:没有 → 追加(结果按 DOM 序重排)。
+    assert_eq!(
+        multi_pick(&all, &["c".to_string()], 0, true, false, None),
+        vec!["a", "c"]
+    );
+    // Shift 范围(锚点 1 → 点击 3)。
+    assert_eq!(
+        multi_pick(&all, &["b".to_string()], 3, false, true, Some(1)),
+        vec!["b", "c", "d"]
+    );
+    // Shift 反向范围(锚点 3 → 点击 1)。
+    assert_eq!(
+        multi_pick(&all, &[], 1, false, true, Some(3)),
+        vec!["b", "c", "d"]
+    );
+    // Shift 无锚点 = 独占。
+    assert_eq!(multi_pick(&all, &[], 1, false, true, None), vec!["b"]);
+}

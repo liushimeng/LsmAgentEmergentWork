@@ -308,6 +308,8 @@ unsafe fn reflow_controls(cw: f64, ch: f64) {
 /// 定时器一拍:同步窗口内容区尺寸——变了就重排控件并上报宿主。
 ///
 /// 宿主收到后按新视口重排重渲染,新帧按 1:1 铺满内容区(不变形)。
+/// P2d:上报视口 = 内容区 ÷ 缩放系数(Chrome 缩放语义:CSS 像素变大、
+/// 可视 CSS 视口变小,媒体查询随之重估);帧等比居中绘制天然完成放大。
 unsafe fn sync_content_size() {
     let window = WINDOW.lock().unwrap().0;
     if window.is_null() {
@@ -324,12 +326,43 @@ unsafe fn sync_content_size() {
         *last = (cw, ch);
     }
     reflow_controls(cw, ch);
-    // 上报宿主:内容区宽 = 视口宽;内容区高扣掉工具栏 = 视口高(四舍五入到整像素)。
-    let vw = cw.round().clamp(1.0, 7680.0) as u32;
-    let vh = (ch - TOOLBAR_H).round().clamp(1.0, 4320.0) as u32;
+    let z = (*ZOOM.lock().unwrap()).max(0.05);
+    // 上报宿主:内容区宽 = 视口宽;内容区高扣掉工具栏 = 视口高
+    //(四舍五入到整像素;P2d 起按缩放系数换算)。
+    let vw = (cw / z).round().clamp(1.0, 7680.0) as u32;
+    let vh = ((ch - TOOLBAR_H) / z).round().clamp(1.0, 4320.0) as u32;
     // 记录本查看器认知里的视口尺寸(键鼠坐标换算用;帧按此等比居中)。
     *VIEWPORT.lock().unwrap() = (vw as f64, vh as f64);
     send_cmd(&super::resize::resize_cmd_json(vw, vh));
+}
+
+/// P2d:标题叠加缩放后缀(≠100% 时 `[125%]`;复位时剥掉旧后缀)。
+fn zoom_title(raw: &str, z: f64) -> String {
+    if (z - 1.0).abs() < 1e-9 {
+        raw.to_string()
+    } else {
+        format!("{} [{}%]", raw, (z * 100.0).round() as i64)
+    }
+}
+
+/// P2d:调整浏览器级缩放并立即生效(视口按新系数换算重报 + 宿主记账 +
+/// 标题后缀)。`dir > 0` 放大、`dir < 0` 缩小、`0` 复位到 100%。
+unsafe fn apply_zoom(dir: i32) {
+    let next = if dir == 0 {
+        1.0
+    } else {
+        super::zoom_step(*ZOOM.lock().unwrap(), dir)
+    };
+    *ZOOM.lock().unwrap() = next;
+    send_cmd(&format!("{{\"cmd\":\"zoom\",\"z\":{next}}}"));
+    // 视口按新缩放换算重报(置零强制变化检测命中)。
+    *CONTENT_SIZE.lock().unwrap() = (0.0, 0.0);
+    sync_content_size();
+    let w = WINDOW.lock().unwrap().0;
+    if !w.is_null() {
+        let t = LAST_TITLE.lock().unwrap().clone();
+        send_void_id(w, sel(b"setTitle:\0"), ns_str(&zoom_title(&t, next)));
+    }
 }
 
 /// 定时器回调:取新帧 → NSImage initWithData → setImage;标题/地址栏/关闭同理。
@@ -352,9 +385,12 @@ extern "C" fn on_tick(_self: Id, _cmd: Sel, _timer: Id) {
         // 人工拖动窗口 → 内容区尺寸变化 → 重排控件 + 上报宿主(视口自适应)。
         sync_content_size();
         if let Some(t) = title {
+            // P2d:原始标题入账 + 叠加缩放后缀(≠100% 时可见)。
+            *LAST_TITLE.lock().unwrap() = t.clone();
+            let z = *ZOOM.lock().unwrap();
             let w = WINDOW.lock().unwrap().0;
             if !w.is_null() {
-                send_void_id(w, sel(b"setTitle:\0"), ns_str(&t));
+                send_void_id(w, sel(b"setTitle:\0"), ns_str(&zoom_title(&t, z)));
             }
         }
         if let Some((url, can_back, can_forward)) = urlbar {
@@ -509,6 +545,12 @@ extern "C" fn on_text_end(_self: Id, _cmd: Sel, _note: Id) {
 /// 帧画面按此尺寸与内容区做等比居中换算(稳态 1:1)。
 static VIEWPORT: once_cell::sync::Lazy<Mutex<(f64, f64)>> =
     once_cell::sync::Lazy::new(|| Mutex::new((0.0, 0.0)));
+/// P2d:人工缩放系数(⌘/Ctrl + =/-/0;查看器侧生效,宿主只记账)。
+static ZOOM: once_cell::sync::Lazy<Mutex<f64>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(1.0));
+/// P2d:宿主最近下发的原始标题(缩放后缀叠加其上,换页/缩放时重设窗口标题)。
+static LAST_TITLE: once_cell::sync::Lazy<Mutex<String>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(String::new()));
 /// 上次已上报的 move(节流:≥30ms 且位移 ≥1px 才再发)。
 static LAST_MOVE: once_cell::sync::Lazy<Mutex<Option<(std::time::Instant, f64, f64)>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(None));
@@ -805,7 +847,10 @@ extern "C" fn on_pv_scroll(_self: Id, _cmd: Sel, event: Id) {
                 let v = if precise { d / 48.0 } else { d };
                 v.clamp(-20.0, 20.0)
             };
-            let (dx, dy) = (norm(raw_dx), norm(raw_dy));
+            // P2d:滚轮档位 ÷ 缩放(视觉滚动距离与缩放无关,Chrome 行为:
+            // 高倍缩放下每档滚过的 CSS 像素更少)。
+            let z = (*ZOOM.lock().unwrap()).max(0.05);
+            let (dx, dy) = (norm(raw_dx) / z, norm(raw_dy) / z);
             if dx.abs() < f64::EPSILON && dy.abs() < f64::EPSILON {
                 return;
             }
@@ -867,6 +912,17 @@ extern "C" fn on_pv_key_down(_self: Id, _cmd: Sel, event: Id) {
         // ⌘/Ctrl+F:页面查找(39 号 P2c;转 find_toggle,不进页面)。
         if (meta || ctrl) && code == 3 {
             send_cmd("{\"cmd\":\"find_toggle\"}");
+            return;
+        }
+        // P2d:浏览器级缩放 —— ⌘/Ctrl + =/+ 放大(键码 24)、- 缩小(27)、
+        // 0 复位(29);Chrome 语义,查看器侧生效,不进页面。
+        if (meta || ctrl) && matches!(code, 24 | 27 | 29) {
+            let dir = match code {
+                27 => -1,
+                29 => 0,
+                _ => 1,
+            };
+            apply_zoom(dir);
             return;
         }
         let shift = flags & NSEVENT_SHIFT != 0;

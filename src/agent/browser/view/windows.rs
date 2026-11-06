@@ -65,7 +65,11 @@ static PENDING_URL: Mutex<Option<(String, bool, bool)>> = Mutex::new(None);
 /// ⌘/Ctrl+L 聚焦地址栏请求(39 号 P2b)。
 static FOCUS_ADDRBAR_FLAG: Mutex<bool> = Mutex::new(false);
 /// P2c:光标形状(`"default"|"pointer"|"text"`),WM_SETCURSOR 读取。
-static CURSOR_KIND: Mutex<String> = Mutex::new("default".to_string());
+// 修复(2026-11-06):静态初始化不能用非 const 的 `to_string()`——Windows
+// 目标下此前根本编不过(P2c 轮引入,本机 macOS 从不编译该文件所以未暴露)。
+// `LazyLock` 用法与 `Mutex` 直连完全一致(Deref 透传)。
+static CURSOR_KIND: std::sync::LazyLock<Mutex<String>> =
+    std::sync::LazyLock::new(|| Mutex::new("default".to_string()));
 static ADDR_EDIT: Mutex<Option<HwndCell>> = Mutex::new(None);
 static BACK_BTN: Mutex<Option<HwndCell>> = Mutex::new(None);
 static FWD_BTN: Mutex<Option<HwndCell>> = Mutex::new(None);
@@ -78,6 +82,10 @@ static LAST_SIZE: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 static VIEWPORT: Mutex<(i32, i32)> = Mutex::new((0, 0));
 /// 上次已上报的 move(节流:≥30ms 且位移 ≥1px 才再发)。
 static LAST_MOVE: Mutex<Option<(std::time::Instant, f64, f64)>> = Mutex::new(None);
+/// P2d:人工缩放系数(Ctrl + =/-/0;查看器侧生效,宿主只记账)。
+static ZOOM: Mutex<f64> = Mutex::new(1.0);
+/// P2d:宿主最近下发的原始标题(缩放后缀叠加其上)。
+static LAST_TITLE: Mutex<String> = Mutex::new(String::new());
 /// 右键原生菜单是否关闭(`LAEW_HUMAN_RMENU=off` → 回退 contextmenu 事件路径)。
 static RMENU_OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 /// 右键菜单是否接管(接管期间 up 不再上报 contextmenu)。
@@ -220,14 +228,25 @@ fn client_to_page(hwnd: HWND, x: i32, y: i32) -> Option<(f64, f64)> {
             }
         }
     };
-    let dx = (cw - fw) / 2;
-    let dy = TOOLBAR_H + (view_h - fh) / 2;
-    let px = x - dx;
-    let py = y - dy;
-    if px < 0 || py < 0 || px >= fw || py >= fh {
+    // P2d:帧等比缩放居中(缩放系数体现在帧尺寸 vs 内容区尺寸的比例),
+    // 坐标按同一变换逆映射到帧(页面)坐标系。
+    if fw <= 0 || fh <= 0 {
         return None;
     }
-    Some((px as f64, py as f64))
+    let scale = (cw as f64 / fw as f64).min(view_h as f64 / fh as f64);
+    if scale <= 0.0 {
+        return None;
+    }
+    let dw = fw as f64 * scale;
+    let dh = fh as f64 * scale;
+    let dx = (cw as f64 - dw) / 2.0;
+    let dy = TOOLBAR_H as f64 + (view_h as f64 - dh) / 2.0;
+    let px = (x as f64 - dx) / scale;
+    let py = (y as f64 - dy) / scale;
+    if px < 0.0 || py < 0.0 || px >= fw as f64 || py >= fh as f64 {
+        return None;
+    }
+    Some((px, py))
 }
 
 fn move_allowed(x: f64, y: f64) -> bool {
@@ -308,7 +327,7 @@ fn send_key_json(key: &str, mods: (bool, bool, bool, bool)) {
 /// 键按下:浏览器级快捷键本地消化(Ctrl+R/F5 刷新、标签页三键、剪贴板三键
 /// 转发);特殊键转发;可打印键等 WM_CHAR(避免 KEYDOWN+CHAR 双发)。
 /// `sys` = Alt 组合(Alt+←/→ 前进后退)。
-unsafe fn forward_key(wp: WPARAM, sys: bool) {
+unsafe fn forward_key(hwnd: HWND, wp: WPARAM, sys: bool) {
     if input_disabled() {
         return;
     }
@@ -347,6 +366,17 @@ unsafe fn forward_key(wp: WPARAM, sys: bool) {
     // Ctrl+F:页面查找(39 号 P2c;浏览器级快捷键,不进页面)。
     if ctrl && vk == 0x46 {
         send_cmd("{\"cmd\":\"find_toggle\"}");
+        return;
+    }
+    // P2d:浏览器级缩放 —— Ctrl + =/数字键盘+ 放大(0xBB/0x6B)、
+    // -/数字键盘- 缩小(0xBD/0x6D)、0 复位(0x30);Chrome 语义。
+    if ctrl && matches!(vk, 0xBB | 0x6B | 0xBD | 0x6D | 0x30) {
+        let dir = match vk {
+            0xBD | 0x6D => -1,
+            0x30 => 0,
+            _ => 1,
+        };
+        apply_zoom(dir, hwnd);
         return;
     }
     if ctrl || alt {
@@ -409,7 +439,9 @@ unsafe fn forward_wheel(hwnd: HWND, wp: WPARAM, lp: LPARAM, horizontal: bool) {
         // 坐标越界仍允许滚动(滚轮作用整页;宿主按视口滚动兜底)。
         return;
     };
-    let (dx, dy) = if horizontal { (delta as f64 / 120.0, 0.0) } else { (0.0, delta as f64 / 120.0) };
+    // P2d:滚轮档位 ÷ 缩放(视觉滚动距离与缩放无关)。
+    let z = (*ZOOM.lock().unwrap()).max(0.05);
+    let (dx, dy) = if horizontal { (delta as f64 / 120.0 / z, 0.0) } else { (0.0, delta as f64 / 120.0 / z) };
     let line = format!(
         "{{\"cmd\":\"input\",\"act\":\"wheel\",\"x\":{px:.0},\"y\":{py:.0},\"dx\":{dx:.3},\"dy\":{dy:.3}}}"
     );
@@ -470,14 +502,18 @@ unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESUL
         WM_TIMER => {
             let mut changed = false;
             if let Some(t) = PENDING_TITLE.lock().unwrap().take() {
-                let _ = SetWindowTextW(hwnd, PCWSTR(to_wide(&t).as_ptr()));
+                // P2d:原始标题入账 + 叠加缩放后缀(≠100% 时可见)。
+                *LAST_TITLE.lock().unwrap() = t.clone();
+                let z = *ZOOM.lock().unwrap();
+                let _ = SetWindowTextW(hwnd, PCWSTR(to_wide(&zoom_title(&t, z)).as_ptr()));
             }
             if let Some((url, can_back, can_forward)) = PENDING_URL.lock().unwrap().take() {
                 apply_urlbar(&url, can_back, can_forward);
             }
             // ⌘/Ctrl+L:聚焦地址栏并全选(与 macOS 同语义)。
             // EM_SETSEL 的 lParam = MAKELONG(0, -1):起点 0、终点 -1 = 全选。
-            if FOCUS_ADDRBAR_FLAG.lock().unwrap().take() {
+            // 修复(2026-11-06):`MutexGuard<bool>` 无 `.take()`,改经解引用取值。
+            if std::mem::take(&mut *FOCUS_ADDRBAR_FLAG.lock().unwrap()) {
                 if let Some(edit) = ADDR_EDIT.lock().unwrap().map(|c| c.0) {
                     let _ = SetFocus(edit);
                     let _ = SendMessageW(edit, EM_SETSEL, WPARAM(0), LPARAM(-1));
@@ -591,7 +627,7 @@ unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESUL
             if edit == Some(focused) {
                 return DefWindowProcW(hwnd, msg, wp, lp);
             }
-            forward_key(wp, false);
+            forward_key(hwnd, wp, false);
             DefWindowProcW(hwnd, msg, wp, lp)
         }
         WM_SYSKEYDOWN => {
@@ -600,7 +636,7 @@ unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESUL
             if edit == Some(focused) {
                 return DefWindowProcW(hwnd, msg, wp, lp);
             }
-            forward_key(wp, true);
+            forward_key(hwnd, wp, true);
             DefWindowProcW(hwnd, msg, wp, lp)
         }
         WM_CHAR => {
@@ -717,14 +753,25 @@ unsafe fn paint(hdc: HDC, hwnd: HWND) {
         };
         let view_w = rc.right - rc.left;
         let view_h = rc.bottom - rc.top - TOOLBAR_H;
-        let dx = (view_w - f.width) / 2;
-        let dy = TOOLBAR_H + (view_h - f.height) / 2;
+        // P2d:帧等比缩放铺满画面区(缩放 = 帧尺寸 ÷ 内容区尺寸的反比;
+        // z=1 且帧 == 内容区时退化为既有 1:1 绘制)。尺寸暂时不一致的
+        // 过渡帧也按比例居中,不再溢出/露边。
+        let mut dx = (view_w - f.width) / 2;
+        let mut dy = TOOLBAR_H + (view_h - f.height) / 2;
+        let (mut dw, mut dh) = (f.width, f.height);
+        if view_w > 0 && view_h > 0 && f.width > 0 && f.height > 0 {
+            let scale = (view_w as f64 / f.width as f64).min(view_h as f64 / f.height as f64);
+            dw = (f.width as f64 * scale).round() as i32;
+            dh = (f.height as f64 * scale).round() as i32;
+            dx = (view_w - dw) / 2;
+            dy = TOOLBAR_H + (view_h - dh) / 2;
+        }
         let _ = StretchDIBits(
             hdc,
             dx,
             dy,
-            f.width,
-            f.height,
+            dw,
+            dh,
             0,
             0,
             f.width,
@@ -744,6 +791,33 @@ unsafe fn client_size(hwnd: HWND) -> Option<(i32, i32)> {
         return None;
     }
     Some((rc.right - rc.left, rc.bottom - rc.top))
+}
+
+/// P2d:标题叠加缩放后缀(≠100% 时 `[125%]`;复位时用原始标题)。
+fn zoom_title(raw: &str, z: f64) -> String {
+    if (z - 1.0).abs() < 1e-9 {
+        raw.to_string()
+    } else {
+        format!("{} [{}%]", raw, (z * 100.0).round() as i64)
+    }
+}
+
+/// P2d:调整浏览器级缩放并立即生效(视口按新系数换算重报 + 宿主记账 +
+/// 标题后缀 + 整窗重绘)。`dir > 0` 放大、`dir < 0` 缩小、`0` 复位。
+unsafe fn apply_zoom(dir: i32, hwnd: HWND) {
+    let next = if dir == 0 {
+        1.0
+    } else {
+        super::zoom_step(*ZOOM.lock().unwrap(), dir)
+    };
+    *ZOOM.lock().unwrap() = next;
+    send_cmd(&format!("{{\"cmd\":\"zoom\",\"z\":{next}}}"));
+    // 视口按新缩放换算重报(置 None 强制变化检测命中)。
+    *LAST_SIZE.lock().unwrap() = None;
+    handle_resize(hwnd);
+    let t = LAST_TITLE.lock().unwrap().clone();
+    let _ = SetWindowTextW(hwnd, PCWSTR(to_wide(&zoom_title(&t, next)).as_ptr()));
+    let _ = InvalidateRect(hwnd, None, true);
 }
 
 /// 人工拖动窗口 → 客户区尺寸变化 → 重排工具栏 + 上报宿主。
@@ -781,9 +855,11 @@ unsafe fn handle_resize(hwnd: HWND) {
         let edit_w = (cw - x - PAD).max(60);
         let _ = MoveWindow(edit, x, (TOOLBAR_H - BTN_H) / 2, edit_w, BTN_H, true);
     }
-    // 上报宿主:内容区宽 = 客户区宽;内容区高扣掉工具栏 = 视口高。
-    let vw = cw.clamp(1, 7680) as u32;
-    let vh = (ch - TOOLBAR_H).clamp(1, 4320) as u32;
+    // 上报宿主:内容区宽 = 客户区宽;内容区高扣掉工具栏 = 视口高
+    //(P2d:按缩放系数换算 —— Chrome 语义,可视 CSS 视口随缩放反比变化)。
+    let z = (*ZOOM.lock().unwrap()).max(0.05);
+    let vw = ((cw as f64 / z).round() as i32).clamp(1, 7680) as u32;
+    let vh = (((ch - TOOLBAR_H) as f64 / z).round() as i32).clamp(1, 4320) as u32;
     // 记录本查看器认知里的视口尺寸(键鼠坐标换算基线)。
     *VIEWPORT.lock().unwrap() = (vw as i32, vh as i32);
     send_cmd(&super::resize::resize_cmd_json(vw, vh));

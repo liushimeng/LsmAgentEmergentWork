@@ -13,7 +13,7 @@ fn render_state(html: &str, values: &[(&str, &str)]) -> (image::RgbaImage, layou
         .iter()
         .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
         .collect();
-    doc.apply_widget_state(&values, &HashMap::new(), &HashMap::new());
+    doc.apply_widget_state(&values, &HashMap::new(), &HashMap::new(), None);
     let font = FontSet::fallback();
     let lay = layout::compute(&doc, 640.0, &font);
     let pm = font

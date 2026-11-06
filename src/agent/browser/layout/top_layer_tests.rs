@@ -128,7 +128,7 @@ fn select展开时铺出浮层面板() {
     );
     let mut open: HashMap<String, bool> = HashMap::new();
     open.insert("#s".to_string(), true);
-    doc.apply_widget_state(&HashMap::new(), &open, &HashMap::new());
+    doc.apply_widget_state(&HashMap::new(), &open, &HashMap::new(), None);
     let lay = compute(&doc, 800.0, &font());
     let texts: Vec<&str> = lay.lines.iter().map(|l| l.text.as_str()).collect();
     assert!(
@@ -161,7 +161,7 @@ fn select面板option产生可寻址几何盒() {
     );
     let mut open: HashMap<String, bool> = HashMap::new();
     open.insert("#s".to_string(), true);
-    doc.apply_widget_state(&HashMap::new(), &open, &HashMap::new());
+    doc.apply_widget_state(&HashMap::new(), &open, &HashMap::new(), None);
     let lay = compute(&doc, 800.0, &font());
     let option_boxes: Vec<_> = lay
         .boxes
@@ -185,7 +185,7 @@ fn select面板重复label按选中项高亮() {
     values.insert("#s".to_string(), "b".to_string());
     let mut open: HashMap<String, bool> = HashMap::new();
     open.insert("#s".to_string(), true);
-    doc.apply_widget_state(&values, &open, &HashMap::new());
+    doc.apply_widget_state(&values, &open, &HashMap::new(), None);
     let lay = compute(&doc, 800.0, &font());
     let highlights = lay
         .display
@@ -211,7 +211,7 @@ fn select面板视口下缘不足时向上翻转() {
     );
     let mut open: HashMap<String, bool> = HashMap::new();
     open.insert("#s".to_string(), true);
-    doc.apply_widget_state(&HashMap::new(), &open, &HashMap::new());
+    doc.apply_widget_state(&HashMap::new(), &open, &HashMap::new(), None);
     let lay = compute(&doc, 800.0, &font());
     let select_box = lay
         .boxes

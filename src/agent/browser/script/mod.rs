@@ -150,6 +150,15 @@ pub enum JsRequest {
         payload: Option<serde_json::Value>,
         reply: std::sync::mpsc::Sender<JsReply>,
     },
+    /// P2d:pointer/mouse 兼容事件**成对批量**分发(一次往返多个事件,
+    /// 按传入顺序;连击窗口不被逐事件往返吃掉)。
+    DispatchSeq {
+        selector: String,
+        events: Vec<(String, Option<serde_json::Value>)>,
+        env: PageEnv,
+        nodes: Vec<super::document::SnapshotNode>,
+        reply: std::sync::mpsc::Sender<JsReply>,
+    },
     /// 语句级错误定位(调试用):在持久 Context 上对给定源码做前缀重放二分。
     Diag {
         source: String,

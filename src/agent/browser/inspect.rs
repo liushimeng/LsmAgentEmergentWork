@@ -427,6 +427,16 @@ pub async fn inspect(
                 },
                 "script_budget_cut": tab.script_budget_cut,
                 "script_pending": tab.script_pending,
+                // P2d:人工缩放如实上报(缩放在查看器侧生效,宿主只记账)。
+                // ≠1 时视口 = 窗口内容区 ÷ 缩放(Chrome 语义),Agent 据此
+                // 解释「为什么视口比窗口小/媒体查询断点变了」;截图取证
+                // 仍是未缩放基准。
+                "human_zoom": tab.human_zoom,
+                "zoom_note": if (tab.human_zoom - 1.0).abs() > 1e-9 {
+                    "人工在查看器按 ⌘/Ctrl+加减缩放了页面:视口 = 内容区÷缩放(媒体查询已重估),本页截图/取证仍是未缩放基准"
+                } else {
+                    ""
+                },
                 // 39 号 P2b 能力缺口(如实上报,免得 Agent 对着「选区没生效」
                 // 反复重试):跨元素整片高亮只画首尾元素内区段;Selection/Range
                 // 全 API 未建模(只有 getSelection().toString() 与文本控件的
