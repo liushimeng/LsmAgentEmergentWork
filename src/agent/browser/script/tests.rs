@@ -60,7 +60,7 @@ fn eval_on_with_rects(handle: &JsHandle, script: &str, doc_html: &str, url: &str
     let font = crate::agent::browser::render::FontSet::fallback();
     let layout = crate::agent::browser::layout::compute(&doc, 1280.0, &font);
     let rects = layout.rect_map();
-    let nodes = doc.snapshot_nodes_with_rects((1280, 720), &rects);
+    let nodes = doc.snapshot_nodes_with_rects((1280, 720), &rects, &Default::default());
     let script = script.to_string();
     let e = env(url);
     handle

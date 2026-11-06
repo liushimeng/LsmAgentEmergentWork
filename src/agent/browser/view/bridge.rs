@@ -85,6 +85,8 @@ impl LsmBrowserManager {
         self.ensure_view_process(tab.viewport.width, tab.viewport.height, &title);
         // 两条告知栏的 1Hz 心跳(全进程单实例,`page_bars.rs`)。
         self.ensure_bars_ticker();
+        // 第 57 轮:动画帧同步 ticker(活跃动画时 40ms 重排推帧,`anim.rs`)。
+        self.ensure_anim_ticker();
         // 推帧(push_frame)同步落跟随页。
         self.push_frame(tab);
     }

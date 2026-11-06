@@ -864,32 +864,35 @@ impl Document {
     ///
     /// 阶段二起改为文档序(先根后子)递归遍历,并记录 `parent` 索引供 JS 侧事件冒泡使用。
     pub fn snapshot_nodes(&self) -> Vec<SnapshotNode> {
-        self.snapshot_nodes_inner(None, None)
+        self.snapshot_nodes_inner(None, None, None)
     }
 
     /// 带计算样式的快照:每个节点附 `css`(供 JS `getComputedStyle`)。
     pub fn snapshot_nodes_styled(&self, viewport: (u32, u32)) -> Vec<SnapshotNode> {
         let media = super::style::MediaCtx::new(viewport.0 as f64, viewport.1 as f64);
         let engine = StyleEngine::from_document(self, media);
-        self.snapshot_nodes_inner(Some(&engine), None)
+        self.snapshot_nodes_inner(Some(&engine), None, None)
     }
 
     /// 带布局矩形的样式快照:rects 由 `layout::Layout::rect_map()` 生成,
     /// 按稳定选择器匹配注入,供 JS 桥暴露 clientWidth/offsetWidth 等几何属性。
+    /// `anim_ov`(第 57 轮):动画覆盖快照,`getComputedStyle` 与布局同源。
     pub fn snapshot_nodes_with_rects(
         &self,
         viewport: (u32, u32),
         rects: &HashMap<String, (f64, f64, f64, f64)>,
+        anim_ov: &super::anim::AnimOverrides,
     ) -> Vec<SnapshotNode> {
         let media = super::style::MediaCtx::new(viewport.0 as f64, viewport.1 as f64);
         let engine = StyleEngine::from_document(self, media);
-        self.snapshot_nodes_inner(Some(&engine), Some(rects))
+        self.snapshot_nodes_inner(Some(&engine), Some(rects), Some(anim_ov))
     }
 
     fn snapshot_nodes_inner(
         &self,
         engine: Option<&StyleEngine>,
         rects: Option<&HashMap<String, (f64, f64, f64, f64)>>,
+        anim_ov: Option<&super::anim::AnimOverrides>,
     ) -> Vec<SnapshotNode> {
         let mut out = Vec::new();
         // 起点用 `html` 而非 `body`:`document.documentElement` / `document.head`
@@ -919,6 +922,7 @@ impl Document {
             engine,
             &root_style,
             rects,
+            anim_ov,
         );
         out
     }
@@ -934,6 +938,7 @@ fn snapshot_walk(
     engine: Option<&StyleEngine>,
     parent_style: &ComputedStyle,
     rects: Option<&HashMap<String, (f64, f64, f64, f64)>>,
+    anim_ov: Option<&super::anim::AnimOverrides>,
 ) {
     if depth > 40 || out.len() >= 5000 {
         return;
@@ -957,6 +962,10 @@ fn snapshot_walk(
             let idx = out.len();
             child_parent = idx;
             let selector = Document::stable_selector(node);
+            // 第 57 轮:动画值覆盖(与布局同一时刻口径),JS getComputedStyle 同源。
+            if let Some(ov) = anim_ov {
+                super::anim::apply_overrides_map(ov, &selector, &mut child_style);
+            }
             // 39 号 P2b:光标/选区 → 规范字段 `selStart/selEnd`(页面脚本读
             // `el.selectionStart/End`)。属性由 `apply_caret_state` 落。
             let sel_start = attr(node, ATTR_CARET).and_then(|v| v.trim().parse::<usize>().ok());
@@ -1010,6 +1019,7 @@ fn snapshot_walk(
                 engine,
                 &child_style,
                 rects,
+                anim_ov,
             );
         }
     }

@@ -5,6 +5,7 @@
 //!
 //! 设计见 `docs/MCP_Web_LsmAgentBrowser_Use/`。
 
+pub mod anim;
 pub mod api;
 pub mod cache;
 pub mod document;
@@ -246,6 +247,8 @@ pub struct TabState {
     pub focused: Option<String>,
     pub mouse: Option<(f64, f64)>,
     pub layout: layout::Layout,
+    /// 第 57 轮:过渡/关键帧动画引擎(跨布局存活;`style_for` 钩子取当前时刻值)。
+    pub anim: anim::AnimEngine,
     /// HTML 修订号:每次 `tab.html` 写入自增(经 `set_html`)。
     /// 与 `layout_rev` 配对做「快照×布局」一致性守卫:
     /// eval/dispatch/screenshot/inspect 入口发现两者不一致即重算布局,
@@ -558,6 +561,8 @@ pub struct LsmBrowserManager {
     self_weak: std::sync::Mutex<std::sync::Weak<LsmBrowserManager>>,
     /// 两条告知栏 1Hz 心跳的单实例闸(`page_bars.rs::ensure_bars_ticker`)。
     bars_ticker_started: std::sync::atomic::AtomicBool,
+    /// 动画帧同步 ticker 的单实例闸(`anim.rs::ensure_anim_ticker`)。
+    anim_ticker_started: std::sync::atomic::AtomicBool,
     /// 人类输入会话态(查看器键鼠;按下/双击/hover 去重,`human_input/mod.rs`)。
     human: std::sync::Mutex<human_input::HumanSession>,
     /// 查看器窗口被人工关闭(`viewer_closed` 信号 / `close_view`)。
@@ -600,6 +605,7 @@ impl LsmBrowserManager {
             view_follow: std::sync::Mutex::new(None),
             self_weak: std::sync::Mutex::new(std::sync::Weak::new()),
             bars_ticker_started: std::sync::atomic::AtomicBool::new(false),
+            anim_ticker_started: std::sync::atomic::AtomicBool::new(false),
             human: std::sync::Mutex::new(human_input::HumanSession::default()),
             view_user_closed: std::sync::atomic::AtomicBool::new(false),
             view_respawns: std::sync::atomic::AtomicUsize::new(0),
@@ -623,18 +629,22 @@ impl LsmBrowserManager {
     /// 页面脚本测量全 0,二维码 canvas/地图容器测量链全断)。
     /// eval/dispatch/screenshot/inspect 入口都必须先过这道守卫。
     pub fn ensure_layout_locked(&self, tab: &mut TabState) {
-        if tab.layout_rev == tab.html_rev {
+        // 第 57 轮:有活跃动画/过渡时即使 html 未变也要重排 —— 动画值随时钟
+        // 推进,旧布局停在上一次动作时刻的补间值(隐藏模式无 ticker,截图/inspect
+        // 必须按当前时钟取值)。无动画页面走原快速路径零开销。
+        if tab.layout_rev == tab.html_rev && !tab.anim.has_active() {
             return;
         }
         let doc = tab.document_with_state();
         let media = style::MediaCtx::new(tab.viewport.width as f64, tab.viewport.height as f64);
         let sizes = images::ImageSizes::from_store(&tab.images);
-        tab.layout = layout::compute_full(
+        tab.layout = layout::compute_full_with_anim(
             &doc,
             tab.viewport.width as f64,
             &self.font,
             &media,
             &sizes,
+            &tab.anim,
         );
         tab.layout_rev = tab.html_rev;
     }
@@ -1047,6 +1057,8 @@ impl LsmBrowserManager {
             &empty_session,
             csp_policy.as_ref(),
             &pre_rects,
+            // 首屏管线在最终布局之前跑,尚无动画跟踪 → 空覆盖快照。
+            &anim::AnimOverrides::new(),
             hints.pipeline_seed(started),
         )
         .await;
@@ -1075,12 +1087,15 @@ impl LsmBrowserManager {
         doc.apply_widget_state(&pipeline.form_values, &HashMap::new(), &HashMap::new(), None);
         let title = pipeline.title.clone().unwrap_or_else(|| doc.title());
         let media = style::MediaCtx::new(viewport.width as f64, viewport.height as f64);
-        let layout = layout::compute_full(
+        // 第 57 轮:页面动画引擎随 TabState 存活,布局取当前时刻的动画值。
+        let anim = anim::AnimEngine::new();
+        let layout = layout::compute_full_with_anim(
             &doc,
             viewport.width as f64,
             &self.font,
             &media,
             &images_out.sizes,
+            &anim,
         );
         let t_layout = std::time::Instant::now();
         let page_id = format!("p_{:08x}", inner.seq + 1);
@@ -1169,6 +1184,7 @@ impl LsmBrowserManager {
             focused: None,
             mouse: None,
             layout,
+            anim,
             // open():布局与 html 同源计算,两者修订号对齐(守卫见 `ensure_layout_locked`)。
             html_rev: 1,
             layout_rev: 1,
@@ -1416,6 +1432,8 @@ impl LsmBrowserManager {
             &session_snapshot,
             csp_policy.as_ref(),
             &pre_rects,
+            // 首屏管线在最终布局之前跑,尚无动画跟踪 → 空覆盖快照。
+            &anim::AnimOverrides::new(),
             hints.pipeline_seed(started),
         )
         .await;
@@ -1440,7 +1458,16 @@ impl LsmBrowserManager {
         doc.apply_widget_state(&pipeline.form_values, &HashMap::new(), &HashMap::new(), None);
         let title = pipeline.title.clone().unwrap_or_else(|| doc.title());
         let media = style::MediaCtx::new(viewport_w as f64, viewport_h as f64);
-        let layout = layout::compute_full(&doc, viewport_w as f64, &self.font, &media, &images_out.sizes);
+        // 导航 = 新文档:动画引擎整体换新(旧页面的过渡/关键帧不跨文档存活)。
+        let anim = anim::AnimEngine::new();
+        let layout = layout::compute_full_with_anim(
+            &doc,
+            viewport_w as f64,
+            &self.font,
+            &media,
+            &images_out.sizes,
+            &anim,
+        );
         let Some(tab) = inner.tabs.get_mut(page_id) else {
             return Err(EngineError::page_not_found(page_id));
         };
@@ -1452,6 +1479,7 @@ impl LsmBrowserManager {
         tab.redirect_chain = resp.redirect_chain.clone();
         tab.source_bytes = resp.bytes.len();
         tab.layout = layout;
+        tab.anim = anim;
         tab.layout_rev = tab.html_rev;
         tab.scroll_x = 0.0;
         tab.scroll_y = 0.0;

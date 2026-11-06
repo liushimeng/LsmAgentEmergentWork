@@ -156,7 +156,9 @@ async fn xhr收到的set_cookie必须随下一次请求回发且落入宿主jar(
         "宿主 CookieJar 应含 set-cookie 动作回传的令牌: {cookie_text}"
     );
 
-    exec(&tool, json!({"action":"close","page_id":"all"})).await;
+    // 只关自己开的页:`close all` 会把并行测试正在用的页一起杀掉
+    // (共享全局内核,cargo test 默认并行;2026-11-06 实测互杀)。
+    exec(&tool, json!({"action":"close","page_id":page_id})).await;
 }
 
 #[tokio::test]
@@ -165,7 +167,7 @@ async fn open带page_id与不同url时必须在该页原地导航() {
     std::env::set_var("LAEW_SITE_RISK_PERSIST", "off");
     // 与上一测试共享全局内核(cargo test 默认并行):先清场,断言只看自己开的页。
     let tool = McpWebLsmBrowserUseTool;
-    let _ = exec(&tool, json!({"action":"close","page_id":"all"})).await;
+    // 不清场:`close all` 与同文件并行测试互杀对方页面;断言按本测试站点过滤。
     let base = start_site().await;
     let open = exec(
         &tool,
@@ -196,8 +198,17 @@ async fn open带page_id与不同url时必须在该页原地导航() {
     );
 
     // 页面总量应为 1(不得悄悄开新页),且该页内容就是第二页。
+    // 同文件另一测试与本测试并行共享全局内核(cargo test 默认并行),对方
+    // 后开的页会出现在 list 里:按本测试站点(端口)过滤,只数自己开的页,
+    // 消除「对方页面漏进 list」的竞态(2026-11-06 实测两页在不同端口)。
     let list = exec(&tool, json!({"action":"list"})).await;
-    let pages = list["data"]["pages"].as_array().cloned().unwrap_or_default();
+    let pages: Vec<Value> = list["data"]["pages"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| p["url"].as_str().unwrap_or("").starts_with(base.as_str()))
+        .collect();
     assert_eq!(pages.len(), 1, "open(page_id,新URL) 不得另开新页: {list}");
     assert_eq!(
         pages[0]["title"].as_str().unwrap_or(""),
@@ -205,5 +216,5 @@ async fn open带page_id与不同url时必须在该页原地导航() {
         "点名页应已加载新文档: {list}"
     );
 
-    exec(&tool, json!({"action":"close","page_id":"all"})).await;
+    exec(&tool, json!({"action":"close","page_id":page_id})).await;
 }

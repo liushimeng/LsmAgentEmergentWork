@@ -876,6 +876,7 @@ mod tests {
             focused: None,
             mouse: None,
             layout: Default::default(),
+            anim: Default::default(),
             html_rev: 0,
             layout_rev: 0,
             created_at_ms: 0,

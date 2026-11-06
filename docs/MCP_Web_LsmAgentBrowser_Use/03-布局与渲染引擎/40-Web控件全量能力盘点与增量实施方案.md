@@ -44,19 +44,19 @@ LsmAgentBrowser 已有「HTML 解析 → CSS 计算 → 布局 → 显示列表 
 | --- | --- | --- | --- | --- |
 | 文本框/搜索/邮箱/电话/URL | value/placeholder/输入/清空 | 单行文本、placeholder 灰字 | 🆕 | 无光标/选区/编辑历史 |
 | 密码框 | value 运行时同步 | `•` 掩码 | 🆕 | 无明文切换 |
-| 数字输入框 | value/min/max/step 属性保真 | 按文本框绘制 | 🟡 | 无增减按钮、步进校验 |
-| 复选框/单选框 | checked 运行时同步、点击切换、radio 同 form/name 互斥 | 几何勾/圆点 | 🆕 | 无 indeterminate、无自定义皮肤 |
-| 下拉选择器 | select_option/select_dropdown、selected option | 只画当前 label + 下拉箭头 | 🆕 | 无原生弹层、multiple/size 列表 |
-| 多行文本框 | value/placeholder | 按盒宽多行换行 | 🆕 | 无滚动条、rows/cols 精确语义、光标 |
-| 按钮/提交/重置 | JS click 先行，preventDefault 尊重；表单提交 | value/默认文案 | 🆕 | 无按压/焦点态、无 CSS :active |
-| 进度条 | value/max | 轨道 + 比例填充 | 🆕 | 无不确定态动画 |
-| 度量条 | value/min/max/low/high/optimum 属性保真 | 轨道 + 比例填充 | 🆕 | 不按 low/high/optimum 分段着色 |
-| 字段集/字段标题 | DOM/accessible name | block/inline 几何 | 🟡 | 无 fieldset disabled 继承、legend 嵌入边框 |
-| 标签 | label[for] 参与 accessible name | 可寻址行内盒 | 🟡 | 点击不聚焦/激活关联控件 |
-| 数据联想框 | datalist/option 存在于 DOM | 默认 `display:none` | 🆕 | 无 input list 联想弹层 |
-| 日期/时间选择器 | value/属性保真、可输入 | 文本框式几何 | 🟡 | 无日历/时间面板 |
-| 文件选择器 | act_upload 记录路径到 form_values | 按钮/文本框几何 | 🟡 | 不读真实文件系统、不显示文件列表 |
-| 滑块/颜色选择器 | min/max/step/value 属性保真 | 通用盒 | 🟡 | 无滑块轨道/拇指、颜色 swatch |
+| 数字输入框 | value/min/max/step 属性保真 | 按文本框绘制 + **微调箭头(41 轮)**;**上下键步进(44 轮 P2d)** | ✅ | 无步进校验拒绝 |
+| 复选框/单选框 | checked 运行时同步、点击切换、radio 同 form/name 互斥 | 几何勾/圆点;**`:indeterminate` 半选横杠(41/42 轮)** | ✅ | 无自定义皮肤 |
+| 下拉选择器 | select_option/select_dropdown、selected option;**点击展开/收起浮层、点 option 选中(42 轮)** | 当前 label + 下拉箭头;**列表形态 `size>1`/`multiple` + `optgroup`(44 轮,Shift/Ctrl 多选 P2d)** | ✅ | 无滚动条长列表 |
+| 多行文本框 | value/placeholder | 按盒宽多行换行 | 🟡 | 无内部滚动条、rows/cols 精确语义(39 号光标/选区已进渲染) |
+| 按钮/提交/重置 | JS click 先行，preventDefault 尊重；表单提交 | value/默认文案;**`:hover/:focus/:active` 状态重绘(41/42 轮)** | ✅ | — |
+| 进度条 | value/max | 轨道 + 比例填充;**不确定态(44 轮)** | ✅ | 无动画 |
+| 度量条 | value/min/max/low/high/optimum 属性保真 | 轨道 + 比例填充;**low/high/optimum 三区配色(44 轮)** | ✅ | — |
+| 字段集/字段标题 | DOM/accessible name | block/inline 几何;**UA 边框+legend 嵌边(48 轮)**;**`fieldset[disabled]` 禁用继承(49 轮)** | ✅ | legend 嵌边为近似 |
+| 标签 | label[for] 参与 accessible name | 可寻址行内盒;**点击转发到关联控件(49 轮)** | ✅ | — |
+| 数据联想框 | datalist/option 存在于 DOM | 默认 `display:none`;**联想面板(聚焦展开/过滤/键盘/点击,39 号 P2d)** | ✅ | — |
+| 日期/时间选择器 | value/属性保真、可输入 | 文本框式几何 + **日历/时钟图标(41 轮)** | 🟡 | 无日历/时间弹出面板 |
+| 文件选择器 | act_upload 记录路径到 form_values | 按钮/文本框几何 + **文件名文案(41 轮)** | 🟡 | 不读真实文件系统 |
+| 滑块/颜色选择器 | min/max/step/value 属性保真 | **滑轨+拇指 / 色块 swatch(41 轮)**;拖拽/点击定位 + number 步进(39 号 P2d) | ✅ | 无 tick 标记 |
 | 输出框/output | DOM/文本 | inline 盒 | 🟡 | 无 for 关联即时计算 |
 | fieldset/legend | ✅（第 48 轮） | fieldset UA 边框+padding；legend 块级化；legend 嵌边为近似；**`fieldset[disabled]` 禁用继承（第 49 轮，首个 legend 例外）** |
 | label | ✅🆕（第 49 轮） | 可寻址、参与 accessible name；**点击转发到关联控件**（`for` / 嵌套首个可标注后代） |
@@ -67,12 +67,12 @@ LsmAgentBrowser 已有「HTML 解析 → CSS 计算 → 布局 → 显示列表 
 | --- | --- | --- |
 | h1~h6、p、行内容器、超链接、strong/em | ✅ | 块/行内排版、文本换行、链接可寻址 |
 | 引用块、预格式化、行内代码、代码块 | ✅/🟡 | pre/code 等宽字体；无语法高亮 |
-| ul/ol/li | 🆕 | ul disc、ol decimal、`list-style-type:none`；无 `::marker`、CSS counter、reversed |
+| ul/ol/li | 🆕→✅（第 41 轮全类型 marker）→✅（第 49 轮 `ol reversed` 含 0/负数） | `list-style-type` 全类型 + `inside/outside`;无 `::marker` 伪元素与 CSS counter |
 | dl/dt/dd | 🟡→✅（第 48 轮） | 普通块级堆叠；dd 补 UA 40px 缩进 |
 | mark、abbr、分隔线、换行符 | ✅（第 48 轮） | mark 高亮背景；abbr 虚线下划线；del/ins/u 语义装饰线；hr 不再 0 高 |
 | table/thead/tbody/tfoot/tr/td/th | 🆕 | 真实行列网格、自动列宽、受控 colspan/rowspan；见下节 |
 | details/summary | 🆕→✅（第 48 轮） | 关闭只显示 summary，summary 点击切换；补 disclosure triangle；无动画 |
-| dialog | 🟡 | 无 `open` 不渲染，有 `open` 显示；无 top-layer、::backdrop、焦点圈禁 |
+| dialog | 🟡→✅（第 41/42 轮 top-layer/`::backdrop`/`showModal()`/Esc 关闭） | 无 `open` 不渲染;模态铺 backdrop 遮罩、顶层恒画在高 z 之上;**焦点圈禁仍缺** |
 | template | ✅ | 不渲染、不进可见快照 |
 | slot | 🟡 | 当普通容器；无 Web Components 分发语义 |
 
@@ -98,7 +98,7 @@ LsmAgentBrowser 已有「HTML 解析 → CSS 计算 → 布局 → 显示列表 
 | div/section/article/aside/header/footer/main/nav/address/figure/figcaption | ✅/🟡 | 块级容器与文本流；无 UA 专属微语义 |
 | 盒模型 | ✅/🟡 | 项目默认 border-box 语义；百分比/包含块已有近似，非完整 CSS 盒模型 |
 | 正常流/Flex/Grid/浮动/定位 | ✅/🟡 | Flex/Grid/Float/absolute/fixed 已有；第 48 轮补 absolute 静态位置；**第 50 轮 sticky 真吸附(视口 top/bottom,光栅期平移)**，元素滚动容器内 sticky 与 inline-flex 内部退化仍在 |
-| 堆叠与溢出 | 🟡 | z-index/opacity/transform/overflow 有近似；无完整层叠上下文、滚动条、负 z-index 语义 |
+| 堆叠与溢出 | 🟡→✅（第 41 轮负 z 沉常规流层/顶层逃逸裁剪）→✅（第 46 轮元素级滚动容器+滚动条） | z-index 三档 paint_tier 终排;`overflow:auto|scroll` 滚动偏移+滚动条;无完整层叠上下文(负 z 压父背景语义) |
 | 表单控件 display:block | 🆕 | 保留替换式固有尺寸，不再退化成 0 高全宽块 |
 | 文本装饰/语义高亮 | ✅（第 48 轮） | del/ins/u/abbr/mark 语义装饰 + CSS `text-decoration` 子集；address 斜体仍缺字形链 |
 
@@ -109,8 +109,8 @@ LsmAgentBrowser 已有「HTML 解析 → CSS 计算 → 布局 → 显示列表 
 | JS 增删节点/改样式后重排 | ✅ | `apply_js_reply` DOM 变化后全量重排、图片补齐、推帧 |
 | 表单运行时值/选中态同步 | 🆕 | `apply_widget_state` 后 inspect/JS/布局/截图一致 |
 | 自定义下拉/分页/轮播/树/标签页/手风琴/菜单/气泡/通知/评分/开关/穿梭框等 | 🟡 | 由页面 JS + 通用 DOM/CSS 渲染；无组件级专用行为 |
-| Shadow DOM / Web Components 样式隔离 | ⛔ | 无 Shadow DOM 样式树；custom element 仅按普通 DOM |
-| CSS 动画/过渡帧同步 | 🟡 | JS 改 DOM 会重排；无 requestAnimationFrame 级动画时序/过渡补间 |
+| Shadow DOM / Web Components 样式隔离 | ⛔ | 无 Shadow DOM 样式树；custom element 仅按普通 DOM(独立轮次目标) |
+| CSS 动画/过渡帧同步 | 🆕（第 57 轮） | **`transition`/`@keyframes` 完整时间轴引擎**:简写/longhand/`@keyframes` 收集、fill/方向/迭代/暂停/retarget、18 项可动画属性;布局钩子覆盖计算样式 → 几何/显示列表/JS `getComputedStyle` 同源;有头 40ms 帧同步 ticker;**rAF 仍是 16ms 定时器近似**(边界见 57 号文档) |
 
 ## 三、基础表格实现边界
 
@@ -152,6 +152,7 @@ LsmAgentBrowser 已有「HTML 解析 → CSS 计算 → 布局 → 显示列表 
 | 样式 | `src/agent/browser/style/state_tests.rs` | checked/disabled、details 抑制、option/datalist 隐藏 |
 | 渲染 | `src/agent/browser/render/widget_tests.rs` | WidgetGlyph 真实像素 |
 | 端到端 | `tests/web_form_state_roundtrip.rs` | input/click/select/summary 后 inspect、表格几何、截图落盘 |
+| 动画(第 57 轮) | `style/anim_style.rs::tests`、`browser/anim.rs::tests`、`layout/anim_tests.rs`、`tests/web_anim_smoke.rs` | 简写/关键帧解析、时间轴插值/retarget/fill/暂停、动画值进几何与显示列表、真时钟过渡端到端 |
 
 验证命令：
 
@@ -166,12 +167,12 @@ cargo test --no-fail-fast
 
 ## 六、后续路线
 
-1. select 原生弹层/multiple、date/color/range 专用 UI。
+1. ~~select 原生弹层/multiple~~（第 42/44 轮已落地）;date 面板、color picker 弹层仍缺。
 2. ~~`srcset/picture` 候选选择与 `currentSrc`~~（第 45 轮已完成）。
 3. ~~`border-collapse`/caption/colgroup/百分比列宽~~（第 41 轮已完成）；
    ~~`border-spacing`/`caption-side`~~（第 49 轮已完成）。
-4. dialog top-layer/::backdrop/焦点圈禁。
-5. ~~SVG 子集光栅化~~（第 50 轮已完成）；~~SVG 渐变/文本/`<image>`~~（第 55 轮已完成，`filter` 仍缺）；~~video poster 静态显示~~（第 55 轮已落地）；iframe 子文档隔离仍非目标。
-6. Shadow DOM 与动画帧同步；~~sticky 真吸附~~（第 50 轮视口 top/bottom 已落地，容器内吸附仍缺）；CSS `transition`/`@keyframes` 帧同步仍未实现（下一轮候选）。
+4. ~~dialog top-layer/::backdrop~~（第 41/42 轮已落地）;焦点圈禁仍缺。
+5. ~~SVG 子集光栅化~~（第 50 轮已完成）；~~SVG 渐变/文本/`<image>`~~（第 55 轮已完成，`filter`/`pattern`/`mask`/`clipPath` 仍缺）；~~video poster 静态显示~~（第 55 轮已落地）；iframe 子文档隔离仍非目标。
+6. ~~CSS `transition`/`@keyframes` 动画帧同步~~（**第 57 轮已落地**,见 57 号文档;rAF 帧对齐与 animationend 事件仍缺）;Shadow DOM 样式隔离仍缺（独立轮次）;~~sticky 真吸附~~（第 50 轮视口 top/bottom 已落地，容器内吸附仍缺）。
 7. dialog 焦点圈禁（top-layer/::backdrop 第 41/42 轮已落地）。
 8. ~~Canvas 高级 2D（路径/文字/渐变/图像源）~~（第 56 轮已落地，见 56 号文档）；createPattern/Path2D/WebGL 仍缺。

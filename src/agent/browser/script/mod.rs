@@ -426,6 +426,8 @@ pub(crate) fn max_external_bytes() -> usize {
 /// `rects`:调用方预布局产生的矩形映射(open/navigate 在管线前算一次),
 /// 注入快照供 JS 桥暴露 clientWidth 等几何属性;容器定宽场景(BMap 初始化)
 /// 不依赖图片固有尺寸,预布局足以供值。
+/// `anim_ov`(第 57 轮):动画覆盖快照,让 JS `getComputedStyle` 与布局读到
+/// 同一份动画值(管线期间按入口时刻冻结,见 57 号文档边界)。
 /// 多轮上限 `MAX_ROUNDS`:脚本注入的新 `<script>`(按内容指纹去重)继续执行。
 /// 持有 `inner` 锁贯穿全程(与主文档取回的既有行为一致)。
 pub(crate) async fn run_pipeline(
@@ -438,6 +440,7 @@ pub(crate) async fn run_pipeline(
     session_storage: &HashMap<String, String>,
     csp: Option<&super::security::CspPolicy>,
     rects: &HashMap<String, (f64, f64, f64, f64)>,
+    anim_ov: &super::anim::AnimOverrides,
     seed: PipelineSeed,
 ) -> PipelineOut {
     let mut out = PipelineOut {
@@ -705,7 +708,7 @@ pub(crate) async fn run_pipeline(
         // 快照后立即销毁 Document(NodeRef 非 Send,不能跨 await 存活)。
         let nodes = {
             let doc = super::document::Document::parse(&out.html, base_url);
-            doc.snapshot_nodes_with_rects(viewport, rects)
+            doc.snapshot_nodes_with_rects(viewport, rects, anim_ov)
         };
         // 等待预算 = 管线剩余墙钟(至少 2s)。不得沿用 eval_js 的 10s 默认值:
         // 重站点首轮脚本总量常超过 10s,旧行为会把「还在正常执行」误判为超时。

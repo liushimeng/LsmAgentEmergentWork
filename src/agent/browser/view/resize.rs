@@ -76,12 +76,13 @@ impl LsmBrowserManager {
         let doc = tab.document_with_state();
         let media = style::MediaCtx::new(tab.viewport.width as f64, tab.viewport.height as f64);
         let sizes = images::ImageSizes::from_store(&tab.images);
-        tab.layout = layout::compute_full(
+        tab.layout = layout::compute_full_with_anim(
             &doc,
             tab.viewport.width as f64,
             &self.font,
             &media,
             &sizes,
+            &tab.anim,
         );
     }
 

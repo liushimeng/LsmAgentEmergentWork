@@ -167,6 +167,8 @@ pub struct ComputedStyle {
     pub overflow_scroll: bool,
     /// 未建模属性的计算值文本(如 border-radius)。
     pub extra: BTreeMap<String, String>,
+    /// 动画/过渡声明(第 57 轮,非继承)。时间轴插值见 `browser/anim.rs`。
+    pub anim: super::anim_style::AnimDecl,
     /// 自定义属性表(继承用,不进入 `to_map`)。
     pub custom: BTreeMap<String, String>,
     /// details 关闭时的子树抑制标志(首个 summary 例外)。仅用于父子传播,
@@ -517,6 +519,7 @@ impl Default for ComputedStyle {
             overflow_scroll: false,
             extra: BTreeMap::new(),
             custom: BTreeMap::new(),
+            anim: super::anim_style::AnimDecl::default(),
             suppress_children: false,
             in_details_closed: false,
         }
@@ -1783,9 +1786,26 @@ pub fn apply_declaration(
         | "letter-spacing"
         | "word-spacing"
         | "list-style"
-        | "list-style-type"
-        | "transition" => {
+        | "list-style-type" => {
             st.extra.insert(key, value.to_string());
+        }
+        // 第 57 轮:动画/过渡简写与 longhand 统一进 AnimDecl(原 transition 只
+        // 透传 extra,动画引擎不可见)。
+        "animation"
+        | "animation-name"
+        | "animation-duration"
+        | "animation-timing-function"
+        | "animation-delay"
+        | "animation-iteration-count"
+        | "animation-direction"
+        | "animation-fill-mode"
+        | "animation-play-state"
+        | "transition"
+        | "transition-property"
+        | "transition-duration"
+        | "transition-timing-function"
+        | "transition-delay" => {
+            super::anim_style::apply_anim_declaration(&mut st.anim, &key, value);
         }
         _ => {
             st.extra.insert(key, value.to_string());

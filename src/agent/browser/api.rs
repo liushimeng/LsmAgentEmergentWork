@@ -359,12 +359,15 @@ pub(crate) async fn relayout_and_push(mgr: &LsmBrowserManager, pid: &str) {
     let doc = tab.document_with_state();
     let media = super::style::MediaCtx::new(tab.viewport.width as f64, tab.viewport.height as f64);
     let sizes = super::images::ImageSizes::from_store(&tab.images);
-    tab.layout = super::layout::compute_full(
+    // 第 57 轮:必须带 `tab.anim`(旧 compute_full 一次性引擎让动作驱动的
+    // 重排看不到过渡基线,过渡要到下一次 inspect 才启动——e2e 实测滞后一拍)。
+    tab.layout = super::layout::compute_full_with_anim(
         &doc,
         tab.viewport.width as f64,
         mgr.font(),
         &media,
         &sizes,
+        &tab.anim,
     );
     tab.layout_rev = tab.html_rev;
     if tab.mode.is_headed() {
@@ -412,7 +415,8 @@ pub(crate) async fn js_dispatch(
         fill_selection_env(&mut env, tab);
         let doc = tab_document(tab);
         let rects = tab.layout.rect_map();
-        let nodes = doc.snapshot_nodes_with_rects((tab.viewport.width, tab.viewport.height), &rects);
+        let anim_ov = tab.anim.override_snapshot();
+        let nodes = doc.snapshot_nodes_with_rects((tab.viewport.width, tab.viewport.height), &rects, &anim_ov);
         (handle, env, nodes)
     };
     let sel = selector.to_string();
@@ -501,7 +505,8 @@ pub(crate) async fn js_dispatch_seq_bounded(
         fill_selection_env(&mut env, tab);
         let doc = tab_document(tab);
         let rects = tab.layout.rect_map();
-        let nodes = doc.snapshot_nodes_with_rects((tab.viewport.width, tab.viewport.height), &rects);
+        let anim_ov = tab.anim.override_snapshot();
+        let nodes = doc.snapshot_nodes_with_rects((tab.viewport.width, tab.viewport.height), &rects, &anim_ov);
         (handle, env, nodes)
     };
     let sel = selector.to_string();
@@ -701,12 +706,13 @@ pub(crate) async fn apply_js_reply(
         let dom = tab_document(tab);
         let media = super::style::MediaCtx::new(tab.viewport.width as f64, tab.viewport.height as f64);
         let sizes = super::images::ImageSizes::from_store(&tab.images);
-        tab.layout = super::layout::compute_full(
+        tab.layout = super::layout::compute_full_with_anim(
             &dom,
             tab.viewport.width as f64,
             mgr.font(),
             &media,
             &sizes,
+            &tab.anim,
         );
         // 有头:JS 动作应用后重排完成,推帧给查看器。
         if tab.mode.is_headed() {
@@ -778,7 +784,7 @@ const INTERACTION_SCRIPT_ROUNDS: usize = 24;
 /// 因此页面全局状态不丢、首屏脚本也不会重复初始化。
 pub(crate) async fn run_pending_scripts(mgr: &LsmBrowserManager, pid: &str, budget_ms: u64, grace_ms: u64) {
     let mut inner = mgr.inner.lock().await;
-    let (html, url, ua, viewport, session, rects, seed, has_pending) = {
+    let (html, url, ua, viewport, session, rects, anim_ov, seed, has_pending) = {
         let Some(tab) = inner.tabs.get(pid) else {
             return;
         };
@@ -801,6 +807,7 @@ pub(crate) async fn run_pending_scripts(mgr: &LsmBrowserManager, pid: &str, budg
             (tab.viewport.width, tab.viewport.height),
             tab.session_storage.clone(),
             tab.layout.rect_map(),
+            tab.anim.override_snapshot(),
             script::PipelineSeed {
                 handle: tab.js.clone(),
                 executed: tab.executed_scripts.clone(),
@@ -826,6 +833,7 @@ pub(crate) async fn run_pending_scripts(mgr: &LsmBrowserManager, pid: &str, budg
         &session,
         None,
         &rects,
+        &anim_ov,
         seed,
     )
     .await;
@@ -879,12 +887,13 @@ pub(crate) async fn run_pending_scripts(mgr: &LsmBrowserManager, pid: &str, budg
         let dom = tab_document(tab);
         let media = super::style::MediaCtx::new(tab.viewport.width as f64, tab.viewport.height as f64);
         let sizes = super::images::ImageSizes::from_store(&tab.images);
-        tab.layout = super::layout::compute_full(
+        tab.layout = super::layout::compute_full_with_anim(
             &dom,
             tab.viewport.width as f64,
             mgr.font(),
             &media,
             &sizes,
+            &tab.anim,
         );
         tab.layout_rev = tab.html_rev;
         if tab.mode.is_headed() {
@@ -985,7 +994,8 @@ async fn js_eval_thread_with_budget(
         fill_selection_env(&mut env, tab);
         let doc = tab_document(tab);
         let rects = tab.layout.rect_map();
-        let nodes = doc.snapshot_nodes_with_rects((tab.viewport.width, tab.viewport.height), &rects);
+        let anim_ov = tab.anim.override_snapshot();
+        let nodes = doc.snapshot_nodes_with_rects((tab.viewport.width, tab.viewport.height), &rects, &anim_ov);
         (handle, env, nodes)
     };
     let script_text = script_text.to_string();
@@ -1230,12 +1240,13 @@ pub async fn control(
             // 阶段三第三步:视口变化复用已解码图片的固有尺寸重排。
             let media = super::style::MediaCtx::new(tab.viewport.width as f64, tab.viewport.height as f64);
             let sizes = super::images::ImageSizes::from_store(&tab.images);
-            tab.layout = super::layout::compute_full(
+            tab.layout = super::layout::compute_full_with_anim(
                 &doc,
                 tab.viewport.width as f64,
                 mgr.font(),
                 &media,
                 &sizes,
+                &tab.anim,
             );
             // 有头:视口/窗口变更后重排完成,推帧给查看器。
             if tab.mode.is_headed() {
@@ -3059,7 +3070,8 @@ async fn act_eval(
         };
         let doc = tab_document(&tab);
         let rects = tab.layout.rect_map();
-        let nodes = doc.snapshot_nodes_with_rects((tab.viewport.width, tab.viewport.height), &rects);
+        let anim_ov = tab.anim.override_snapshot();
+        let nodes = doc.snapshot_nodes_with_rects((tab.viewport.width, tab.viewport.height), &rects, &anim_ov);
         let cookie_header = inner.cookies.header_for(&tab.url).unwrap_or_default();
         let empty = empty_map();
         let meta = JsPageMeta {

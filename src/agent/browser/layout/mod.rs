@@ -26,6 +26,8 @@ mod position_tests;
 #[cfg(test)]
 mod form_widget_tests;
 #[cfg(test)]
+mod anim_tests;
+#[cfg(test)]
 mod inline_atomic_tests;
 #[cfg(test)]
 mod scroll_tests;
@@ -348,9 +350,39 @@ pub fn compute_full(
     media: &MediaCtx,
     images: &ImageSizes,
 ) -> Layout {
+    // 一次性引擎:不带跨布局过渡基线(测试/静态路径零改动)。
+    let anim = super::anim::AnimEngine::new();
+    compute_full_with_anim(doc, viewport_width, font, media, images, &anim)
+}
+
+/// 带动画引擎的完整布局入口(第 57 轮):`style_for` 在计算样式后过
+/// `AnimEngine::track_and_apply`,动画值覆盖进布局/显示列表/几何。
+pub fn compute_full_with_anim(
+    doc: &Document,
+    viewport_width: f64,
+    font: &FontSet,
+    media: &MediaCtx,
+    images: &ImageSizes,
+    anim: &super::anim::AnimEngine,
+) -> Layout {
+    anim.begin_pass();
+    let layout = compute_full_inner(doc, viewport_width, font, media, images, anim);
+    anim.end_pass();
+    layout
+}
+
+fn compute_full_inner(
+    doc: &Document,
+    viewport_width: f64,
+    font: &FontSet,
+    media: &MediaCtx,
+    images: &ImageSizes,
+    anim: &super::anim::AnimEngine,
+) -> Layout {
     let engine = StyleEngine::from_document(doc, *media);
     let mut ctx = LayoutCtx {
         engine: &engine,
+        anim,
         font,
         width: viewport_width.max(320.0),
         viewport_h: media.viewport_height.max(1.0),
@@ -541,6 +573,8 @@ pub(crate) const PAGE_H_SANITY_MAX: f64 = 1_000_000.0;
 
 pub(crate) struct LayoutCtx<'a> {
     engine: &'a StyleEngine,
+    /// 动画引擎(第 57 轮):`style_for` 钩子按当前时刻覆盖动画值。
+    anim: &'a super::anim::AnimEngine,
     font: &'a FontSet,
     width: f64,
     viewport_h: f64,
@@ -1089,6 +1123,19 @@ impl<'a> LayoutCtx<'a> {
         containing_width: f64,
     ) -> ComputedStyle {
         let mut style = self.engine.computed(node, parent);
+        // 第 57 轮动画钩子:有动画/过渡声明的节点才惰性求稳定键(零声明节点
+        // 零开销);先 diff 触发过渡,再按当前时刻覆盖动画值。同一布局内
+        // measure/final 多次调用幂等(值未变不重复触发)。
+        if style.anim.is_trackable() {
+            let key = document::Document::stable_selector(node);
+            let vctx = super::style::values::ValueCtx {
+                viewport_width: self.width,
+                viewport_height: self.viewport_h,
+                root_font_size: self.engine.root_font_size(),
+            };
+            self.anim
+                .track_and_apply(&key, &mut style, self.engine.keyframes(), &vctx);
+        }
         // MAX_CONTENT_WIDTH 是测量哨兵而非真实包含块;此时百分比 padding
         // 按不定包含块退化,最终宽度下的正式重排再按真实父宽求解。
         style.resolve_padding_percent(if containing_width >= MAX_CONTENT_WIDTH {

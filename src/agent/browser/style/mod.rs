@@ -4,6 +4,7 @@
 //! 布局、渲染、JS 快照与 inspect 共用同一份计算样式真源。
 //! 设计见 `docs/MCP_Web_LsmAgentBrowser_Use/02-脚本运行时与样式引擎/06-阶段二第二步CSS级联与外链样式加载设计.md`。
 
+pub mod anim_style;
 pub mod gradient;
 pub mod selector;
 pub mod transform;
@@ -18,6 +19,7 @@ use std::collections::BTreeMap;
 
 use kuchikiki::NodeRef;
 
+pub use anim_style::{AnimDecl, AnimSpec, Easing, KeyframesDef, KeyframesMap, TransitionSpec};
 pub use gradient::{GradientKind, GradientSpec, GradientStop};
 pub use selector::selector_specificity;
 pub use transform::{Affine, Length, Transform2D, TransformOrigin};
@@ -311,6 +313,8 @@ pub struct StyleEngine {
     media: MediaCtx,
     sheets: Vec<SheetInfo>,
     root_font_size: f64,
+    /// `@keyframes` 表(第 57 轮);动画引擎按名查步进。
+    keyframes: KeyframesMap,
 }
 
 impl std::fmt::Debug for StyleEngine {
@@ -328,6 +332,7 @@ impl StyleEngine {
     pub fn from_document(doc: &Document, media: MediaCtx) -> Self {
         let mut rules = Vec::new();
         let mut sheets = Vec::new();
+        let mut keyframes = KeyframesMap::new();
         let mut order = 0usize;
         for node in doc.select("style").unwrap_or_default() {
             let css = node.text_contents();
@@ -335,7 +340,7 @@ impl StyleEngine {
             let href = document::attr(&node, "data-lsm-href");
             let attr_expr = parse_media_query(&media_attr);
             let before = rules.len();
-            parse_block(&css, attr_expr, &mut rules, &mut order, 0);
+            parse_block(&css, attr_expr, &mut rules, &mut order, 0, &mut keyframes);
             sheets.push(SheetInfo {
                 href,
                 media: media_attr,
@@ -348,7 +353,18 @@ impl StyleEngine {
             media,
             sheets,
             root_font_size: 16.0,
+            keyframes,
         }
+    }
+
+    /// `@keyframes` 表(动画引擎按名查步进)。
+    pub fn keyframes(&self) -> &KeyframesMap {
+        &self.keyframes
+    }
+
+    /// 根字号(em/% 换算基准;动画关键帧长度解析同用)。
+    pub fn root_font_size(&self) -> f64 {
+        self.root_font_size
     }
 
     pub fn media(&self) -> MediaCtx {
@@ -605,7 +621,14 @@ impl Candidate {
 
 // ===================== CSS 解析 =====================
 
-fn parse_block(css: &str, media: MediaExpr, out: &mut Vec<Rule>, order: &mut usize, depth: usize) {
+fn parse_block(
+    css: &str,
+    media: MediaExpr,
+    out: &mut Vec<Rule>,
+    order: &mut usize,
+    depth: usize,
+    kf: &mut KeyframesMap,
+) {
     if depth > 8 {
         return;
     }
@@ -622,12 +645,25 @@ fn parse_block(css: &str, media: MediaExpr, out: &mut Vec<Rule>, order: &mut usi
             if lower.starts_with("media") {
                 let query = after[5..].trim();
                 let expr = parse_media_query(query);
-                parse_block(&body, media.clone().and(expr), out, order, depth + 1);
+                parse_block(&body, media.clone().and(expr), out, order, depth + 1, kf);
             } else if lower.starts_with("supports") || lower.starts_with("layer") {
                 // 乐观解析内部规则:`@supports` 常用于渐进增强,`@layer` 只影响层级顺序。
-                parse_block(&body, media.clone(), out, order, depth + 1);
+                parse_block(&body, media.clone(), out, order, depth + 1, kf);
+            } else if lower.starts_with("keyframes") || lower.starts_with("-webkit-keyframes") {
+                // 第 57 轮:`@keyframes`(含 `-webkit-` 前缀)收集为动画步进表。
+                // 同名后者覆盖前者(与 CSS 层叠一致,后声明生效)。
+                let name = after
+                    .split_once(char::is_whitespace)
+                    .map(|(_, n)| n.trim().to_string())
+                    .unwrap_or_default();
+                if !name.is_empty() {
+                    let def = anim_style::parse_keyframes_body(&body);
+                    if !def.steps.is_empty() {
+                        kf.insert(name, def);
+                    }
+                }
             }
-            // @font-face / @keyframes / @import / @page / @charset 等跳过。
+            // @font-face / @import / @page / @charset 等跳过。
             continue;
         }
         let selectors = parse_selector_list(header);

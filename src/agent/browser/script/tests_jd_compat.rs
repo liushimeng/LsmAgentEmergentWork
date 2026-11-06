@@ -322,6 +322,7 @@ document.getElementById('x').textContent = 'heavy-ran';
             &session,
             None,
             &rects,
+            &Default::default(),
             PipelineSeed { budget_ms: 300, ..Default::default() },
         )
         .await
@@ -344,6 +345,7 @@ document.getElementById('x').textContent = 'heavy-ran';
             &session,
             None,
             &rects,
+            &Default::default(),
             PipelineSeed {
                 handle: out1.js.clone(),
                 executed: out1.executed.clone(),
