@@ -1230,3 +1230,113 @@ async fn inspect_elements_列表模式返回全部匹配项() {
     assert!(first_text.contains('A'), "首项文本:{first_text}");
     mgr.shutdown().await;
 }
+
+#[test]
+fn merge_console_logs_清空标记与四百条上限() {
+    // `__clear` 标记(console.clear())清台账且标记本身不落账。
+    let mut logs = Vec::new();
+    merge_console_logs(
+        &mut logs,
+        [
+            ("log".to_string(), "旧1".to_string()),
+            ("log".to_string(), "旧2".to_string()),
+            ("__clear".to_string(), String::new()),
+            ("warn".to_string(), "新1".to_string()),
+        ],
+    );
+    assert_eq!(logs.len(), 1, "{logs:?}");
+    assert_eq!(logs[0].level, "warn");
+    assert_eq!(logs[0].text, "新1");
+    // 400 条上限:超限从头淘汰。
+    let mut logs = Vec::new();
+    let batch: Vec<(String, String)> = (0..420)
+        .map(|i| ("log".to_string(), format!("t{i}")))
+        .collect();
+    merge_console_logs(&mut logs, batch);
+    assert_eq!(logs.len(), 400, "上限 400 条");
+    assert_eq!(logs[0].text, "t20", "超限从头淘汰:{:?}", logs[0]);
+    assert_eq!(logs.last().unwrap().text, "t419");
+}
+
+#[tokio::test]
+async fn console_eval_表达式求值回写台账() {
+    let mgr = LsmBrowserManager::new_arc();
+    let url = html_doc("<h1>t</h1>");
+    let out = mgr
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 10_000, &NavHints::default())
+        .await
+        .unwrap();
+    // 表达式求值:回显 input + 结果 result。
+    mgr.handle_console_eval(&out.page_id, "1 + 2").await;
+    // 异常:eval_error 级(不用 error,免污染 console_errors 统计)。
+    mgr.handle_console_eval(&out.page_id, "throw new Error('boom-x')")
+        .await;
+    // 快捷语法 $$_:上一条返回值。
+    mgr.handle_console_eval(&out.page_id, "$_ ").await;
+    let v = inspect::inspect(&mgr, &out.page_id, "console", &serde_json::json!({}))
+        .await
+        .unwrap();
+    let events = v["events"].as_array().cloned().unwrap_or_default();
+    let has = |level: &str, text: &str| {
+        events
+            .iter()
+            .any(|e| e["level"] == level && e["text"].as_str().unwrap_or("").contains(text))
+    };
+    assert!(has("input", "1 + 2"), "输入回显:{events:?}");
+    assert!(has("result", "3"), "求值结果:{events:?}");
+    assert!(has("eval_error", "boom-x"), "异常回写 eval_error:{events:?}");
+    // $_ = 上一条返回值(异常后仍是上次成功的 3)。
+    assert!(
+        events
+            .iter()
+            .filter(|e| e["level"] == "result")
+            .count()
+            >= 2,
+        "$_ 快捷语法应产生第二条 result:{events:?}"
+    );
+    // eval_error 不进 error 级(page_health 统计不被人工调试污染)。
+    assert!(
+        !events.iter().any(|e| e["level"] == "error"),
+        "eval 异常不得记 error 级:{events:?}"
+    );
+    mgr.shutdown().await;
+}
+
+#[tokio::test]
+async fn console_clear_经合并助手清台账() {
+    let mgr = LsmBrowserManager::new_arc();
+    let url = html_doc("<p>x</p>");
+    let out = mgr
+        .new_page(&url, BrowserMode::Hidden, None, None, None, false, true, 10_000, &NavHints::default())
+        .await
+        .unwrap();
+    mgr.handle_console_eval(&out.page_id, "(console.log('keep-me'), 1)")
+        .await;
+    let before = inspect::inspect(&mgr, &out.page_id, "console", &serde_json::json!({}))
+        .await
+        .unwrap();
+    assert!(
+        before["count"].as_u64().unwrap_or(0) >= 1,
+        "console.log 应落台账:{before}"
+    );
+    // console.clear():PRELUDE 推 __clear 标记 → merge_console_logs 清台账。
+    mgr.handle_console_eval(&out.page_id, "(console.clear(), 1)")
+        .await;
+    let after = inspect::inspect(&mgr, &out.page_id, "console", &serde_json::json!({}))
+        .await
+        .unwrap();
+    // clear 之后本轮 eval 自身的 input/result 仍会落账,但旧的 keep-me 应已清掉。
+    let texts: Vec<String> = after["events"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|e| e["text"].as_str().unwrap_or("").to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        !texts.iter().any(|t| t.contains("keep-me")),
+        "clear 后旧日志不得复活:{texts:?}"
+    );
+    mgr.shutdown().await;
+}

@@ -530,6 +530,11 @@ const PRELUDE_BODY: &str = r##"
   var requestAnimationFrame = function (fn) { return __timer(fn); };
   var cancelAnimationFrame = function () {};
 
+  // 58 号:阶段一快照桥的 console 与 PRELUDE 同语义的最小集
+  // (clear 标记/group/count/time/dir/table;表格为文本近似)。
+  var __c_group = 0;
+  var __c_counts = {};
+  var __c_times = {};
   var console = {
     log: function () { __lsm_console.push({ level: "log", text: Array.prototype.map.call(arguments, String).join(" ") }); },
     info: function () { __lsm_console.push({ level: "info", text: Array.prototype.map.call(arguments, String).join(" ") }); },
@@ -537,10 +542,49 @@ const PRELUDE_BODY: &str = r##"
     error: function () { __lsm_console.push({ level: "error", text: Array.prototype.map.call(arguments, String).join(" ") }); },
     debug: function () { __lsm_console.push({ level: "debug", text: Array.prototype.map.call(arguments, String).join(" ") }); },
     trace: function () { __lsm_console.push({ level: "trace", text: Array.prototype.map.call(arguments, String).join(" ") }); },
-    dir: function () {},
-    table: function () {},
-    time: function () {},
-    timeEnd: function () {}
+    clear: function () { __lsm_console.push({ level: "__clear", text: "" }); __c_group = 0; },
+    assert: function (c) {
+      if (!c) {
+        var d = Array.prototype.slice.call(arguments, 1).map(String).join(" ");
+        __lsm_console.push({ level: "error", text: "Assertion failed" + (d ? ": " + d : "") });
+      }
+    },
+    dir: function (x) { __lsm_console.push({ level: "log", text: (x === null) ? "null" : (x === undefined) ? "undefined" : (typeof x === "object" ? (function () { try { return JSON.stringify(x); } catch (e) { return String(x); } })() : String(x)) }); },
+    table: function (x) {
+      try {
+        var lines = [];
+        if (x !== null && typeof x === "object" && Array.isArray(x)) {
+          for (var i = 0; i < x.length && i < 100; i++) lines.push(String(i) + " | " + (typeof x[i] === "object" ? JSON.stringify(x[i]) : String(x[i])));
+          __lsm_console.push({ level: "log", text: "(index) | Values\n" + lines.join("\n") });
+        } else if (x !== null && typeof x === "object") {
+          for (var k in x) { if (Object.prototype.hasOwnProperty.call(x, k)) lines.push(String(k) + " | " + String(x[k])); }
+          __lsm_console.push({ level: "log", text: "(index) | Values\n" + lines.join("\n") });
+        } else {
+          __lsm_console.push({ level: "log", text: String(x) });
+        }
+      } catch (e) { __lsm_console.push({ level: "log", text: String(x) }); }
+    },
+    group: function () { __lsm_console.push({ level: "group", text: Array.prototype.map.call(arguments, String).join(" ") }); __c_group++; },
+    groupCollapsed: function () { console.group.apply(console, arguments); },
+    groupEnd: function () { if (__c_group > 0) __c_group--; },
+    count: function (label) {
+      var k = (label === undefined) ? "default" : String(label);
+      __c_counts[k] = (__c_counts[k] || 0) + 1;
+      __lsm_console.push({ level: "count", text: k + ": " + __c_counts[k] });
+    },
+    countReset: function (label) { delete __c_counts[(label === undefined) ? "default" : String(label)]; },
+    time: function (label) { __c_times[(label === undefined) ? "default" : String(label)] = Date.now(); },
+    timeLog: function (label) {
+      var k = (label === undefined) ? "default" : String(label);
+      if (__c_times[k] === undefined) { __lsm_console.push({ level: "warn", text: "Timer " + k + " does not exist" }); return; }
+      __lsm_console.push({ level: "time", text: k + ": " + (Date.now() - __c_times[k]) + "ms" });
+    },
+    timeEnd: function (label) {
+      var k = (label === undefined) ? "default" : String(label);
+      if (__c_times[k] === undefined) { __lsm_console.push({ level: "warn", text: "Timer " + k + " does not exist" }); return; }
+      __lsm_console.push({ level: "time", text: k + ": " + (Date.now() - __c_times[k]) + "ms" });
+      delete __c_times[k];
+    }
   };
 
   var alert = function (m) { __lsm_console.push({ level: "alert", text: String(m || "") }); };

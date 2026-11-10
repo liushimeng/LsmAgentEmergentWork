@@ -1,15 +1,18 @@
 //! Windows 有头帧查看器:Win32(GDI `StretchDIBits` + 原生工具栏控件)。
 //!
 //! 只在 `laew __browser-view` 子进程内运行(与 `__hitl-dialog` 同一模式)。
-//! 窗口客户区 = 工具栏(后退/前进/刷新/首页 + 地址栏,在**上**边)+ 视口画面;
+//! 窗口客户区自上而下 = 一级菜单栏(58 号,DevTools 十按钮)+ 工具栏
+//! (后退/前进/刷新/首页 + 地址栏)+ 视口画面 + DevTools 面板(展开时贴底,
+//! 页面区收缩,Chrome dock-to-bottom 语义);
 //! PNG 帧经 image crate 解码为 RGBA 后以自顶向下 32bpp DIB **1:1 绘制**
 //! (不拉伸:宿主按内容区尺寸重渲染,新帧尺寸 == 内容区尺寸 → 铺满且不变形)。
 //! 100ms `WM_TIMER` 轮询共享帧槽(与 macOS 侧同构)。
 //!
 //! **人工拖动窗口**(视口自适应):`WM_SIZE` → 读客户区尺寸 → 变了就重排工具栏
-//! 子控件并向宿主上报 `{"cmd":"resize","w":..,"h":..}`(内容区扣掉工具栏)。
+//! 子控件并向宿主上报 `{"cmd":"resize","w":..,"h":..}`(内容区扣掉三层 chrome)。
 //!
-//! 工具栏交互经 stdout 命令通道驱动宿主引擎(与 macOS 侧协议一致)。
+//! 工具栏交互经 stdout 命令通道驱动宿主引擎(与 macOS 侧协议一致);
+//! DevTools 面板状态/快照合并/过滤逻辑在 `view::devtools_common`(双平台共用)。
 
 use std::sync::Mutex;
 
@@ -17,9 +20,11 @@ use windows::core::w;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetMonitorInfoW, InvalidateRect,
-    MonitorFromWindow, ScreenToClient, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-    DIB_RGB_COLORS, HDC, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, SRCCOPY,
+    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetMonitorInfoW,
+    InvalidateRect, MonitorFromWindow, ScreenToClient, SelectObject, SetBkMode, SetTextColor,
+    StretchDIBits, TextOutW, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLIP_DEFAULT_PRECIS,
+    DEFAULT_CHARSET, DEFAULT_QUALITY, DIB_RGB_COLORS, FF_DONTCARE, FW_NORMAL, HDC, HFONT, HGDIOBJ,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus, GetKeyState, SetFocus};
@@ -29,9 +34,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetClientRect, GetMessageW,
     GetWindowLongPtrW, GetWindowRect, GetWindowTextW, LoadCursorW, MoveWindow, PostQuitMessage,
     RegisterClassW, SendMessageW, SetCursor, SetTimer, SetWindowTextW, SetWindowLongPtrW,
-    ShowWindow, TrackPopupMenu, TranslateMessage, BS_PUSHBUTTON, CS_DBLCLKS, CS_HREDRAW,
-    CS_VREDRAW, CW_USEDEFAULT, ES_AUTOHSCROLL, GWL_STYLE, HMENU, IDC_ARROW, IDC_HAND, IDC_IBEAM,
-    MF_STRING, MSG, SW_SHOWNORMAL, TPM_RIGHTBUTTON, TPM_RETURNCMD, WINDOW_EX_STYLE,
+    ShowWindow, TrackPopupMenu, TranslateMessage, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX,
+    BS_PUSHBUTTON, CS_DBLCLKS, CS_HREDRAW,
+    CS_VREDRAW, CW_USEDEFAULT, ES_AUTOHSCROLL, GetDlgCtrlID, GWL_STYLE, HMENU, IDC_ARROW,
+    IDC_HAND, IDC_IBEAM,
+    MF_STRING, MSG, SW_HIDE, SW_SHOWNORMAL, TPM_RIGHTBUTTON, TPM_RETURNCMD, WINDOW_EX_STYLE,
     WINDOW_STYLE, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_KEYDOWN,
     WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
     WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN,
@@ -41,6 +48,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 // EM_SETSEL 定义在 Controls 模块(不在 WindowsAndMessaging;39 号 P2b)。
 use windows::Win32::UI::Controls::EM_SETSEL;
 
+pub(super) mod devtools;
+use devtools::*;
+
+use super::devtools_common as dt;
 use super::read_frame;
 
 /// 解码后的帧(自顶向下 RGBA)。
@@ -162,6 +173,8 @@ const ID_RELOAD: i32 = 103;
 const ID_HOME: i32 = 104;
 const ID_EDIT: i32 = 110;
 
+
+
 fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -213,7 +226,8 @@ unsafe fn mods_state() -> (bool, bool, bool, bool) {
 /// 客户区坐标 → 视口坐标(画面 1:1 居中,与 paint 同一换算;越界返回 None)。
 fn client_to_page(hwnd: HWND, x: i32, y: i32) -> Option<(f64, f64)> {
     let (cw, ch) = unsafe { client_size(hwnd) }?;
-    let view_h = ch - TOOLBAR_H;
+    // 页面区 = 客户区 - 一级菜单栏 - 工具栏 - DevTools 面板(58 号)。
+    let view_h = ch - MENU_H - TOOLBAR_H - panel_h();
     if view_h <= 0 {
         return None;
     }
@@ -243,7 +257,7 @@ fn client_to_page(hwnd: HWND, x: i32, y: i32) -> Option<(f64, f64)> {
     let dw = fw as f64 * scale;
     let dh = fh as f64 * scale;
     let dx = (cw as f64 - dw) / 2.0;
-    let dy = TOOLBAR_H as f64 + (view_h as f64 - dh) / 2.0;
+    let dy = (MENU_H + TOOLBAR_H) as f64 + (view_h as f64 - dh) / 2.0;
     let px = (x as f64 - dx) / scale;
     let py = (y as f64 - dy) / scale;
     if px < 0.0 || py < 0.0 || px >= fw as f64 || py >= fh as f64 {
@@ -523,16 +537,45 @@ unsafe fn edit_subclass_inner(
     _id: usize,
     _ref: usize,
 ) -> LRESULT {
+    let ctrl_id = GetDlgCtrlID(hwnd);
     if msg == WM_KEYDOWN && (wp.0 & 0xFFFF) as u32 == 0x0D {
-        let text = address_text(hwnd).trim().to_string();
-        if !text.is_empty() {
-            let esc = text.replace('\\', "\\\\").replace('"', "\\\"");
-            send_cmd(&format!("{{\"cmd\":\"navigate\",\"url\":\"{esc}\"}}"));
+        match ctrl_id {
+            // Console eval 输入(58 号):表达式送宿主页面全局求值,清空输入框。
+            ID_EVAL => {
+                if let Some(text) = hwnd_text(hwnd) {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        send_cmd(&format!(
+                            "{{\"cmd\":\"console_eval\",\"expr\":{}}}",
+                            dt::json_string(trimmed)
+                        ));
+                        let _ = SetWindowTextW(hwnd, PCWSTR::null());
+                    }
+                }
+                return LRESULT(0);
+            }
+            // 搜索框(58 号):回车按关键词重绘日志区。
+            ID_SEARCH => {
+                if let Some(text) = hwnd_text(hwnd) {
+                    if let Ok(mut f) = dt::FILTER.lock() {
+                        f.search = text.trim().to_string();
+                    }
+                }
+                return LRESULT(0);
+            }
+            // 地址栏(既有语义)。
+            _ => {
+                let text = address_text(hwnd).trim().to_string();
+                if !text.is_empty() {
+                    let esc = text.replace('\\', "\\\\").replace('"', "\\\"");
+                    send_cmd(&format!("{{\"cmd\":\"navigate\",\"url\":\"{esc}\"}}"));
+                }
+                return LRESULT(0);
+            }
         }
-        return LRESULT(0);
     }
-    if msg == WM_KILLFOCUS {
-        // 失焦:回填宿主 URL(清掉误入的外来输入,与 macOS 侧同语义)。
+    if msg == WM_KILLFOCUS && ctrl_id == ID_EDIT {
+        // 失焦:回填宿主 URL(清掉误入的外来输入,与 macOS 侧同语义;仅地址栏)。
         if let Some((url, _, _)) = PENDING_URL.lock().unwrap().clone() {
             let _ = SetWindowTextW(hwnd, PCWSTR(to_wide(&url).as_ptr()));
         }
@@ -580,6 +623,10 @@ unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESUL
                     });
                     changed = true;
                 }
+            }
+            // 58 号:消费 DevTools 快照槽 → 合并进日志缓冲 → 重绘面板。
+            if dt::take_slot_and_merge() {
+                changed = true;
             }
             if *CLOSE_FLAG.lock().unwrap() {
                 let _ = DestroyWindow(hwnd);
@@ -663,6 +710,11 @@ unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESUL
             }
         }
         WM_MOUSEWHEEL => {
+            // 58 号:光标在 DevTools 面板区时滚轮翻日志(不进页面)。
+            let delta = ((wp.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
+            if scroll_console(hwnd, delta) {
+                return LRESULT(0);
+            }
             forward_wheel(hwnd, wp, lp, false);
             DefWindowProcW(hwnd, msg, wp, lp)
         }
@@ -699,7 +751,7 @@ unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESUL
             LRESULT(0)
         }
         WM_COMMAND => {
-            // 子控件通知:BN_CLICKED(高 16 位 = 0)→ 工具栏按钮。
+            // 子控件通知:BN_CLICKED(高 16 位 = 0)→ 工具栏/DevTools 按钮。
             let id = (wp.0 & 0xFFFF) as i32;
             let code = ((wp.0 >> 16) & 0xFFFF) as u32;
             if code == 0 {
@@ -713,6 +765,8 @@ unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESUL
                 if let Some(cmd) = cmd {
                     send_cmd(&format!("{{\"cmd\":\"{cmd}\"}}"));
                 }
+                // DevTools(58 号):菜单/过滤/清空/关闭经 devtools 模块分发。
+                let _ = devtools::on_command(hwnd, id);
             }
             LRESULT(0)
         }
@@ -765,22 +819,34 @@ unsafe fn paint(hdc: HDC, hwnd: HWND) {
     if GetClientRect(hwnd, &mut rc).is_err() {
         return;
     }
-    // 工具栏条:浅灰底(工具栏在**上**边,与既有视觉一致)。
-    let bar = RECT {
+    let ch = rc.bottom - rc.top;
+    // 一级菜单栏条:浅灰底(58 号,最顶一行)。
+    let menu_bar = RECT {
         left: 0,
         top: 0,
         right: rc.right,
-        bottom: TOOLBAR_H,
+        bottom: MENU_H,
+    };
+    let brush = CreateSolidBrush(COLORREF(0x00F0F0F0));
+    FillRect(hdc, &menu_bar, brush);
+    let _ = DeleteObject(brush);
+    // 工具栏条:浅灰底(菜单栏之下)。
+    let bar = RECT {
+        left: 0,
+        top: MENU_H,
+        right: rc.right,
+        bottom: MENU_H + TOOLBAR_H,
     };
     let brush = CreateSolidBrush(COLORREF(0x00F0F0F0));
     FillRect(hdc, &bar, brush);
     let _ = DeleteObject(brush);
-    // 画面区:工具栏之下,先铺白底(帧比内容区小时露白边)。
+    // 画面区:工具栏之下、面板之上,先铺白底(帧比内容区小时露白边)。
+    let ph = panel_h();
     let area = RECT {
         left: 0,
-        top: TOOLBAR_H,
+        top: MENU_H + TOOLBAR_H,
         right: rc.right,
-        bottom: rc.bottom,
+        bottom: ch - ph,
     };
     let brush = CreateSolidBrush(COLORREF(0x00FFFFFF));
     FillRect(hdc, &area, brush);
@@ -802,19 +868,19 @@ unsafe fn paint(hdc: HDC, hwnd: HWND) {
             ..Default::default()
         };
         let view_w = rc.right - rc.left;
-        let view_h = rc.bottom - rc.top - TOOLBAR_H;
+        let view_h = ch - MENU_H - TOOLBAR_H - ph;
         // P2d:帧等比缩放铺满画面区(缩放 = 帧尺寸 ÷ 内容区尺寸的反比;
         // z=1 且帧 == 内容区时退化为既有 1:1 绘制)。尺寸暂时不一致的
         // 过渡帧也按比例居中,不再溢出/露边。
         let mut dx = (view_w - f.width) / 2;
-        let mut dy = TOOLBAR_H + (view_h - f.height) / 2;
+        let mut dy = MENU_H + TOOLBAR_H + (view_h - f.height) / 2;
         let (mut dw, mut dh) = (f.width, f.height);
         if view_w > 0 && view_h > 0 && f.width > 0 && f.height > 0 {
             let scale = (view_w as f64 / f.width as f64).min(view_h as f64 / f.height as f64);
             dw = (f.width as f64 * scale).round() as i32;
             dh = (f.height as f64 * scale).round() as i32;
             dx = (view_w - dw) / 2;
-            dy = TOOLBAR_H + (view_h - dh) / 2;
+            dy = MENU_H + TOOLBAR_H + (view_h - dh) / 2;
         }
         let _ = StretchDIBits(
             hdc,
@@ -832,6 +898,24 @@ unsafe fn paint(hdc: HDC, hwnd: HWND) {
             SRCCOPY,
         );
     }
+    drop(frame);
+    // DevTools 面板(58 号):展开时贴底绘制日志区。
+    if ph > 0 {
+        paint_console(hdc, rc.right, ch);
+    }
+}
+
+/// 读子控件文本(空/失败返回 None)。
+unsafe fn hwnd_text(hwnd: HWND) -> Option<String> {
+    if hwnd.0.is_null() {
+        return None;
+    }
+    let mut buf = vec![0u16; 4096];
+    let n = GetWindowTextW(hwnd, &mut buf);
+    if n == 0 {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&buf[..n as usize]))
 }
 
 /// 客户区尺寸(像素);取不到返回 None。
@@ -879,7 +963,7 @@ unsafe fn handle_resize(hwnd: HWND) {
     let Some((cw, ch)) = client_size(hwnd) else {
         return;
     };
-    if cw <= 0 || ch <= TOOLBAR_H {
+    if cw <= 0 || ch <= MENU_H + TOOLBAR_H {
         return;
     }
     {
@@ -889,27 +973,31 @@ unsafe fn handle_resize(hwnd: HWND) {
         }
         *last = Some((cw, ch));
     }
-    // 工具栏子控件重排(按钮宽度固定,地址栏吃掉剩余宽度)。
+    // 工具栏子控件重排(按钮宽度固定,地址栏吃掉剩余宽度;菜单栏之下)。
     let mut x = PAD;
+    let bar_y = MENU_H + (TOOLBAR_H - BTN_H) / 2;
     let back = BACK_BTN.lock().unwrap().map(|c| c.0);
     let fwd = FWD_BTN.lock().unwrap().map(|c| c.0);
     let reload = RELOAD_BTN.lock().unwrap().map(|c| c.0);
     let home = HOME_BTN.lock().unwrap().map(|c| c.0);
     for b in [back, fwd, reload, home] {
         if let Some(b) = b {
-            let _ = MoveWindow(b, x, (TOOLBAR_H - BTN_H) / 2, BTN_W, BTN_H, true);
+            let _ = MoveWindow(b, x, bar_y, BTN_W, BTN_H, true);
         }
         x += BTN_W + BTN_GAP;
     }
     if let Some(edit) = ADDR_EDIT.lock().unwrap().map(|c| c.0) {
         let edit_w = (cw - x - PAD).max(60);
-        let _ = MoveWindow(edit, x, (TOOLBAR_H - BTN_H) / 2, edit_w, BTN_H, true);
+        let _ = MoveWindow(edit, x, bar_y, edit_w, BTN_H, true);
     }
-    // 上报宿主:内容区宽 = 客户区宽;内容区高扣掉工具栏 = 视口高
+    // DevTools 菜单栏 + 面板控件重排(58 号)。
+    layout_controls(cw, ch);
+    // 上报宿主:内容区宽 = 客户区宽;内容区高扣掉菜单栏 + 工具栏 + 面板 = 视口高
     //(P2d:按缩放系数换算 —— Chrome 语义,可视 CSS 视口随缩放反比变化)。
     let z = (*ZOOM.lock().unwrap()).max(0.05);
     let vw = ((cw as f64 / z).round() as i32).clamp(1, 7680) as u32;
-    let vh = (((ch - TOOLBAR_H) as f64 / z).round() as i32).clamp(1, 4320) as u32;
+    let vh = (((ch - MENU_H - TOOLBAR_H - panel_h()) as f64 / z).round() as i32)
+        .clamp(1, 4320) as u32;
     // 记录本查看器认知里的视口尺寸(键鼠坐标换算基线)。
     *VIEWPORT.lock().unwrap() = (vw as i32, vh as i32);
     send_cmd(&super::resize::resize_cmd_json(vw, vh));
@@ -925,7 +1013,7 @@ unsafe fn make_button(parent: HWND, hinst: HINSTANCE, x: i32, text: &str, id: i3
         PCWSTR(txt.as_ptr()),
         WINDOW_STYLE((WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON as u32) as u32),
         x,
-        (TOOLBAR_H - BTN_H) / 2,
+        MENU_H + (TOOLBAR_H - BTN_H) / 2,
         BTN_W,
         BTN_H,
         parent,
@@ -970,20 +1058,20 @@ pub fn run(width: u32, height: u32, title: &str) -> i32 {
         let h = height.clamp(240, 2160) as i32;
         // 键鼠坐标换算基线:初始视口 = argv(后续随 resize 上报同步)。
         *VIEWPORT.lock().unwrap() = (w, h);
-        // 客户区尺寸 = 视口 + 工具栏;用 AdjustWindowRectEx 反算外框尺寸,
-        // 保证客户区**正好**是 w × (h + TOOLBAR_H)(否则画面区比视口小,
-        // 1:1 绘制会在右侧/底部露白边)。
+        // 客户区尺寸 = 视口 + 工具栏 + 一级菜单栏(58 号);用 AdjustWindowRectEx
+        // 反算外框尺寸,保证客户区**正好**是 w × (h + TOOLBAR_H + MENU_H)
+        //(否则画面区比视口小,1:1 绘制会在右侧/底部露白边)。
         let mut wr = RECT {
             left: 0,
             top: 0,
             right: w,
-            bottom: h + TOOLBAR_H,
+            bottom: h + TOOLBAR_H + MENU_H,
         };
         let _ = AdjustWindowRectEx(&mut wr, WS_OVERLAPPEDWINDOW, false, WINDOW_EX_STYLE(0));
         let outer_w = (wr.right - wr.left).max(w);
-        let outer_h = (wr.bottom - wr.top).max(h + TOOLBAR_H);
+        let outer_h = (wr.bottom - wr.top).max(h + TOOLBAR_H + MENU_H);
         // 初始客户区尺寸登记为基线:创建过程中的 WM_SIZE 不重复上报。
-        *LAST_SIZE.lock().unwrap() = Some((w, h + TOOLBAR_H));
+        *LAST_SIZE.lock().unwrap() = Some((w, h + TOOLBAR_H + MENU_H));
         let title_w = to_wide(title);
         let hwnd = match CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -1030,7 +1118,7 @@ pub fn run(width: u32, height: u32, title: &str) -> i32 {
                     | ES_AUTOHSCROLL as u32) as u32,
             ),
             x,
-            (TOOLBAR_H - BTN_H) / 2,
+            MENU_H + (TOOLBAR_H - BTN_H) / 2,
             edit_w,
             BTN_H,
             hwnd,
@@ -1048,6 +1136,10 @@ pub fn run(width: u32, height: u32, title: &str) -> i32 {
         *FWD_BTN.lock().unwrap() = Some(HwndCell(forward));
         *RELOAD_BTN.lock().unwrap() = Some(HwndCell(reload));
         *HOME_BTN.lock().unwrap() = Some(HwndCell(home));
+        // 58 号:一级菜单栏 + Console/占位面板控件(初始隐藏)。
+        build_ui(hwnd, hinstance, w, h + TOOLBAR_H + MENU_H);
+        // 测试钩子:LAEW_DEVTOOLS_AUTO=<panel> 启动即展开面板(与 macOS 同语义)。
+        maybe_auto_panel(hwnd);
 
         let _ = SetTimer(hwnd, TIMER_ID, TIMER_MS, None);
         let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
@@ -1100,6 +1192,10 @@ pub fn run(width: u32, height: u32, title: &str) -> i32 {
                         if let Ok(kind) = std::str::from_utf8(&payload) {
                             *CURSOR_KIND.lock().unwrap() = kind.trim().to_string();
                         }
+                    }
+                    // 58 号:DevTools 状态帧(console 台账快照;latest-wins 入槽)。
+                    Some((b'd', payload)) => {
+                        dt::push_payload(&payload);
                     }
                     Some((b'c', _)) | None => {
                         *CLOSE_FLAG.lock().unwrap() = true;

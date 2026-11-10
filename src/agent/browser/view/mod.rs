@@ -7,13 +7,16 @@
 //! 帧协议(stdin,二进制,小端):
 //! `[u32 总长][u8 kind][payload]`
 //! kind `'i'` = PNG 帧;`'t'` = 标题 JSON({"title": "..."});`'c'` = 关闭;
-//! `'u'` = 地址栏状态 JSON({"url","can_back","can_forward"})。
+//! `'u'` = 地址栏状态 JSON({"url","can_back","can_forward"});
+//! `'d'` = DevTools 状态 JSON(58 号:console 台账快照等)。
 //! 写失败即视为查看器退出,静默降级为纯无头(不影响任何工具行为)。
 //!
 //! 命令通道(stdout,查看器 → 宿主,按行 JSON):
 //! `{"cmd":"navigate","url":"..."}` / `{"cmd":"back"}` / `{"cmd":"forward"}` /
 //! `{"cmd":"reload"}` / `{"cmd":"home"}` / `{"cmd":"resize","w":1920,"h":1080}` /
-//! `{"cmd":"input","act":"move|down|up|wheel|key",...}`(人类键鼠,39 号设计文档)。
+//! `{"cmd":"input","act":"move|down|up|wheel|key",...}`(人类键鼠,39 号设计文档);
+//! `{"cmd":"devtools","panel":"console|none|…"}`(58 号:一级菜单栏面板切换)/
+//! `{"cmd":"console_eval","expr":"…"}`(58 号:Console 实时 JS 交互)。
 //! 浏览器窗口的工具栏(后退/前进/刷新/首页)与地址栏都经这条通道驱动宿主引擎,
 //! 窗口因此是**可交互的真浏览器形态**,而不只是被动显示渲染帧。
 //! `resize` 是人工拖动窗口后查看器上报的新内容区尺寸(已扣工具栏),
@@ -24,6 +27,8 @@
 #[cfg(target_os = "macos")]
 pub mod macos;
 pub mod bridge;
+/// DevTools 一级菜单栏 + Console 面板的平台无关共享层(58 号设计文档)。
+pub(crate) mod devtools_common;
 pub mod resize;
 #[cfg(target_os = "windows")]
 pub mod windows;
@@ -41,6 +46,10 @@ const KIND_URLBAR: u8 = b'u';
 const KIND_FOCUS_ADDRBAR: u8 = b'f';
 /// 光标形状帧(P2c:`"default"|"pointer"|"text"`,payload 为原始字符串)。
 pub(crate) const KIND_CURSOR: u8 = b'k';
+/// DevTools 状态帧(58 号设计文档:一级菜单栏 + Console 面板)。
+/// payload 为 JSON,首字段 `"kind"` 区分:`"console_sync"` = console 台账整份快照
+/// (`{"kind":"console_sync","page_id":..,"entries":[{level,text,at_ms}…]}`)。
+pub(crate) const KIND_DEVTOOLS: u8 = b'd';
 
 /// 查看器 → 宿主的交互命令(工具栏按钮 / 地址栏回车 / 人类键鼠)。
 #[derive(Debug, Clone, PartialEq)]
@@ -74,6 +83,11 @@ pub enum ViewCommand {
     /// P2d:人工缩放系数变化(查看器侧已生效,宿主只记账展示——
     /// `page_health` 如实上报,Agent 能解释「为什么视口变了」)。
     Zoom(f64),
+    /// 58 号:一级菜单栏面板切换。`panel` = `"console"` / `"none"` /
+    /// `"elements"|"sources"|…`(占位面板,宿主只认 console/none)。
+    DevTools { panel: String },
+    /// 58 号:Console 输入框回车执行 JS 表达式(作用于显示页)。
+    ConsoleEval(String),
     /// 查看器窗口被人工关闭(`windowWillClose:` 退出前上报)。
     /// 宿主据此**不自动重生**查看器(不与用户抢窗口);进程意外死亡
     /// (崩溃,无此信号)则按自愈策略重生(见 `bridge::push_frame`)。
@@ -166,6 +180,22 @@ pub fn parse_command(line: &str) -> Option<ViewCommand> {
                 return None;
             }
             Some(ViewCommand::Zoom(z))
+        }
+        // 58 号:一级菜单栏面板切换(console/none/占位面板名)。
+        "devtools" => {
+            let panel = v.get("panel")?.as_str()?.trim().to_ascii_lowercase();
+            if panel.is_empty() || panel.len() > 32 {
+                return None;
+            }
+            Some(ViewCommand::DevTools { panel })
+        }
+        // 58 号:Console 实时 JS 交互(表达式必非空;超长拒绝)。
+        "console_eval" => {
+            let expr = v.get("expr")?.as_str()?;
+            if expr.trim().is_empty() || expr.len() > 64 * 1024 {
+                return None;
+            }
+            Some(ViewCommand::ConsoleEval(expr.to_string()))
         }
         "viewer_closed" => Some(ViewCommand::ViewerClosed),
         _ => None,
@@ -317,6 +347,12 @@ impl ViewSink {
     pub fn send_cursor(&self, kind: &str) {
         self.send(KIND_CURSOR, kind.as_bytes());
     }
+
+    /// 58 号:推一条 DevTools 状态帧(payload = 原始 JSON 字符串)。
+    /// 首字段 `"kind"` 区分语义(当前:`"console_sync"` console 台账整份快照)。
+    pub fn send_devtools(&self, payload_json: &str) {
+        self.send(KIND_DEVTOOLS, payload_json.as_bytes());
+    }
 }
 
 impl std::fmt::Debug for ViewSink {
@@ -445,12 +481,54 @@ mod tests {
 
     #[test]
     fn 光标帧常量与命令互斥() {
-        // 帧 kind 不得与既有种类冲突('i'/'t'/'c'/'u'/'f')。
+        // 帧 kind 不得与既有种类冲突('i'/'t'/'c'/'u'/'f'/'d')。
         assert_ne!(KIND_CURSOR, KIND_IMAGE);
         assert_ne!(KIND_CURSOR, KIND_TITLE);
         assert_ne!(KIND_CURSOR, KIND_CLOSE);
         assert_ne!(KIND_CURSOR, KIND_URLBAR);
         assert_ne!(KIND_CURSOR, KIND_FOCUS_ADDRBAR);
+        assert_ne!(KIND_CURSOR, KIND_DEVTOOLS);
+    }
+
+    #[test]
+    fn 解析命令_devtools面板与console求值() {
+        // 面板切换:console / none / 占位面板名(统一小写归一)。
+        assert_eq!(
+            parse_command(r#"{"cmd":"devtools","panel":"console"}"#),
+            Some(ViewCommand::DevTools {
+                panel: "console".to_string()
+            })
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"devtools","panel":"none"}"#),
+            Some(ViewCommand::DevTools {
+                panel: "none".to_string()
+            })
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"devtools","panel":"Elements"}"#),
+            Some(ViewCommand::DevTools {
+                panel: "elements".to_string()
+            })
+        );
+        // 非法行:缺 panel / 空串 / 超长。
+        assert_eq!(parse_command(r#"{"cmd":"devtools"}"#), None);
+        assert_eq!(parse_command(r#"{"cmd":"devtools","panel":"  "}"#), None);
+        assert_eq!(
+            parse_command(&format!(r#"{{"cmd":"devtools","panel":"{}"}}"#, "x".repeat(40))),
+            None
+        );
+        // console_eval:表达式保留原文;空/纯空白/缺字段拒绝。
+        assert_eq!(
+            parse_command(r#"{"cmd":"console_eval","expr":"1 + 2"}"#),
+            Some(ViewCommand::ConsoleEval("1 + 2".to_string()))
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"console_eval","expr":"var x = 1; x"}"#),
+            Some(ViewCommand::ConsoleEval("var x = 1; x".to_string()))
+        );
+        assert_eq!(parse_command(r#"{"cmd":"console_eval"}"#), None);
+        assert_eq!(parse_command(r#"{"cmd":"console_eval","expr":"   "}"#), None);
     }
 
     #[test]

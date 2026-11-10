@@ -195,6 +195,34 @@ pub struct ConsoleRecord {
     pub at_ms: u128,
 }
 
+/// console 台账统一合并入口(58 号设计文档:一级菜单栏与 Console 面板)。
+///
+/// 所有写入 `tab.console` 的点都必须经过这里,统一两类台账语义:
+/// * **`__clear` 标记**(`console.clear()` 由 PRELUDE 推入批次):清空既有台账
+///   后继续累计,标记本身不落账——分散写入点各自处理必然漏;
+/// * **400 条上限**:超限从头淘汰(旧逻辑各写入点各写一遍 `if len>400 remove(0)`)。
+///
+/// `at_ms` 一律按落账时刻盖章(批次产出时刻与落账时刻相差毫秒级)。
+pub(super) fn merge_console_logs<I>(dest: &mut Vec<ConsoleRecord>, logs: I)
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    for (level, text) in logs {
+        if level == "__clear" {
+            dest.clear();
+            continue;
+        }
+        if dest.len() >= 400 {
+            dest.remove(0);
+        }
+        dest.push(ConsoleRecord {
+            level,
+            text,
+            at_ms: now_ms(),
+        });
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct GuardState {
     pub mode: String,
@@ -576,6 +604,9 @@ pub struct LsmBrowserManager {
     /// 查看器子进程启动次数(首启不计;意外死亡自动重生上限 3 次/会话,
     /// 防崩溃循环;超限回退纯无头并打 WARN,见 `view::bridge::push_frame`)。
     view_respawns: std::sync::atomic::AtomicUsize,
+    /// 58 号:查看器 Console 面板是否打开(`{"cmd":"devtools","panel":…}` 翻转)。
+    /// 打开期间 `push_frame` 收尾把 console 台账整份快照推给查看器;关闭即停推。
+    devtools_console_open: std::sync::atomic::AtomicBool,
 }
 
 /// 兼容旧调用点的类型名。
@@ -613,6 +644,7 @@ impl LsmBrowserManager {
             human: std::sync::Mutex::new(human_input::HumanSession::default()),
             view_user_closed: std::sync::atomic::AtomicBool::new(false),
             view_respawns: std::sync::atomic::AtomicUsize::new(0),
+            devtools_console_open: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1174,9 +1206,10 @@ impl LsmBrowserManager {
                 recs
             },
             console: {
-                let mut logs = resources_out.console.clone();
-                logs.extend(pipeline.console.clone());
-                logs.extend(images_out.console.clone());
+                let mut logs = Vec::new();
+                merge_console_logs(&mut logs, resources_out.console.iter().map(|l| (l.level.clone(), l.text.clone())));
+                merge_console_logs(&mut logs, pipeline.console.iter().map(|l| (l.level.clone(), l.text.clone())));
+                merge_console_logs(&mut logs, images_out.console.iter().map(|l| (l.level.clone(), l.text.clone())));
                 logs
             },
             form_values: pipeline.form_values.clone(),
@@ -1499,9 +1532,10 @@ impl LsmBrowserManager {
         if let Some(policy) = &csp_policy {
             tab.security.cache_csp(&resp.final_url, policy.clone());
         }
-        tab.console = resources_out.console.clone();
-        tab.console.extend(pipeline.console.clone());
-        tab.console.extend(images_out.console.clone());
+        tab.console.clear();
+        merge_console_logs(&mut tab.console, resources_out.console.iter().map(|l| (l.level.clone(), l.text.clone())));
+        merge_console_logs(&mut tab.console, pipeline.console.iter().map(|l| (l.level.clone(), l.text.clone())));
+        merge_console_logs(&mut tab.console, images_out.console.iter().map(|l| (l.level.clone(), l.text.clone())));
         for rec in resources_out.network {
             record_network(tab, rec);
         }

@@ -3172,16 +3172,91 @@ function __lsmTick() {
   return JSON.stringify({ pending: __lsmTimers.length, ran: ran });
 }
 
-// ---------- console ----------
+// ---------- console(58 号:一级菜单栏 Console 面板台账能力) ----------
+var __lsmGroupDepth = 0;
+var __lsmCounters = {};
+var __lsmConsoleTimes = {};
+function __cjoin(args) { return Array.prototype.map.call(args, function (x) { return __str(x); }).join(" "); }
+function __cgrp() {
+  if (__lsmGroupDepth <= 0) return "";
+  var s = "";
+  for (var i = 0; i < __lsmGroupDepth; i++) s += "| ";
+  return s;
+}
+function __cpad(s, w) { while (s.length < w) s += " "; return s; }
+// console.table 文本近似:数组 → 行 × 键列对齐;普通对象 → (index)|Values 两列。
+function __ctable(x) {
+  try {
+    if (x === null || typeof x !== "object") return __str(x);
+    if (!Array.isArray(x)) {
+      var lines = ["(index) | Values"];
+      for (var ok in x) {
+        if (Object.prototype.hasOwnProperty.call(x, ok)) {
+          lines.push(String(ok) + " | " + __str(x[ok]));
+        }
+      }
+      return lines.join("\n");
+    }
+    var rows = x.slice(0, 100);
+    var cols = [];
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i];
+      if (r !== null && typeof r === "object") {
+        for (var k in r) {
+          if (Object.prototype.hasOwnProperty.call(r, k) && cols.indexOf(k) < 0) cols.push(k);
+        }
+      }
+    }
+    if (cols.length === 0) {
+      var out = ["(index) | Values"];
+      for (var j = 0; j < rows.length; j++) out.push(String(j) + " | " + __str(rows[j]));
+      return out.join("\n");
+    }
+    var widths = [];
+    var cells = [];
+    for (var c = 0; c < cols.length; c++) widths.push(cols[c].length);
+    for (var ri = 0; ri < rows.length; ri++) {
+      var row = rows[ri];
+      var line = [];
+      for (var ci = 0; ci < cols.length; ci++) {
+        var v = (row !== null && typeof row === "object") ? row[cols[ci]] : undefined;
+        var s = (v === undefined && (row === null || typeof row !== "object" || !Object.prototype.hasOwnProperty.call(row, cols[ci]))) ? "" : __str(v);
+        if (s.length > 60) s = s.slice(0, 57) + "...";
+        if (s.length > widths[ci]) widths[ci] = s.length;
+        line.push(s);
+      }
+      cells.push(line);
+    }
+    var header = "";
+    for (var h = 0; h < cols.length; h++) header += (h ? " | " : "") + __cpad(cols[h], widths[h]);
+    var res = ["(index) | " + header];
+    for (var e = 0; e < cells.length; e++) {
+      var ln = __cpad(String(e), 7) + " | ";
+      for (var f = 0; f < cells[e].length; f++) ln += (f ? " | " : "") + __cpad(cells[e][f], widths[f]);
+      res.push(ln);
+    }
+    return res.join("\n");
+  } catch (e2) {
+    return __str(x);
+  }
+}
 var console = {
-  log: function () { __clog("log", Array.prototype.map.call(arguments, function (x) { return __str(x); }).join(" ")); },
-  info: function () { __clog("info", Array.prototype.map.call(arguments, function (x) { return __str(x); }).join(" ")); },
-  warn: function () { __clog("warn", Array.prototype.map.call(arguments, function (x) { return __str(x); }).join(" ")); },
-  error: function () { __clog("error", Array.prototype.map.call(arguments, function (x) { return __str(x); }).join(" ")); },
-  debug: function () { __clog("debug", Array.prototype.map.call(arguments, function (x) { return __str(x); }).join(" ")); },
-  trace: function () { __clog("trace", Array.prototype.map.call(arguments, function (x) { return __str(x); }).join(" ")); },
-  // 站点会在初始化时取 console.clear.bind(console);缺少该方法会在定时器注册前直接断链。
-  clear: function () {},
+  log: function () { __clog("log", __cgrp() + __cjoin(arguments)); },
+  info: function () { __clog("info", __cgrp() + __cjoin(arguments)); },
+  warn: function () { __clog("warn", __cgrp() + __cjoin(arguments)); },
+  error: function () { __clog("error", __cgrp() + __cjoin(arguments)); },
+  debug: function () { __clog("debug", __cgrp() + __cjoin(arguments)); },
+  trace: function () {
+    var stack = "";
+    try { stack = String((new Error()).stack || ""); } catch (e) {}
+    __clog("trace", __cgrp() + __cjoin(arguments) + (stack ? "\n" + stack : ""));
+  },
+  // clear 不再是 no-op:推 `__clear` 标记,宿主 `merge_console_logs` 识别后清台账
+  // (标记本身不落账);分组深度随之复位。站点 `console.clear.bind(console)` 链路不变。
+  clear: function () {
+    try { __lsmConsole.push({ level: "__clear", text: "" }); } catch (e) {}
+    __lsmGroupDepth = 0;
+  },
   // console.assert 只记录失败、绝不抛错;站点初始化里的 UUID/配置自检
   // 若因方法缺失抛 TypeError,会让整个 React 挂载链静默中断。
   assert: function (condition) {
@@ -3190,10 +3265,38 @@ var console = {
       __clog("error", "Assertion failed" + (detail ? ": " + detail : ""));
     }
   },
-  dir: function () {},
-  table: function () {},
-  time: function () {},
-  timeEnd: function () {}
+  dir: function () { __clog("log", __cgrp() + __str(arguments.length ? arguments[0] : undefined)); },
+  table: function () { __clog("log", __cgrp() + __ctable(arguments.length ? arguments[0] : undefined)); },
+  group: function () { __clog("group", __cgrp() + __cjoin(arguments)); __lsmGroupDepth++; },
+  groupCollapsed: function () { __clog("group", __cgrp() + __cjoin(arguments)); __lsmGroupDepth++; },
+  groupEnd: function () { if (__lsmGroupDepth > 0) __lsmGroupDepth--; },
+  count: function (label) {
+    var k = (label === undefined) ? "default" : String(label);
+    __lsmCounters[k] = (__lsmCounters[k] || 0) + 1;
+    __clog("count", __cgrp() + k + ": " + __lsmCounters[k]);
+  },
+  countReset: function (label) {
+    var k = (label === undefined) ? "default" : String(label);
+    delete __lsmCounters[k];
+  },
+  time: function (label) {
+    var k = (label === undefined) ? "default" : String(label);
+    __lsmConsoleTimes[k] = Date.now();
+  },
+  timeLog: function (label) {
+    var k = (label === undefined) ? "default" : String(label);
+    if (__lsmConsoleTimes[k] === undefined) { __clog("warn", "Timer " + k + " does not exist"); return; }
+    var d = Date.now() - __lsmConsoleTimes[k];
+    var extra = Array.prototype.slice.call(arguments, 1).map(function (x) { return __str(x); }).join(" ");
+    __clog("time", __cgrp() + k + ": " + d + "ms" + (extra ? " " + extra : ""));
+  },
+  timeEnd: function (label) {
+    var k = (label === undefined) ? "default" : String(label);
+    if (__lsmConsoleTimes[k] === undefined) { __clog("warn", "Timer " + k + " does not exist"); return; }
+    var d = Date.now() - __lsmConsoleTimes[k];
+    delete __lsmConsoleTimes[k];
+    __clog("time", __cgrp() + k + ": " + d + "ms");
+  }
 };
 function __str(x) {
   if (x === null) return "null";
@@ -4917,7 +5020,7 @@ function __lsmEvalUser(src) {
         else { __r = (0, eval)(src); }
       } else { throw e1; }
     }
-  } catch (e) { __err = String((e && e.stack) || e); }
+  } catch (e) { __err = __lsmErrText(e); }
   var __val = null;
   if (__err === null) {
     try { __val = (typeof __r === "undefined") ? null : JSON.stringify(__r); }

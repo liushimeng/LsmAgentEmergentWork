@@ -220,6 +220,31 @@ impl LsmBrowserManager {
                 }
                 return;
             }
+            // 58 号:一级菜单栏面板切换。占位面板(elements/sources/…)纯查看器
+            // 本地渲染;宿主只认 console/none——控制 console 台账快照推送的开关。
+            ViewCommand::DevTools { panel } => {
+                let open = panel == "console";
+                self.devtools_console_open
+                    .store(open, std::sync::atomic::Ordering::Relaxed);
+                if open {
+                    // 打开面板立即回推整份快照(推送时机①)。
+                    if let Some(pid) = self.input_target_page().await {
+                        let inner = self.inner.lock().await;
+                        if let Some(tab) = inner.tabs.get(&pid) {
+                            self.sync_devtools_console(tab);
+                        }
+                    }
+                }
+                return;
+            }
+            // 58 号:Console 输入框回车执行 JS 表达式(作用于显示页,不改显示跟随)。
+            ViewCommand::ConsoleEval(expr) => {
+                let target = self.input_target_page().await;
+                if let Some(pid) = target {
+                    self.handle_console_eval(&pid, &expr).await;
+                }
+                return;
+            }
             _ => {}
         }
         let page_id = self.foreground_page_id().await;
@@ -259,7 +284,9 @@ impl LsmBrowserManager {
             | ViewCommand::NextTab
             | ViewCommand::Clip(_)
             | ViewCommand::FocusAddrbar
-            | ViewCommand::ToggleFind => unreachable!("已在函数开头单独处理"),
+            | ViewCommand::ToggleFind
+            | ViewCommand::DevTools { .. }
+            | ViewCommand::ConsoleEval(_) => unreachable!("已在函数开头单独处理"),
         };
         self.refresh_view(&page_id).await;
     }
@@ -484,6 +511,107 @@ impl LsmBrowserManager {
                 sink.send_urlbar(&tab.url, can_back, can_forward);
             }
         }
+        // 58 号:凡推帧即同步 console 台账快照(推送时机②;面板未开零开销)。
+        self.sync_devtools_console(tab);
+    }
+
+    /// 58 号:把 console 台账**整份快照**推给查看器 Console 面板(幂等)。
+    ///
+    /// 仅在「Console 面板打开 + headed + 查看器存活」时推送;快照模型
+    /// (`{"kind":"console_sync","page_id":..,"entries":[…]}`)天然免疫乱序/丢帧,
+    /// 查看器按「同页增长追加尾巴 / 缩短或换页整体替换」合并。
+    pub(in crate::agent::browser) fn sync_devtools_console(&self, tab: &TabState) {
+        if !self
+            .devtools_console_open
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        if !tab.mode.is_headed() {
+            return;
+        }
+        let entries: Vec<serde_json::Value> = tab
+            .console
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "level": r.level,
+                    "text": r.text,
+                    "at_ms": r.at_ms,
+                })
+            })
+            .collect();
+        let payload = serde_json::json!({
+            "kind": "console_sync",
+            "page_id": tab.id,
+            "entries": entries,
+        })
+        .to_string();
+        if let Ok(guard) = self.view.lock() {
+            if let Some(sink) = guard.as_ref() {
+                sink.send_devtools(&payload);
+            }
+        }
+    }
+
+    /// 58 号:Console 实时 JS 交互——表达式在**显示页**全局上下文求值
+    /// (复用 `act_eval` 全链路:JS 线程持久全局 / 快照桥回退),回显/结果/
+    /// 异常回写 console 台账(`input`/`result`/`eval_error` 级,`eval_error`
+    /// 刻意不用 `error` 级免污染 page_health 的 console_errors 统计)。
+    pub(in crate::agent::browser) async fn handle_console_eval(
+        self: &Arc<Self>,
+        pid: &str,
+        expr: &str,
+    ) {
+        // $0 = 最近聚焦/点击元素(39 号 P2a 的 focused 选择器;Elements 面板
+        // 未实现前的近似)。
+        let sel = {
+            let inner = self.inner.lock().await;
+            inner.tabs.get(pid).and_then(|t| t.focused.clone())
+        };
+        let wrapped = crate::agent::js_preprocess::wrap_console_eval(expr, sel.as_deref());
+        // 回显人工输入(Chrome Console 同款「> 表达式」回显语义)。
+        self.append_console_and_sync(pid, "input", expr).await;
+        let params = serde_json::json!({ "expression": wrapped });
+        let top = serde_json::json!({});
+        match crate::agent::browser::api::act_eval(self, pid, &params, &top).await {
+            Ok(v) => {
+                let ok = v.get("ok").and_then(|b| b.as_bool()).unwrap_or(true);
+                let result = v
+                    .get("result")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if ok {
+                    self.append_console_and_sync(pid, "result", &result).await;
+                } else {
+                    let err = v
+                        .get("js_error")
+                        .and_then(|e| e.as_str())
+                        .unwrap_or("求值失败")
+                        .to_string();
+                    self.append_console_and_sync(pid, "eval_error", &err).await;
+                }
+            }
+            Err(e) => {
+                self.append_console_and_sync(pid, "eval_error", &format!("[{}] {}", e.code, e.message))
+                    .await;
+            }
+        }
+    }
+
+    /// 追加一条 console 台账记录并把整份快照推给查看器(58 号推送时机③)。
+    async fn append_console_and_sync(&self, pid: &str, level: &str, text: &str) {
+        let mut inner = self.inner.lock().await;
+        let Some(tab) = inner.tabs.get_mut(pid) else {
+            return;
+        };
+        crate::agent::browser::merge_console_logs(
+            &mut tab.console,
+            [(level.to_string(), text.to_string())],
+        );
+        let tab = inner.tabs.get(pid).expect("台账追加后页仍在");
+        self.sync_devtools_console(tab);
     }
 
     /// 关闭查看器(所有页面关闭后)。

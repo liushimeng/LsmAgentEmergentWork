@@ -693,16 +693,10 @@ pub(crate) async fn apply_js_reply(
         }
         t.focused = None;
     }
-    for log in &reply.outcome.logs {
-        if t.console.len() > 400 {
-            t.console.remove(0);
-        }
-        t.console.push(super::ConsoleRecord {
-            level: log.level.clone(),
-            text: log.text.clone(),
-            at_ms: super::now_ms(),
-        });
-    }
+    super::merge_console_logs(
+        &mut t.console,
+        reply.outcome.logs.iter().map(|l| (l.level.clone(), l.text.clone())),
+    );
     if reply.outcome.webgl_asked > t.webgl_asked {
         t.webgl_asked = reply.outcome.webgl_asked;
     }
@@ -805,16 +799,10 @@ pub(crate) async fn apply_js_reply(
                 from_cache: false,
                 at_ms: super::now_ms(), req_body: None,});
         }
-        for log in images_out.console {
-            if tab.console.len() > 400 {
-                tab.console.remove(0);
-            }
-            tab.console.push(super::ConsoleRecord {
-                level: log.level,
-                text: log.text,
-                at_ms: super::now_ms(),
-            });
-        }
+        super::merge_console_logs(
+            &mut tab.console,
+            images_out.console.into_iter().map(|l| (l.level, l.text)),
+        );
     }
     drop(inner);
     // 交互后补齐懒加载脚本:真实浏览器里 `require.async`/动态 <script> 会在
@@ -928,16 +916,10 @@ pub(crate) async fn run_pending_scripts(mgr: &LsmBrowserManager, pid: &str, budg
     for (k, v) in pipeline.form_values {
         tab.form_values.insert(k, v);
     }
-    for log in pipeline.console {
-        if tab.console.len() > 400 {
-            tab.console.remove(0);
-        }
-        tab.console.push(super::ConsoleRecord {
-            level: log.level,
-            text: log.text,
-            at_ms: super::now_ms(),
-        });
-    }
+    super::merge_console_logs(
+        &mut tab.console,
+        pipeline.console.into_iter().map(|l| (l.level, l.text)),
+    );
     for rec in pipeline.network {
         if tab.network.len() > 200 {
             tab.network.remove(0);
@@ -3096,7 +3078,7 @@ async fn network_idle_state(
     }
 }
 
-async fn act_eval(
+pub(in crate::agent::browser) async fn act_eval(
     mgr: &LsmBrowserManager,
     pid: &str,
     params: &Value,
