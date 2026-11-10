@@ -24,6 +24,8 @@ mod tests;
 #[cfg(test)]
 mod tests_dom_insert;
 #[cfg(test)]
+mod tests_human_p2e;
+#[cfg(test)]
 mod tests_jd_compat;
 #[cfg(test)]
 mod tests_jsonp;
@@ -64,6 +66,9 @@ pub struct PageEnv {
     pub caret_text: HashMap<String, String>,
     /// 39 号 P2b:当前聚焦元素的稳定选择器(`getSelection()` 回落查找用)。
     pub focused: String,
+    /// 39 号 P2e:pointer capture 当前捕获元素的稳定选择器(空串 = 无捕获;
+    /// `hasPointerCapture` 读)。
+    pub pointer_capture: String,
 }
 
 /// 脚本来源:inline 文本或宿主预取的外链内容。
@@ -156,6 +161,19 @@ pub enum JsRequest {
     DispatchSeq {
         selector: String,
         events: Vec<(String, Option<serde_json::Value>)>,
+        env: PageEnv,
+        nodes: Vec<super::document::SnapshotNode>,
+        reply: std::sync::mpsc::Sender<JsReply>,
+    },
+    /// P2e:**逐事件自带目标**的批量分发((selector, event, payload, 不冒泡)。
+    ///
+    /// hover 切换的 Chrome 完整事件序(out/leave×N/over/enter×N × pointer+mouse
+    /// 两轮)中每个事件的目标元素都不同(跨越边界集 = 链差集),`DispatchSeq`
+    /// 的单 selector 模型装不下;逐事件单独派发又会把往返数翻倍。本变体把
+    /// 整条序列合并为**一次往返**,PRELUDE `__lsmDispatchMulti` 逐项路由到
+    /// `__fire`(冒泡)/`__fireNoBubble`(enter/leave 等边界事件)。
+    DispatchMulti {
+        events: Vec<(String, String, Option<serde_json::Value>, bool)>,
         env: PageEnv,
         nodes: Vec<super::document::SnapshotNode>,
         reply: std::sync::mpsc::Sender<JsReply>,
@@ -874,6 +892,7 @@ pub(crate) fn build_env(
         page_sel_text: String::new(),
         caret_text: HashMap::new(),
         focused: String::new(),
+        pointer_capture: String::new(),
     }
 }
 

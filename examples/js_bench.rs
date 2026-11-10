@@ -40,6 +40,7 @@ async fn main() {
         page_sel_text: String::new(),
         caret_text: Default::default(),
         focused: String::new(),
+        pointer_capture: String::new(),
     };
 
     let handle = JsHandle::spawn();

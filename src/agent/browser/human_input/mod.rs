@@ -189,6 +189,8 @@ struct PageInputState {
     last_click: Option<ClickMark>,
     /// 当前 hover 目标(selector;同元素不重排)。
     hover: Option<String>,
+    /// P2e:hover 目标的祖先链(target→root;边界事件 enter/leave 的链差集用)。
+    hover_chain: Vec<String>,
     /// 最近一次 JS mousemove 派发时刻(毫秒;100ms 节流)。
     last_js_move_ms: u128,
     /// HTML5 drag 近似:按下后位移超阈值时已派发 dragstart。
@@ -1243,6 +1245,21 @@ fn format_num(v: f64) -> String {
     } else {
         format!("{v:.3}")
     }
+}
+
+/// P2e:input[type=number] 的点击是否落在右端**微调箭头区**(宽度与
+/// `layout/widgets.rs::SPINNER_W` 同源)。命中返回步进方向:上半 = +1、
+/// 下半 = −1(Chrome 语义)。`page_x` 为页坐标(视口 x 补回滚动量)。
+pub(crate) fn number_spinner_hit(rect: (f64, f64, f64, f64), page_x: f64, y: f64) -> Option<i32> {
+    const SPINNER_W: f64 = 13.0;
+    if rect.2 <= SPINNER_W {
+        return None;
+    }
+    let zone_x0 = rect.0 + rect.2 - SPINNER_W;
+    if page_x < zone_x0 || page_x > rect.0 + rect.2 || y < rect.1 || y > rect.1 + rect.3 {
+        return None;
+    }
+    Some(if y < rect.1 + rect.3 / 2.0 { 1 } else { -1 })
 }
 
 // ---------- 事件载荷(39 号设计文档阶段二) ----------

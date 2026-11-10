@@ -912,3 +912,20 @@ fn 多选语义_翻转范围与独占() {
     // Shift 无锚点 = 独占。
     assert_eq!(multi_pick(&all, &[], 1, false, true, None), vec!["b"]);
 }
+
+// ---------- P2e:number 微调箭头命中(纯函数) ----------
+
+#[test]
+fn number微调箭头命中_上下半区与区外() {
+    let rect = (100.0, 50.0, 160.0, 24.0);
+    // 右端 13px(x ∈ 247..260):上半(y < 62)= +1、下半 = −1。
+    assert_eq!(number_spinner_hit(rect, 250.0, 55.0), Some(1));
+    assert_eq!(number_spinner_hit(rect, 250.0, 65.0), Some(-1));
+    // 文本区(左端)与盒外:None。
+    assert_eq!(number_spinner_hit(rect, 120.0, 55.0), None);
+    assert_eq!(number_spinner_hit(rect, 259.9, 55.0), Some(1));
+    assert_eq!(number_spinner_hit(rect, 260.5, 55.0), None, "越出右缘");
+    assert_eq!(number_spinner_hit(rect, 160.0, 49.0), None, "越出上缘");
+    // 控件比箭头区还窄:不判微调(点击整个落在文本区)。
+    assert_eq!(number_spinner_hit((0.0, 0.0, 10.0, 24.0), 5.0, 10.0), None);
+}

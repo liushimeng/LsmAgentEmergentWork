@@ -182,6 +182,56 @@ document.getElementById('num').addEventListener('input',function(){put('NUM:'+th
 </body></html>"#
                 .to_string(),
         ),
+        // P2e:边界事件(enter/leave)· pointer capture · select 读值桥 ·
+        // number 微调箭头点击 · 跨元素选区整片高亮 验证页。
+        "/p2e" => (
+            "200 OK",
+            r#"<!doctype html><html><head><title>P2e页</title></head><body>
+<div id="wrap" style="width:300px">
+<div id="boxA" style="width:100px;height:40px;background:#eee">甲</div>
+<div id="boxB" style="width:100px;height:40px;background:#ddd">乙</div>
+</div>
+<div id="drag" style="width:120px;height:40px;background:#ccc">拖柄</div>
+<div id="far" style="width:200px;height:60px;background:#bbb">远处</div>
+<select id="ss"><option value="a">甲</option><option value="b" selected>乙</option><option value="c">丙</option></select>
+<input id="nn" type="number" min="0" max="10" step="2" style="width:120px;height:30px" value="4">
+<p id="pa" style="font-size:16px">甲甲甲甲甲</p>
+<p id="pm" style="font-size:16px">中中中中中</p>
+<p id="pc" style="font-size:16px">丙丙丙丙丙</p>
+<div style="position:absolute;left:700px;top:0;width:400px">
+<span id="out"></span><span id="out2"></span><span id="out3"></span>
+</div>
+<script>
+var logs = {h: [], cap: [], num: []};
+function flush(key){
+  var el = document.getElementById(key === 'h' ? 'out' : key === 'cap' ? 'out2' : 'out3');
+  el.textContent = logs[key].join('|');
+}
+function on(id, ev, key, tag){
+  document.getElementById(id).addEventListener(ev, function(){ logs[key].push(tag); flush(key); });
+}
+// 边界事件:甲/乙与公共祖先 #wrap 各挂 enter/leave(公共祖先在
+// 兄弟切换时不应触发 —— 不冒泡语义的根基)。
+on('boxA','pointerenter','h','PE-A'); on('boxA','mouseenter','h','ME-A');
+on('boxA','pointerleave','h','PL-A'); on('boxA','mouseleave','h','ML-A');
+on('boxB','pointerenter','h','PE-B'); on('boxB','mouseenter','h','ME-B');
+on('boxB','pointerleave','h','PL-B'); on('boxB','mouseleave','h','ML-B');
+on('wrap','pointerenter','h','PE-W'); on('wrap','mouseenter','h','ME-W');
+on('wrap','pointerleave','h','PL-W'); on('wrap','mouseleave','h','ML-W');
+// pointer capture:d3-drag 形态 —— pointerdown 里捕获自己,只监听捕获元素。
+document.getElementById('drag').addEventListener('pointerdown', function(e){
+  e.target.setPointerCapture(1); logs.cap.push('DOWN'); flush('cap');
+});
+document.getElementById('drag').addEventListener('pointermove', function(){ logs.cap.push('MOVE'); flush('cap'); });
+document.getElementById('drag').addEventListener('pointerup', function(){ logs.cap.push('UP'); flush('cap'); });
+document.getElementById('drag').addEventListener('lostpointercapture', function(){ logs.cap.push('LOST'); flush('cap'); });
+document.getElementById('drag').addEventListener('gotpointercapture', function(){ logs.cap.push('GOT'); flush('cap'); });
+document.getElementById('drag').addEventListener('click', function(){ logs.cap.push('CLK'); flush('cap'); });
+document.getElementById('nn').addEventListener('input', function(){ logs.num.push('N:' + this.value); flush('num'); });
+</script>
+</body></html>"#
+                .to_string(),
+        ),
         p if p.starts_with("/search") => (
             "200 OK",
             format!(
@@ -1298,15 +1348,18 @@ async fn hover切换派发mouseover与pointer兼容事件() {
     let pid = open_p2d(&tool, &base).await;
     let mgr = LsmBrowserManager::global();
 
-    // 移入甲区:pointerover + mouseover;再移到乙区:甲区先 out、乙区后 over。
+    // 移入甲区:pointerover + mouseover;再移到乙区(P2e 起 Chrome 完整序:
+    // pointerout → pointerleave → pointerover → pointerenter →
+    // mouseout → mouseleave → mouseover → mouseenter,enter/leave 本页无监听):
+    // 可见序 = 甲 out → 乙 over(pointer 先行)→ 甲 mouseout → 乙 mouseover。
     let (ax, ay) = center_of(&tool, &pid, "#pa").await;
     mgr.handle_human_input(&pid, HumanInput::Move { x: ax, y: ay }).await;
     let (bx, by) = center_of(&tool, &pid, "#pb").await;
     mgr.handle_human_input(&pid, HumanInput::Move { x: bx, y: by }).await;
     let log = text_of(&tool, &pid, "#out2").await;
     assert_eq!(
-        log, "POV-A|OV-A|POUT-A|OUT-A|POV-B|OV-B",
-        "hover 切换应按 pointerout→mouseout→pointerover→mouseover 派发:{log}"
+        log, "POV-A|OV-A|POUT-A|POV-B|OUT-A|OV-B",
+        "hover 切换应按 Chrome 完整序派发(out/over 先于 mouseout/mouseover):{log}"
     );
 
     web_control::clear(Engine::Lsm, &pid);
@@ -1506,6 +1559,226 @@ async fn number输入方向键步进() {
     )
     .await;
     assert_eq!(v["data"]["value"], "10", "步进应钳制在 max:{v}");
+
+    web_control::clear(Engine::Lsm, &pid);
+    exec(&tool, json!({"action": "close", "page_id": &pid})).await;
+}
+
+// ---------- P2e 用例(边界事件 / pointer capture / select 读值 / number 微调 / 选区整片) ----------
+
+/// 打开 P2e 验证页并转用户控制态。
+async fn open_p2e(tool: &McpWebLsmBrowserUseTool, base: &str) -> String {
+    let open = exec(
+        tool,
+        json!({"action": "open", "url": format!("{base}/p2e"), "mode": "hidden", "reuse": false}),
+    )
+    .await;
+    assert_eq!(open["code"], 0, "{open}");
+    let pid = open["data"]["page_id"].as_str().unwrap().to_string();
+    web_control::set_state(Engine::Lsm, &pid, ControlState::User, None, "test");
+    pid
+}
+
+/// hover 切换派发完整边界事件序:兄弟元素间切换时,目标各自 enter/leave,
+/// **公共祖先 #wrap 的 enter/leave 不触发**(同一祖先内移动 —— 菜单语义根基)。
+#[tokio::test]
+async fn hover切换派发enter与leave边界事件_公共祖先不触发() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+    let pid = open_p2e(&tool, &base).await;
+    let mgr = LsmBrowserManager::global();
+
+    // 甲 → 乙:pointerout/leave(甲)→ over/enter(乙)→ mouse out/leave/over/enter。
+    let (ax, ay) = center_of(&tool, &pid, "#boxA").await;
+    mgr.handle_human_input(&pid, HumanInput::Move { x: ax, y: ay }).await;
+    let (bx, by) = center_of(&tool, &pid, "#boxB").await;
+    mgr.handle_human_input(&pid, HumanInput::Move { x: bx, y: by }).await;
+    let log = text_of(&tool, &pid, "#out").await;
+    // 进入甲(自空白):pointer 轮先完(enter 甲 → enter wrap,自内向外),
+    // mouse 轮后完(同序);切换甲→乙:甲 leave → 乙 enter(pointer 轮)、
+    // 甲 mouseleave → 乙 mouseenter(mouse 轮);wrap 是公共祖先全程不触发。
+    assert_eq!(
+        log, "PE-A|PE-W|ME-A|ME-W|PL-A|PE-B|ML-A|ME-B",
+        "边界事件应按 Chrome 序派发且公共祖先不触发:{log}"
+    );
+
+    web_control::clear(Engine::Lsm, &pid);
+    exec(&tool, json!({"action": "close", "page_id": &pid})).await;
+}
+
+/// pointer capture 真语义(d3-drag 形态):pointerdown 里 setPointerCapture 后,
+/// 拖到别的元素上 pointermove/pointerup 仍派发到**捕获元素**;隐式释放时
+/// lostpointercapture;捕获目标 == 按下目标时 click 照常合成且 pointerup 不双发。
+#[tokio::test]
+async fn pointerCapture重定向移动与抬起事件() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+    let pid = open_p2e(&tool, &base).await;
+    let mgr = LsmBrowserManager::global();
+
+    let (dx_, dy_) = center_of(&tool, &pid, "#drag").await;
+    let (fx, fy) = center_of(&tool, &pid, "#far").await;
+    // 第一段:按下(监听器捕获自己)→ 拖到远处 → 抬起 = 拖拽收尾
+    //(位移超阈值,不合成 click;pointerup 重定向到捕获元素后隐式释放)。
+    mgr.handle_human_input(
+        &pid,
+        HumanInput::Down { x: dx_, y: dy_, button: MouseButton::Left, mods: Mods::default() },
+    )
+    .await;
+    // 捕获建立后的移动要越过 100ms 节流:等一拍再发(节流窗口按到达时刻)。
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    mgr.handle_human_input(&pid, HumanInput::Move { x: fx, y: fy }).await;
+    let up = mgr
+        .handle_human_input(
+            &pid,
+            HumanInput::Up { x: fx, y: fy, button: MouseButton::Left, mods: Mods::default() },
+        )
+        .await;
+    assert_eq!(up["clicked"], false, "拖离按下点(捕获目标 == 按下目标)按拖拽收尾:{up}");
+    // 隐式释放由日志佐证(下方 LOST);drag_started 分支的回执不带 capture_released。
+    let log = text_of(&tool, &pid, "#out2").await;
+    // GOT(pointerdown 后建立)→ MOVE(拖到 #far 上仍落捕获元素)→
+    // UP(重定向)→ LOST(隐式释放);位移大无 CLK。
+    assert_eq!(
+        log, "DOWN|GOT|MOVE|UP|LOST",
+        "捕获应重定向 pointer 事件并在抬起时隐式释放:{log}"
+    );
+
+    // 释放后再移动:pointermove 回落命中元素(#far),不再进捕获元素。
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    mgr.handle_human_input(&pid, HumanInput::Move { x: fx, y: fy + 10.0 }).await;
+    let log = text_of(&tool, &pid, "#out2").await;
+    assert_eq!(log, "DOWN|GOT|MOVE|UP|LOST", "释放后不应再有捕获元素的事件:{log}");
+
+    // 第二段:原地按下+抬起(捕获目标 == 按下目标、位移小)→ click 照常合成,
+    // 且 pointerup 只派发一次(捕获路径已发,click_inner 不再补发)。
+    let click = human_click(&mgr, &pid, dx_, dy_).await;
+    assert_eq!(click["clicked"], true, "原地点击应照常合成:{click}");
+    let log = text_of(&tool, &pid, "#out2").await;
+    assert_eq!(
+        log, "DOWN|GOT|MOVE|UP|LOST|DOWN|GOT|UP|LOST|CLK",
+        "原地点击:UP 单次 + CLK 合成(不双发 pointerup):{log}"
+    );
+
+    web_control::clear(Engine::Lsm, &pid);
+    exec(&tool, json!({"action": "close", "page_id": &pid})).await;
+}
+
+/// select 读值桥:页面脚本 `select.value/selectedIndex` 读到真实选中值
+/// (HTML 初始与人工点选后两个时点)。
+#[tokio::test]
+async fn select读值桥_页面脚本可读选中值() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+    let pid = open_p2e(&tool, &base).await;
+
+    // 初始(HTML selected=乙,value="b"):value=b / selectedIndex=1。
+    let v = eval_js(
+        &tool,
+        &pid,
+        "var s=document.getElementById('ss'); s.value + ':' + s.selectedIndex",
+    )
+    .await;
+    assert_eq!(v.as_str().unwrap_or(""), "b:1", "初始选中值应可读:{v}");
+
+    // 人工点开下拉并点「丙」→ value=3 / selectedIndex=2。
+    let mgr = LsmBrowserManager::global();
+    let (sx, sy) = center_of(&tool, &pid, "#ss").await;
+    human_click(&mgr, &pid, sx, sy).await;
+    let v = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": &pid, "info": "elements",
+               "params": {"selector": "#ss option", "nth": 2}}),
+    )
+    .await;
+    assert_eq!(v["code"], 0, "面板展开后 option 应有几何:{v}");
+    let r = &v["data"]["rect"];
+    let (ox, oy) = (
+        r["x"].as_f64().unwrap() + r["width"].as_f64().unwrap() / 2.0,
+        r["y"].as_f64().unwrap() + r["height"].as_f64().unwrap() / 2.0,
+    );
+    human_click(&mgr, &pid, ox, oy).await;
+    let v = eval_js(
+        &tool,
+        &pid,
+        "var s=document.getElementById('ss'); s.value + ':' + s.selectedIndex",
+    )
+    .await;
+    assert_eq!(v.as_str().unwrap_or(""), "c:2", "人工点选后读值应更新:{v}");
+
+    web_control::clear(Engine::Lsm, &pid);
+    exec(&tool, json!({"action": "close", "page_id": &pid})).await;
+}
+
+/// number 微调箭头点击步进:右上 +step、右下 −step(Chrome 语义)。
+#[tokio::test]
+async fn number微调箭头点击步进() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+    let pid = open_p2e(&tool, &base).await;
+    let mgr = LsmBrowserManager::global();
+
+    let (x, y, w, h) = rect_of(&tool, &pid, "#nn").await;
+    // 右上角(箭头区宽 13px):value 4 → 6(step=2)。
+    let up = human_click(&mgr, &pid, x + w - 6.0, y + h * 0.25).await;
+    assert_eq!(up["spinner"], 1, "右上应命中递增箭头:{up}");
+    assert_eq!(up["value"], "6", "点击递增箭头应 +step:{up}");
+    // 右下角:6 → 4。
+    let dn = human_click(&mgr, &pid, x + w - 6.0, y + h * 0.75).await;
+    assert_eq!(dn["spinner"], -1, "右下应命中递减箭头:{dn}");
+    assert_eq!(dn["value"], "4", "点击递减箭头应 −step:{dn}");
+    // 文本区点击仍走光标语义(不步进)。
+    let mid = human_click(&mgr, &pid, x + w / 2.0, y + h / 2.0).await;
+    assert!(mid.get("spinner").is_none(), "文本区点击不应步进:{mid}");
+    // input 事件每个步进派发一次。
+    let log = text_of(&tool, &pid, "#out3").await;
+    assert_eq!(log, "N:6|N:4", "步进应派发 input 事件:{log}");
+
+    web_control::clear(Engine::Lsm, &pid);
+    exec(&tool, json!({"action": "close", "page_id": &pid})).await;
+}
+
+/// 跨元素拖选:中间元素整片点亮(page_health.page_sel.marked_elements
+/// 覆盖首 + 中 + 尾)。
+#[tokio::test]
+async fn 跨元素拖选中间元素整片点亮() {
+    allow_loopback();
+    let base = start_site().await;
+    let tool = McpWebLsmBrowserUseTool;
+    let pid = open_p2e(&tool, &base).await;
+    let mgr = LsmBrowserManager::global();
+
+    // #pa 左端按下 → 拖到 #pc 右端(越过 #pm)。
+    let (ax, ay, _, ah) = rect_of(&tool, &pid, "#pa").await;
+    let (cx, cy, cw, ch) = rect_of(&tool, &pid, "#pc").await;
+    mgr.handle_human_input(
+        &pid,
+        HumanInput::Down { x: ax + 6.0, y: ay + ah / 2.0, button: MouseButton::Left, mods: Mods::default() },
+    )
+    .await;
+    mgr.handle_human_input(&pid, HumanInput::Move { x: cx + cw - 6.0, y: cy + ch / 2.0 }).await;
+    mgr.handle_human_input(
+        &pid,
+        HumanInput::Up { x: cx + cw - 6.0, y: cy + ch / 2.0, button: MouseButton::Left, mods: Mods::default() },
+    )
+    .await;
+    let v = exec(
+        &tool,
+        json!({"action": "inspect", "page_id": &pid, "info": "page_health"}),
+    )
+    .await;
+    assert_eq!(v["code"], 0, "{v}");
+    let ps = &v["data"]["page_sel"];
+    assert_eq!(ps["active"], true, "拖选后应有页面选区:{ps}");
+    let marked = ps["marked_elements"].as_i64().unwrap_or(0);
+    assert!(
+        marked >= 3,
+        "首 + 中间(#pm)+ 尾都应点亮(实际 {marked}):{ps}"
+    );
 
     web_control::clear(Engine::Lsm, &pid);
     exec(&tool, json!({"action": "close", "page_id": &pid})).await;

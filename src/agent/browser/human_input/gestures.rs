@@ -185,21 +185,24 @@ impl LsmBrowserManager {
             api::relayout_and_push(self, pid).await;
         }
         let mut focused = None;
-        let (changed, hover_prev) = {
+        let (changed, hover_prev_chain, hit_chain) = {
             let mut s = self.human.lock().unwrap_or_else(|p| p.into_inner());
             let st = s.page(pid);
             let changed = st.hover.as_deref() != hit_sel.as_deref();
-            let prev = st.hover.clone();
+            let prev_chain = st.hover_chain.clone();
+            let hit_chain = hit.as_ref().map(|h| h.hover_chain.clone()).unwrap_or_default();
             if changed {
                 st.hover = hit_sel.clone();
+                st.hover_chain = hit_chain.clone();
             }
-            (changed, prev)
+            (changed, prev_chain, hit_chain)
         };
-        // P2d:hover 目标切换派发兼容事件:旧目标 pointerout/mouseout、
-        // 新目标 pointerover/mouseover(指针事件先于 mouse 兼容事件)。
-        // JS 驱动的悬停菜单/tooltip(只挂 mouseover/pointerover)由此可用。
+        // P2e:hover 目标切换派发 Chrome 完整事件序(out/leave×N/over/enter×N
+        // × pointer+mouse 两轮;leave/enter 不冒泡,公共祖先不派发)——
+        // 只挂 mouseenter/pointerenter 的悬停菜单(Bootstrap/AntD)由此可用;
+        // 整条序列一次 JS 往返。
         if changed {
-            self.dispatch_hover_change(pid, hover_prev.as_deref(), hit_sel.as_deref(), x, y)
+            self.dispatch_hover_change(pid, &hover_prev_chain, &hit_chain, x, y)
                 .await;
         }
         if changed {
@@ -241,12 +244,18 @@ impl LsmBrowserManager {
             }
         };
         if due {
-            if let Some(sel) = hit_sel.as_deref().or(focused.as_deref()) {
+            // P2e:pointer capture 活跃时,pointer/mouse 移动对重定向到捕获元素
+            //(d3-drag 只监听捕获元素;原生手势 —— 文本拖选/滑块 —— 仍按命中)。
+            let cap_before = self.pointer_capture_target(pid).await;
+            let target = cap_before
+                .clone()
+                .or_else(|| hit_sel.clone().or(focused.clone()));
+            if let Some(sel) = target {
                 // P2d:pointermove+mousemove 成对一次往返(共用 100ms 节流)。
                 if let Some(reply) = api::js_dispatch_seq_bounded(
                     self,
                     pid,
-                    sel,
+                    &sel,
                     vec![
                         ("pointermove", Some(pointer::pointer_payload(x, y, MouseButton::Left, pressed, 0))),
                         ("mousemove", Some(mouse_payload(x, y, MouseButton::Left, pressed, 0))),
@@ -256,6 +265,9 @@ impl LsmBrowserManager {
                 {
                     api::apply_js_reply(self, pid, &reply).await;
                 }
+                // 拖拽途中页面可能 releasePointerCapture/换目标 → 转换点补发
+                // got/lostpointercapture(常态无转换零开销)。
+                self.reconcile_pointer_capture(pid, cap_before).await;
             }
         }
         // P2c:回执带光标形状(测试断言与日志用;查看器不消费回执)。
@@ -303,9 +315,21 @@ impl LsmBrowserManager {
                     .unwrap_or(false)
             };
         let focusable = !disabled && is_focusable(&hit.tag, &hit.typ);
+        // P2e:number 微调箭头区(右端 13px):不放光标、不进 datalist 展开逻辑,
+        // 抬起时按上/下半区步进(Chrome 语义)。
+        let spinner_zone = if hit.tag == "input" && hit.typ == "number" {
+            let scroll_x = {
+                let inner = self.inner.lock().await;
+                inner.tabs.get(pid).map(|t| t.scroll_x).unwrap_or(0.0)
+            };
+            let page_x = if hit.fixed { x } else { x + scroll_x };
+            number_spinner_hit(hit.rect, page_x, y)
+        } else {
+            None
+        };
         // P2a:文本控件点击定位光标(Shift+点击沿用旧锚点扩选)。
         let mut caret_out = Value::Null;
-        if !disabled && is_text_like(&hit.tag, &hit.typ) {
+        if !disabled && spinner_zone.is_none() && is_text_like(&hit.tag, &hit.typ) {
             if let Some(st) = self.place_text_caret(pid, &hit, x, y, mods.shift).await {
                 {
                     let mut s = self.human.lock().unwrap_or_else(|p| p.into_inner());
@@ -376,6 +400,9 @@ impl LsmBrowserManager {
         let tag = hit.tag.clone();
         // P2d:pointerdown+mousedown **一次往返**成对派发(指针事件先行,
         // Chrome 兼容事件顺序;逐事件往返的开销会吃掉双击/三击连击窗口)。
+        // P2e:页面常在 pointerdown 监听里 setPointerCapture(d3-drag),
+        // 派发后 reconcile —— 捕获建立即补发 gotpointercapture。
+        let cap_before = self.pointer_capture_target(pid).await;
         if let Some(reply) = api::js_dispatch_seq_bounded(
             self,
             pid,
@@ -389,9 +416,10 @@ impl LsmBrowserManager {
         {
             api::apply_js_reply(self, pid, &reply).await;
         }
+        self.reconcile_pointer_capture(pid, cap_before).await;
         // P2d:点击聚焦带 list 的 input → 展开 datalist 联想面板
         //(点进联想输入框 = Chrome 的展开全量语义)。
-        if focusable {
+        if focusable && spinner_zone.is_none() {
             self.on_focus_maybe_datalist(pid, &sel).await;
         }
         api::relayout_and_push(self, pid).await;
@@ -533,6 +561,34 @@ impl LsmBrowserManager {
         // 左键:同目标且位移小 → 点击;否则视为拖拽收尾。
         let same_target = press.selector.is_some()
             && hit.as_ref().map(|h| h.selector.as_str()) == press.selector.as_deref();
+        // P2e:pointer capture 活跃 —— pointerup/mouseup **重定向到捕获元素**
+        // (d3-drag 只监听捕获元素),随后隐式释放(Chrome:pointerup 后自动
+        // release + lostpointercapture)。捕获目标 ≠ 按下目标时不合成 click
+        //(Chrome 的 click 目标是两者的共同祖先,这里按拖拽收尾,边界如实)。
+        let cap_active = self.pointer_capture_target(pid).await;
+        if let Some(cap_sel) = cap_active.clone() {
+            if let Some(reply) = api::js_dispatch_seq_bounded(
+                self,
+                pid,
+                &cap_sel,
+                vec![
+                    ("pointerup", Some(pointer::pointer_payload(x, y, MouseButton::Left, false, 1))),
+                    ("mouseup", Some(mouse_payload(x, y, MouseButton::Left, false, 1))),
+                ],
+            )
+            .await
+            {
+                api::apply_js_reply(self, pid, &reply).await;
+            }
+            self.release_pointer_capture_implicit(pid).await;
+            if press.selector.as_deref() != Some(cap_sel.as_str()) {
+                api::relayout_and_push(self, pid).await;
+                self.note_human_event(pid, "人工拖拽(指针捕获收尾)");
+                return json!({"x": x, "y": y, "clicked": false, "drag": true, "capture_released": cap_sel});
+            }
+            // 捕获目标 == 按下目标:继续走点击合成(下方 click_inner 不再补发
+            // pointerup —— 本分支已发过,双发会扰动 d3 的拖拽结束判定)。
+        }
         if !same_target || dist > CLICK_DIST {
             // HTML5 drag 近似:dragstart 已派发 → drop(命中他者)+ dragend(源)。
             if drag_started {
@@ -639,6 +695,25 @@ impl LsmBrowserManager {
             self.set_range_by_x(pid, &sel, target.rect, x).await;
         }
 
+        // P2e:input[type=number] 右端微调箭头区:上半 +step / 下半 −step
+        //(复用键盘步进语义:min/max 钳制、空值从 0 起步、派发 input)。
+        if tag == "input" && target.typ == "number" {
+            let scroll_x = {
+                let inner = self.inner.lock().await;
+                inner.tabs.get(pid).map(|t| t.scroll_x).unwrap_or(0.0)
+            };
+            let page_x = if target.fixed { x } else { x + scroll_x };
+            if let Some(dir) = number_spinner_hit(target.rect, page_x, y) {
+                // `step_number` 沿用键路由的方向约定(ArrowUp = −1,内部取反
+                // 成递增),这里把「+1 = 递增」换算过去。
+                self.step_number(pid, &sel, -dir).await;
+                api::relayout_and_push(self, pid).await;
+                let value = self.current_value(pid, &sel).await;
+                self.note_human_event(pid, "人工点击微调箭头(number)");
+                return json!({"x": x, "y": y, "clicked": true, "selector": sel, "spinner": dir, "value": value});
+            }
+        }
+
         let mut params = json!({"selector": sel, "client_x": x, "client_y": y});
         // P2d:列表多选 select 的 option 点击携带修饰键(Ctrl 翻转/Shift 范围);
         // 「Cmd/Ctrl+点击 = 新标签」只是链接语义,option 目标不适用。
@@ -657,7 +732,11 @@ impl LsmBrowserManager {
         // P2d:pointerup 挂到 click_inner 的 click 派发前**同一次往返**发出
         //(完整序列 = 按下时 pointerdown/mousedown + 此处 pointerup + click;
         // 单独往返的 pointerup 会把双击/三击连击窗口吃掉)。
-        params["pointer_pre_click"] = json!({"x": x, "y": y});
+        // P2e:指针捕获路径已在上方发过 pointerup —— 双发会扰动 d3 的拖拽
+        // 结束判定(pointerup 监听器二次触发),此时不再补发。
+        if cap_active.is_none() {
+            params["pointer_pre_click"] = json!({"x": x, "y": y});
+        }
         let clicked = api::click_inner(self, pid, &params, "human").await;
         if dbl {
             if let Some(reply) = api::js_dispatch_bounded_with(

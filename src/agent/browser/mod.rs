@@ -242,6 +242,10 @@ pub struct TabState {
     /// 39 号 P2b:页面级自由选区(跨元素拖选,与 `form_caret` 两本账)。
     /// `document_with_state` 落首/尾元素 `data-lsm-page-sel` 属性。
     pub page_sel: Option<document::PageSelection>,
+    /// 39 号 P2e:pointer capture 当前捕获元素(页面脚本
+    /// `setPointerCapture` 回写;后续 pointer 系事件重定向到它,
+    /// pointerup 隐式释放)。导航换页 TabState 重建,捕获自然清零。
+    pub pointer_capture: Option<String>,
     /// P2c:页面查找(Ctrl/Cmd+F)状态;查找栏与高亮画在查看器帧合成层。
     pub find: find::FindState,
     pub focused: Option<String>,
@@ -1180,6 +1184,7 @@ impl LsmBrowserManager {
             pseudo_states: HashMap::new(),
             form_caret: HashMap::new(),
             page_sel: None,
+            pointer_capture: None,
             find: find::FindState::default(),
             focused: None,
             mouse: None,

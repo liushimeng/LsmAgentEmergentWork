@@ -25,6 +25,7 @@ pub(super) fn env(url: &str) -> PageEnv {
         page_sel_text: String::new(),
         caret_text: HashMap::new(),
         focused: String::new(),
+        pointer_capture: String::new(),
     }
 }
 

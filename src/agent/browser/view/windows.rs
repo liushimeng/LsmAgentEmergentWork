@@ -17,8 +17,9 @@ use windows::core::w;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, InvalidateRect, ScreenToClient,
-    StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HDC, PAINTSTRUCT, SRCCOPY,
+    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetMonitorInfoW, InvalidateRect,
+    MonitorFromWindow, ScreenToClient, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    DIB_RGB_COLORS, HDC, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus, GetKeyState, SetFocus};
@@ -26,16 +27,16 @@ use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
     DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetClientRect, GetMessageW,
-    GetWindowTextW, LoadCursorW, MoveWindow, PostQuitMessage, RegisterClassW, SendMessageW,
-    SetCursor, SetTimer, SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage,
-    BS_PUSHBUTTON, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, ES_AUTOHSCROLL, HMENU,
-    IDC_ARROW, IDC_HAND, IDC_IBEAM, MF_STRING, MSG, SW_SHOWNORMAL, TPM_RIGHTBUTTON,
-    TPM_RETURNCMD, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_DESTROY,
-    WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDBLCLK,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER,
-    WM_XBUTTONDOWN, WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
-    WS_VISIBLE,
+    GetWindowLongPtrW, GetWindowRect, GetWindowTextW, LoadCursorW, MoveWindow, PostQuitMessage,
+    RegisterClassW, SendMessageW, SetCursor, SetTimer, SetWindowTextW, SetWindowLongPtrW,
+    ShowWindow, TrackPopupMenu, TranslateMessage, BS_PUSHBUTTON, CS_DBLCLKS, CS_HREDRAW,
+    CS_VREDRAW, CW_USEDEFAULT, ES_AUTOHSCROLL, GWL_STYLE, HMENU, IDC_ARROW, IDC_HAND, IDC_IBEAM,
+    MF_STRING, MSG, SW_SHOWNORMAL, TPM_RIGHTBUTTON, TPM_RETURNCMD, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_KEYDOWN,
+    WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WM_XBUTTONDOWN, WNDCLASSW,
+    WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
 };
 // EM_SETSEL 定义在 Controls 模块(不在 WindowsAndMessaging;39 号 P2b)。
 use windows::Win32::UI::Controls::EM_SETSEL;
@@ -78,6 +79,8 @@ static RELOAD_BTN: Mutex<Option<HwndCell>> = Mutex::new(None);
 static HOME_BTN: Mutex<Option<HwndCell>> = Mutex::new(None);
 /// 上一次已知的客户区尺寸(像素);变了才重排 + 上报宿主。
 static LAST_SIZE: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+/// P2e:F11 全屏前的窗口样式与位置(还原用;None = 当前非全屏)。
+static FULLSCREEN_SAVE: Mutex<Option<(u32, RECT)>> = Mutex::new(None);
 /// 本查看器认知里的视口尺寸(键鼠坐标换算基线;初始来自 argv,随 resize 同步)。
 static VIEWPORT: Mutex<(i32, i32)> = Mutex::new((0, 0));
 /// 上次已上报的 move(节流:≥30ms 且位移 ≥1px 才再发)。
@@ -379,6 +382,12 @@ unsafe fn forward_key(hwnd: HWND, wp: WPARAM, sys: bool) {
         apply_zoom(dir, hwnd);
         return;
     }
+    // P2e:F11(VK_F11 = 0x7A)全屏切换 —— 无边框铺满所在显示器,再按还原;
+    // 浏览器级快捷键不进页面(与 Chrome 行为一致)。
+    if vk == 0x7A {
+        toggle_fullscreen(hwnd);
+        return;
+    }
     if ctrl || alt {
         // 组合键只转发剪贴板三键(宿主侧按聚焦控件整值处理)。
         if ctrl && (vk == 0x43 || vk == 0x56 || vk == 0x58) {
@@ -430,6 +439,11 @@ unsafe fn forward_wheel(hwnd: HWND, wp: WPARAM, lp: LPARAM, horizontal: bool) {
     if delta == 0 {
         return;
     }
+    // P2e:Shift+纵滚 = 横向滚动(Chrome 语义:上滚 = 向左滚,即 dx 取反号)。
+    // 系统对触控板横滚已走 WM_MOUSEHWHEEL 不经此分支;经典鼠标 Shift+滚轮
+    // 在 Windows 原生仍是纵向 WM_MOUSEWHEEL,这里按 MK_SHIFT(0x0004)转横。
+    let shift = (wp.0 & 0xFFFF) & 0x0004 != 0;
+    let horizontal = horizontal || shift;
     let (sx, sy) = lparam_xy(lp);
     let mut pt = windows::Win32::Foundation::POINT { x: sx, y: sy };
     if !ScreenToClient(hwnd, &mut pt).as_bool() {
@@ -441,11 +455,47 @@ unsafe fn forward_wheel(hwnd: HWND, wp: WPARAM, lp: LPARAM, horizontal: bool) {
     };
     // P2d:滚轮档位 ÷ 缩放(视觉滚动距离与缩放无关)。
     let z = (*ZOOM.lock().unwrap()).max(0.05);
-    let (dx, dy) = if horizontal { (delta as f64 / 120.0 / z, 0.0) } else { (0.0, delta as f64 / 120.0 / z) };
+    let (dx, dy) = if horizontal {
+        let d = if shift { -(delta as f64) } else { delta as f64 };
+        (d / 120.0 / z, 0.0)
+    } else {
+        (0.0, delta as f64 / 120.0 / z)
+    };
     let line = format!(
         "{{\"cmd\":\"input\",\"act\":\"wheel\",\"x\":{px:.0},\"y\":{py:.0},\"dx\":{dx:.3},\"dy\":{dy:.3}}}"
     );
     send_cmd(&line);
+}
+
+/// P2e:F11 全屏切换。进入:记录原窗口样式与位置 → `WS_POPUP` 无边框铺满
+/// 窗口所在显示器;再次按下还原记录值。客户区变化经既有 `WM_SIZE` 链
+/// 重排工具栏并上报宿主新视口(与人工拖动窗口同一条路径)。
+unsafe fn toggle_fullscreen(hwnd: HWND) {
+    let mut saved = FULLSCREEN_SAVE.lock().unwrap();
+    if let Some((style, rect)) = *saved {
+        // 还原:先回样式再回位置(顺序错了边框会被裁)。
+        SetWindowLongPtrW(hwnd, GWL_STYLE, style as isize);
+        let _ = MoveWindow(hwnd, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, true);
+        *saved = None;
+    } else {
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect).is_err() {
+            return;
+        }
+        *saved = Some((style, rect));
+        SetWindowLongPtrW(hwnd, GWL_STYLE, WS_POPUP.0 as isize);
+        let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(mon, &mut info).as_bool() {
+            let r = info.rcMonitor;
+            let _ = MoveWindow(hwnd, r.left, r.top, r.right - r.left, r.bottom - r.top, true);
+        }
+    }
+    let _ = InvalidateRect(hwnd, None, true);
 }
 
 /// 地址栏编辑框子类:回车 → 导航命令。

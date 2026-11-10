@@ -705,6 +705,8 @@ mod tests {
             value: String::new(),
             href: href.to_string(),
             checked: false,
+            selected: false,
+            selected_index: None,
             text: text.to_string(),
             visible: true,
             attrs: Default::default(),

@@ -242,6 +242,61 @@ fn collect_page_sel_text(
     false
 }
 
+/// P2e:`collect_page_sel_middle` 的遍历状态(先序 = 文档序)。
+enum PageSelMidState {
+    /// 尚未遇到起始元素。
+    Before,
+    /// 已过起始、未到终点(中间候选区间)。
+    Middle,
+    /// 已到终点(剪枝)。
+    Done,
+}
+
+/// P2e:收集起止元素**之间**(不含两端)的叶子文本元素选择器(文档序)。
+///
+/// 与 [`collect_page_sel_text`] 同一套「叶子才计数」口径(父元素的
+/// `node_text` 已含子代,重复标记会让高亮越界;script/style/head 已被
+/// `node_text` 排除)。这些元素将整段点亮(`data-lsm-page-sel = "0,-1"`)。
+fn collect_page_sel_middle(
+    node: &NodeRef,
+    start_sel: &str,
+    end_sel: &str,
+    state: &mut PageSelMidState,
+    out: &mut Vec<String>,
+) -> bool {
+    if node.as_element().is_some() {
+        let sel_here = Document::stable_selector(node);
+        match state {
+            PageSelMidState::Before => {
+                if sel_here == *start_sel {
+                    *state = if sel_here == *end_sel {
+                        PageSelMidState::Done
+                    } else {
+                        PageSelMidState::Middle
+                    };
+                }
+            }
+            PageSelMidState::Middle => {
+                if sel_here == *end_sel {
+                    *state = PageSelMidState::Done;
+                    return true;
+                }
+                let has_el_child = node.children().any(|c| c.as_element().is_some());
+                if !has_el_child && !node_text(node).is_empty() {
+                    out.push(sel_here);
+                }
+            }
+            PageSelMidState::Done => return true,
+        }
+    }
+    for c in node.children() {
+        if collect_page_sel_middle(&c, start_sel, end_sel, state, out) {
+            return true;
+        }
+    }
+    false
+}
+
 /// 节点的文档序(先序遍历序号):`PageSelection::ordered` 的比较依据。
 /// 取不到时返回 `usize::MAX`(排到最后,不 panic)。
 fn node_doc_order(node: &NodeRef) -> usize {
@@ -463,6 +518,15 @@ impl Document {
         }
         // 首元素:从 start 到文本末尾(-1 = 到末尾,布局层按可见文本长度解释)。
         apply(self, &start_sel, (start_idx as i64, -1));
+        // P2e:中间叶子元素整段点亮(39 号 §7.2 的渲染近似收敛:此前只画
+        // 首尾两端,视觉上"选了三段只有头尾亮",与 `getSelection().toString()`
+        // 的文本范围不一致)。`0,-1` = 全段,渲染层既有语义零改动。
+        let mut middles: Vec<String> = Vec::new();
+        let mut state = PageSelMidState::Before;
+        collect_page_sel_middle(self.root(), &start_sel, &end_sel, &mut state, &mut middles);
+        for m in middles {
+            apply(self, &m, (0, -1));
+        }
         // 尾元素:从文本开头到 end。
         apply(self, &end_sel, (0, end_idx as i64));
     }
@@ -974,6 +1038,34 @@ fn snapshot_walk(
                     .and_then(|v| v.trim().parse::<usize>().ok())
                     .unwrap_or(pos)
             });
+            // P2e:select 读值桥 —— 运行时选中值经 `apply_widget_state` 已物化
+            // 成 option 的 `selected` 属性,这里按「首个 selected,缺省回落
+            // 首项」取值(与 `selected_option` 同口径),页面脚本
+            // `select.value` 从此读到真实选中值而非恒空串(56 号文档缺口)。
+            let (select_value, select_index, option_selected) = if tag == "select" {
+                let opts: Vec<NodeRef> = node
+                    .select("option")
+                    .map(|os| os.into_iter().map(|o| o.as_node().clone()).collect())
+                    .unwrap_or_default();
+                let chosen = opts
+                    .iter()
+                    .enumerate()
+                    .find(|(_, o)| attr(o, "selected").is_some())
+                    .map(|(i, o)| (i as i64, o.clone()))
+                    .or_else(|| opts.first().map(|o| (0i64, o.clone())));
+                match chosen {
+                    Some((i, o)) => (
+                        Some(attr(&o, "value").unwrap_or_else(|| collapse_ws(&o.text_contents()))),
+                        Some(i),
+                        false,
+                    ),
+                    None => (Some(String::new()), Some(-1), false),
+                }
+            } else if tag == "option" {
+                (None, None, attr(node, "selected").is_some())
+            } else {
+                (None, None, false)
+            };
             out.push(SnapshotNode {
                 index: idx,
                 parent,
@@ -984,11 +1076,17 @@ fn snapshot_walk(
                 class: attrs.get("class").cloned().unwrap_or_default(),
                 name: attrs.get("name").cloned().unwrap_or_default(),
                 typ: attrs.get("type").cloned().unwrap_or_default(),
-                value: attrs.get("value").cloned().unwrap_or_default(),
+                value: if tag == "select" {
+                    select_value.unwrap_or_default()
+                } else {
+                    attrs.get("value").cloned().unwrap_or_default()
+                },
                 href: attr(node, "href")
                     .and_then(|h| urlutil::resolve(base_url, &h))
                     .unwrap_or_default(),
                 checked: attr(node, "checked").is_some(),
+                selected: option_selected,
+                selected_index: select_index,
                 sel_start,
                 sel_end,
                 // 可见文本:`text_contents()` 会把 `<script>` 源码算进来,
@@ -1039,6 +1137,11 @@ pub struct SnapshotNode {
     pub value: String,
     pub href: String,
     pub checked: bool,
+    /// P2e:option 的选中态(读路径:页面脚本 `option.selected`、
+    /// `select.selectedOptions` 都靠它)。
+    pub selected: bool,
+    /// P2e:select 的选中项序号(无 option = −1;仅 select 有值)。
+    pub selected_index: Option<i64>,
     pub text: String,
     pub visible: bool,
     pub attrs: HashMap<String, String>,
@@ -1067,6 +1170,9 @@ impl SnapshotNode {
             "value": self.value,
             "href": self.href,
             "checked": self.checked,
+            // P2e:select 读值桥(option.selected / select.selectedIndex)。
+            "selected": self.selected,
+            "selectedIndex": self.selected_index,
             "text": self.text,
             "visible": self.visible,
             "attrs": self.attrs,
@@ -1898,6 +2004,75 @@ mod tests {
         // 视口 1200 → 命中宽屏 source。
         let cands = picture_srcset(&img, 1200.0).expect("应有 source 候选");
         assert_eq!(cands[0].0, "/wide.png");
+    }
+
+    #[test]
+    fn 页面选区中间叶子元素整段点亮() {
+        let html = r#"<body><p id="a">第一段文字</p><span id="mid">中间文字</span><span id="mid2"></span><p id="b">最后一段</p></body>"#;
+        let mut d = Document::parse(html, "https://a.test/");
+        let sel_a = d.first("#a").unwrap().unwrap();
+        let sel_b = d.first("#b").unwrap().unwrap();
+        let ps = PageSelection {
+            anchor_sel: Document::stable_selector(&sel_a),
+            anchor_idx: 1,
+            head_sel: Document::stable_selector(&sel_b),
+            head_idx: 2,
+        };
+        d.apply_page_sel(&ps);
+        let attr_of = |sel: &str| {
+            let n = d.first(sel).unwrap().unwrap();
+            attr(&n, ATTR_PAGE_SEL)
+        };
+        // 首元素:从 1 到末尾(-1)。
+        assert_eq!(attr_of("#a").as_deref(), Some("1,-1"));
+        // 中间叶子(有文本)整段点亮;空文本叶子跳过。
+        assert_eq!(attr_of("#mid").as_deref(), Some("0,-1"));
+        assert_eq!(attr_of("#mid2"), None, "空文本叶子不标记");
+        // 尾元素:0 到 end。
+        assert_eq!(attr_of("#b").as_deref(), Some("0,2"));
+    }
+
+    #[test]
+    fn 页面选区同元素不产生中间标记() {
+        let html = r#"<body><p id="a">一段文字</p><p id="b">另一段</p></body>"#;
+        let mut d = Document::parse(html, "https://a.test/");
+        let a = d.first("#a").unwrap().unwrap();
+        let ps = PageSelection {
+            anchor_sel: Document::stable_selector(&a),
+            anchor_idx: 1,
+            head_sel: Document::stable_selector(&a),
+            head_idx: 3,
+        };
+        d.apply_page_sel(&ps);
+        assert_eq!(attr(&d.first("#a").unwrap().unwrap(), ATTR_PAGE_SEL).as_deref(), Some("1,3"));
+        assert!(attr(&d.first("#b").unwrap().unwrap(), ATTR_PAGE_SEL).is_none());
+    }
+
+    #[test]
+    fn 快照select读到选中值与序号() {
+        let html = r#"<body><select id="s"><option value="1">One</option><option value="2" selected>Two</option></select>
+<select id="empty"></select><select id="d"><option value="x">X</option></select></body>"#;
+        let d = Document::parse(html, "https://a.test/");
+        let nodes = d.snapshot_nodes();
+        let find = |id: &str| nodes.iter().find(|n| n.id == id).unwrap();
+        // 带 selected:值 = "2"、序号 = 1。
+        let s = find("s");
+        assert_eq!(s.value, "2");
+        assert_eq!(s.selected_index, Some(1));
+        // 无 option:值空、序号 −1。
+        let empty = find("empty");
+        assert_eq!(empty.value, "");
+        assert_eq!(empty.selected_index, Some(-1));
+        // 无 selected 属性:回落首项(浏览器 DOM 语义)。
+        let dd = find("d");
+        assert_eq!(dd.value, "x");
+        assert_eq!(dd.selected_index, Some(0));
+        // option 的 selected 布尔。
+        let opt2 = nodes
+            .iter()
+            .find(|n| n.tag == "option" && n.value == "2")
+            .expect("option 应在快照里");
+        assert!(opt2.selected);
     }
 
 }

@@ -1390,12 +1390,20 @@ function __mk(n) {
     },
     focus: function () { __push({ type: "focus", selector: n.sel }); },
     blur: function () { __push({ type: "blur", selector: n.sel }); },
-    // 指针捕获(39 号 P2d):d3-drag 等库特性检测 PointerEvent 后会调用
-    // setPointerCapture —— 缺方法会抛错断链。内核无捕获语义(事件本就按
-    // 命中元素派发),提供 no-op stub 防崩。
-    setPointerCapture: function () {},
-    releasePointerCapture: function () {},
-    hasPointerCapture: function () { return false; },
+    // 指针捕获(39 号 P2d 起 no-op 防崩;P2e 落真语义):setPointerCapture 后
+    // 后续 pointer 事件重定向到本元素 —— d3-drag 在 pointerdown 里捕获后
+    // **只监听捕获元素的 pointermove/pointerup**,捕获不生效拖两下就"丢"。
+    // set/release 经动作回写宿主(pointer_capture);hasPointerCapture 读
+    // 宿主每轮注入的 __lsmMeta.pointerCapture。
+    setPointerCapture: function () {
+      __push({ type: "pointer_capture", selector: n.sel, key: "set" });
+    },
+    releasePointerCapture: function () {
+      __push({ type: "pointer_capture", selector: n.sel, key: "release" });
+    },
+    hasPointerCapture: function () {
+      return !!(__lsmMeta && __lsmMeta.pointerCapture === n.sel);
+    },
     submit: function () { __push({ type: "submit", selector: n.sel }); },
     dispatchEvent: function (e) {
       var t = String((e && e.type) || e);
@@ -1649,6 +1657,44 @@ function __mk(n) {
     __lsmSetSel(n, key, cur.start, Number(v) || 0);
   });
   __lsmInstallSetSelectionRange(el, n, key);
+  // P2e:select/option 读值桥。select.value 读走既有 define("value") 的
+  // n.value 通道(快照侧已按「首个 selected/回落首项」物化),写走既有
+  // set_value 动作(经 form_values → selected 属性,Chrome 语义:脚本赋值
+  // 不发 change);这里补 selectedIndex / selectedOptions / options 与
+  // option.selected。options 每次读现算(近似活集合),含 optgroup 内的项。
+  if (n.tag === "select") {
+    var __selOptions = function () {
+      var out = [];
+      for (var oi = 0; oi < __lsmNodes.length; oi++) {
+        var on = __lsmNodes[oi];
+        if (on && on.tag === "option" && __lsmUnderIdx(on, n.i)) out.push(__mk(on));
+      }
+      return out;
+    };
+    define("options", function () { return __selOptions(); }, function (v) {});
+    define("selectedIndex", function () {
+      return (n.selectedIndex == null) ? -1 : Number(n.selectedIndex);
+    }, function (v) {
+      var opts = __selOptions();
+      var i = Number(v) | 0;
+      if (i < 0 || i >= opts.length) return;
+      var ov = opts[i].value;
+      if (ov != null) el.value = ov;
+    });
+    define("selectedOptions", function () {
+      var out = [], opts = __selOptions();
+      for (var si = 0; si < opts.length; si++) if (opts[si].selected) out.push(opts[si]);
+      return out;
+    }, function (v) {});
+  }
+  if (n.tag === "option") {
+    define("selected", function () { return !!n.selected; }, function (v) {
+      // 写近似:直接置/撤 selected 属性回写宿主(select 有运行时值时以
+      // form_values 物化结果为准,与本写不冲突 —— 无运行时值的静态页生效)。
+      if (v) __push({ type: "set_attr", selector: n.sel, key: "selected", value: "" });
+      else __push({ type: "remove_attr", selector: n.sel, key: "selected" });
+    });
+  }
   // 第 41 轮:半选态(indeterminate)。内核以同名属性承载,布局层据此画横杠,
   // 样式引擎的 `:indeterminate` 也按该属性命中。
   define("indeterminate", function () {
@@ -2014,10 +2060,19 @@ function __newEl(tag) {
     },
     focus: function () { __fireDyn(el, "focus"); },
     blur: function () { __fireDyn(el, "blur"); },
-    // 指针捕获 no-op stub(与快照元素同口径,39 号 P2d)。
-    setPointerCapture: function () {},
-    releasePointerCapture: function () {},
-    hasPointerCapture: function () { return false; },
+    // 指针捕获真语义(P2e,与快照元素同口径):动态节点以挂载后的快照
+    // 选择器为准(未挂载时退 @dyn: 键,宿主派发自然落空 —— 无盒即无按下,
+    // 捕获不可能建立)。
+    setPointerCapture: function () {
+      __push({ type: "pointer_capture", selector: __lsmDynSel(el), key: "set" });
+    },
+    releasePointerCapture: function () {
+      __push({ type: "pointer_capture", selector: __lsmDynSel(el), key: "release" });
+    },
+    hasPointerCapture: function () {
+      var s = (el.__lsm_node && el.__lsm_node.sel) ? el.__lsm_node.sel : "";
+      return !!(s && __lsmMeta && __lsmMeta.pointerCapture === s);
+    },
     // 深拷贝:属性 / innerHTML 原文 / 子树都带走(旧实现返回空元素,
     // 站点「建模板 → cloneNode → 挂载」模式克隆出的控件是空壳)。
     cloneNode: function (deep) {
@@ -3916,6 +3971,55 @@ function __fire(sel, type, detail) {
   }
   return { handled: handled, defaultPrevented: prevented };
 }
+// P2e:不冒泡派发(enter/leave 等边界事件专用)。只命中**精确挂在目标元素上**
+// 的监听:静态监听要求 L.sel 严格等于目标选择器(@document/@window 不参与),
+// 动态监听按 data-lsm-id 反查到的动态对象**自身**(不含动态父链)。若复用
+// __fire 的祖先链匹配,mouseleave 会误触发公共祖先上的监听 —— 恰好破坏
+// jQuery/Bootstrap 菜单最依赖的 enter/leave 语义(同一祖先内移动不触发)。
+// P2e:动态节点的派发选择器 —— 挂载后以快照 sel 为准(宿主可命中/可派发),
+// 未挂载退 @dyn: 键(派发自然落空:无盒即无按下,捕获不可能建立)。
+function __lsmDynSel(el) {
+  if (el && el.__lsm_node && el.__lsm_node.sel) return el.__lsm_node.sel;
+  return "@dyn:" + __lsmDynKey(el);
+}
+// P2e:快照节点是否位于某祖先快照索引的子树内(沿 parent 指针上行;
+// select.options 要把 optgroup 内的 option 也收进来)。
+function __lsmUnderIdx(node, rootIdx) {
+  var p = node && node.parent;
+  var guard = 0;
+  while (p != null && p >= 0 && p < __lsmNodes.length && guard++ < 64) {
+    if (p === rootIdx) return true;
+    p = __lsmNodes[p].parent;
+  }
+  return false;
+}
+function __fireNoBubble(sel, type, detail) {
+  var node = __lsmFindBySel(sel);
+  if (!node) return { handled: false, defaultPrevented: false };
+  var dynSelf = null;
+  var dk = node.attrs ? node.attrs["data-lsm-id"] : null;
+  if (dk && __lsmDynById[dk]) dynSelf = __lsmDynById[dk];
+  var handled = false, prevented = false;
+  for (var i = 0; i < __lsmListeners.length; i++) {
+    var L = __lsmListeners[i];
+    if (L.type !== String(type)) continue;
+    var match = false;
+    if (L.node) {
+      match = (L.node === dynSelf);
+    } else {
+      match = (L.sel === sel && L.sel !== "@document" && L.sel !== "@window");
+    }
+    if (!match) continue;
+    var ev = __mkEvent(type, detail);
+    ev.target = __mk(node);
+    ev.currentTarget = L.node ? L.node : __mk(node);
+    handled = true;
+    try { L.fn.call(ev.currentTarget, ev); } catch (e) { __cerror("listener " + type + ": " + String((e && e.stack) || e)); }
+    if (ev.defaultPrevented) prevented = true;
+    if (ev.propagationStopped) break;
+  }
+  return { handled: handled, defaultPrevented: prevented };
+}
 // 动态节点自身触发(el.click() 等):沿动态父链冒泡,只跑动态监听。
 function __fireDyn(target, type) {
   if (!target) return { handled: false, defaultPrevented: false };
@@ -4853,6 +4957,29 @@ function __lsmDispatchSeq(sel, seq) {
       } catch (e) { d = null; }
     }
     var res = __fire(String(sel), String(item[0]), d);
+    if (res.handled) handled = true;
+    if (res.defaultPrevented) prevented = true;
+  }
+  var out = { handled: handled, defaultPrevented: prevented };
+  __lsmDispatchResult = out;
+  return JSON.stringify(out);
+}
+// P2e:逐事件自带目标的批量分发(hover 切换的 Chrome 完整事件序:每个事件的
+// 目标元素与冒泡性都不同)。items = [[sel, type, detail, noBubble], ...];
+// noBubble=1 走 __fireNoBubble(enter/leave),否则走 __fire(冒泡)。
+// 整条序列一次往返 —— 逐事件往返的开销会吃掉手势响应(与 DispatchSeq 同因)。
+function __lsmDispatchMulti(items) {
+  var handled = false, prevented = false;
+  for (var i = 0; i < items.length; i++) {
+    var it = items[i];
+    var d = null;
+    if (it[2]) {
+      try {
+        d = (typeof it[2] === "string") ? JSON.parse(it[2]) : it[2];
+      } catch (e) { d = null; }
+    }
+    var res = it[3] ? __fireNoBubble(String(it[0]), String(it[1]), d)
+      : __fire(String(it[0]), String(it[1]), d);
     if (res.handled) handled = true;
     if (res.defaultPrevented) prevented = true;
   }

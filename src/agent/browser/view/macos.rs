@@ -890,6 +890,16 @@ extern "C" fn on_pv_key_down(_self: Id, _cmd: Sel, event: Id) {
             send_cmd("{\"cmd\":\"reload\"}");
             return;
         }
+        // P2e:F11(键码 103)全屏切换 —— AppKit 原生动画与还原,浏览器级
+        // 快捷键不进页面(与 Chrome 行为一致;系统"显示桌面"手势优先时本键
+        // 不达,属用户设置)。
+        if code == 103 {
+            let window = send_id(_self, sel(b"window\0"));
+            if !window.is_null() && respond(window, b"toggleFullScreen:\0") {
+                send_void_id(window, sel(b"toggleFullScreen:\0"), std::ptr::null_mut());
+            }
+            return;
+        }
         // 标签页快捷键(39 号设计文档阶段二):⌘/Ctrl+T 新标签、⌘/Ctrl+W 关标签
         //、Ctrl+Tab 切换(⌘+Tab 是系统级切换器,不占用)。
         if (meta || ctrl) && code == 17 {

@@ -192,6 +192,7 @@ fn take_reply(req: &mut JsRequest) -> Option<std::sync::mpsc::Sender<JsReply>> {
         | JsRequest::Eval { reply, .. }
         | JsRequest::Dispatch { reply, .. }
         | JsRequest::DispatchSeq { reply, .. }
+        | JsRequest::DispatchMulti { reply, .. }
         | JsRequest::Diag { reply, .. } => Some(reply.clone()),
         JsRequest::Shutdown => None,
     }
@@ -381,6 +382,9 @@ impl ThreadRuntime {
                 nodes,
                 ..
             } => Some(self.dispatch_seq(&selector, &events, &env, &nodes)),
+            JsRequest::DispatchMulti {
+                events, env, nodes, ..
+            } => Some(self.dispatch_multi(&events, &env, &nodes)),
             JsRequest::Shutdown => None,
         }
     }
@@ -834,6 +838,43 @@ impl ThreadRuntime {
             serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into()),
             seq.join(", ")
         );
+        self.eval_quiet(&src);
+        self.timer_budget = MAX_TIMER_CALLBACKS;
+        self.event_wall_ms = 0;
+        self.eval_quiet("__lsmTimerBudget=64");
+        self.event_loop(None);
+        self.collect(None)
+    }
+
+    /// P2e:逐事件自带目标的批量分发(hover 切换的 Chrome 完整事件序,
+    /// 每个事件的目标元素与冒泡性都不同)。JS 侧 `__lsmDispatchMulti`。
+    fn dispatch_multi(
+        &mut self,
+        events: &[(String, String, Option<serde_json::Value>, bool)],
+        env: &PageEnv,
+        nodes: &[SnapshotNode],
+    ) -> JsReply {
+        self.begin_request(env, 0);
+        if let Err(e) = self.refresh(nodes, env) {
+            return JsReply::error(e);
+        }
+        let items: Vec<String> = events
+            .iter()
+            .map(|(sel, ev, payload, no_bubble)| {
+                let detail = match payload {
+                    Some(v) => serde_json::to_string(v).unwrap_or_else(|_| "null".into()),
+                    None => "null".to_string(),
+                };
+                format!(
+                    "[{}, {}, {}, {}]",
+                    serde_json::to_string(sel).unwrap_or_else(|_| "\"\"".into()),
+                    serde_json::to_string(ev).unwrap_or_else(|_| "\"\"".into()),
+                    detail,
+                    if *no_bubble { 1 } else { 0 }
+                )
+            })
+            .collect();
+        let src = format!("__lsmDispatchMulti([{}])", items.join(", "));
         self.eval_quiet(&src);
         self.timer_budget = MAX_TIMER_CALLBACKS;
         self.event_wall_ms = 0;
@@ -1592,6 +1633,7 @@ mod diag_probe {
             page_sel_text: String::new(),
             caret_text: Default::default(),
             focused: String::new(),
+            pointer_capture: String::new(),
         };
         let reply = rt.run_scripts(
             &[ScriptSource {

@@ -244,6 +244,8 @@ fn fill_selection_env(env: &mut script::PageEnv, tab: &super::TabState) {
         .as_ref()
         .map(|s| page_selection_text(&doc, s))
         .unwrap_or_default();
+    // P2e:pointer capture 注入(页面脚本 hasPointerCapture 读)。
+    env.pointer_capture = tab.pointer_capture.clone().unwrap_or_default();
 }
 
 /// `page_selection_text` 的公开包装(人工输入的页面复制复用同一实现)。
@@ -534,6 +536,66 @@ pub(crate) async fn js_dispatch_seq_bounded(
     }
 }
 
+/// P2e:逐事件自带目标的批量分发(hover 切换的 Chrome 完整事件序:每个事件的
+/// 目标元素与冒泡性都不同;超时 2s 同口径)。events = (selector, event,
+/// payload, 不冒泡)。
+pub(crate) async fn js_dispatch_multi_bounded(
+    mgr: &LsmBrowserManager,
+    pid: &str,
+    events: Vec<(String, &str, Option<Value>, bool)>,
+) -> Option<script::JsReply> {
+    let (handle, env, nodes) = {
+        let mut inner = mgr.inner.lock().await;
+        if let Some(tab) = inner.tabs.get_mut(pid) {
+            mgr.ensure_layout_locked(tab);
+        }
+        let inner = &*inner;
+        let Some(tab) = inner.tabs.get(pid) else {
+            return None;
+        };
+        let handle = tab.js.clone()?;
+        let mut env = script::build_env(
+            inner,
+            &tab.url,
+            &tab.title,
+            &tab.user_agent,
+            (tab.viewport.width, tab.viewport.height),
+            &tab.session_storage,
+            tab.security.get_csp(&tab.url),
+        );
+        env.scroll_x = tab.scroll_x;
+        env.scroll_y = tab.scroll_y;
+        env.resources = tab.network.iter().rev().take(120).rev().cloned().collect();
+        fill_selection_env(&mut env, tab);
+        let doc = tab_document(tab);
+        let rects = tab.layout.rect_map();
+        let anim_ov = tab.anim.override_snapshot();
+        let nodes = doc.snapshot_nodes_with_rects((tab.viewport.width, tab.viewport.height), &rects, &anim_ov);
+        (handle, env, nodes)
+    };
+    let events: Vec<(String, String, Option<Value>, bool)> = events
+        .into_iter()
+        .map(|(sel, ev, payload, nb)| (sel, ev.to_string(), payload, nb))
+        .collect();
+    let result = tokio::task::spawn_blocking(move || {
+        handle.request(|tx| script::JsRequest::DispatchMulti {
+            events,
+            env,
+            nodes,
+            reply: tx,
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(reply)) => Some(reply),
+        Ok(Err(e)) if e.contains("已退出") => {
+            mgr.clear_js(pid).await;
+            None
+        }
+        _ => None,
+    }
+}
+
 /// 应用 JS 回复:DOM 动作落到 `tab.html` 并重算布局;存储/Cookie/标题/滚动/台账合并。
 /// 返回导航类待执行动作(click/navigate/submit/new_tab/back/forward/reload)。
 pub(crate) async fn apply_js_reply(
@@ -597,6 +659,16 @@ pub(crate) async fn apply_js_reply(
     for (k, (s, e)) in summary.form_selections {
         t.form_caret
             .insert(k, super::document::CaretState { pos: e, anchor: s });
+    }
+    // P2e:pointer capture 状态迁移(set = 捕获;release/换目标 = 先放旧)。
+    // got/lostpointercapture 的派发由手势处理器的 reconcile 负责(锁内不可
+    // 再起 JS 往返)。
+    if let Some((sel, on)) = summary.pointer_capture {
+        if on {
+            t.pointer_capture = Some(sel);
+        } else if t.pointer_capture.as_deref() == Some(sel.as_str()) {
+            t.pointer_capture = None;
+        }
     }
     let state_changed = !summary.form_values.is_empty()
         || has_selections

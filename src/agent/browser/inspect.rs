@@ -4,7 +4,7 @@
 
 use serde_json::{json, Value};
 
-use super::document::{self, Document};
+use super::document::{self, Document, ATTR_PAGE_SEL};
 use super::render::display::{BgFill, DisplayKind};
 use super::style::{MediaCtx, StyleEngine};
 use super::{EngineError, EngineResult, LsmBrowserManager};
@@ -438,10 +438,27 @@ pub async fn inspect(
                     ""
                 },
                 // 39 号 P2b 能力缺口(如实上报,免得 Agent 对着「选区没生效」
-                // 反复重试):跨元素整片高亮只画首尾元素内区段;Selection/Range
-                // 全 API 未建模(只有 getSelection().toString() 与文本控件的
-                // selectionStart/End/setSelectionRange)。
-                "selection_note": "页面自由选区:跨元素拖选可用,getSelection().toString() 可读;但 Selection/Range 全 API 未建模,且跨元素高亮只画首尾元素内区段(中间元素不画)",
+                // 反复重试)。P2e 起中间元素已整段点亮,只剩 Selection/Range
+                // 全 API 与多行近似两条边界。
+                "selection_note": "页面自由选区:跨元素拖选可用,getSelection().toString() 可读,中间元素整片高亮(P2e);但 Selection/Range 全 API 未建模(只有 getSelection().toString() 与文本控件的 selectionStart/End/setSelectionRange),多行文本按单行近似",
+                // P2e:页面自由选区观测字段(标记元素数 = 首 + 中间 + 尾)。
+                "page_sel": match &tab.page_sel {
+                    Some(s) if !s.is_empty() => {
+                        let doc = tab.document_with_state();
+                        let (start_sel, _si, end_sel, _ei) = s.ordered(&doc);
+                        let marked = doc
+                            .select(&format!("[{ATTR_PAGE_SEL}]"))
+                            .map(|v| v.into_iter().count())
+                            .unwrap_or(0);
+                        json!({
+                            "active": true,
+                            "start": start_sel,
+                            "end": end_sel,
+                            "marked_elements": marked,
+                        })
+                    }
+                    _ => json!({"active": false}),
+                },
                 // 39 号 P2c:页面查找(Ctrl/Cmd+F)能力缺口如实上报。
                 "find_note": "页面查找(Ctrl/Cmd+F)可用:匹配高亮+查找栏画在查看器帧合成层(不进截图);每元素按自有文本(直接文本节点)匹配、父子不重复;多行文本按单行近似,混合内容里夹子元素时高亮 x 会偏移,查找栏只键盘可操作(Esc 关闭)",
                 // 第 57 轮:动画状态如实上报 —— 截图/几何停在补间中间态时,

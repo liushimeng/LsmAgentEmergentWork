@@ -722,7 +722,7 @@ impl LsmBrowserManager {
     /// number 步进(P2d,ArrowUp/Down):min/max/step 钳制,派发 `input`。
     /// 与 range 不同,number 的 min/max 缺省是**无界**(range 缺省 0..100),
     /// 空值起步从 0(Chrome 语义)。
-    async fn step_number(&self, pid: &str, selector: &str, dir: i32) -> Value {
+    pub(super) async fn step_number(&self, pid: &str, selector: &str, dir: i32) -> Value {
         let next_val = {
             let inner = self.inner.lock().await;
             let Some(tab) = inner.tabs.get(pid) else {

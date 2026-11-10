@@ -31,6 +31,8 @@ pub struct ApplySummary {
     pub form_values: HashMap<String, String>,
     /// 39 号 P2b:selector → (start, end) 文本控件选区(set_selection)。
     pub form_selections: HashMap<String, (usize, usize)>,
+    /// P2e:pointer capture 状态迁移(`(选择器, 是否捕获)`;set/release 两键)。
+    pub pointer_capture: Option<(String, bool)>,
     pub title: Option<String>,
     /// 原样 Set-Cookie 行。
     pub cookies: Vec<String>,
@@ -322,6 +324,14 @@ pub fn apply(doc: &Document, actions: &[JsAction], base_url: &str) -> ApplySumma
                         ));
                     }
                 }
+            }
+            // P2e:pointer capture 真语义:页面脚本 setPointerCapture/
+            // releasePointerCapture 回写宿主(selector 走动作的 selector 位,
+            // set/release 走 key 位)。不带 DOM 改写,只汇总状态迁移。
+            "pointer_capture" => {
+                let on = action.key.trim() == "set";
+                summary.pointer_capture = Some((action.selector.clone(), on));
+                summary.applied += 1;
             }
             "set_title" => summary.title = Some(action.value.clone()),
             "set_cookie" => summary.cookies.push(action.value.clone()),
