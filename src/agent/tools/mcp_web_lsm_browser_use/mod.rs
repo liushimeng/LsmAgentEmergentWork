@@ -413,16 +413,38 @@ fn envelope_page_id(out: &str) -> Option<String> {
 
 // ===================== open / list / close =====================
 
+/// open 参数合并:params 里的已知键无条件补缺到顶层(顶层显式值优先)。
+///
+/// 2026-11-20 闲鱼真机:此前只在顶层缺 url 时才整体上提 params,顶层有 url
+/// 就早退 —— Agent 惯用 `{"url":...,"params":{"window_width":1080,...}}`,
+/// 窗口尺寸被静默丢弃(响应 requested 恒 null),被迫追加 set_viewport 补救。
+/// 未知键仍忽略(params 不当杂物盒放大攻击面)。
 fn merge_open_params(args: &mut Value) {
-    if str_arg(args, "url").is_some() {
-        return;
-    }
+    const KNOWN_KEYS: &[&str] = &[
+        "url",
+        "window_width",
+        "window_height",
+        "mode",
+        "new_window",
+        "user_agent",
+        "wait_until",
+        "timeout_ms",
+        "reload",
+        "force",
+        "reuse",
+        "page_id",
+        "save_path",
+        "ocr",
+        "full_page",
+    ];
     let Some(Value::Object(params)) = args.get("params").cloned() else {
         return;
     };
     if let Value::Object(top) = args {
         for (k, v) in params {
-            top.entry(k).or_insert(v);
+            if KNOWN_KEYS.contains(&k.as_str()) {
+                top.entry(k).or_insert(v);
+            }
         }
     }
 }

@@ -182,3 +182,50 @@ fn description_点明标签页治理() {
     // (行续行写成 `\\` 会让模型看到 "文字\\" 这种噪声)。
     assert!(!d.contains('\\'), "description 不得含反斜杠残留:{d}");
 }
+
+/// 2026-11-20 闲鱼真机回归:顶层有 url 时,`params` 里的已知标量键
+/// (window_width/window_height 等)必须补缺上提 —— 此前早退导致
+/// Agent 惯用 `{"url":...,"params":{"window_width":...}}` 的窗口参数
+/// 被静默丢弃(响应 requested 恒 null),被迫追加 set_viewport 补救。
+#[test]
+fn merge_open_params_顶层有url时params已知键仍上提() {
+    let mut args = json!({
+        "action": "open",
+        "url": "https://www.goofish.com/",
+        "params": {
+            "window_width": 1080,
+            "window_height": 1920,
+            "wait_until": "domcontentloaded"
+        }
+    });
+    merge_open_params(&mut args);
+    assert_eq!(args["window_width"], 1080, "params.window_width 必须上提到顶层");
+    assert_eq!(args["window_height"], 1920, "params.window_height 必须上提到顶层");
+    assert_eq!(args["wait_until"], "domcontentloaded", "params.wait_until 必须上提到顶层");
+}
+
+/// 顶层显式值优先:params 只补缺,不得覆盖调用方顶层的明确取值。
+#[test]
+fn merge_open_params_顶层显式值不被params覆盖() {
+    let mut args = json!({
+        "action": "open",
+        "url": "https://www.goofish.com/",
+        "window_width": 1920,
+        "params": { "window_width": 800, "unknown_junk": "x" }
+    });
+    merge_open_params(&mut args);
+    assert_eq!(args["window_width"], 1920, "顶层显式值优先,params 只补缺");
+    assert!(args.get("unknown_junk").is_none(), "未知键仍须忽略(params 不当杂物盒)");
+}
+
+/// 顶层缺 url 的旧路径(整体上提救 url)行为保持不变。
+#[test]
+fn merge_open_params_顶层缺url时仍整体上提() {
+    let mut args = json!({
+        "action": "open",
+        "params": { "url": "https://a.test/" }
+    });
+    merge_open_params(&mut args);
+    assert_eq!(args["url"], "https://a.test/", "缺 url 时 params.url 必须上提");
+    assert!(args.get("params").is_some(), "params 本体保留不删(其余键仍可读)");
+}

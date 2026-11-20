@@ -5183,16 +5183,19 @@ function __lsmCollect(ov) {
 __lsmFatal = null;
 "##;
 
-/// 完整 PRELUDE 源码:主体 + 共享选择器引擎 + 共享标准全局。
+/// 完整 PRELUDE 源码:主体 + 共享选择器引擎 + 共享标准全局 + IndexedDB 内存实现。
 ///
 /// 选择器引擎与标准全局抽成独立常量,阶段一(`js.rs`)与阶段二共用,
 /// 避免两套 PRELUDE 各改各的、行为悄悄漂移(历史上阶段二丢了 `el.title`)。
+/// IndexedDB 最小内存实现(2026-11-20 闲鱼根因)排在尾部:依赖主体已定义的
+/// `setTimeout`(虚拟时钟)与 `__cerror`(console 台账)。
 pub static PRELUDE: once_cell::sync::Lazy<String> = once_cell::sync::Lazy::new(|| {
     format!(
-        "{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}",
         PRELUDE_BODY,
         super::canvas_js::CANVAS_JS,
         super::env_js::SELECTOR_JS,
-        super::env_js::GLOBALS_JS
+        super::env_js::GLOBALS_JS,
+        super::idb_js::IDB_JS
     )
 });

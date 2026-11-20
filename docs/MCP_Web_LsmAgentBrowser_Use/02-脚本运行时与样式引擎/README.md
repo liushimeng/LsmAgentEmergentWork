@@ -10,3 +10,4 @@
 | [19-浏览器请求头合成层与抗风控指纹补齐.md](19-浏览器请求头合成层与抗风控指纹补齐.md) | 按目的地合成 UA/Referer/Origin/Accept/Sec-Fetch-*；**缺 Referer 被风控 403 的根因** |
 | [21-Boa0.22升级与重站点异步模块启动链修复.md](21-Boa0.22升级与重站点异步模块启动链修复.md) | Boa 0.20/0.21 直接 eval 闭包 panic 与重复 eval `var` 缺陷阻断百度地图异步模块装载 |
 | [21b-Sizzle选择器引擎与document.nodeType修复.md](21b-Sizzle选择器引擎与document.nodeType修复.md) | 快照桥 `document.nodeType` 缺失 → jQuery/Sizzle 守卫恒返 `[]` → 整页 widget 不渲染 |
+| [22-IndexedDB最小内存实现与闲鱼动态子树渲染中断根因.md](22-IndexedDB最小内存实现与闲鱼动态子树渲染中断根因.md) | PRELUDE 注入 IndexedDB 内存实现;闲鱼「mtop 200 有数据但 React 子树渲染空态」根因:SDK 探测 `window.indexedDB` 缺失即 throw;附带 merge_open_params 白名单上提修复 |

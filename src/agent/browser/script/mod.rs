@@ -11,6 +11,7 @@ pub mod diag;
 pub mod dom_ops;
 pub mod env_js;
 pub mod for_in_guard;
+pub mod idb_js;
 pub mod preact_guard;
 pub mod prelude;
 pub mod runtime;
@@ -25,6 +26,8 @@ mod tests;
 mod tests_dom_insert;
 #[cfg(test)]
 mod tests_human_p2e;
+#[cfg(test)]
+mod tests_idb;
 #[cfg(test)]
 mod tests_jd_compat;
 #[cfg(test)]
